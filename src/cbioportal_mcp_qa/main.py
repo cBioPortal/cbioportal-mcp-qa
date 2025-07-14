@@ -73,6 +73,26 @@ from .output_manager import OutputManager
     envvar="CLICKHOUSE_SEND_RECEIVE_TIMEOUT",
     help="ClickHouse send/receive timeout (or set CLICKHOUSE_SEND_RECEIVE_TIMEOUT env var)",
 )
+@click.option(
+    "--model",
+    "-m",
+    default="anthropic:claude-sonnet-4-20250514",
+    help="Anthropic model to use (default: claude-sonnet-4-20250514)",
+)
+@click.option(
+    "--delay",
+    "-d",
+    default=30,
+    type=int,
+    help="Delay between questions in seconds (default: 30)",
+)
+@click.option(
+    "--batch-size",
+    "-b",
+    default=5,
+    type=int,
+    help="Number of questions to process before longer pause (default: 5)",
+)
 def cli(
     csv_file: Path,
     questions: str,
@@ -86,6 +106,9 @@ def cli(
     clickhouse_verify: Optional[str],
     clickhouse_connect_timeout: Optional[str],
     clickhouse_send_receive_timeout: Optional[str],
+    model: str,
+    delay: int,
+    batch_size: int,
 ):
     """Process cBioPortal QA questions using MCP integration.
     
@@ -104,6 +127,9 @@ def cli(
         clickhouse_verify,
         clickhouse_connect_timeout,
         clickhouse_send_receive_timeout,
+        model,
+        delay,
+        batch_size,
     ))
 
 
@@ -120,6 +146,9 @@ async def async_main(
     clickhouse_verify: Optional[str],
     clickhouse_connect_timeout: Optional[str],
     clickhouse_send_receive_timeout: Optional[str],
+    model: str,
+    delay: int,
+    batch_size: int,
 ):
     """Async main function for processing questions."""
     try:
@@ -137,6 +166,7 @@ async def async_main(
         # Initialize clients
         llm_client = LLMClient(
             api_key=api_key,
+            model=model,
             clickhouse_host=clickhouse_host,
             clickhouse_port=clickhouse_port,
             clickhouse_user=clickhouse_user,

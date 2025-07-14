@@ -1,10 +1,15 @@
 """PydanticAI client with MCP ClickHouse integration."""
 
 import os
-from typing import Optional
+import asyncio
+import time
+import json
+from typing import Optional, List, Dict, Any
 
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPServerStdio
+
+from .prompts import DEFAULT_SYSTEM_PROMPT
 
 
 class LLMClient:
@@ -13,6 +18,7 @@ class LLMClient:
     def __init__(
         self, 
         api_key: Optional[str] = None,
+        model: str = "anthropic:claude-sonnet-4-20250514",
         clickhouse_host: Optional[str] = None,
         clickhouse_port: Optional[str] = None,
         clickhouse_user: Optional[str] = None,
@@ -26,6 +32,7 @@ class LLMClient:
         
         Args:
             api_key: Anthropic API key. If None, will read from ANTHROPIC_API_KEY env var.
+            model: Anthropic model to use.
             clickhouse_*: ClickHouse configuration parameters.
         """
         api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
@@ -69,26 +76,11 @@ class LLMClient:
         
         # Create agent with MCP server
         self.agent = Agent(
-            'anthropic:claude-3-5-sonnet-20241022',
+            model,
             mcp_servers=[self.mcp_server],
-            system_prompt="""You are a helpful assistant with access to cBioPortal data through MCP integration.
-
-Use the cBioPortal clickhouse cgds_public_2025_06_24 database to answer user questions. The database has tables for patients, sample and associated clinical data. Studies are in the cancer_study table. Focus on data in the msk_chord_2024 if no specific studies are mentioned. There are genomic alterations in mutation, cna, structural_variant and related columns. The events table determines treatments for each patient.
-
-cBioPortal Cohort URLs can be constructed like this for example where P-0001534 is a PATIENT_ID: `https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson={%22patientIdentifiers%22:[{%22studyId%22:%22msk_chord_2024%22,%22patientId%22:%22P-0001534%22}]}`. When you talk about a specific group of patient provide links using that URL pattern (don't explain to the user how to make them, but just give the URL).
-
-Always aim to use the clickhouse MCP server unless specifically prompted to do something else.
-
-When answering questions about cBioPortal data:
-1. Use the available MCP tools to query the ClickHouse database
-2. Provide accurate, data-driven responses
-3. Include specific numbers and statistics when available
-4. Be clear about any limitations or assumptions
-5. Format your response in a clear, structured way
-
-If you need to access cBioPortal data, use the MCP tools available to you."""
+            system_prompt=DEFAULT_SYSTEM_PROMPT
         )
-    
+        
     async def ask_question(self, question: str) -> str:
         """Ask a question using PydanticAI with MCP integration.
         

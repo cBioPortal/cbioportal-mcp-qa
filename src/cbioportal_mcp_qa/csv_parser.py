@@ -57,6 +57,6 @@ def load_questions(csv_path: Path, selected_questions: List[int]) -> List[Tuple[
     # Return as list of tuples
     questions = []
     for _, row in filtered_df.iterrows():
-        questions.append((row['#'], row['Qustion Type'], row['Question']))
+        questions.append((int(row['#']), row['Qustion Type'], row['Question']))
     
     return questions
