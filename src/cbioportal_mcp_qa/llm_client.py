@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPServerStdio
+from pydantic_ai.settings import ModelSettings
 
 from .prompts import DEFAULT_SYSTEM_PROMPT
 
@@ -75,10 +76,12 @@ class LLMClient:
         )
         
         # Create agent with MCP server
+        model_settings = ModelSettings(max_tokens=2048)
         self.agent = Agent(
             model,
             mcp_servers=[self.mcp_server],
-            system_prompt=DEFAULT_SYSTEM_PROMPT
+            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            model_settings=model_settings
         )
         
     async def ask_question(self, question: str) -> str:
