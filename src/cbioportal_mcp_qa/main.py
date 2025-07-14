@@ -1,5 +1,6 @@
 """Main CLI entry point for cBioPortal MCP QA processing."""
 
+import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -32,16 +33,95 @@ from .output_manager import OutputManager
     envvar="ANTHROPIC_API_KEY",
     help="Anthropic API key (or set ANTHROPIC_API_KEY env var)",
 )
+@click.option(
+    "--clickhouse-host",
+    envvar="CLICKHOUSE_HOST",
+    help="ClickHouse host (or set CLICKHOUSE_HOST env var)",
+)
+@click.option(
+    "--clickhouse-port",
+    envvar="CLICKHOUSE_PORT",
+    help="ClickHouse port (or set CLICKHOUSE_PORT env var)",
+)
+@click.option(
+    "--clickhouse-user",
+    envvar="CLICKHOUSE_USER",
+    help="ClickHouse user (or set CLICKHOUSE_USER env var)",
+)
+@click.option(
+    "--clickhouse-password",
+    envvar="CLICKHOUSE_PASSWORD",
+    help="ClickHouse password (or set CLICKHOUSE_PASSWORD env var)",
+)
+@click.option(
+    "--clickhouse-secure",
+    envvar="CLICKHOUSE_SECURE",
+    help="ClickHouse secure connection (or set CLICKHOUSE_SECURE env var)",
+)
+@click.option(
+    "--clickhouse-verify",
+    envvar="CLICKHOUSE_VERIFY",
+    help="ClickHouse verify SSL (or set CLICKHOUSE_VERIFY env var)",
+)
+@click.option(
+    "--clickhouse-connect-timeout",
+    envvar="CLICKHOUSE_CONNECT_TIMEOUT",
+    help="ClickHouse connect timeout (or set CLICKHOUSE_CONNECT_TIMEOUT env var)",
+)
+@click.option(
+    "--clickhouse-send-receive-timeout",
+    envvar="CLICKHOUSE_SEND_RECEIVE_TIMEOUT",
+    help="ClickHouse send/receive timeout (or set CLICKHOUSE_SEND_RECEIVE_TIMEOUT env var)",
+)
 def cli(
     csv_file: Path,
     questions: str,
     output_dir: Path,
     api_key: Optional[str],
+    clickhouse_host: Optional[str],
+    clickhouse_port: Optional[str],
+    clickhouse_user: Optional[str],
+    clickhouse_password: Optional[str],
+    clickhouse_secure: Optional[str],
+    clickhouse_verify: Optional[str],
+    clickhouse_connect_timeout: Optional[str],
+    clickhouse_send_receive_timeout: Optional[str],
 ):
     """Process cBioPortal QA questions using MCP integration.
     
     CSV_FILE: Path to the CSV file containing questions
     """
+    asyncio.run(async_main(
+        csv_file,
+        questions,
+        output_dir,
+        api_key,
+        clickhouse_host,
+        clickhouse_port,
+        clickhouse_user,
+        clickhouse_password,
+        clickhouse_secure,
+        clickhouse_verify,
+        clickhouse_connect_timeout,
+        clickhouse_send_receive_timeout,
+    ))
+
+
+async def async_main(
+    csv_file: Path,
+    questions: str,
+    output_dir: Path,
+    api_key: Optional[str],
+    clickhouse_host: Optional[str],
+    clickhouse_port: Optional[str],
+    clickhouse_user: Optional[str],
+    clickhouse_password: Optional[str],
+    clickhouse_secure: Optional[str],
+    clickhouse_verify: Optional[str],
+    clickhouse_connect_timeout: Optional[str],
+    clickhouse_send_receive_timeout: Optional[str],
+):
+    """Async main function for processing questions."""
     try:
         # Parse question selection
         selected_questions = parse_question_selection(questions)
@@ -55,7 +135,17 @@ def cli(
             return
         
         # Initialize clients
-        llm_client = LLMClient(api_key)
+        llm_client = LLMClient(
+            api_key=api_key,
+            clickhouse_host=clickhouse_host,
+            clickhouse_port=clickhouse_port,
+            clickhouse_user=clickhouse_user,
+            clickhouse_password=clickhouse_password,
+            clickhouse_secure=clickhouse_secure,
+            clickhouse_verify=clickhouse_verify,
+            clickhouse_connect_timeout=clickhouse_connect_timeout,
+            clickhouse_send_receive_timeout=clickhouse_send_receive_timeout,
+        )
         output_manager = OutputManager(output_dir)
         
         # Process questions
@@ -64,7 +154,7 @@ def cli(
                 pbar.set_description(f"Processing question {question_num}")
                 
                 # Get answer from LLM
-                answer = llm_client.ask_question(question_text)
+                answer = await llm_client.ask_question(question_text)
                 
                 # Write result
                 output_path = output_manager.write_question_result(
