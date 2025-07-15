@@ -16,6 +16,7 @@ KEY TABLES (use these directly without exploration):
 - cgds_public_2025_06_24.genetic_profile: genetic_profile_id, cancer_study_id, genetic_alteration_type
 - cgds_public_2025_06_24.genomic_event_derived: pre-joined mutation + sample + gene data (USE THIS for mutations)
 - cgds_public_2025_06_24.clinical_data_derived: pre-joined clinical data (USE THIS for clinical attributes)
+- cgds_public_2025_06_24.clinical_attribute_meta: metadata about clinical attributes (attr_id, description, patient_attribute, cancer_study_id)
 
 GENOMIC DATA GUIDANCE:
 ### Key Tables & Relationships:
@@ -41,6 +42,14 @@ GENOMIC DATA GUIDANCE:
 - **Decision**: Match the attribute to the level of detail requested in the question
 - **When unsure**: start with CANCER_TYPE for broader matching
 
+### Clinical Attribute Discovery:
+**clinical_attribute_meta**: Use for discovering available clinical attributes
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: provides human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+- **Usage**: SELECT attr_id, description, patient_attribute FROM clinical_attribute_meta WHERE cancer_study_id = (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'msk_chord_2024')
+
 ### Common Mistake:
 DON'T filter `mutation_status = 'SOMATIC'` - include ALL statuses ('SOMATIC', 'UNKNOWN', etc.)
 
@@ -57,6 +66,7 @@ IMPORTANT:
 - For gene mutations (like TP53): use genomic_event_derived WHERE hugo_gene_symbol = 'TP53' AND variant_type = 'mutation'
 - For clinical attributes (like TMB): use clinical_data_derived WHERE attribute_name = 'TMB_NONSYNONYMOUS'
 - For cancer types: use CANCER_TYPE for broad categories, CANCER_TYPE_DETAILED for specific subtypes
+- For clinical attribute discovery: use clinical_attribute_meta to find available attributes and their descriptions
 - Clinical attributes are key-value pairs: attr_id identifies the attribute, attr_value contains the data
 - Clinical data comes from clinical_* tables, structural data from base tables
 - ALWAYS use DESCRIBE TABLE to discover actual column structure
@@ -86,6 +96,7 @@ Key tables include:
 - cgds_public_2025_06_24.genetic_profile: genomic profile definitions
 - cgds_public_2025_06_24.genomic_event_derived: pre-joined mutation + sample + gene data (USE THIS for mutations)
 - cgds_public_2025_06_24.clinical_data_derived: pre-joined clinical data (USE THIS for clinical attributes)
+- cgds_public_2025_06_24.clinical_attribute_meta: metadata about clinical attributes (attr_id, description, patient_attribute, cancer_study_id)
 
 GENOMIC DATA GUIDANCE:
 ### Key Tables & Relationships:
@@ -110,6 +121,14 @@ GENOMIC DATA GUIDANCE:
 - **CANCER_TYPE_DETAILED**: specific subtypes like 'Spindle Cell Carcinoma of the Lung', 'Invasive Ductal Carcinoma'
 - **Decision**: Match the attribute to the level of detail requested in the question
 - **When unsure**: start with CANCER_TYPE for broader matching
+
+### Clinical Attribute Discovery:
+**clinical_attribute_meta**: Use for discovering available clinical attributes
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: provides human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+- **Usage**: SELECT attr_id, description, patient_attribute FROM clinical_attribute_meta WHERE cancer_study_id = (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'msk_chord_2024')
 
 ### Common Mistake:
 DON'T filter `mutation_status = 'SOMATIC'` - include ALL statuses ('SOMATIC', 'UNKNOWN', etc.)

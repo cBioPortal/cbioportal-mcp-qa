@@ -76,7 +76,7 @@ class LLMClient:
         )
         
         # Create agent with MCP server
-        model_settings = ModelSettings(max_tokens=2048)
+        model_settings = ModelSettings(max_tokens=4096)
         self.agent = Agent(
             model,
             mcp_servers=[self.mcp_server],
