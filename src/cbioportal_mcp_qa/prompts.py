@@ -32,7 +32,14 @@ GENOMIC DATA GUIDANCE:
 
 **clinical_data_derived**: Pre-joined clinical data  
 - Contains: sample_unique_id, patient_unique_id, attribute_name, attribute_value
-- Use attribute_name like 'TMB_NONSYNONYMOUS', 'CANCER_TYPE_DETAILED'
+- Use attribute_name like 'TMB_NONSYNONYMOUS', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED'
+
+### Cancer Type Selection:
+**CANCER_TYPE vs CANCER_TYPE_DETAILED**: Choose based on question specificity
+- **CANCER_TYPE**: broader categories like 'Non-Small Cell Lung Cancer', 'Breast Cancer'
+- **CANCER_TYPE_DETAILED**: specific subtypes like 'Spindle Cell Carcinoma of the Lung', 'Invasive Ductal Carcinoma'
+- **Decision**: Match the attribute to the level of detail requested in the question
+- **When unsure**: start with CANCER_TYPE for broader matching
 
 ### Common Mistake:
 DON'T filter `mutation_status = 'SOMATIC'` - include ALL statuses ('SOMATIC', 'UNKNOWN', etc.)
@@ -49,6 +56,7 @@ IMPORTANT:
 - For sample_type: use clinical_data_derived WHERE attribute_name = 'SAMPLE_TYPE' OR clinical_sample WHERE attr_id = 'SAMPLE_TYPE'
 - For gene mutations (like TP53): use genomic_event_derived WHERE hugo_gene_symbol = 'TP53' AND variant_type = 'mutation'
 - For clinical attributes (like TMB): use clinical_data_derived WHERE attribute_name = 'TMB_NONSYNONYMOUS'
+- For cancer types: use CANCER_TYPE for broad categories, CANCER_TYPE_DETAILED for specific subtypes
 - Clinical attributes are key-value pairs: attr_id identifies the attribute, attr_value contains the data
 - Clinical data comes from clinical_* tables, structural data from base tables
 - ALWAYS use DESCRIBE TABLE to discover actual column structure
@@ -94,7 +102,14 @@ GENOMIC DATA GUIDANCE:
 
 **clinical_data_derived**: Pre-joined clinical data  
 - Contains: sample_unique_id, patient_unique_id, attribute_name, attribute_value
-- Use attribute_name like 'TMB_NONSYNONYMOUS', 'CANCER_TYPE_DETAILED'
+- Use attribute_name like 'TMB_NONSYNONYMOUS', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED'
+
+### Cancer Type Selection:
+**CANCER_TYPE vs CANCER_TYPE_DETAILED**: Choose based on question specificity
+- **CANCER_TYPE**: broader categories like 'Non-Small Cell Lung Cancer', 'Breast Cancer'
+- **CANCER_TYPE_DETAILED**: specific subtypes like 'Spindle Cell Carcinoma of the Lung', 'Invasive Ductal Carcinoma'
+- **Decision**: Match the attribute to the level of detail requested in the question
+- **When unsure**: start with CANCER_TYPE for broader matching
 
 ### Common Mistake:
 DON'T filter `mutation_status = 'SOMATIC'` - include ALL statuses ('SOMATIC', 'UNKNOWN', etc.)
