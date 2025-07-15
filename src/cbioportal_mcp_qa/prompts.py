@@ -14,6 +14,28 @@ KEY TABLES (use these directly without exploration):
 - cgds_public_2025_06_24.mutation: sample_id, entrez_gene_id, hugo_gene_symbol, mutation_status
 - cgds_public_2025_06_24.cna: sample_id, entrez_gene_id, hugo_gene_symbol, alteration
 - cgds_public_2025_06_24.genetic_profile: genetic_profile_id, cancer_study_id, genetic_alteration_type
+- cgds_public_2025_06_24.genomic_event_derived: pre-joined mutation + sample + gene data (USE THIS for mutations)
+- cgds_public_2025_06_24.clinical_data_derived: pre-joined clinical data (USE THIS for clinical attributes)
+
+GENOMIC DATA GUIDANCE:
+### Key Tables & Relationships:
+**mutation** → **mutation_event** → **gene** (via entrez_gene_id)
+**mutation** → **sample** → **patient** (via internal_id fields)
+
+### CRITICAL: Use Derived Tables
+**Don't join raw tables manually.** Use these pre-computed views:
+
+**genomic_event_derived**: Pre-joined mutation + sample + gene data
+- Contains: sample_unique_id, hugo_gene_symbol, mutation_type, mutation_status, variant_type
+- Filter: `variant_type = 'mutation'` for mutations
+- Filter: `cancer_study_identifier = 'msk_chord_2024'`
+
+**clinical_data_derived**: Pre-joined clinical data  
+- Contains: sample_unique_id, patient_unique_id, attribute_name, attribute_value
+- Use attribute_name like 'TMB_NONSYNONYMOUS', 'CANCER_TYPE_DETAILED'
+
+### Common Mistake:
+DON'T filter `mutation_status = 'SOMATIC'` - include ALL statuses ('SOMATIC', 'UNKNOWN', etc.)
 
 SCHEMA RELATIONSHIPS:
 - cancer_study.cancer_study_identifier = 'msk_chord_2024' (identifies the study)
@@ -24,7 +46,9 @@ IMPORTANT:
 - ALL queries must filter to msk_chord_2024 study: JOIN with cgds_public_2025_06_24.cancer_study WHERE cancer_study_identifier = 'msk_chord_2024'
 - For patient data: JOIN patient → clinical_patient via patient.internal_id
 - For sample data: JOIN cancer_study → patient → sample → clinical_sample (3-hop relationship)
-- For sample_type: use clinical_sample WHERE attr_id = 'SAMPLE_TYPE', NOT sample.sample_type
+- For sample_type: use clinical_data_derived WHERE attribute_name = 'SAMPLE_TYPE' OR clinical_sample WHERE attr_id = 'SAMPLE_TYPE'
+- For gene mutations (like TP53): use genomic_event_derived WHERE hugo_gene_symbol = 'TP53' AND variant_type = 'mutation'
+- For clinical attributes (like TMB): use clinical_data_derived WHERE attribute_name = 'TMB_NONSYNONYMOUS'
 - Clinical attributes are key-value pairs: attr_id identifies the attribute, attr_value contains the data
 - Clinical data comes from clinical_* tables, structural data from base tables
 - ALWAYS use DESCRIBE TABLE to discover actual column structure
@@ -52,6 +76,28 @@ Key tables include:
 - cgds_public_2025_06_24.cna: copy number alteration data
 - cgds_public_2025_06_24.structural_variant: structural variant data
 - cgds_public_2025_06_24.genetic_profile: genomic profile definitions
+- cgds_public_2025_06_24.genomic_event_derived: pre-joined mutation + sample + gene data (USE THIS for mutations)
+- cgds_public_2025_06_24.clinical_data_derived: pre-joined clinical data (USE THIS for clinical attributes)
+
+GENOMIC DATA GUIDANCE:
+### Key Tables & Relationships:
+**mutation** → **mutation_event** → **gene** (via entrez_gene_id)
+**mutation** → **sample** → **patient** (via internal_id fields)
+
+### CRITICAL: Use Derived Tables
+**Don't join raw tables manually.** Use these pre-computed views:
+
+**genomic_event_derived**: Pre-joined mutation + sample + gene data
+- Contains: sample_unique_id, hugo_gene_symbol, mutation_type, mutation_status, variant_type
+- Filter: `variant_type = 'mutation'` for mutations
+- Filter: `cancer_study_identifier = 'msk_chord_2024'`
+
+**clinical_data_derived**: Pre-joined clinical data  
+- Contains: sample_unique_id, patient_unique_id, attribute_name, attribute_value
+- Use attribute_name like 'TMB_NONSYNONYMOUS', 'CANCER_TYPE_DETAILED'
+
+### Common Mistake:
+DON'T filter `mutation_status = 'SOMATIC'` - include ALL statuses ('SOMATIC', 'UNKNOWN', etc.)
 
 VERIFIED COLUMN NAMES:
 - cgds_public_2025_06_24.cancer_study: cancer_study_id (primary key), cancer_study_identifier (study identifier), name, description
@@ -70,7 +116,9 @@ QUERY REQUIREMENTS:
 6. Column names are lowercase with underscores
 7. ALWAYS use fully qualified table names with cgds_public_2025_06_24 prefix
 8. NEVER use default database - always specify cgds_public_2025_06_24
-9. For sample_type: use clinical_sample WHERE attr_id = 'SAMPLE_TYPE' - clinical attributes are key-value pairs
+9. For sample_type: use clinical_data_derived WHERE attribute_name = 'SAMPLE_TYPE' - prefer derived tables
+10. For gene mutations: use genomic_event_derived WHERE hugo_gene_symbol = 'GENE' AND variant_type = 'mutation'
+11. DON'T manually join mutation tables - use genomic_event_derived instead
 
 SCHEMA VALIDATION:
 - Use "DESCRIBE cgds_public_2025_06_24.table_name" to check table structure
