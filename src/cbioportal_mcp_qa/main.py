@@ -77,7 +77,17 @@ from .output_manager import OutputManager
     "--model",
     "-m",
     default="anthropic:claude-sonnet-4-20250514",
-    help="Anthropic model to use (default: claude-sonnet-4-20250514)",
+    help="Model to use (default: claude-sonnet-4-20250514 for Anthropic, e.g., qwen3:8b for Ollama)",
+)
+@click.option(
+    "--use-ollama",
+    is_flag=True,
+    help="Use Ollama instead of Anthropic API",
+)
+@click.option(
+    "--ollama-base-url",
+    default="http://localhost:11434",
+    help="Ollama base URL (default: http://localhost:11434)",
 )
 @click.option(
     "--delay",
@@ -107,6 +117,8 @@ def cli(
     clickhouse_connect_timeout: Optional[str],
     clickhouse_send_receive_timeout: Optional[str],
     model: str,
+    use_ollama: bool,
+    ollama_base_url: str,
     delay: int,
     batch_size: int,
 ):
@@ -128,6 +140,8 @@ def cli(
         clickhouse_connect_timeout,
         clickhouse_send_receive_timeout,
         model,
+        use_ollama,
+        ollama_base_url,
         delay,
         batch_size,
     ))
@@ -147,6 +161,8 @@ async def async_main(
     clickhouse_connect_timeout: Optional[str],
     clickhouse_send_receive_timeout: Optional[str],
     model: str,
+    use_ollama: bool,
+    ollama_base_url: str,
     delay: int,
     batch_size: int,
 ):
@@ -167,6 +183,8 @@ async def async_main(
         llm_client = LLMClient(
             api_key=api_key,
             model=model,
+            use_ollama=use_ollama,
+            ollama_base_url=ollama_base_url,
             clickhouse_host=clickhouse_host,
             clickhouse_port=clickhouse_port,
             clickhouse_user=clickhouse_user,

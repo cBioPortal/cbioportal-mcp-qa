@@ -9,6 +9,8 @@ from typing import Optional, List, Dict, Any
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPServerStdio
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from .prompts import DEFAULT_SYSTEM_PROMPT
 
@@ -20,6 +22,8 @@ class LLMClient:
         self, 
         api_key: Optional[str] = None,
         model: str = "anthropic:claude-sonnet-4-20250514",
+        use_ollama: bool = False,
+        ollama_base_url: str = "http://localhost:11434",
         clickhouse_host: Optional[str] = None,
         clickhouse_port: Optional[str] = None,
         clickhouse_user: Optional[str] = None,
@@ -33,12 +37,16 @@ class LLMClient:
         
         Args:
             api_key: Anthropic API key. If None, will read from ANTHROPIC_API_KEY env var.
-            model: Anthropic model to use.
+            model: Model to use (Anthropic or Ollama format).
+            use_ollama: Whether to use Ollama instead of Anthropic.
+            ollama_base_url: Base URL for Ollama server.
             clickhouse_*: ClickHouse configuration parameters.
         """
-        api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY environment variable must be set")
+        # Only require API key for Anthropic models
+        if not use_ollama:
+            api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise ValueError("ANTHROPIC_API_KEY environment variable must be set")
         
         # Set up ClickHouse environment variables
         clickhouse_env = {}
@@ -77,8 +85,20 @@ class LLMClient:
         
         # Create agent with MCP server
         model_settings = ModelSettings(max_tokens=4096)
+        
+        # Create model based on whether using Ollama or Anthropic
+        if use_ollama:
+            # For Ollama, create OpenAI-compatible model
+            agent_model = OpenAIModel(
+                model_name=model,  # This should be the ollama_model passed from main.py
+                provider=OpenAIProvider(base_url=f"{ollama_base_url}/v1")
+            )
+        else:
+            # For Anthropic, use model string directly
+            agent_model = model
+        
         self.agent = Agent(
-            model,
+            agent_model,
             mcp_servers=[self.mcp_server],
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             model_settings=model_settings
