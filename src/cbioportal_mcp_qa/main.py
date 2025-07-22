@@ -90,6 +90,11 @@ from .output_manager import OutputManager
     help="Ollama base URL (default: http://localhost:11434)",
 )
 @click.option(
+    "--include-sql",
+    is_flag=True,
+    help="Include SQL queries in the output markdown files",
+)
+@click.option(
     "--delay",
     "-d",
     default=30,
@@ -119,6 +124,7 @@ def cli(
     model: str,
     use_ollama: bool,
     ollama_base_url: str,
+    include_sql: bool,
     delay: int,
     batch_size: int,
 ):
@@ -142,6 +148,7 @@ def cli(
         model,
         use_ollama,
         ollama_base_url,
+        include_sql,
         delay,
         batch_size,
     ))
@@ -163,6 +170,7 @@ async def async_main(
     model: str,
     use_ollama: bool,
     ollama_base_url: str,
+    include_sql: bool,
     delay: int,
     batch_size: int,
 ):
@@ -185,6 +193,7 @@ async def async_main(
             model=model,
             use_ollama=use_ollama,
             ollama_base_url=ollama_base_url,
+            include_sql=include_sql,
             clickhouse_host=clickhouse_host,
             clickhouse_port=clickhouse_port,
             clickhouse_user=clickhouse_user,
@@ -206,7 +215,7 @@ async def async_main(
                 
                 # Write result
                 output_path = output_manager.write_question_result(
-                    question_num, question_type, question_text, answer
+                    question_num, question_type, question_text, answer, include_sql
                 )
                 
                 click.echo(f"Question {question_num} -> {output_path}")

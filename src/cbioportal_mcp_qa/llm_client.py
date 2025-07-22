@@ -13,10 +13,19 @@ from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from .prompts import DEFAULT_SYSTEM_PROMPT
+from .sql_logger import sql_query_logger, MCPServerStdioWithLogging
 
 
 class LLMClient:
     """PydanticAI client with MCP ClickHouse integration."""
+    
+    def get_sql_queries(self) -> List[Any]:
+        """Get captured SQL queries for the current question.
+        
+        Returns:
+            List of SqlQuery objects
+        """
+        return sql_query_logger.get_queries()
     
     def __init__(
         self, 
@@ -32,6 +41,7 @@ class LLMClient:
         clickhouse_verify: Optional[str] = None,
         clickhouse_connect_timeout: Optional[str] = None,
         clickhouse_send_receive_timeout: Optional[str] = None,
+        include_sql: bool = False,
     ):
         """Initialize the client.
         
@@ -41,6 +51,7 @@ class LLMClient:
             use_ollama: Whether to use Ollama instead of Anthropic.
             ollama_base_url: Base URL for Ollama server.
             clickhouse_*: ClickHouse configuration parameters.
+            include_sql: Whether to capture and log SQL queries.
         """
         # Only require API key for Anthropic models
         if not use_ollama:
@@ -76,12 +87,26 @@ class LLMClient:
         if missing_params:
             raise ValueError(f"Missing required ClickHouse parameters: {', '.join(missing_params)}")
         
+        # Configure SQL logging
+        if include_sql:
+            sql_query_logger.enable()
+        else:
+            sql_query_logger.disable()
+        
         # Configure MCP server with ClickHouse
-        self.mcp_server = MCPServerStdio(
-            command="mcp-clickhouse",
-            args=[],
-            env=clickhouse_env
-        )
+        if include_sql:
+            self.mcp_server = MCPServerStdioWithLogging(
+                sql_query_logger,
+                command="mcp-clickhouse",
+                args=[],
+                env=clickhouse_env
+            )
+        else:
+            self.mcp_server = MCPServerStdio(
+                command="mcp-clickhouse",
+                args=[],
+                env=clickhouse_env
+            )
         
         # Create agent with MCP server
         model_settings = ModelSettings(max_tokens=4096)
@@ -114,6 +139,9 @@ class LLMClient:
             The response from the agent
         """
         try:
+            # Clear previous queries for this question
+            sql_query_logger.clear()
+            
             # Use the agent's run_mcp_servers context manager
             async with self.agent.run_mcp_servers():
                 response = await self.agent.run(question)
