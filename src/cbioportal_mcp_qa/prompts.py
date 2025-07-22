@@ -33,7 +33,7 @@ GENOMIC DATA GUIDANCE:
 
 **clinical_data_derived**: Pre-joined clinical data  
 - Contains: sample_unique_id, patient_unique_id, attribute_name, attribute_value
-- Use attribute_name like 'TMB_NONSYNONYMOUS', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED'
+- Use attribute_name like 'MUTATION_COUNT', 'TMB_NONSYNONYMOUS', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED'
 
 ### Cancer Type Selection:
 **CANCER_TYPE vs CANCER_TYPE_DETAILED**: Choose based on question specificity
@@ -113,7 +113,7 @@ GENOMIC DATA GUIDANCE:
 
 **clinical_data_derived**: Pre-joined clinical data  
 - Contains: sample_unique_id, patient_unique_id, attribute_name, attribute_value
-- Use attribute_name like 'TMB_NONSYNONYMOUS', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED'
+- Use attribute_name like 'MUTATION_COUNT','TMB_NONSYNONYMOUS', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED'
 
 ### Cancer Type Selection:
 **CANCER_TYPE vs CANCER_TYPE_DETAILED**: Choose based on question specificity
