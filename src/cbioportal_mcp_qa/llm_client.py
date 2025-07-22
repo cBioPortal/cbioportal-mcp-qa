@@ -13,7 +13,7 @@ from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from .prompts import DEFAULT_SYSTEM_PROMPT
-from .sql_logger import sql_query_logger, MCPServerStdioWithLogging
+from .sql_logger import sql_query_logger, MCPServerStdioWithSQLCapture
 
 
 class LLMClient:
@@ -95,7 +95,7 @@ class LLMClient:
         
         # Configure MCP server with ClickHouse
         if include_sql:
-            self.mcp_server = MCPServerStdioWithLogging(
+            self.mcp_server = MCPServerStdioWithSQLCapture(
                 sql_query_logger,
                 command="mcp-clickhouse",
                 args=[],
