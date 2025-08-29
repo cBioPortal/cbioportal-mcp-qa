@@ -71,35 +71,6 @@ cbioportal-mcp-qa ask "Show me mutation data for BRCA1" --format markdown --incl
 - **Environment configuration**: CLI options and environment variables
 - **Model flexibility**: Support for Anthropic Claude and Ollama models
 
-## Examples
-
-### Batch Processing Examples
-
-```bash
-# Process questions 1-10 with SQL logging
-cbioportal-mcp-qa batch input/QA_pairs_20250714.csv -q 1-10 --include-sql
-
-# Use Ollama instead of Anthropic
-cbioportal-mcp-qa batch input/QA_pairs_20250714.csv --use-ollama --model qwen3:8b
-
-# Custom delays and batch sizes
-cbioportal-mcp-qa batch input/QA_pairs_20250714.csv --delay 45 --batch-size 3
-```
-
-### Single Question Examples
-
-```bash
-# Quick question to stdout
-cbioportal-mcp-qa ask "How many patients have BRCA1 mutations?"
-
-# Formatted output with SQL queries
-cbioportal-mcp-qa ask "What are the survival rates for lung cancer patients?" \
-  --format markdown --include-sql --output-file lung_cancer_survival.md
-
-# Using Ollama with custom model
-cbioportal-mcp-qa ask "Show mutation frequencies for TP53" --use-ollama --model qwen3:8b
-```
-
 ## Output
 
 **Batch Mode:**
