@@ -7,17 +7,38 @@ from typing import List, Tuple
 import pandas as pd
 
 
-def parse_question_selection(selection: str) -> List[int]:
+def get_max_questions(csv_path: Path) -> int:
+    """Get the maximum number of questions in a CSV file.
+    
+    Args:
+        csv_path: Path to CSV file
+        
+    Returns:
+        Maximum question number available
+    """
+    df = pd.read_csv(csv_path)
+    
+    if '#' in df.columns:
+        # Use the maximum value in the '#' column, ignoring NaN values
+        return int(df['#'].dropna().max())
+    else:
+        # Use the number of data rows (excluding header)
+        return len(df)
+
+
+def parse_question_selection(selection: str, csv_path: Path) -> List[int]:
     """Parse question selection string into list of question numbers.
     
     Args:
         selection: String like "1-5", "1,3,5", or "all"
+        csv_path: Path to CSV file (to determine max questions for "all")
         
     Returns:
         List of question numbers
     """
     if selection.lower() == "all":
-        return list(range(1, 103))  # 1-102
+        max_questions = get_max_questions(csv_path)
+        return list(range(1, max_questions + 1))
     
     questions = []
     

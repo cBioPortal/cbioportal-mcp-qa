@@ -253,7 +253,7 @@ async def async_batch_main(
     """Async main function for batch processing questions."""
     try:
         # Parse question selection
-        selected_questions = parse_question_selection(questions)
+        selected_questions = parse_question_selection(questions, csv_file)
         click.echo(f"Processing {len(selected_questions)} questions...")
         
         # Load questions from CSV
