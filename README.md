@@ -9,8 +9,8 @@ Process cBioPortal QA questions using PydanticAI with MCP ClickHouse integration
 uv venv .venv --python 3.13
 source .venv/bin/activate
 
-# Install dependencies
-uv pip install -e .
+# Install dependencies in editable mode (uses pyproject.toml + uv.lock)
+uv sync --editable
 ```
 
 ## Configuration

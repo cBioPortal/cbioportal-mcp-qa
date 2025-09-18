@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPServerStdio
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from .prompts import DEFAULT_SYSTEM_PROMPT
@@ -114,7 +114,7 @@ class LLMClient:
         # Create model based on whether using Ollama or Anthropic
         if use_ollama:
             # For Ollama, create OpenAI-compatible model
-            agent_model = OpenAIModel(
+            agent_model = OpenAIChatModel(
                 model_name=model,  # This should be the ollama_model passed from main.py
                 provider=OpenAIProvider(base_url=f"{ollama_base_url}/v1")
             )
@@ -124,7 +124,7 @@ class LLMClient:
         
         self.agent = Agent(
             agent_model,
-            mcp_servers=[self.mcp_server],
+            toolsets=[self.mcp_server],
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             model_settings=model_settings
         )
@@ -143,9 +143,9 @@ class LLMClient:
             sql_query_logger.clear()
             
             # Use the agent's run_mcp_servers context manager
-            async with self.agent.run_mcp_servers():
+            async with self.agent:
                 response = await self.agent.run(question)
-                return response.data
+                return response.output
         
         except Exception as e:
             return f"Error processing question: {str(e)}"
