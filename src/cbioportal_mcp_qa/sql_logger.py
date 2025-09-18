@@ -5,7 +5,8 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime
 from pydantic_ai.mcp import MCPServerStdio
-
+from pydantic_ai.tools import RunContext
+from pydantic_ai.toolsets.abstract import ToolsetTool
 
 @dataclass
 class SqlQuery:
@@ -121,15 +122,19 @@ class MCPServerStdioWithSQLCapture(MCPServerStdio):
         super().__init__(*args, **kwargs)
         self.sql_logger = sql_logger
         
-    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+    async def call_tool(self,
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[Any],
+        tool: ToolsetTool[Any],) -> Any:
         """Override call_tool to capture SQL queries during tool execution."""
         # Capture SQL query directly from tool arguments
-        if self.sql_logger.enabled and 'query' in arguments:
-            sql_query = arguments['query']
+        if self.sql_logger.enabled and 'query' in tool_args:
+            sql_query = tool_args['query']
             self.sql_logger.add_query(sql_query)
         
         # Call the original tool
-        return await super().call_tool(name, arguments)
+        return await super().call_tool(name, tool_args, ctx, tool)
     
     
 
