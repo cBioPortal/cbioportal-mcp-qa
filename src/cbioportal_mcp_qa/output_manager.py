@@ -25,7 +25,8 @@ class OutputManager:
         question_type: str, 
         question_text: str, 
         answer: str,
-        include_sql: bool = False
+        include_sql: bool = False,
+        model_info: Optional[dict] = None
     ) -> Path:
         """Write a question result to a markdown file.
         
@@ -35,6 +36,7 @@ class OutputManager:
             question_text: The original question
             answer: The answer from the LLM
             include_sql: Whether to include SQL queries in the output
+            model_info: Dict with model and parameter information
             
         Returns:
             Path to the created file
@@ -62,6 +64,16 @@ class OutputManager:
             sql_markdown = sql_query_logger.get_queries_markdown()
             if sql_markdown:
                 content_parts.extend(["", "---", "", sql_markdown])
+        
+        # Add model information section
+        if model_info:
+            content_parts.extend(["", "---", "", "## Model Information"])
+            content_parts.append(f"**Model:** {model_info.get('model', 'Unknown')}")
+            if model_info.get('use_ollama'):
+                content_parts.append(f"**Provider:** Ollama ({model_info.get('ollama_base_url', 'http://localhost:11434')})")
+            else:
+                content_parts.append("**Provider:** Anthropic")
+            content_parts.append(f"**Max Tokens:** {model_info.get('max_tokens', 4096)}")
         
         content_parts.extend(["", "---", "", f"*Generated on {timestamp}*"])
         

@@ -281,6 +281,14 @@ async def async_batch_main(
         )
         output_manager = OutputManager(output_dir)
         
+        # Prepare model information for output
+        model_info = {
+            'model': model,
+            'use_ollama': use_ollama,
+            'ollama_base_url': ollama_base_url,
+            'max_tokens': 4096
+        }
+        
         # Process questions
         with tqdm(question_data, desc="Processing questions") as pbar:
             for question_num, question_type, question_text in pbar:
@@ -291,7 +299,7 @@ async def async_batch_main(
                 
                 # Write result
                 output_path = output_manager.write_question_result(
-                    question_num, question_type, question_text, answer, include_sql
+                    question_num, question_type, question_text, answer, include_sql, model_info
                 )
                 
                 click.echo(f"Question {question_num} -> {output_path}")
@@ -366,6 +374,15 @@ async def async_ask_main(
                 sql_markdown = sql_query_logger.get_queries_markdown()
                 if sql_markdown:
                     output_parts.extend(["", "---", "", sql_markdown])
+            
+            # Add model information section
+            output_parts.extend(["", "---", "", "## Model Information"])
+            output_parts.append(f"**Model:** {model}")
+            if use_ollama:
+                output_parts.append(f"**Provider:** Ollama ({ollama_base_url})")
+            else:
+                output_parts.append("**Provider:** Anthropic")
+            output_parts.append("**Max Tokens:** 4096")
             
             output_parts.extend(["", "---", "", f"*Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*"])
             
