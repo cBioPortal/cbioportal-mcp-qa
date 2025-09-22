@@ -97,13 +97,13 @@ class LLMClient:
         if include_sql:
             self.mcp_server = MCPServerStdioWithSQLCapture(
                 sql_query_logger,
-                command="mcp-clickhouse",
+                command="cbioportal-mcp",
                 args=[],
                 env=clickhouse_env
             )
         else:
             self.mcp_server = MCPServerStdio(
-                command="mcp-clickhouse",
+                command="cbioportal-mcp",
                 args=[],
                 env=clickhouse_env
             )
