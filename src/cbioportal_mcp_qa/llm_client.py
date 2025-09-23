@@ -34,6 +34,7 @@ class LLMClient:
         use_ollama: bool = False,
         ollama_base_url: str = "http://localhost:11434",
         clickhouse_host: Optional[str] = None,
+        clickhouse_database: Optional[str] = None,
         clickhouse_port: Optional[str] = None,
         clickhouse_user: Optional[str] = None,
         clickhouse_password: Optional[str] = None,
@@ -64,6 +65,7 @@ class LLMClient:
         
         # Add required parameters
         clickhouse_env["CLICKHOUSE_HOST"] = clickhouse_host or os.getenv("CLICKHOUSE_HOST")
+        clickhouse_env["CLICKHOUSE_DATABASE"] = clickhouse_database or os.getenv("CLICKHOUSE_DATABASE")
         clickhouse_env["CLICKHOUSE_USER"] = clickhouse_user or os.getenv("CLICKHOUSE_USER")
         clickhouse_env["CLICKHOUSE_PASSWORD"] = clickhouse_password or os.getenv("CLICKHOUSE_PASSWORD")
         
@@ -81,7 +83,7 @@ class LLMClient:
                 clickhouse_env[key] = value
         
         # Check for required ClickHouse parameters
-        required_params = ["CLICKHOUSE_HOST", "CLICKHOUSE_USER", "CLICKHOUSE_PASSWORD"]
+        required_params = ["CLICKHOUSE_HOST", "CLICKHOUSE_DATABASE", "CLICKHOUSE_USER", "CLICKHOUSE_PASSWORD"]
         missing_params = [param for param in required_params if not clickhouse_env.get(param)]
         
         if missing_params:

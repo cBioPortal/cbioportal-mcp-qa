@@ -22,6 +22,7 @@ export ANTHROPIC_API_KEY="your-anthropic-api-key"
 export CLICKHOUSE_HOST="your-clickhouse-host"
 export CLICKHOUSE_USER="your-clickhouse-user"
 export CLICKHOUSE_PASSWORD="your-clickhouse-password"
+export CLICKHOUSE_DATABASE=your-cbioportal-database  # e.g., cgds_public_2025_06_24
 ```
 
 ## Usage
