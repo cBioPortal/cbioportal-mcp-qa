@@ -11,8 +11,8 @@ from pydantic_ai.mcp import MCPServerStdio
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from cbioportal_mcp.server import mcp
 
-from .prompts import DEFAULT_SYSTEM_PROMPT
 from .sql_logger import sql_query_logger, MCPServerStdioWithSQLCapture
 
 
@@ -127,27 +127,27 @@ class LLMClient:
         self.agent = Agent(
             agent_model,
             toolsets=[self.mcp_server],
-            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            system_prompt=mcp.instructions,
             model_settings=model_settings
         )
         
     async def ask_question(self, question: str) -> str:
         """Ask a question using PydanticAI with MCP integration.
-        
+
         Args:
             question: The question to ask
-            
+
         Returns:
             The response from the agent
         """
         try:
             # Clear previous queries for this question
             sql_query_logger.clear()
-            
+
             # Use the agent's run_mcp_servers context manager
             async with self.agent:
                 response = await self.agent.run(question)
                 return response.output
-        
+
         except Exception as e:
             return f"Error processing question: {str(e)}"
