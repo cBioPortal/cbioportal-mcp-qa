@@ -496,3 +496,140 @@ ALTER TABLE resource_patient COMMENT COLUMN url 'URL or link associated with thi
 ALTER TABLE resource_study COMMENT COLUMN internal_id 'References cancer_study.cancer_study_id.';
 ALTER TABLE resource_study COMMENT COLUMN resource_id 'References resource_definition.resource_id.';
 ALTER TABLE resource_study COMMENT COLUMN url 'URL or link associated with this resource and study.';
+
+-- ===========================================
+-- Table: sample_to_gene_panel_derived
+-- ===========================================
+ALTER TABLE sample_to_gene_panel_derived MODIFY COMMENT 'Denormalized mapping table linking samples to their associated gene panels for each genetic alteration type. Derived from sample_profile, genetic_profile, gene_panel, sample, and cancer_study tables. Defaults to WES (Whole Exome Sequencing) when no specific gene panel is assigned.';
+
+-- ===========================================
+-- Column Comments
+-- ===========================================
+ALTER TABLE sample_to_gene_panel_derived COMMENT COLUMN sample_unique_id 'Unique identifier for the sample, constructed as cancer_study_identifier + "_" + sample.stable_id to ensure global uniqueness across studies.';
+ALTER TABLE sample_to_gene_panel_derived COMMENT COLUMN alteration_type 'Type of genetic alteration (e.g. MUTATION_EXTENDED, COPY_NUMBER_ALTERATION, MRNA_EXPRESSION, PROTEIN_LEVEL, GENERIC_ASSAY, STRUCTURAL_VARIANT, METHYLATION). References genetic_profile.genetic_alteration_type.';
+ALTER TABLE sample_to_gene_panel_derived COMMENT COLUMN gene_panel_id 'Identifier of the gene panel used for this sample and alteration type. Defaults to "WES" (Whole Exome Sequencing) when no specific panel is assigned (panel_id is NULL).';
+ALTER TABLE sample_to_gene_panel_derived COMMENT COLUMN cancer_study_identifier 'Stable string identifier for the cancer study, used in URLs and APIs. References cancer_study.cancer_study_identifier.';
+ALTER TABLE sample_to_gene_panel_derived COMMENT COLUMN genetic_profile_id 'Stable identifier of the genetic profile. References genetic_profile.stable_id.';
+
+-- ===========================================
+-- Table: gene_panel_to_gene_derived
+-- ===========================================
+ALTER TABLE gene_panel_to_gene_derived MODIFY COMMENT 'Denormalized mapping table linking gene panels to their constituent genes. Includes both specific targeted gene panels (from gene_panel and gene_panel_list tables) and a comprehensive WES (Whole Exome Sequencing) panel containing all genes with valid Entrez IDs. Used for efficient gene panel coverage queries.';
+
+-- ===========================================
+-- Column Comments
+-- ===========================================
+ALTER TABLE gene_panel_to_gene_derived COMMENT COLUMN gene_panel_id 'Identifier of the gene panel. Contains actual gene panel stable IDs from gene_panel table, plus "WES" representing Whole Exome Sequencing which includes all genes with positive Entrez IDs.';
+ALTER TABLE gene_panel_to_gene_derived COMMENT COLUMN gene 'HUGO gene symbol from the gene table. References gene.hugo_gene_symbol for genes included in the specified panel.';
+
+-- ===========================================
+-- Table: sample_derived
+-- ===========================================
+ALTER TABLE sample_derived MODIFY COMMENT 'Denormalized sample table with globally unique identifiers and enriched metadata. Combines sample, patient, and cancer_study data with computed flags for sequencing status and copy number segment availability. Optimized for summary and detailed projections with base64-encoded identifiers for URL-safe usage.';
+
+-- ===========================================
+-- Column Comments
+-- ===========================================
+ALTER TABLE sample_derived COMMENT COLUMN sample_unique_id 'Globally unique sample identifier constructed as cancer_study_identifier + "_" + sample.stable_id to ensure uniqueness across all studies.';
+ALTER TABLE sample_derived COMMENT COLUMN sample_unique_id_base64 'Base64-encoded version of sample.stable_id for URL-safe usage in web applications and APIs.';
+ALTER TABLE sample_derived COMMENT COLUMN sample_stable_id 'Original stable identifier of the sample within its study. References sample.stable_id.';
+ALTER TABLE sample_derived COMMENT COLUMN patient_unique_id 'Globally unique patient identifier constructed as cancer_study_identifier + "_" + patient.stable_id to ensure uniqueness across all studies.';
+ALTER TABLE sample_derived COMMENT COLUMN patient_unique_id_base64 'Base64-encoded version of patient.stable_id for URL-safe usage in web applications and APIs.';
+ALTER TABLE sample_derived COMMENT COLUMN patient_stable_id 'Original stable identifier of the patient within its study. References patient.stable_id.';
+ALTER TABLE sample_derived COMMENT COLUMN cancer_study_identifier 'Stable string identifier for the cancer study, used in URLs and APIs. References cancer_study.cancer_study_identifier.';
+ALTER TABLE sample_derived COMMENT COLUMN internal_id 'Internal database identifier for the sample. References sample.internal_id.';
+ALTER TABLE sample_derived COMMENT COLUMN patient_internal_id 'Internal database identifier for the patient. References patient.internal_id.';
+ALTER TABLE sample_derived COMMENT COLUMN sample_type 'Type of biological sample (free text, e.g. Primary, Metastatic, Recurrent). References sample.sample_type.';
+ALTER TABLE sample_derived COMMENT COLUMN sequenced 'Flag indicating if the sample has sequencing data available (1=yes, 0=no). Determined by membership in study-specific sequenced sample lists with naming pattern: cancer_study_identifier + "_sequenced". Used for DETAILED projection optimization.';
+ALTER TABLE sample_derived COMMENT COLUMN copy_number_segment_present 'Flag indicating if copy number segmentation data is available for this sample (1=yes, 0=no). Determined by presence in copy_number_seg table. Used for DETAILED projection optimization.';
+
+-- ===========================================
+-- Table: genomic_event_derived
+-- ===========================================
+ALTER TABLE genomic_event_derived MODIFY COMMENT 'Unified genomic events table combining mutations, copy number alterations (CNA), and structural variants into a single denormalized view. Each row represents a gene-level genomic event observed in a sample. Structural variants are split into separate rows for site1 and site2 genes (excluding duplicates). Includes off-panel detection to identify events in genes not covered by the associated gene panel.';
+
+-- ===========================================
+-- Column Comments
+-- ===========================================
+ALTER TABLE genomic_event_derived COMMENT COLUMN sample_unique_id 'Globally unique sample identifier constructed as cancer_study_identifier + "_" + sample.stable_id to ensure uniqueness across all studies.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN hugo_gene_symbol 'Official HUGO gene symbol for the affected gene. References gene.hugo_gene_symbol.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN entrez_gene_id 'Entrez Gene ID for the affected gene. References gene.entrez_gene_id.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN gene_panel_stable_id 'Identifier of the gene panel used for this sample. Defaults to "WES" (Whole Exome Sequencing) when no specific panel is assigned.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN cancer_study_identifier 'Stable string identifier for the cancer study. References cancer_study.cancer_study_identifier.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN genetic_profile_stable_id 'Stable identifier of the genetic profile containing this event. References genetic_profile.stable_id.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN variant_type 'Type of genomic variant: "mutation" for point mutations/indels, "cna" for copy number alterations, "structural_variant" for structural rearrangements.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN mutation_variant 'Protein-level change for mutations (e.g., p.V600E). Set to "NA" for non-mutation events. References mutation_event.protein_change.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN mutation_type 'Classification of mutation type (e.g., Missense, Nonsense, Frame_Shift). Set to "NA" for non-mutation events. References mutation_event.mutation_type.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN mutation_status 'Mutation status: Germline, Somatic, or LOH. Set to "NA" for non-mutation events. References mutation.mutation_status.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN driver_filter 'Driver annotation filter applied to the alteration. Currently set to "NA" for all events (driver annotations not yet implemented).';
+ALTER TABLE genomic_event_derived COMMENT COLUMN driver_tiers_filter 'Driver tiers annotation filter. Currently set to "NA" for all events (driver annotations not yet implemented).';
+ALTER TABLE genomic_event_derived COMMENT COLUMN cna_alteration 'Copy number alteration value (e.g., -2 for deep deletion, +2 for amplification). NULL for non-CNA events. References cna_event.alteration.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN cna_cytoband 'Cytogenetic band location of the gene for CNA events. Empty string for non-CNA events. References reference_genome_gene.cytoband.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN sv_event_info 'Additional information about structural variant events. Empty string for non-SV events. References structural_variant.event_info.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN patient_unique_id 'Globally unique patient identifier constructed as cancer_study_identifier + "_" + patient.stable_id to ensure uniqueness across all studies.';
+ALTER TABLE genomic_event_derived COMMENT COLUMN off_panel 'Boolean flag indicating whether this genomic event occurred in a gene not covered by the associated gene panel (TRUE=off-panel, FALSE=on-panel). Determined by checking presence in gene_panel_to_gene_derived table.';
+
+-- ===========================================
+-- Table: clinical_data_derived
+-- ===========================================
+ALTER TABLE clinical_data_derived MODIFY COMMENT 'Unified clinical data table combining both patient-level and sample-level clinical attributes in a normalized key-value format. Uses FULL OUTER JOIN to ensure all defined clinical attributes appear for each patient/sample, even when no value is recorded (populated with empty string). Enables efficient querying of clinical data across different attribute types and levels.';
+
+-- ===========================================
+-- Column Comments
+-- ===========================================
+ALTER TABLE clinical_data_derived COMMENT COLUMN internal_id 'Internal database identifier. For sample-level data, references sample.internal_id; for patient-level data, references patient.internal_id.';
+ALTER TABLE clinical_data_derived COMMENT COLUMN sample_unique_id 'Globally unique sample identifier constructed as cancer_study_identifier + "_" + sample.stable_id. Populated only for sample-level clinical data; empty string for patient-level data.';
+ALTER TABLE clinical_data_derived COMMENT COLUMN patient_unique_id 'Globally unique patient identifier constructed as cancer_study_identifier + "_" + patient.stable_id. Populated for both sample-level and patient-level clinical data.';
+ALTER TABLE clinical_data_derived COMMENT COLUMN attribute_name 'Name/identifier of the clinical attribute. References clinical_attribute_meta.attr_id.';
+ALTER TABLE clinical_data_derived COMMENT COLUMN attribute_value 'Value of the clinical attribute for this patient/sample. Empty string when no value is recorded but attribute is defined for the study.';
+ALTER TABLE clinical_data_derived COMMENT COLUMN cancer_study_identifier 'Stable string identifier for the cancer study. References cancer_study.cancer_study_identifier.';
+ALTER TABLE clinical_data_derived COMMENT COLUMN type 'Level of the clinical data: "sample" for sample-level attributes, "patient" for patient-level attributes. Determined by clinical_attribute_meta.patient_attribute flag.';
+
+-- ===========================================
+-- Table: clinical_event_derived
+-- ===========================================
+ALTER TABLE clinical_event_derived MODIFY COMMENT 'Denormalized clinical timeline events table combining temporal clinical events with their associated key-value attributes. Each row represents a specific attribute of a clinical event (e.g., treatment, surgery, specimen collection) with start/stop dates. Flattens the normalized clinical_event and clinical_event_data relationship into a queryable format for timeline analysis.';
+
+-- ===========================================
+-- Column Comments
+-- ===========================================
+ALTER TABLE clinical_event_derived COMMENT COLUMN patient_unique_id 'Globally unique patient identifier constructed as cancer_study_identifier + "_" + patient.stable_id to ensure uniqueness across all studies.';
+ALTER TABLE clinical_event_derived COMMENT COLUMN key 'Attribute name/key for the clinical event data. References clinical_event_data.key. Examples might include drug_name, dosage, procedure_type, etc.';
+ALTER TABLE clinical_event_derived COMMENT COLUMN value 'Attribute value for the clinical event data. References clinical_event_data.value. Contains the actual data value corresponding to the key.';
+ALTER TABLE clinical_event_derived COMMENT COLUMN start_date 'Start date of the clinical event in numeric format (typically epoch time or days from diagnosis). References clinical_event.start_date.';
+ALTER TABLE clinical_event_derived COMMENT COLUMN stop_date 'Stop/end date of the clinical event in numeric format. Defaults to 0 when no stop date is specified (ongoing or point-in-time events). References clinical_event.stop_date.';
+ALTER TABLE clinical_event_derived COMMENT COLUMN event_type 'Type/category of clinical event such as Treatment, Surgery, Specimen, Status, etc. References clinical_event.event_type.';
+ALTER TABLE clinical_event_derived COMMENT COLUMN cancer_study_identifier 'Stable string identifier for the cancer study. References cancer_study.cancer_study_identifier.';
+
+-- ===========================================
+-- Table: genetic_alteration_derived
+-- ===========================================
+ALTER TABLE genetic_alteration_derived MODIFY COMMENT 'Denormalized genetic alteration data table that unpivots the wide-format genetic_alteration values into a long-format structure. Each row represents one gene-sample-profile combination with its alteration value. Excludes mutation data (handled separately) and generic assays, focusing on continuous/discrete data like expression, methylation, and copy number. Filters out "NA" values to reduce storage and improve query performance.';
+
+-- ===========================================
+-- Column Comments
+-- ===========================================
+ALTER TABLE genetic_alteration_derived COMMENT COLUMN sample_unique_id 'Globally unique sample identifier constructed as cancer_study_identifier + "_" + sample.stable_id to ensure uniqueness across all studies.';
+ALTER TABLE genetic_alteration_derived COMMENT COLUMN cancer_study_identifier 'Stable string identifier for the cancer study. References cancer_study.cancer_study_identifier.';
+ALTER TABLE genetic_alteration_derived COMMENT COLUMN hugo_gene_symbol 'Official HUGO gene symbol for the gene being measured. References gene.hugo_gene_symbol.';
+ALTER TABLE genetic_alteration_derived COMMENT COLUMN profile_type 'Type of genetic profile with study prefix removed (e.g., "mrna_expression", "cna_discrete", "methylation"). Derived from genetic_profile.stable_id by removing the cancer_study_identifier prefix.';
+ALTER TABLE genetic_alteration_derived COMMENT COLUMN alteration_value 'The actual genetic alteration measurement value (e.g., expression level, methylation beta value, copy number). NULL when no measurement available. Excludes "NA" values which are filtered out during insertion.';
+
+-- ===========================================
+-- Table: generic_assay_data_derived
+-- ===========================================
+ALTER TABLE generic_assay_data_derived MODIFY COMMENT 'Denormalized generic assay data table that unpivots wide-format genetic_alteration values for generic assay profiles into a long-format structure. Handles diverse assay types like treatment response, phosphosite quantification, and other non-genomic measurements. Each row represents one entity-sample combination with its measured value. Supports both sample-level and patient-level data based on profile configuration.';
+
+-- ===========================================
+-- Column Comments
+-- ===========================================
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN sample_unique_id 'Globally unique sample identifier constructed as cancer_study_identifier + "_" + sample.stable_id to ensure uniqueness across all studies.';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN patient_unique_id 'Globally unique patient identifier constructed as cancer_study_identifier + "_" + patient.stable_id to ensure uniqueness across all studies.';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN genetic_entity_id 'Internal identifier for the genetic entity being measured. References genetic_entity.id. For generic assays, this represents the assay target (e.g., drug compound, phosphosite, pathway).';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN value 'The measured value for this entity-sample combination. Data type and format depend on the specific assay type (e.g., IC50 values, phosphorylation levels, pathway scores).';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN generic_assay_type 'Type of generic assay performed (e.g., TREATMENT_RESPONSE, PHOSPHOSITE_QUANTIFICATION, PATHWAY_SCORE). References genetic_profile.generic_assay_type.';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN profile_stable_id 'Stable identifier of the genetic profile containing this assay data. References genetic_profile.stable_id.';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN entity_stable_id 'Stable external identifier of the genetic entity being measured. References genetic_entity.stable_id. Examples include drug names, phosphosite identifiers, or pathway names.';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN datatype 'Data format of the measurements (e.g., CONTINUOUS, DISCRETE, CATEGORICAL, LIMIT-VALUE). References genetic_profile.datatype.';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN patient_level 'Flag indicating data level: 1 for patient-level data, 0 for sample-level data. References genetic_profile.patient_level.';
+ALTER TABLE generic_assay_data_derived COMMENT COLUMN profile_type 'Type of assay profile with study prefix removed for cleaner categorization. Derived from profile_stable_id by removing the cancer_study_identifier prefix.';
