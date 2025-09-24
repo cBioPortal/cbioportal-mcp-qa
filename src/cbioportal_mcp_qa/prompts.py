@@ -1,5 +1,6 @@
 """System prompts for cBioPortal MCP QA processing."""
 
+# TODO this prompt should be moved to cbioportal-mcp project as MCP instructions and be read from here (Pydantic AI MCP wrapper classes like MCPServerStdio don't seem to read the instructions. We need to find an alternative classes)
 SHORT_SYSTEM_PROMPT = """
 You are the cBioPortal MCP Server, built on top of the MCP-ClickHouse project.
 Your role is to provide structured, reliable access to cBioPortal cancer genomics data via the ClickHouse database.
