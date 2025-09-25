@@ -28,6 +28,11 @@ def shared_options(f):
             help="ClickHouse host (or set CLICKHOUSE_HOST env var)",
         ),
         click.option(
+            "--clickhouse-database",
+            envvar="CLICKHOUSE_DATABASE",
+            help="ClickHouse database (or set CLICKHOUSE_DATABASE env var)",
+        ),
+        click.option(
             "--clickhouse-port",
             envvar="CLICKHOUSE_PORT",
             help="ClickHouse port (or set CLICKHOUSE_PORT env var)",
@@ -134,6 +139,7 @@ def batch(
     batch_size: int,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
+    clickhouse_database: Optional[str],
     clickhouse_port: Optional[str],
     clickhouse_user: Optional[str],
     clickhouse_password: Optional[str],
@@ -147,7 +153,7 @@ def batch(
     include_sql: bool,
 ):
     """Process multiple cBioPortal QA questions from a CSV file.
-    
+
     CSV_FILE: Path to the CSV file containing questions
     """
     asyncio.run(async_batch_main(
@@ -156,6 +162,7 @@ def batch(
         output_dir,
         api_key,
         clickhouse_host,
+        clickhouse_database,
         clickhouse_port,
         clickhouse_user,
         clickhouse_password,
@@ -194,6 +201,7 @@ def ask(
     format: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
+    clickhouse_database: Optional[str],
     clickhouse_port: Optional[str],
     clickhouse_user: Optional[str],
     clickhouse_password: Optional[str],
@@ -216,6 +224,7 @@ def ask(
         format,
         api_key,
         clickhouse_host,
+        clickhouse_database,
         clickhouse_port,
         clickhouse_user,
         clickhouse_password,
@@ -236,6 +245,7 @@ async def async_batch_main(
     output_dir: Path,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
+    clickhouse_database: Optional[str],
     clickhouse_port: Optional[str],
     clickhouse_user: Optional[str],
     clickhouse_password: Optional[str],
@@ -271,6 +281,7 @@ async def async_batch_main(
             ollama_base_url=ollama_base_url,
             include_sql=include_sql,
             clickhouse_host=clickhouse_host,
+            clickhouse_database=clickhouse_database,
             clickhouse_port=clickhouse_port,
             clickhouse_user=clickhouse_user,
             clickhouse_password=clickhouse_password,
@@ -318,6 +329,7 @@ async def async_ask_main(
     format: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
+    clickhouse_database: Optional[str],
     clickhouse_port: Optional[str],
     clickhouse_user: Optional[str],
     clickhouse_password: Optional[str],
@@ -340,6 +352,7 @@ async def async_ask_main(
             ollama_base_url=ollama_base_url,
             include_sql=include_sql,
             clickhouse_host=clickhouse_host,
+            clickhouse_database=clickhouse_database,
             clickhouse_port=clickhouse_port,
             clickhouse_user=clickhouse_user,
             clickhouse_password=clickhouse_password,
