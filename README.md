@@ -119,7 +119,17 @@ The input CSV file should have the following columns:
 - `Claude Clickhouse MCP Answer`: The filename of the LLM output stored in the `answers-dir`.
 
 ### Output
-The tool generates a CSV file with a timestamped filename containing the following columns:
-- `Question`: The question being evaluated.
-- `Score`: A score between 0-10 indicating the quality of the LLM output.
-- `Explanation`: A brief explanation of the score.
+
+The `simple_eval.py` script generates a CSV file with a timestamped filename in the specified output directory. The CSV contains the following columns:
+
+- **question**: The original question being evaluated.
+- **correctness_score**: A score (0-5) indicating the factual accuracy of the LLM output.
+- **correctness_explanation**: A brief explanation for the correctness score.
+- **completeness_score**: A score (0-5) indicating how well the LLM output addresses the question.
+- **completeness_explanation**: A brief explanation for the completeness score.
+- **conciseness_score**: A score (0-5) indicating how concise the LLM output is.
+- **conciseness_explanation**: A brief explanation for the conciseness score.
+- **faithfulness_score**: A score (0-5) indicating whether the LLM output relies solely on the provided context.
+- **faithfulness_explanation**: A brief explanation for the faithfulness score.
+
+Additionally, the script calculates average scores for each category and appends them as comments at the top of the CSV file. These averages provide an overall evaluation summary.
