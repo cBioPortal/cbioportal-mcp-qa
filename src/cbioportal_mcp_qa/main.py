@@ -1,11 +1,18 @@
 """Main CLI entry point for cBioPortal MCP QA processing."""
 
+import os
 import asyncio
 from pathlib import Path
 from typing import Optional
 
 import click
 from tqdm import tqdm
+
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
 from .csv_parser import load_questions, parse_question_selection
 from .llm_client import LLMClient
@@ -88,6 +95,11 @@ def shared_options(f):
             is_flag=True,
             help="Include SQL queries in the output",
         ),
+        click.option(
+            "--enable-open-telemetry-tracing",
+            is_flag=True,
+            help="Trace calls to Arize Phoenix",
+        ),
     ]
     
     for option in reversed(options):
@@ -100,6 +112,19 @@ def cli():
     """cBioPortal MCP QA tool - Ask questions about cBioPortal data using AI."""
     pass
 
+def setup_open_telemetry_tracing():
+    # Set up the tracer provider
+    tracer_provider = TracerProvider()
+    trace.set_tracer_provider(tracer_provider)
+
+    # Add the OpenInference span processor
+    endpoint = f"{os.environ['PHOENIX_COLLECTOR_ENDPOINT']}/v1/traces"
+
+    headers = {"Authorization": f"Bearer {os.environ['PHOENIX_API_KEY']}"}
+    exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers)
+
+    tracer_provider.add_span_processor(OpenInferenceSpanProcessor())
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
 
 @cli.command()
 @click.argument("csv_file", type=click.Path(exists=True, path_type=Path))
@@ -151,6 +176,7 @@ def batch(
     use_ollama: bool,
     ollama_base_url: str,
     include_sql: bool,
+    enable_open_telemetry_tracing: bool,
 ):
     """Process multiple cBioPortal QA questions from a CSV file.
 
@@ -174,6 +200,7 @@ def batch(
         use_ollama,
         ollama_base_url,
         include_sql,
+        enable_open_telemetry_tracing,
         delay,
         batch_size,
     ))
@@ -213,6 +240,7 @@ def ask(
     use_ollama: bool,
     ollama_base_url: str,
     include_sql: bool,
+    enable_open_telemetry_tracing: bool,
 ):
     """Ask a single question about cBioPortal data.
     
@@ -236,6 +264,7 @@ def ask(
         use_ollama,
         ollama_base_url,
         include_sql,
+        enable_open_telemetry_tracing,
     ))
 
 
@@ -257,11 +286,15 @@ async def async_batch_main(
     use_ollama: bool,
     ollama_base_url: str,
     include_sql: bool,
+    enable_open_telemetry_tracing: bool,
     delay: int,
     batch_size: int,
 ):
     """Async main function for batch processing questions."""
     try:
+        if enable_open_telemetry_tracing:
+            setup_open_telemetry_tracing()
+
         # Parse question selection
         selected_questions = parse_question_selection(questions, csv_file)
         click.echo(f"Processing {len(selected_questions)} questions...")
@@ -280,6 +313,7 @@ async def async_batch_main(
             use_ollama=use_ollama,
             ollama_base_url=ollama_base_url,
             include_sql=include_sql,
+            enable_open_telemetry_tracing=enable_open_telemetry_tracing,
             clickhouse_host=clickhouse_host,
             clickhouse_database=clickhouse_database,
             clickhouse_port=clickhouse_port,
@@ -341,9 +375,13 @@ async def async_ask_main(
     use_ollama: bool,
     ollama_base_url: str,
     include_sql: bool,
+    enable_open_telemetry_tracing: bool,
 ):
     """Async main function for asking a single question."""
     try:
+        if enable_open_telemetry_tracing:
+            setup_open_telemetry_tracing()
+
         # Initialize LLM client
         llm_client = LLMClient(
             api_key=api_key,
@@ -351,6 +389,7 @@ async def async_ask_main(
             use_ollama=use_ollama,
             ollama_base_url=ollama_base_url,
             include_sql=include_sql,
+            enable_open_telemetry_tracing=enable_open_telemetry_tracing,
             clickhouse_host=clickhouse_host,
             clickhouse_database=clickhouse_database,
             clickhouse_port=clickhouse_port,
@@ -499,6 +538,11 @@ async def async_ask_main(
     help="Include SQL queries in the output markdown files",
 )
 @click.option(
+    "--enable-open-telemetry-tracing",
+    is_flag=True,
+    help="Trace calls to Arize Phoenix",
+)
+@click.option(
     "--delay",
     "-d",
     default=30,
@@ -529,6 +573,7 @@ def legacy_cli(
     use_ollama: bool,
     ollama_base_url: str,
     include_sql: bool,
+    enable_open_telemetry_tracing: bool,
     delay: int,
     batch_size: int,
 ):
@@ -557,6 +602,7 @@ def legacy_cli(
         use_ollama,
         ollama_base_url,
         include_sql,
+        enable_open_telemetry_tracing,
         delay,
         batch_size,
     ))

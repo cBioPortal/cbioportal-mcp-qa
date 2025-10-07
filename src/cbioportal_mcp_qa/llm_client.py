@@ -43,6 +43,7 @@ class LLMClient:
         clickhouse_connect_timeout: Optional[str] = None,
         clickhouse_send_receive_timeout: Optional[str] = None,
         include_sql: bool = False,
+        enable_open_telemetry_tracing: bool = False,
     ):
         """Initialize the client.
         
@@ -53,6 +54,7 @@ class LLMClient:
             ollama_base_url: Base URL for Ollama server.
             clickhouse_*: ClickHouse configuration parameters.
             include_sql: Whether to capture and log SQL queries.
+            enable_open_telemetry_tracing: Whether to capture traces with Arize Phoenix
         """
         # Only require API key for Anthropic models
         if not use_ollama:
@@ -128,7 +130,8 @@ class LLMClient:
             agent_model,
             toolsets=[self.mcp_server],
             system_prompt=DEFAULT_SYSTEM_PROMPT,
-            model_settings=model_settings
+            model_settings=model_settings,
+            instrument=enable_open_telemetry_tracing
         )
         
     async def ask_question(self, question: str) -> str:
