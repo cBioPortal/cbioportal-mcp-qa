@@ -133,3 +133,11 @@ The `simple_eval.py` script generates a CSV file with a timestamped filename in 
 - **faithfulness_explanation**: A brief explanation for the faithfulness score.
 
 Additionally, the script calculates average scores for each category and appends them as comments at the top of the CSV file. These averages provide an overall evaluation summary.
+
+## Phoenix Evaluation Tool
+
+To run evaluations on dataset uploaded to Arize Phoenix, make sure you installed open telemetry env. variables described above.
+
+```bash
+python phoenix_eval.py [--dataset-name <arize-phoenix-dataset-name>]
+```
