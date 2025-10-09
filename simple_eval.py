@@ -28,12 +28,12 @@ def evaluate(client: Client, question: str, expected: str,
     LLM Output: {output}
 
     Instructions:
-    Evaluate the LLM Output based on the following criteria. Provide a score from 0 to 5 for each criterion and a brief explanation.
+    Evaluate the LLM Output based on the following criteria. Provide a score from 1 to 3 for each criterion and a brief explanation.
 
-    - **Correctness (0-5)**: Is the information in the LLM Output factually accurate? Score 5 for perfectly accurate, 0 for completely incorrect.
-    - **Completeness (0-5)**: Does the LLM Output fully address the user's question? Score 5 for a complete answer, 0 for a missing answer.
-    - **Conciseness (0-5)**: Is the LLM Output direct and to the point, avoiding unnecessary details? Score 5 for perfectly concise, 0 for excessively verbose. Ignore the included SQL queries and timestamops when evaluating conciseness.
-    - **Faithfulness (0-5)**: Does the LLM Output rely only on the provided Context/Source? Score 5 if all information is traceable to the source, 0 if it contains hallucinations or outside knowledge.
+    - **Correctness (1-3)**: Is the information in the LLM Output factually accurate? Score 3 for perfectly accurate, 2 for partially accurate, 1 for completely incorrect.
+    - **Completeness (1-3)**: Does the LLM Output fully address the user's question? Score 3 for a complete answer, 2 for a partially complete answer, 1 for a missing answer.
+    - **Conciseness (1-3)**: Is the LLM Output direct and to the point, avoiding unnecessary details? Score 3 for perfectly concise, 2 for somewhat verbose, 1 for excessively verbose. Ignore the included SQL queries and timestamops when evaluating conciseness.
+    - **Faithfulness (1-3)**: Does the LLM Output rely only on the provided Context/Source? Score 3 if all information is traceable to the source, 2 for some reliance on external information, 1 if it contains hallucinations or outside knowledge.
 
     Provide your final output in a structured format, as a JSON object with the following keys:
     - "question": The original question.
@@ -50,13 +50,13 @@ def evaluate(client: Client, question: str, expected: str,
     ```json
     {{
     "question": "What is the mutational frequency of BRAF in breast cancer?",
-    "correctness_score": 5,
+    "correctness_score": 3,
     "correctness_explanation": "The output correctly states the mutational frequency as 5.2%.",
-    "completeness_score": 5,
+    "completeness_score": 3,
     "completeness_explanation": "The answer fully addresses the question by providing the frequency and the cancer type.",
-    "conciseness_score": 4,
+    "conciseness_score": 2,
     "conciseness_explanation": "The output is mostly concise but includes a minor, unnecessary detail about a related gene.",
-    "faithfulness_score": 5,
+    "faithfulness_score": 3,
     "faithfulness_explanation": "The answer is based solely on the provided context, with no external information."
     }}
     ```
@@ -144,7 +144,7 @@ def main(input_csv: str, answers_dir: str, output_dir: str):
 
         # Add average scores as a comment at the top of the CSV file
         comment_lines = [
-            f"# Average {col}: {averages[col]:.2f}" for col in numeric_cols]
+            f"# Average {col}: {averages[col]:.2f},,,,,,,," for col in numeric_cols]
         comment_block = "\n".join(comment_lines) + "\n"
         with open(output_csv, 'r') as f:
             csv_content = f.read()
