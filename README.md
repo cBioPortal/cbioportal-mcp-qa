@@ -25,6 +25,19 @@ export CLICKHOUSE_PASSWORD="your-clickhouse-password"
 export CLICKHOUSE_DATABASE=your-cbioportal-database  # e.g., cgds_public_2025_06_24
 ```
 
+### Open Telemetry with Arize Phoenix
+
+Set the following environment variable to enable tracing:
+```bash
+PHOENIX_API_KEY='<your-api-key>'
+PHOENIX_COLLECTOR_ENDPOINT='<your-collector-endpoint>'
+```
+
+You collector enpoint looks like `https://app.phoenix.arize.com/s/<USER/ORG>`. Don't add `/v1/traces` at the end.
+
+Use `--enable-open-telemetry-tracing` option with `ask` or `batch` commands to trace the interactions.
+
+
 ## Usage
 
 The tool provides two main modes: batch processing for multiple questions and single question mode for quick queries.
