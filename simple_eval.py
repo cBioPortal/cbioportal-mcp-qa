@@ -67,6 +67,7 @@ def evaluate(client: Client, question: str, expected: str,
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=500,
+            temperature=0.0,
             messages=[{"role": "user", "content": prompt}]
         )
 
