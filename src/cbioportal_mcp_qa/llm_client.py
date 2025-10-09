@@ -111,7 +111,7 @@ class LLMClient:
             )
         
         # Create agent with MCP server
-        model_settings = ModelSettings(max_tokens=4096)
+        model_settings = ModelSettings(max_tokens=4096, temperature=0.0)
         
         # Create model based on whether using Ollama or Anthropic
         if use_ollama:
