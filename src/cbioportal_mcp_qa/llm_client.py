@@ -4,7 +4,7 @@ import os
 import asyncio
 import time
 import json
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Type
 
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPServerStdio
@@ -12,11 +12,13 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from .base_client import BaseQAClient
+from .null_agent_client import CBioAgentNullClient
 from .prompts import DEFAULT_SYSTEM_PROMPT
 from .sql_logger import sql_query_logger, MCPServerStdioWithSQLCapture
 
 
-class LLMClient:
+class MCPClickHouseClient(BaseQAClient):
     """PydanticAI client with MCP ClickHouse integration."""
     
     def get_sql_queries(self) -> List[Any]:
@@ -26,6 +28,16 @@ class LLMClient:
             List of SqlQuery objects
         """
         return sql_query_logger.get_queries()
+
+    def get_sql_queries_markdown(self) -> str:
+        """Get captured SQL queries in markdown format for the current question.
+
+        Returns:
+            Markdown string of captured queries (if supported/enabled)
+        """
+        if sql_query_logger.enabled:
+            return sql_query_logger.get_queries_markdown()
+        return ""
     
     def __init__(
         self, 
@@ -44,6 +56,7 @@ class LLMClient:
         clickhouse_send_receive_timeout: Optional[str] = None,
         include_sql: bool = False,
         enable_open_telemetry_tracing: bool = False,
+        **kwargs,
     ):
         """Initialize the client.
         
@@ -55,12 +68,11 @@ class LLMClient:
             clickhouse_*: ClickHouse configuration parameters.
             include_sql: Whether to capture and log SQL queries.
             enable_open_telemetry_tracing: Whether to capture traces with Arize Phoenix
+            **kwargs: Additional arguments ignored by this client.
         """
         # Only require API key for Anthropic models
         if not use_ollama:
             api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise ValueError("ANTHROPIC_API_KEY environment variable must be set")
         
         # Set up ClickHouse environment variables
         clickhouse_env = {}
@@ -154,3 +166,29 @@ class LLMClient:
         
         except Exception as e:
             return f"Error processing question: {str(e)}"
+
+
+# Backwards compatibility
+LLMClient = MCPClickHouseClient
+
+
+def get_qa_client(agent_type: str = "mcp-clickhouse", **kwargs) -> BaseQAClient:
+    """Factory function to get the appropriate QA client.
+    
+    Args:
+        agent_type: Type of agent to create.
+        **kwargs: Arguments to pass to the client constructor.
+        
+    Returns:
+        An instance of BaseQAClient.
+        
+    Raises:
+        ValueError: If agent_type is unknown.
+    """
+    if agent_type == "mcp-clickhouse":
+        return MCPClickHouseClient(**kwargs)
+    elif agent_type == "cbio-agent-null":
+        return CBioAgentNullClient(**kwargs)
+    else:
+        raise ValueError(f"Unknown agent type: {agent_type}")
+
