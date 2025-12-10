@@ -102,3 +102,4 @@ python simple_eval.py \
 *   `input/`: Benchmark datasets (e.g., `autosync-public.csv`).
 *   `results/`: Generated answers and evaluation reports.
 *   `simple_eval.py`: Wrapper script for running evaluation manually.
+*   `agents/`: Contains Docker Compose configurations for running external agent services, such as `docker-compose.yml` for `cbio-null-agent`.
