@@ -97,4 +97,57 @@ Results are saved as individual markdown files in the `export/` directory (`1.md
 
 **Ask Mode:**
 - **Plain format**: Direct answer text to stdout or file
-- **Markdown format**: Structured markdown with question, answer, optional SQL queries, and timestamp
+- **Markdown format**: Structured markdown with question, answer, optional SQL queries, and 
+
+## API endpoint for DB Agent
+
+Run the FastAPI server:
+
+```bash
+uvicorn cbioportal_mcp_qa.api:app --host 0.0.0.0 --port <port>
+```
+
+Endpoint: `POST /chat/completions`
+
+Request body (only these fields are accepted; extras are ignored and logged):
+- `messages` (required): list of `{ "role": "user|assistant|system", "content": "..." }`
+- `stream` (default true): `true` for SSE streaming, `false` for a single JSON payload
+- `include_sql` (default true): include captured SQL markdown in the response
+
+Behavior:
+- Uses the default model from `llm_client.DEFAULT_MODEL`; request-side model selection is disabled.
+- Streaming sends OpenAI-style `chat.completion.chunk` SSE frames of the already-generated answer (chunked for transport, not token-by-token generation).
+- Non-streaming returns an OpenAI-style `chat.completion` JSON payload.
+
+#### Connecting to LibreChat
+
+Connect the DB Agent to LibreChat as an OpenAI-compatible custom endpoint by adding this to librechat.yaml:
+
+```yaml
+endpoints:
+  custom:
+    - name: "<DB-agent-name>"
+      apiKey: "none"
+      baseURL: "http://<host>:<port>"
+      models:
+        default: ["<DB-agent-name>"]
+      titleConvo: true
+      titleModel: "<DB-agent-name>"
+      modelDisplayLabel: "<DB-agent-name>"
+```
+
+#### cURL Example
+
+Call the API directly with curl (non-streaming example):
+
+```bash
+curl -X POST http://localhost:4000/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "List available cancer types."}
+    ],
+    "stream": false,
+    "include_sql": false
+  }'
+```
