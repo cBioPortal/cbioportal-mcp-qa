@@ -1,6 +1,22 @@
-# cBioPortal MCP QA
+# cBioPortal MCP QA & Benchmarking
 
-Process cBioPortal QA questions using PydanticAI with MCP ClickHouse integration.
+This repository serves as the benchmarking system for efforts to provide an agentic interface to cBioPortal.org. It is designed to evaluate various "agents" (like MCP servers or standalone APIs) that answer questions about cancer genomics data.
+
+**🏆 [View the Leaderboard](LEADERBOARD.md)** to see current benchmark results.
+
+## Overview
+
+The system provides a modular CLI to:
+1.  **Ask** single questions to different agents.
+2.  **Batch** process a set of questions.
+3.  **Benchmark** agents against a gold-standard dataset, automatically evaluating their accuracy using an LLM judge.
+
+## Supported Agents
+
+The system currently supports the following agent types via the `--agent-type` flag:
+
+1.  `mcp-clickhouse`: The original Model Context Protocol (MCP) agent connected to a ClickHouse database.
+2.  `cbio-agent-null`: A baseline/testing agent (or a specific implementation hosted at a URL).
 
 ## Setup
 
@@ -9,92 +25,81 @@ Process cBioPortal QA questions using PydanticAI with MCP ClickHouse integration
 uv venv .venv --python 3.13
 source .venv/bin/activate
 
-# Install dependencies in editable mode (uses pyproject.toml + uv.lock)
+# Install dependencies in editable mode
 uv sync --editable
 ```
 
 ## Configuration
 
-Set required environment variables:
+Create a `.env` file or export the following environment variables:
+
+**General:**
+*   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation) and the `mcp-clickhouse` agent.
+
+**For `cbio-agent-null`:**
+*   `CBIO_NULL_AGENT_URL`: URL of the agent API (e.g., `http://localhost:8000`).
+
+**For `mcp-clickhouse`:**
+*   `CLICKHOUSE_HOST`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`: Connection details.
+
+**Optional (Tracing):**
+*   `PHOENIX_API_KEY`: For Arize Phoenix tracing.
+*   `PHOENIX_COLLECTOR_ENDPOINT`: Tracing endpoint.
+
+## Benchmarking (Primary Workflow)
+
+The `benchmark` command is the main way to evaluate an agent. It automates generation, evaluation, and leaderboard updates.
 
 ```bash
-export ANTHROPIC_API_KEY="your-anthropic-api-key"
-export CLICKHOUSE_HOST="your-clickhouse-host"
-export CLICKHOUSE_USER="your-clickhouse-user"
-export CLICKHOUSE_PASSWORD="your-clickhouse-password"
-export CLICKHOUSE_DATABASE=your-cbioportal-database  # e.g., cgds_public_2025_06_24
+# Run benchmark for the null agent
+cbioportal-mcp-qa benchmark --agent-type cbio-agent-null --questions 1-5
+
+# Run benchmark for the MCP agent
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse
 ```
 
-### Open Telemetry with Arize Phoenix
+**What happens:**
+1.  Questions are loaded from `input/autosync-public.csv`.
+2.  The specified agent generates answers.
+3.  Answers are saved to `results/{agent_type}/{YYYYMMDD}/answers/`.
+4.  `simple_eval.py` evaluates the answers against the expected output (using `Navbot Expected Link` as the ground truth).
+5.  Results are saved to `results/{agent_type}/{YYYYMMDD}/eval/`.
+6.  `LEADERBOARD.md` is updated with the latest scores.
 
-Set the following environment variable to enable tracing:
+## Manual Usage (CLI Reference)
+
+You can also run individual components manually.
+
+### 1. Ask a Question
 ```bash
-PHOENIX_API_KEY='<your-api-key>'
-PHOENIX_COLLECTOR_ENDPOINT='<your-collector-endpoint>'
+cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-agent-null
 ```
 
-You collector enpoint looks like `https://app.phoenix.arize.com/s/<USER/ORG>`. Don't add `/v1/traces` at the end.
-
-Use `--enable-open-telemetry-tracing` option with `ask` or `batch` commands to trace the interactions.
-
-
-## Usage
-
-The tool provides two main modes: batch processing for multiple questions and single question mode for quick queries.
-
-### Batch Processing
-
-Process multiple questions from a CSV file:
-
+### 2. Batch Processing
+Generate answers without running the full benchmark evaluation.
 ```bash
-# Process all questions
-cbioportal-mcp-qa batch input/QA_pairs_20250714.csv
-
-# Process specific questions
-cbioportal-mcp-qa batch input/QA_pairs_20250714.csv --questions 1-5
-cbioportal-mcp-qa batch input/QA_pairs_20250714.csv --questions 1,3,5
-
-# Custom output directory with SQL query capture
-cbioportal-mcp-qa batch input/QA_pairs_20250714.csv --questions 1-10 --output-dir results/ --include-sql
+cbioportal-mcp-qa batch input/autosync-public.csv --questions 1-10 --output-dir my_results/
 ```
 
-### Single Questions
-
-Ask individual questions directly:
-
+### 3. Manual Evaluation
+Run the evaluation script on existing output files.
 ```bash
-# Basic question (output to stdout)
-cbioportal-mcp-qa ask "How many studies are there?"
-
-# Save to file with markdown formatting
-cbioportal-mcp-qa ask "What are the top 5 cancer types by sample count?" --output-file answer.md --format markdown
-
-# Include SQL queries in output
-cbioportal-mcp-qa ask "Show me mutation data for BRCA1" --format markdown --include-sql
+python simple_eval.py \
+  --input-csv input/autosync-public.csv \
+  --answers-dir my_results/ \
+  --answer-column "Navbot Expected Link"
 ```
 
-## Features
+## Project Structure
 
-- **Two operation modes**: Batch processing for CSV files and single question mode
-- **Flexible question selection**: ranges (`1-5`), lists (`1,3,5`), or all questions (batch mode)
-- **Multiple output formats**: Plain text or markdown formatting
-- **SQL query capture**: Optional inclusion of executed SQL queries with `--include-sql`
-- **Flexible output destinations**: stdout or file output
-- **PydanticAI integration**: with MCP ClickHouse server for cBioPortal data access
-- **Progress tracking**: real-time progress bars and status updates
-- **Environment configuration**: CLI options and environment variables
-- **Model flexibility**: Support for Anthropic Claude and Ollama models
-
-## Output
-
-**Batch Mode:**
-Results are saved as individual markdown files in the `export/` directory (`1.md`, `2.md`, etc.) with:
-- Question number, type, and original text
-- AI-generated answer using cBioPortal data
-- Optional SQL queries section (with `--include-sql`)
-- cBioPortal cohort URLs for patient groups
-- Timestamp and metadata
-
-**Ask Mode:**
-- **Plain format**: Direct answer text to stdout or file
-- **Markdown format**: Structured markdown with question, answer, optional SQL queries, and timestamp
+*   `src/cbioportal_mcp_qa/`: Source code.
+    *   `main.py`: CLI entry point.
+    *   `benchmark.py`: Benchmarking workflow logic.
+    *   `evaluation.py`: Core evaluation logic (LLM judge).
+    *   `base_client.py`: Abstract base class for agents.
+    *   `null_agent_client.py`: Client for `cbio-agent-null`.
+    *   `llm_client.py`: Client for `mcp-clickhouse`.
+*   `input/`: Benchmark datasets (e.g., `autosync-public.csv`).
+*   `results/`: Generated answers and evaluation reports.
+*   `simple_eval.py`: Wrapper script for running evaluation manually.
+*   `agents/`: Contains Docker Compose configurations for running external agent services, such as `docker-compose.yml` for `cbio-null-agent`.

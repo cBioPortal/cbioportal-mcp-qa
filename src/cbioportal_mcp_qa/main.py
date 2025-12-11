@@ -8,6 +8,8 @@ from typing import Optional
 import click
 from tqdm import tqdm
 
+from dotenv import load_dotenv
+
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
@@ -15,14 +17,25 @@ from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
 from .csv_parser import load_questions, parse_question_selection
-from .llm_client import LLMClient
+from .llm_client import get_qa_client
+from .base_client import BaseQAClient
 from .output_manager import OutputManager
+from .benchmark import run_benchmark
+from .batch_processor import async_batch_main, setup_open_telemetry_tracing # Import from new module
 
+
+load_dotenv()  # Load environment variables from .env
 
 # Shared options for both commands
 def shared_options(f):
     """Decorator for common options used by both batch and ask commands."""
     options = [
+        click.option(
+            "--agent-type",
+            "-a",
+            default="mcp-clickhouse",
+            help="Type of QA agent to use (default: mcp-clickhouse)",
+        ),
         click.option(
             "--api-key",
             "-k",
@@ -112,20 +125,6 @@ def cli():
     """cBioPortal MCP QA tool - Ask questions about cBioPortal data using AI."""
     pass
 
-def setup_open_telemetry_tracing():
-    # Set up the tracer provider
-    tracer_provider = TracerProvider()
-    trace.set_tracer_provider(tracer_provider)
-
-    # Add the OpenInference span processor
-    endpoint = f"{os.environ['PHOENIX_COLLECTOR_ENDPOINT']}/v1/traces"
-
-    headers = {"Authorization": f"Bearer {os.environ['PHOENIX_API_KEY']}"}
-    exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers)
-
-    tracer_provider.add_span_processor(OpenInferenceSpanProcessor())
-    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
-
 @cli.command()
 @click.argument("csv_file", type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -162,6 +161,7 @@ def batch(
     output_dir: Path,
     delay: int,
     batch_size: int,
+    agent_type: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
     clickhouse_database: Optional[str],
@@ -186,6 +186,7 @@ def batch(
         csv_file,
         questions,
         output_dir,
+        agent_type,
         api_key,
         clickhouse_host,
         clickhouse_database,
@@ -226,6 +227,7 @@ def ask(
     question: str,
     output_file: Optional[Path],
     format: str,
+    agent_type: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
     clickhouse_database: Optional[str],
@@ -250,6 +252,7 @@ def ask(
         question,
         output_file,
         format,
+        agent_type,
         api_key,
         clickhouse_host,
         clickhouse_database,
@@ -268,10 +271,85 @@ def ask(
     ))
 
 
+@cli.command()
+@click.option(
+    "--questions",
+    "-q",
+    default="all",
+    help="Questions to process. Examples: 'all', '1-5', '1,3,5'",
+)
+@click.option(
+    "--delay",
+    "-d",
+    default=30,
+    type=int,
+    help="Delay between questions in seconds (default: 30)",
+)
+@click.option(
+    "--batch-size",
+    "-b",
+    default=5,
+    type=int,
+    help="Number of questions to process before longer pause (default: 5)",
+)
+@shared_options
+def benchmark(
+    questions: str,
+    delay: int,
+    batch_size: int,
+    agent_type: str,
+    api_key: Optional[str],
+    clickhouse_host: Optional[str],
+    clickhouse_database: Optional[str],
+    clickhouse_port: Optional[str],
+    clickhouse_user: Optional[str],
+    clickhouse_password: Optional[str],
+    clickhouse_secure: Optional[str],
+    clickhouse_verify: Optional[str],
+    clickhouse_connect_timeout: Optional[str],
+    clickhouse_send_receive_timeout: Optional[str],
+    model: str,
+    use_ollama: bool,
+    ollama_base_url: str,
+    include_sql: bool,
+    enable_open_telemetry_tracing: bool,
+):
+    """Run a standard benchmark for a specific agent type.
+    
+    This command:
+    1. Generates answers for the specified questions (default: all)
+    2. Runs evaluation against the expected answers
+    3. Updates the LEADERBOARD.md file
+    """
+    
+    asyncio.run(run_benchmark(
+        agent_type,
+        questions,
+        api_key,
+        clickhouse_host,
+        clickhouse_database,
+        clickhouse_port,
+        clickhouse_user,
+        clickhouse_password,
+        clickhouse_secure,
+        clickhouse_verify,
+        clickhouse_connect_timeout,
+        clickhouse_send_receive_timeout,
+        model,
+        use_ollama,
+        ollama_base_url,
+        include_sql,
+        enable_open_telemetry_tracing,
+        delay,
+        batch_size,
+    ))
+
+
 async def async_batch_main(
     csv_file: Path,
     questions: str,
     output_dir: Path,
+    agent_type: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
     clickhouse_database: Optional[str],
@@ -307,7 +385,8 @@ async def async_batch_main(
             return
         
         # Initialize clients
-        llm_client = LLMClient(
+        qa_client: BaseQAClient = get_qa_client(
+            agent_type=agent_type,
             api_key=api_key,
             model=model,
             use_ollama=use_ollama,
@@ -328,6 +407,7 @@ async def async_batch_main(
         
         # Prepare model information for output
         model_info = {
+            'agent_type': agent_type,
             'model': model,
             'use_ollama': use_ollama,
             'ollama_base_url': ollama_base_url,
@@ -340,7 +420,7 @@ async def async_batch_main(
                 pbar.set_description(f"Processing question {question_num}")
                 
                 # Get answer from LLM
-                answer = await llm_client.ask_question(question_text)
+                answer = await qa_client.ask_question(question_text)
                 
                 # Write result
                 output_path = output_manager.write_question_result(
@@ -361,6 +441,7 @@ async def async_ask_main(
     question: str,
     output_file: Optional[Path],
     format: str,
+    agent_type: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
     clickhouse_database: Optional[str],
@@ -383,7 +464,8 @@ async def async_ask_main(
             setup_open_telemetry_tracing()
 
         # Initialize LLM client
-        llm_client = LLMClient(
+        qa_client: BaseQAClient = get_qa_client(
+            agent_type=agent_type,
             api_key=api_key,
             model=model,
             use_ollama=use_ollama,
@@ -403,13 +485,12 @@ async def async_ask_main(
         
         # Get answer from LLM
         with click.progressbar(length=1, label="Processing question") as bar:
-            answer = await llm_client.ask_question(question)
+            answer = await qa_client.ask_question(question)
             bar.update(1)
         
         # Format output
         if format == "markdown":
             from datetime import datetime
-            from .sql_logger import sql_query_logger
             
             output_parts = [
                 f"# Question",
@@ -422,13 +503,14 @@ async def async_ask_main(
             ]
             
             # Add SQL queries if enabled and available
-            if include_sql and sql_query_logger.enabled:
-                sql_markdown = sql_query_logger.get_queries_markdown()
+            if include_sql:
+                sql_markdown = qa_client.get_sql_queries_markdown()
                 if sql_markdown:
                     output_parts.extend(["", "---", "", sql_markdown])
             
             # Add model information section
             output_parts.extend(["", "---", "", "## Model Information"])
+            output_parts.append(f"**Agent Type:** {agent_type}")
             output_parts.append(f"**Model:** {model}")
             if use_ollama:
                 output_parts.append(f"**Provider:** Ollama ({ollama_base_url})")
@@ -589,8 +671,10 @@ def legacy_cli(
         csv_file,
         questions,
         output_dir,
+        "mcp-clickhouse",
         api_key,
         clickhouse_host,
+        None, # clickhouse_database is missing in legacy signature, passing None
         clickhouse_port,
         clickhouse_user,
         clickhouse_password,
