@@ -89,7 +89,8 @@ def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answ
     '''
     load_dotenv()
     client = Client()
-    data = pd.read_csv(input_csv)
+    sep = '\t' if input_csv.endswith('.tsv') else ','
+    data = pd.read_csv(input_csv, sep=sep)
     results = []
 
     # assert we have answer column (which is used as the EXPECTED answer column here)
@@ -139,18 +140,14 @@ def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answ
     # Save all results to a single CSV file with timestamp
     if results:
         all_results = pd.concat(results)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d")
         output_csv = os.path.join(output_dir, f"evaluation_{timestamp}.csv")
         os.makedirs(output_dir, exist_ok=True)
         all_results.to_csv(output_csv, index=False)
         print(f"\nEvaluation results saved to {output_csv}")
         
-        numeric_cols = [
-            "correctness_score",
-            "completeness_score",
-            "conciseness_score",
-            "faithfulness_score"
-        ]
+        # Calculate averages for all columns ending with '_score'
+        numeric_cols = [col for col in all_results.columns if col.endswith('_score')]
         
         # Calculate averages
         avg_series = all_results[numeric_cols].astype(float).mean()

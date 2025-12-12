@@ -16,7 +16,8 @@ def get_max_questions(csv_path: Path) -> int:
     Returns:
         Maximum question number available
     """
-    df = pd.read_csv(csv_path)
+    sep = '\t' if str(csv_path).endswith('.tsv') else ','
+    df = pd.read_csv(csv_path, sep=sep)
     
     if '#' in df.columns:
         # Use the maximum value in the '#' column, ignoring NaN values
@@ -70,7 +71,8 @@ def load_questions(csv_path: Path, selected_questions: List[int]) -> List[Tuple[
     Returns:
         List of tuples (question_num, question_type, question_text)
     """
-    df = pd.read_csv(csv_path)
+    sep = '\t' if str(csv_path).endswith('.tsv') else ','
+    df = pd.read_csv(csv_path, sep=sep)
     
     # Check if '#' column exists, if not use row numbers (1-based)
     if '#' in df.columns:
