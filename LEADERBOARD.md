@@ -1,5 +1,6 @@
 # Benchmark Leaderboard
 
-| Date | Agent Type | Correctness | Completeness | Faithfulness | Conciseness |
-|---|---|---|---|---|---|
-| 20251210 | cbio-agent-null | 1.80 | 1.00 | 2.40 | 1.60 |
+|     Date | Agent Type    |   Completeness Score |   Conciseness Score |   Correctness Score |   Faithfulness Score |
+|---------:|:--------------|---------------------:|--------------------:|--------------------:|---------------------:|
+| 20251212 | cbio-nav-null |                    1 |                 1.6 |                   2 |                  2.4 |
+| 20251212 | cbio-qa-null  |                    1 |                 1   |                   1 |                  1.8 |

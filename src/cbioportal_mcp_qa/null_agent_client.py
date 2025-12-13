@@ -4,18 +4,18 @@ from typing import Any, List, Optional
 from .base_client import BaseQAClient
 
 class CBioAgentNullClient(BaseQAClient):
-    """Client for the cBio-agent-null API."""
+    """Client for the cBio-nav-null API."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, env_var_name: str = "NULL_NAV_URL", **kwargs):
         """Initialize the client.
         
         Args:
+            env_var_name: The name of the environment variable holding the base URL.
             **kwargs: Additional arguments. 
-                      CBIO_NULL_AGENT_URL is read from env var.
         """
-        self.base_url = os.getenv("CBIO_NULL_AGENT_URL")
+        self.base_url = os.getenv(env_var_name)
         if not self.base_url:
-            raise ValueError("CBIO_NULL_AGENT_URL environment variable must be set")
+            raise ValueError(f"{env_var_name} environment variable must be set")
         
         # Remove trailing slash if present for consistent path joining
         self.base_url = self.base_url.rstrip("/")

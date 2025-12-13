@@ -16,7 +16,8 @@ from .evaluation import run_evaluation_logic
 # So we mainly need the Ground Truth column.
 AGENT_COLUMN_MAPPING = {
     "mcp-clickhouse": "Navbot Expected Link",
-    "cbio-agent-null": "Navbot Expected Link",
+    "cbio-nav-null": "Navbot Expected Link",
+    "cbio-qa-null": "DBBot Expected Answer",
     # Add other agents here
 }
 
@@ -50,7 +51,7 @@ async def run_benchmark(
         setup_open_telemetry_tracing()
 
     # Hardcoded input CSV
-    csv_file = Path("input/autosync-public.csv")
+    csv_file = Path("input/benchmark-testing.csv")
 
     today_str = datetime.datetime.now().strftime("%Y%m%d")
     base_results_dir = Path(f"results/{agent_type}/{today_str}")
@@ -104,34 +105,108 @@ async def run_benchmark(
 
     # 4. Update Leaderboard
     print("Step 3: Updating Leaderboard...")
-    update_leaderboard(
-        agent_type=agent_type,
-        metrics=metrics,
-        date_str=today_str
-    )
+    regenerate_leaderboard()
 
     print(f"Benchmark Complete. Results in {base_results_dir}")
 
 
-def update_leaderboard(agent_type: str, metrics: Dict[str, float], date_str: str):
+def regenerate_leaderboard():
+    """
+    Scans the results/ directory for all evaluation results, aggregates them,
+    and overwrites LEADERBOARD.md with a sorted table.
+    """
     leaderboard_path = Path("LEADERBOARD.md")
+    results_root = Path("results")
     
-    # Header for the table
-    header = "| Date | Agent Type | Correctness | Completeness | Faithfulness | Conciseness |\n"
-    separator = "|---|---|---|---|---|---|\n"
+    if not results_root.exists():
+        print("No results directory found.")
+        return
+
+    aggregated_data = []
+
+    # Walk through results directory structure: results/{agent_type}/{date}/eval/*.csv
+    for agent_dir in results_root.iterdir():
+        if not agent_dir.is_dir():
+            continue
+        agent_type = agent_dir.name
+        # print(f"Found agent dir: {agent_type}")
+        
+        for date_dir in agent_dir.iterdir():
+            if not date_dir.is_dir():
+                continue
+            date_str = date_dir.name
+            # print(f"  Found date dir: {date_str}")
+            
+            eval_dir = date_dir / "eval"
+            if not eval_dir.exists():
+                # print(f"    No eval dir in {date_dir}")
+                continue
+                
+            # Find the latest evaluation CSV in this folder
+            csv_files = list(eval_dir.glob("evaluation_*.csv"))
+            if not csv_files:
+                # print(f"    No CSVs in {eval_dir}")
+                continue
+            
+            # Use the most recent CSV if multiple exist (though usually one per run)
+            csv_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            latest_csv = csv_files[0]
+            # print(f"    Processing {latest_csv}")
+            
+            try:
+                df = pd.read_csv(latest_csv, comment='#')
+                
+                # Identify score columns
+                score_cols = [c for c in df.columns if c.endswith('_score')]
+                if not score_cols:
+                    continue
+                
+                # Calculate averages
+                averages = df[score_cols].astype(float).mean().to_dict()
+                
+                # Create row record
+                record = {
+                    "Date": date_str,
+                    "Agent Type": agent_type,
+                }
+                record.update(averages)
+                aggregated_data.append(record)
+                
+            except Exception as e:
+                print(f"Error reading {latest_csv}: {e}")
+                continue
+
+    if not aggregated_data:
+        print("No evaluation data found to generate leaderboard.")
+        return
+
+    # Create DataFrame
+    df_leaderboard = pd.DataFrame(aggregated_data)
     
-    row = f"| {date_str} | {agent_type} | {metrics.get('correctness_score', 0):.2f} | {metrics.get('completeness_score', 0):.2f} | {metrics.get('faithfulness_score', 0):.2f} | {metrics.get('conciseness_score', 0):.2f} |\n"
+    # Sort by Date (descending) and Agent Type
+    df_leaderboard.sort_values(by=["Date", "Agent Type"], ascending=[False, True], inplace=True)
     
-    content = []
-    if leaderboard_path.exists():
-        content = leaderboard_path.read_text().splitlines(keepends=True)
+    # Format headers: 'correctness_score' -> 'Correctness Score'
+    df_leaderboard.columns = [c.replace('_', ' ').title() if c.endswith('_score') else c for c in df_leaderboard.columns]
     
-    # Check if we need to initialize the file
-    if not content or "| Date |" not in content[0]:
-        content = ["# Benchmark Leaderboard\n\n", header, separator]
+    # Identify score columns again after rename
+    score_cols_display = [c for c in df_leaderboard.columns if ' Score' in c]
+    # Sort score columns alphabetically
+    score_cols_display.sort()
     
-    # Append the new row
-    content.append(row)
+    # Reorder columns: Date, Agent Type, ...Scores
+    final_cols = ["Date", "Agent Type"] + score_cols_display
+    df_leaderboard = df_leaderboard[final_cols]
     
-    leaderboard_path.write_text("".join(content))
-    print(f"Updated {leaderboard_path}")
+    # Format scores to 2 decimal places
+    for col in score_cols_display:
+        df_leaderboard[col] = df_leaderboard[col].map('{:.2f}'.format)
+
+    # Convert to Markdown table
+    markdown_table = df_leaderboard.to_markdown(index=False)
+    
+    # Add Title
+    final_content = "# Benchmark Leaderboard\n\n" + markdown_table + "\n"
+    
+    leaderboard_path.write_text(final_content)
+    print(f"Regenerated {leaderboard_path} with {len(aggregated_data)} entries.")

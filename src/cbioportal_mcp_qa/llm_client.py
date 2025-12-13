@@ -187,8 +187,10 @@ def get_qa_client(agent_type: str = "mcp-clickhouse", **kwargs) -> BaseQAClient:
     """
     if agent_type == "mcp-clickhouse":
         return MCPClickHouseClient(**kwargs)
-    elif agent_type == "cbio-agent-null":
-        return CBioAgentNullClient(**kwargs)
+    elif agent_type == "cbio-nav-null":
+        return CBioAgentNullClient(env_var_name="NULL_NAV_URL", **kwargs)
+    elif agent_type == "cbio-qa-null":
+        return CBioAgentNullClient(env_var_name="NULL_QA_URL", **kwargs)
     else:
         raise ValueError(f"Unknown agent type: {agent_type}")
 

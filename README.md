@@ -16,7 +16,8 @@ The system provides a modular CLI to:
 The system currently supports the following agent types via the `--agent-type` flag:
 
 1.  `mcp-clickhouse`: The original Model Context Protocol (MCP) agent connected to a ClickHouse database.
-2.  `cbio-agent-null`: A baseline/testing agent (or a specific implementation hosted at a URL).
+2.  `cbio-nav-null`: A baseline/testing agent (or a specific implementation hosted at a URL).
+3.  `cbio-qa-null`: Another baseline/testing agent, similar to `cbio-nav-null` but using a different configuration.
 
 ## Setup
 
@@ -36,8 +37,11 @@ Create a `.env` file or export the following environment variables:
 **General:**
 *   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation) and the `mcp-clickhouse` agent.
 
-**For `cbio-agent-null`:**
-*   `CBIO_NULL_AGENT_URL`: URL of the agent API (e.g., `http://localhost:8000`).
+**For `cbio-nav-null`:**
+*   `NULL_NAV_URL`: URL of the agent API (e.g., `http://localhost:5000`).
+
+**For `cbio-qa-null`:**
+*   `NULL_QA_URL`: URL of the agent API (e.g., `http://localhost:5002`).
 
 **For `mcp-clickhouse`:**
 *   `CLICKHOUSE_HOST`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`: Connection details.
@@ -52,7 +56,7 @@ The `benchmark` command is the main way to evaluate an agent. It automates gener
 
 ```bash
 # Run benchmark for the null agent
-cbioportal-mcp-qa benchmark --agent-type cbio-agent-null --questions 1-5
+cbioportal-mcp-qa benchmark --agent-type cbio-nav-null --questions 1-5
 
 # Run benchmark for the MCP agent
 cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse
@@ -72,7 +76,7 @@ You can also run individual components manually.
 
 ### 1. Ask a Question
 ```bash
-cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-agent-null
+cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-nav-null
 ```
 
 ### 2. Batch Processing
@@ -90,6 +94,68 @@ python simple_eval.py \
   --answer-column "Navbot Expected Link"
 ```
 
+## Manual Usage (CLI Reference)
+
+You can also run individual components manually.
+
+### 1. Ask a Question
+```bash
+cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-nav-null
+```
+
+### 2. Batch Processing
+Generate answers without running the full benchmark evaluation.
+```bash
+cbioportal-mcp-qa batch input/autosync-public.csv --questions 1-10 --output-dir my_results/
+```
+
+### 3. Manual Evaluation
+Run the evaluation script on existing output files.
+```bash
+python simple_eval.py \
+  --input-csv input/autosync-public.csv \
+  --answers-dir my_results/ \
+  --answer-column "Navbot Expected Link"
+```
+
+## Adding New Agents
+
+To integrate a new agent into the benchmarking system:
+
+1.  **Create a new client class**: In `src/cbioportal_mcp_qa/`, create a new Python file (e.g., `my_new_agent_client.py`) with a class that inherits from `BaseQAClient` and implements the `ask_question` and `get_sql_queries_markdown` methods.
+
+2.  **Register the client in `llm_client.py`**: Open `src/cbioportal_mcp_qa/llm_client.py`:
+    *   Import your new client class.
+    *   Add a new `elif` condition in the `get_qa_client` factory function to return an instance of your new client when a specific `--agent-type` string is provided.
+
+    ```python
+    # Example in src/cbioportal_mcp_qa/llm_client.py
+    from .my_new_agent_client import MyNewAgentClient
+    # ...
+    def get_qa_client(agent_type: str = "mcp-clickhouse", **kwargs) -> BaseQAClient:
+        if agent_type == "mcp-clickhouse":
+            return MCPClickHouseClient(**kwargs)
+        elif agent_type == "cbio-nav-null":
+            return CBioAgentNullClient(**kwargs)
+        elif agent_type == "my-new-agent": # Your new agent type
+            return MyNewAgentClient(**kwargs)
+        else:
+            raise ValueError(f"Unknown agent type: {agent_type}")
+    ```
+
+3.  **Update `AGENT_COLUMN_MAPPING` in `benchmark.py`**: In `src/cbioportal_mcp_qa/benchmark.py`, add an entry to the `AGENT_COLUMN_MAPPING` dictionary. This maps your new `agent_type` to the corresponding column in your `input/autosync-public.csv` (or other benchmark CSV) that contains the *expected answer* for evaluation.
+
+    ```python
+    # Example in src/cbioportal_mcp_qa/benchmark.py
+    AGENT_COLUMN_MAPPING = {
+        "mcp-clickhouse": "Navbot Expected Link",
+        "cbio-nav-null": "Navbot Expected Link",
+        "my-new-agent": "My New Agent Expected Answer Column", # Your agent's expected answer column
+    }
+    ```
+
+4.  **Add Configuration (if any)**: If your new agent requires specific environment variables or CLI options, update the `Configuration` section in `README.md` and add `click.option` decorators in `src/cbioportal_mcp_qa/main.py` if needed.
+
 ## Project Structure
 
 *   `src/cbioportal_mcp_qa/`: Source code.
@@ -97,7 +163,7 @@ python simple_eval.py \
     *   `benchmark.py`: Benchmarking workflow logic.
     *   `evaluation.py`: Core evaluation logic (LLM judge).
     *   `base_client.py`: Abstract base class for agents.
-    *   `null_agent_client.py`: Client for `cbio-agent-null`.
+    *   `null_agent_client.py`: Client for `cbio-nav-null`.
     *   `llm_client.py`: Client for `mcp-clickhouse`.
 *   `input/`: Benchmark datasets (e.g., `autosync-public.csv`).
 *   `results/`: Generated answers and evaluation reports.
