@@ -60,7 +60,7 @@ python compare_urls.py --input-csv <input_csv_path> --answers-dir <answers_direc
 ### How It Works
 - Uses `Question ID` when present (else the row index) to pair each dataset row to its Markdown answer file.
 - Extracts URLs from the expected answer column and from each LLM output, limits comparisons to `cbioportal.org`, and scores matches on path, query params, and fragments.
-- Writes a TSV per question (`url_result_q<id>.tsv`) plus `url_scores_summary.tsv` with per-question scores and the average printed to the console. Adjust or remove the internal `data.iloc[23:]` slice in the script if you need to start scoring earlier rows.
+- Writes a TSV per question (`url_result_q<id>.tsv`) plus `url_scores_summary.tsv` with per-question scores and the average printed to the console.
 
 ### URL Score Calculation (0–1)
 - Expected URLs are compared against each answer URL and the best score is kept for that question.
