@@ -449,7 +449,7 @@ def main(input_csv: str, answers_dir: str, output_dir: str, answer_column: str):
     scores = dict()
     special_flags: Dict[int, str] = dict()
     # Iterate over each row in the input CSV and evaluate the LLM output
-    for idx, row in data.iloc[23:].iterrows():
+    for idx, row in data.iterrows():
         print(f'Processing Q{idx+1}...')
         qidx = idx + 1
 
