@@ -159,7 +159,7 @@ def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answ
 
         # Add average scores as a comment at the top of the CSV file
         comment_lines = [
-            f"# Average {col}: {averages[col]:.2f},,,,,,,,," for col in numeric_cols]
+            f"# Average {col}: {averages[col]:.2f},,,,,,,," for col in numeric_cols]
         comment_block = "\n".join(comment_lines) + "\n"
         with open(output_csv, 'r') as f:
             csv_content = f.read()
