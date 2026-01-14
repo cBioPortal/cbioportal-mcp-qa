@@ -62,7 +62,7 @@ def evaluate(client: Client, question: str, expected: str,
     max_retries = 3
     for attempt in range(max_retries):
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5-20250929",
             max_tokens=500,
             temperature=0.0,
             messages=[{"role": "user", "content": prompt}]

@@ -43,7 +43,7 @@ class MCPClickHouseClient(BaseQAClient):
     def __init__(
         self, 
         api_key: Optional[str] = None,
-        model: str = "anthropic:claude-sonnet-4-20250514",
+        model: str = "anthropic:claude-sonnet-4-5-20250929",
         use_ollama: bool = False,
         ollama_base_url: str = "http://localhost:11434",
         clickhouse_host: Optional[str] = None,
