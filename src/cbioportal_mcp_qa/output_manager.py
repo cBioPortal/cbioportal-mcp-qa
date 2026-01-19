@@ -68,12 +68,16 @@ class OutputManager:
         # Add model information section
         if model_info:
             content_parts.extend(["", "---", "", "## Model Information"])
-            content_parts.append(f"**Model:** {model_info.get('model', 'Unknown')}")
-            if model_info.get('use_ollama'):
-                content_parts.append(f"**Provider:** Ollama ({model_info.get('ollama_base_url', 'http://localhost:11434')})")
-            else:
-                content_parts.append("**Provider:** Anthropic")
-            content_parts.append(f"**Max Tokens:** {model_info.get('max_tokens', 4096)}")
+            for key, value in model_info.items():
+                if key != "usage":
+                    content_parts.append(f"- **{key}**: {value}")
+
+            if "usage" in model_info:
+                usage = model_info["usage"]
+                content_parts.append("")
+                content_parts.append("### Usage")
+                for usage_key, usage_value in usage.items():
+                    content_parts.append(f"- **{usage_key}**: {usage_value}")
         
         content_parts.extend(["", "---", "", f"*Generated on {timestamp}*"])
         

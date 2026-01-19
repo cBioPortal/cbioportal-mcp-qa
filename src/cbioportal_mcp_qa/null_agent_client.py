@@ -32,7 +32,8 @@ class CBioAgentNullClient(BaseQAClient):
         url = f"{self.base_url}/chat/completions"
         payload = {
             "messages": [{"role": "user", "content": question}],
-            "stream": False
+            "stream": False,
+            "include_model_info": True
         }
 
         try:
@@ -49,15 +50,20 @@ class CBioAgentNullClient(BaseQAClient):
                 # If that fails, we'll dump the whole JSON.
                 
                 data = response.json()
-                
+            
                 # check for OpenAI format
                 if "choices" in data and len(data["choices"]) > 0:
                     message = data["choices"][0].get("message", {})
                     if "content" in message:
-                        return message["content"]
+                        content = message["content"]
+                else:
+                    # Fallback: if it's just a direct dict
+                    content = str(data)
+                    
+                model_info = data.get("model_info") or dict()
                 
-                # Fallback: if it's just a direct dict
-                return str(data)
+                return content, model_info
+                
 
         except httpx.HTTPStatusError as e:
             return f"Error: API request failed with status {e.response.status_code}: {e.response.text}"
