@@ -16,8 +16,9 @@ The system provides a modular CLI to:
 The system currently supports the following agent types via the `--agent-type` flag:
 
 1.  `mcp-clickhouse`: The original Model Context Protocol (MCP) agent connected to a ClickHouse database.
-2.  `cbio-nav-null`: A baseline/testing agent (or a specific implementation hosted at a URL).
-3.  `cbio-qa-null`: Another baseline/testing agent, similar to `cbio-nav-null` but using a different configuration.
+2.  `cbio-mcp-agent`: cBioPortal MCP agent service (HTTP API wrapper around MCP).
+3.  `cbio-nav-null`: A baseline/testing agent (or a specific implementation hosted at a URL).
+4.  `cbio-qa-null`: Another baseline/testing agent, similar to `cbio-nav-null` but using a different configuration.
 
 ## Setup
 
@@ -37,6 +38,9 @@ Create a `.env` file or export the following environment variables:
 **General:**
 *   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation) and the `mcp-clickhouse` agent.
 
+**For `cbio-mcp-agent`:**
+*   `CBIOPORTAL_MCP_AGENT_URL`: URL of the cBioPortal MCP agent API (e.g., `http://localhost:8080`).
+
 **For `cbio-nav-null`:**
 *   `NULL_NAV_URL`: URL of the agent API (e.g., `http://localhost:5000`).
 
@@ -55,10 +59,13 @@ Create a `.env` file or export the following environment variables:
 The `benchmark` command is the main way to evaluate an agent. It automates generation, evaluation, and leaderboard updates.
 
 ```bash
+# Run benchmark for the cBioPortal MCP agent
+cbioportal-mcp-qa benchmark --agent-type cbio-mcp-agent --questions 1-5
+
 # Run benchmark for the null agent
 cbioportal-mcp-qa benchmark --agent-type cbio-nav-null --questions 1-5
 
-# Run benchmark for the MCP agent
+# Run benchmark for the direct MCP connection
 cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse
 ```
 
@@ -76,30 +83,10 @@ You can also run individual components manually.
 
 ### 1. Ask a Question
 ```bash
-cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-nav-null
-```
+# Ask using the cBioPortal MCP agent
+cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-mcp-agent
 
-### 2. Batch Processing
-Generate answers without running the full benchmark evaluation.
-```bash
-cbioportal-mcp-qa batch input/autosync-public.csv --questions 1-10 --output-dir my_results/
-```
-
-### 3. Manual Evaluation
-Run the evaluation script on existing output files.
-```bash
-python simple_eval.py \
-  --input-csv input/autosync-public.csv \
-  --answers-dir my_results/ \
-  --answer-column "Navbot Expected Link"
-```
-
-## Manual Usage (CLI Reference)
-
-You can also run individual components manually.
-
-### 1. Ask a Question
-```bash
+# Ask using a null agent
 cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-nav-null
 ```
 

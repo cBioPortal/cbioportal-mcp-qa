@@ -49,7 +49,7 @@ def evaluate_steps(client: Client, question: str, expected: str,
 
     prompt = prompt.format(question=question, expected=expected, output=output)
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-5-20250929",
         max_tokens=500,
         temperature=0.0,
         messages=[{"role": "user", "content": prompt}]

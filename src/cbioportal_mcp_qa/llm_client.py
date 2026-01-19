@@ -14,6 +14,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from .base_client import BaseQAClient
 from .null_agent_client import CBioAgentNullClient
+from .mcp_agent_client import CBioPortalMCPAgentClient
 from .prompts import DEFAULT_SYSTEM_PROMPT
 from .sql_logger import sql_query_logger, MCPServerStdioWithSQLCapture
 
@@ -42,7 +43,7 @@ class MCPClickHouseClient(BaseQAClient):
     def __init__(
         self, 
         api_key: Optional[str] = None,
-        model: str = "anthropic:claude-sonnet-4-20250514",
+        model: str = "anthropic:claude-sonnet-4-5-20250929",
         use_ollama: bool = False,
         ollama_base_url: str = "http://localhost:11434",
         clickhouse_host: Optional[str] = None,
@@ -191,6 +192,8 @@ def get_qa_client(agent_type: str = "mcp-clickhouse", **kwargs) -> BaseQAClient:
         return CBioAgentNullClient(env_var_name="NULL_NAV_URL", **kwargs)
     elif agent_type == "cbio-qa-null":
         return CBioAgentNullClient(env_var_name="NULL_QA_URL", **kwargs)
+    elif agent_type == "cbio-mcp-agent":
+        return CBioPortalMCPAgentClient(env_var_name="CBIOPORTAL_MCP_AGENT_URL", **kwargs)
     else:
         raise ValueError(f"Unknown agent type: {agent_type}")
 
