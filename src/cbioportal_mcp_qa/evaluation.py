@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import time
+import re
 import pandas as pd
 from anthropic import Client
 from dotenv import load_dotenv
@@ -82,6 +83,14 @@ def evaluate(client: Client, question: str, expected: str,
                 return {"error": "Invalid JSON", "raw_response": response_text}
 
 
+def extract_tokens(llm_output: str) -> tuple[int | None, int | None]:
+    m_in = re.search(r"^\s*-\s*\*\*input_tokens\*\*:\s*(\d+)\s*$", llm_output, re.M)
+    m_out = re.search(r"^\s*-\s*\*\*output_tokens\*\*:\s*(\d+)\s*$", llm_output, re.M)
+    input_tokens = int(m_in.group(1)) if m_in else None
+    output_tokens = int(m_out.group(1)) if m_out else None
+    return input_tokens, output_tokens
+
+
 def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answer_column: str) -> dict:
     '''
     Programmatic entry point for evaluation.
@@ -130,6 +139,11 @@ def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answ
             
         response = evaluate(client, row['Question'],
                             str(expected_val), llm_output)
+        
+        input_tokens, output_tokens = extract_tokens(llm_output)
+        response['input_tokens'] = input_tokens
+        response['output_tokens'] = output_tokens
+
         print(
             f"\nEvaluation response for question '{row['Question']}':\n{response}")
         df = pd.DataFrame([response])
