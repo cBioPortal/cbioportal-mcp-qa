@@ -135,7 +135,7 @@ To integrate a new agent into the benchmarking system:
     ```python
     # Example in src/cbioportal_mcp_qa/benchmark.py
     AGENT_COLUMN_MAPPING = {
-        "mcp-clickhouse": "Navbot Expected Link",
+        "mcp-clickhouse": "DBBot Expected Answer",
         "cbio-nav-null": "Navbot Expected Link",
         "my-new-agent": "My New Agent Expected Answer Column", # Your agent's expected answer column
     }

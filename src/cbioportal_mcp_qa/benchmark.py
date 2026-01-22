@@ -15,7 +15,7 @@ from .evaluation import run_evaluation_logic
 # we might need this. But benchmark generates its OWN answers in a fresh directory.
 # So we mainly need the Ground Truth column.
 AGENT_COLUMN_MAPPING = {
-    "mcp-clickhouse": "Navbot Expected Link",
+    "mcp-clickhouse": "DBBot Expected Answer",
     "cbio-nav-null": "Navbot Expected Link",
     "cbio-qa-null": "DBBot Expected Answer",
     "cbio-mcp-agent": "DBBot Expected Answer",
