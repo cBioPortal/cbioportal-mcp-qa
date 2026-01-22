@@ -1,4 +1,5 @@
 import os
+import time
 import httpx
 from typing import Any, List, Optional
 from .base_client import BaseQAClient
@@ -37,9 +38,11 @@ class CBioPortalMCPAgentClient(BaseQAClient):
         }
 
         try:
+            start_time = time.perf_counter()
             async with httpx.AsyncClient() as client:
                 response = await client.post(url, json=payload, timeout=300.0)  # 5 minutes for complex queries
                 response.raise_for_status()
+                elapsed_seconds = time.perf_counter() - start_time
                 
                 data = response.json()
                                 
@@ -53,6 +56,7 @@ class CBioPortalMCPAgentClient(BaseQAClient):
                     content = str(data)
                     
                 model_info = data.get("model_info") or dict()
+                model_info["response_time_seconds"] = elapsed_seconds
                 
                 return content, model_info
 

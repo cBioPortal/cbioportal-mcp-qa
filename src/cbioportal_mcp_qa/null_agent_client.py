@@ -1,4 +1,5 @@
 import os
+import time
 import httpx
 from typing import Any, List, Optional
 from .base_client import BaseQAClient
@@ -37,9 +38,11 @@ class CBioAgentNullClient(BaseQAClient):
         }
 
         try:
+            start_time = time.perf_counter()
             async with httpx.AsyncClient() as client:
                 response = await client.post(url, json=payload, timeout=60.0)
                 response.raise_for_status()
+                elapsed_seconds = time.perf_counter() - start_time
                 
                 # Assume standard OpenAI-like response format based on endpoint name
                 # or just look for 'content' in the response.
@@ -61,6 +64,7 @@ class CBioAgentNullClient(BaseQAClient):
                     content = str(data)
                     
                 model_info = data.get("model_info") or dict()
+                model_info["response_time_seconds"] = elapsed_seconds
                 
                 return content, model_info
                 
