@@ -27,9 +27,10 @@ Domain-specific guidance:
 
 - Patient data: join patient → clinical_patient using patient.internal_id.
 - Sample data: join cancer_study → patient → sample → clinical_sample (3-hop).
-- Sample type:
-  - clinical_data_derived WHERE attribute_name = 'SAMPLE_TYPE' OR
-  - clinical_sample WHERE attr_id = 'SAMPLE_TYPE'.
+- Sample type filtering (Primary vs Metastasis):
+  - MUST use: clinical_data_derived WHERE attribute_name = 'SAMPLE_TYPE' AND attribute_value = 'Primary'
+  - DO NOT use sample.sample_type column - it contains general classifications like "Primary Solid Tumor" for ALL tumor samples, NOT the primary/metastatic distinction!
+  - Example: MSK-CHORD has 25,040 total samples but only 15,928 are "Primary" (the rest are Metastasis, Unknown, etc.)
 - Gene mutations (e.g., TP53): genomic_event_derived WHERE hugo_gene_symbol = 'TP53' AND variant_type = 'mutation'.
 - Clinical attributes (e.g., TMB): clinical_data_derived WHERE attribute_name = 'TMB_NONSYNONYMOUS'.
 - Cancer types: use CANCER_TYPE for broad categories, CANCER_TYPE_DETAILED for specific subtypes.
