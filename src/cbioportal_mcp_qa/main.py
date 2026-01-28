@@ -404,24 +404,29 @@ async def async_batch_main(
             clickhouse_send_receive_timeout=clickhouse_send_receive_timeout,
         )
         output_manager = OutputManager(output_dir)
-        
-        # Prepare model information for output
-        model_info = {
-            'agent_type': agent_type,
-            'model': model,
-            'use_ollama': use_ollama,
-            'ollama_base_url': ollama_base_url,
-            'max_tokens': 4096
-        }
-        
+
         # Process questions
         with tqdm(question_data, desc="Processing questions") as pbar:
             for question_num, question_type, question_text in pbar:
                 pbar.set_description(f"Processing question {question_num}")
-                
-                # Get answer from LLM
-                answer = await qa_client.ask_question(question_text)
-                
+
+                # Get answer from LLM (support both tuple and string returns)
+                result = await qa_client.ask_question(question_text)
+                if isinstance(result, tuple):
+                    answer, model_info = result
+                    model_info['agent_type'] = agent_type
+                else:
+                    answer, model_info = result, dict()
+
+                if agent_type == "mcp-clickhouse":
+                    model_info = {
+                        'agent_type': agent_type,
+                        'model': model,
+                        'use_ollama': use_ollama,
+                        'ollama_base_url': ollama_base_url,
+                        'max_tokens': 4096
+                    }
+
                 # Write result
                 output_path = output_manager.write_question_result(
                     question_num, question_type, question_text, answer, include_sql, model_info

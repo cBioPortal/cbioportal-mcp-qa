@@ -1,4 +1,5 @@
 import os
+import time
 import httpx
 from typing import Any, List, Optional
 from .base_client import BaseQAClient
@@ -32,24 +33,32 @@ class CBioPortalMCPAgentClient(BaseQAClient):
         url = f"{self.base_url}/chat/completions"
         payload = {
             "messages": [{"role": "user", "content": question}],
-            "stream": False
+            "stream": False,
+            "include_model_info": True
         }
 
         try:
+            start_time = time.perf_counter()
             async with httpx.AsyncClient() as client:
                 response = await client.post(url, json=payload, timeout=300.0)  # 5 minutes for complex queries
                 response.raise_for_status()
+                elapsed_seconds = time.perf_counter() - start_time
                 
                 data = response.json()
-                
-                # Check for OpenAI format
+                                
+                # check for OpenAI format
                 if "choices" in data and len(data["choices"]) > 0:
                     message = data["choices"][0].get("message", {})
                     if "content" in message:
-                        return message["content"]
+                        content = message["content"]
+                else:
+                    # Fallback: if it's just a direct dict
+                    content = str(data)
+                    
+                model_info = data.get("model_info") or dict()
+                model_info["response_time_seconds"] = elapsed_seconds
                 
-                # Fallback: if it's just a direct dict
-                return str(data)
+                return content, model_info
 
         except httpx.HTTPStatusError as e:
             return f"Error: API request failed with status {e.response.status_code}: {e.response.text}"
