@@ -3,12 +3,40 @@ import json
 import os
 import time
 import pandas as pd
-from anthropic import Client
+from anthropic import Anthropic, AnthropicBedrock
 from dotenv import load_dotenv
 
 
-def evaluate(client: Client, question: str, expected: str,
-             output: str) -> str:
+def get_anthropic_client(use_bedrock: bool = False, aws_profile: str = None):
+    """Get the appropriate Anthropic client based on configuration.
+
+    Args:
+        use_bedrock: Whether to use AWS Bedrock instead of Anthropic API
+        aws_profile: AWS profile name for Bedrock authentication
+
+    Returns:
+        Anthropic or AnthropicBedrock client
+    """
+    if use_bedrock:
+        import boto3
+        if aws_profile:
+            session = boto3.Session(profile_name=aws_profile)
+            credentials = session.get_credentials()
+            return AnthropicBedrock(
+                aws_access_key=credentials.access_key,
+                aws_secret_key=credentials.secret_key,
+                aws_session_token=credentials.token,
+                aws_region=session.region_name or "us-east-1",
+            )
+        else:
+            # Use default AWS credential chain
+            return AnthropicBedrock()
+    else:
+        return Anthropic()
+
+
+def evaluate(client, question: str, expected: str,
+             output: str, use_bedrock: bool = False) -> str:
     '''
     Evaluate the LLM output against the expected answer using multiple criteria.
         client: Initialized Anthropic Client.
@@ -59,10 +87,16 @@ def evaluate(client: Client, question: str, expected: str,
     ```
     '''
 
+    # Select model based on client type
+    if use_bedrock:
+        model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    else:
+        model = "claude-sonnet-4-5-20250929"
+
     max_retries = 3
     for attempt in range(max_retries):
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model=model,
             max_tokens=500,
             temperature=0.0,
             messages=[{"role": "user", "content": prompt}]
@@ -82,13 +116,22 @@ def evaluate(client: Client, question: str, expected: str,
                 return {"error": "Invalid JSON", "raw_response": response_text}
 
 
-def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answer_column: str) -> dict:
+def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answer_column: str,
+                         use_bedrock: bool = False, aws_profile: str = None) -> dict:
     '''
     Programmatic entry point for evaluation.
     Returns a dictionary of average scores.
+
+    Args:
+        input_csv: Path to input CSV with questions and expected answers
+        answers_dir: Directory containing generated answer files
+        output_dir: Directory to save evaluation results
+        answer_column: Column name containing expected answers
+        use_bedrock: Whether to use AWS Bedrock instead of Anthropic API
+        aws_profile: AWS profile name for Bedrock authentication
     '''
     load_dotenv()
-    client = Client()
+    client = get_anthropic_client(use_bedrock=use_bedrock, aws_profile=aws_profile)
     sep = '\t' if input_csv.endswith('.tsv') else ','
     data = pd.read_csv(input_csv, sep=sep)
     results = []
@@ -129,7 +172,7 @@ def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answ
             continue
             
         response = evaluate(client, row['Question'],
-                            str(expected_val), llm_output)
+                            str(expected_val), llm_output, use_bedrock=use_bedrock)
         print(
             f"\nEvaluation response for question '{row['Question']}':\n{response}")
         df = pd.DataFrame([response])
