@@ -34,6 +34,11 @@ Domain-specific guidance:
 - Gene mutations (e.g., TP53): genomic_event_derived WHERE hugo_gene_symbol = 'TP53' AND variant_type = 'mutation'.
 - Clinical attributes (e.g., TMB): clinical_data_derived WHERE attribute_name = 'TMB_NONSYNONYMOUS'.
 - Cancer types: use CANCER_TYPE for broad categories, CANCER_TYPE_DETAILED for specific subtypes.
+- Finding studies by cancer type: ALWAYS search multiple fields with abbreviations/OncoTree codes:
+  - Search name, cancer_study_identifier, AND type_of_cancer_id
+  - Use common abbreviations (e.g., GBM for glioblastoma, BRCA for breast cancer)
+  - Example for glioblastoma: search for 'glioblastoma', 'gbm', 'glioma' AND type_of_cancer_id IN ('gb', 'difg')
+  - Note: 'difg' (Diffuse Glioma) includes many glioblastoma studies like lgggbm_tcga_pub
 - Clinical attribute discovery: query clinical_attribute_meta for available attributes and descriptions.
 - Clinical attributes are key-value pairs:
   - attr_id = attribute identifier
