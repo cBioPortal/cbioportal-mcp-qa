@@ -2,6 +2,8 @@
 
 |     Date | Agent Type     |   Completeness Score |   Conciseness Score |   Correctness Score |   Faithfulness Score |
 |---------:|:---------------|---------------------:|--------------------:|--------------------:|---------------------:|
+| 20260203 | mcp-clickhouse |                  3   |                 1.9 |                 2.4 |                  2.8 |
+| 20260128 | mcp-clickhouse |                  3   |                 2.2 |                 2.8 |                  3   |
 | 20260115 | cbio-mcp-agent |                  2.8 |                 2.4 |                 2.8 |                  3   |
 | 20251212 | cbio-nav-null  |                  1   |                 1.6 |                 2   |                  2.4 |
 | 20251212 | cbio-qa-null   |                  1   |                 1   |                 1   |                  1.8 |
