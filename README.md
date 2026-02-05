@@ -36,7 +36,7 @@ uv sync --editable
 Create a `.env` file or export the following environment variables:
 
 **General:**
-*   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation) and the `mcp-clickhouse` agent.
+*   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation). Alternatively, use AWS Bedrock with `--use-bedrock` and `--aws-profile`.
 
 **For `mcp-navigator-agent`:**
 *   `CBIOPORTAL_MCP_AGENT_URL`: URL of the cBioPortal MCP agent API (e.g., `http://localhost:8080`).
@@ -48,7 +48,7 @@ Create a `.env` file or export the following environment variables:
 *   `NULL_QA_URL`: URL of the agent API (e.g., `http://localhost:5002`).
 
 **For `mcp-clickhouse`:**
-*   `CLICKHOUSE_HOST`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`: Connection details.
+*   `MCP_CLICKHOUSE_AGENT_URL`: URL of the MCP ClickHouse agent API (e.g., `http://localhost:8080`).
 
 **Optional (Tracing):**
 *   `PHOENIX_API_KEY`: For Arize Phoenix tracing.
