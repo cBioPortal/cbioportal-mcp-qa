@@ -18,7 +18,7 @@ AGENT_COLUMN_MAPPING = {
     "mcp-clickhouse": "DBBot Expected Answer",
     "cbio-nav-null": "Navbot Expected Link(s)",
     "cbio-qa-null": "DBBot Expected Answer",
-    "mcp-navigator-agent": "NavBot Expected Answer",
+    "mcp-navigator-agent": "Navbot Expected Link(s)",
     # Add other agents here
 }
 
