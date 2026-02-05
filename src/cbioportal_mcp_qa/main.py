@@ -104,6 +104,16 @@ def shared_options(f):
             help="Ollama base URL (default: http://localhost:11434)",
         ),
         click.option(
+            "--use-bedrock",
+            is_flag=True,
+            help="Use AWS Bedrock instead of Anthropic API",
+        ),
+        click.option(
+            "--aws-profile",
+            default=None,
+            help="AWS profile name for Bedrock authentication",
+        ),
+        click.option(
             "--include-sql",
             is_flag=True,
             help="Include SQL queries in the output",
@@ -175,6 +185,8 @@ def batch(
     model: str,
     use_ollama: bool,
     ollama_base_url: str,
+    use_bedrock: bool,
+    aws_profile: Optional[str],
     include_sql: bool,
     enable_open_telemetry_tracing: bool,
 ):
@@ -200,6 +212,8 @@ def batch(
         model,
         use_ollama,
         ollama_base_url,
+        use_bedrock,
+        aws_profile,
         include_sql,
         enable_open_telemetry_tracing,
         delay,
@@ -241,11 +255,13 @@ def ask(
     model: str,
     use_ollama: bool,
     ollama_base_url: str,
+    use_bedrock: bool,
+    aws_profile: Optional[str],
     include_sql: bool,
     enable_open_telemetry_tracing: bool,
 ):
     """Ask a single question about cBioPortal data.
-    
+
     QUESTION: The question to ask about the cBioPortal data
     """
     asyncio.run(async_ask_main(
@@ -266,6 +282,8 @@ def ask(
         model,
         use_ollama,
         ollama_base_url,
+        use_bedrock,
+        aws_profile,
         include_sql,
         enable_open_telemetry_tracing,
     ))
@@ -311,17 +329,19 @@ def benchmark(
     model: str,
     use_ollama: bool,
     ollama_base_url: str,
+    use_bedrock: bool,
+    aws_profile: Optional[str],
     include_sql: bool,
     enable_open_telemetry_tracing: bool,
 ):
     """Run a standard benchmark for a specific agent type.
-    
+
     This command:
     1. Generates answers for the specified questions (default: all)
     2. Runs evaluation against the expected answers
     3. Updates the LEADERBOARD.md file
     """
-    
+
     asyncio.run(run_benchmark(
         agent_type,
         questions,
@@ -338,6 +358,8 @@ def benchmark(
         model,
         use_ollama,
         ollama_base_url,
+        use_bedrock,
+        aws_profile,
         include_sql,
         enable_open_telemetry_tracing,
         delay,
@@ -363,6 +385,8 @@ async def async_batch_main(
     model: str,
     use_ollama: bool,
     ollama_base_url: str,
+    use_bedrock: bool,
+    aws_profile: Optional[str],
     include_sql: bool,
     enable_open_telemetry_tracing: bool,
     delay: int,
@@ -391,6 +415,8 @@ async def async_batch_main(
             model=model,
             use_ollama=use_ollama,
             ollama_base_url=ollama_base_url,
+            use_bedrock=use_bedrock,
+            aws_profile=aws_profile,
             include_sql=include_sql,
             enable_open_telemetry_tracing=enable_open_telemetry_tracing,
             clickhouse_host=clickhouse_host,
@@ -460,6 +486,8 @@ async def async_ask_main(
     model: str,
     use_ollama: bool,
     ollama_base_url: str,
+    use_bedrock: bool,
+    aws_profile: Optional[str],
     include_sql: bool,
     enable_open_telemetry_tracing: bool,
 ):
@@ -475,6 +503,8 @@ async def async_ask_main(
             model=model,
             use_ollama=use_ollama,
             ollama_base_url=ollama_base_url,
+            use_bedrock=use_bedrock,
+            aws_profile=aws_profile,
             include_sql=include_sql,
             enable_open_telemetry_tracing=enable_open_telemetry_tracing,
             clickhouse_host=clickhouse_host,
@@ -519,6 +549,8 @@ async def async_ask_main(
             output_parts.append(f"**Model:** {model}")
             if use_ollama:
                 output_parts.append(f"**Provider:** Ollama ({ollama_base_url})")
+            elif use_bedrock:
+                output_parts.append(f"**Provider:** AWS Bedrock (profile: {aws_profile or 'default'})")
             else:
                 output_parts.append("**Provider:** Anthropic")
             output_parts.append("**Max Tokens:** 4096")

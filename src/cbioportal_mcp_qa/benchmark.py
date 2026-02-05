@@ -15,8 +15,8 @@ from .evaluation import run_evaluation_logic
 # we might need this. But benchmark generates its OWN answers in a fresh directory.
 # So we mainly need the Ground Truth column.
 AGENT_COLUMN_MAPPING = {
-    "mcp-clickhouse": "Navbot Expected Link",
-    "cbio-nav-null": "Navbot Expected Link",
+    "mcp-clickhouse": "DBBot Expected Answer",
+    "cbio-nav-null": "Navbot Expected Link(s)",
     "cbio-qa-null": "DBBot Expected Answer",
     "cbio-mcp-agent": "DBBot Expected Answer",
     # Add other agents here
@@ -38,6 +38,8 @@ async def run_benchmark(
     model: str,
     use_ollama: bool,
     ollama_base_url: str,
+    use_bedrock: bool,
+    aws_profile: Optional[str],
     include_sql: bool,
     enable_open_telemetry_tracing: bool,
     delay: int,
@@ -85,6 +87,8 @@ async def run_benchmark(
         model=model,
         use_ollama=use_ollama,
         ollama_base_url=ollama_base_url,
+        use_bedrock=use_bedrock,
+        aws_profile=aws_profile,
         include_sql=include_sql,
         enable_open_telemetry_tracing=enable_open_telemetry_tracing,
         delay=delay,
@@ -101,7 +105,9 @@ async def run_benchmark(
         input_csv=str(csv_file),
         answers_dir=str(answers_dir),
         output_dir=str(eval_dir),
-        answer_column=expected_answer_col 
+        answer_column=expected_answer_col,
+        use_bedrock=use_bedrock,
+        aws_profile=aws_profile,
     )
 
     # 4. Update Leaderboard

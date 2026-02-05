@@ -41,11 +41,13 @@ class MCPClickHouseClient(BaseQAClient):
         return ""
     
     def __init__(
-        self, 
+        self,
         api_key: Optional[str] = None,
         model: str = "anthropic:claude-sonnet-4-5-20250929",
         use_ollama: bool = False,
         ollama_base_url: str = "http://localhost:11434",
+        use_bedrock: bool = False,
+        aws_profile: Optional[str] = None,
         clickhouse_host: Optional[str] = None,
         clickhouse_database: Optional[str] = None,
         clickhouse_port: Optional[str] = None,
@@ -60,19 +62,24 @@ class MCPClickHouseClient(BaseQAClient):
         **kwargs,
     ):
         """Initialize the client.
-        
+
         Args:
             api_key: Anthropic API key. If None, will read from ANTHROPIC_API_KEY env var.
             model: Model to use (Anthropic or Ollama format).
             use_ollama: Whether to use Ollama instead of Anthropic.
             ollama_base_url: Base URL for Ollama server.
+            use_bedrock: Whether to use AWS Bedrock instead of Anthropic.
+            aws_profile: AWS profile name for Bedrock authentication.
             clickhouse_*: ClickHouse configuration parameters.
             include_sql: Whether to capture and log SQL queries.
             enable_open_telemetry_tracing: Whether to capture traces with Arize Phoenix
             **kwargs: Additional arguments ignored by this client.
         """
-        # Only require API key for Anthropic models
-        if not use_ollama:
+        self.use_bedrock = use_bedrock
+        self.aws_profile = aws_profile
+
+        # Only require API key for Anthropic models (not Ollama or Bedrock)
+        if not use_ollama and not use_bedrock:
             api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         
         # Set up ClickHouse environment variables
@@ -128,13 +135,29 @@ class MCPClickHouseClient(BaseQAClient):
         # Create agent with MCP server
         model_settings = ModelSettings(max_tokens=4096, temperature=0.0)
         
-        # Create model based on whether using Ollama or Anthropic
+        # Create model based on provider
         if use_ollama:
             # For Ollama, create OpenAI-compatible model
             agent_model = OpenAIChatModel(
                 model_name=model,  # This should be the ollama_model passed from main.py
                 provider=OpenAIProvider(base_url=f"{ollama_base_url}/v1")
             )
+        elif use_bedrock:
+            # For Bedrock, use bedrock: prefix with model ID
+            # Set up AWS credentials if profile specified
+            if aws_profile:
+                import boto3
+                session = boto3.Session(profile_name=aws_profile)
+                credentials = session.get_credentials()
+                os.environ["AWS_ACCESS_KEY_ID"] = credentials.access_key
+                os.environ["AWS_SECRET_ACCESS_KEY"] = credentials.secret_key
+                if credentials.token:
+                    os.environ["AWS_SESSION_TOKEN"] = credentials.token
+                os.environ["AWS_DEFAULT_REGION"] = session.region_name or "us-east-1"
+
+            # Use bedrock model format
+            bedrock_model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+            agent_model = f"bedrock:{bedrock_model_id}"
         else:
             # For Anthropic, use model string directly
             agent_model = model
