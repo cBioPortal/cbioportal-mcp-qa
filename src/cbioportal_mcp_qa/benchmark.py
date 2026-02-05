@@ -18,7 +18,7 @@ AGENT_COLUMN_MAPPING = {
     "mcp-clickhouse": "DBBot Expected Answer",
     "cbio-nav-null": "Navbot Expected Link(s)",
     "cbio-qa-null": "DBBot Expected Answer",
-    "cbio-mcp-agent": "DBBot Expected Answer",
+    "mcp-navigator-agent": "NavBot Expected Answer",
     # Add other agents here
 }
 
@@ -190,8 +190,8 @@ def regenerate_leaderboard():
     # Create DataFrame
     df_leaderboard = pd.DataFrame(aggregated_data)
     
-    # Sort by Date (descending) and Agent Type
-    df_leaderboard.sort_values(by=["Date", "Agent Type"], ascending=[False, True], inplace=True)
+    # Sort by Correctness Score (descending), then Date (descending)
+    df_leaderboard.sort_values(by=["correctness_score", "Date"], ascending=[False, False], inplace=True)
     
     # Format headers: 'correctness_score' -> 'Correctness Score'
     df_leaderboard.columns = [c.replace('_', ' ').title() if c.endswith('_score') else c for c in df_leaderboard.columns]
