@@ -3,7 +3,7 @@
 from functools import lru_cache
 
 
-from simple_eval import evaluate
+from cbioportal_mcp_qa.evaluation import evaluate
 from src.cbioportal_mcp_qa.llm_client import LLMClient
 from src.cbioportal_mcp_qa.main import setup_open_telemetry_tracing
 
