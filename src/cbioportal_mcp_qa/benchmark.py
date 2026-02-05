@@ -190,8 +190,8 @@ def regenerate_leaderboard():
     # Create DataFrame
     df_leaderboard = pd.DataFrame(aggregated_data)
     
-    # Sort by Correctness Score (descending), then Date (descending)
-    df_leaderboard.sort_values(by=["correctness_score", "Date"], ascending=[False, False], inplace=True)
+    # Sort by Date (descending), then Correctness Score (descending)
+    df_leaderboard.sort_values(by=["Date", "correctness_score"], ascending=[False, False], inplace=True)
     
     # Format headers: 'correctness_score' -> 'Correctness Score'
     df_leaderboard.columns = [c.replace('_', ' ').title() if c.endswith('_score') else c for c in df_leaderboard.columns]
