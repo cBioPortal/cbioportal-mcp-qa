@@ -109,15 +109,6 @@ async def async_batch_main(
                     model_info['agent_type'] = agent_type
                 else:
                     answer, model_info = result, dict()
-
-                if agent_type == "mcp-clickhouse":
-                    model_info = {
-                        'agent_type': agent_type,
-                        'model': model,
-                        'use_ollama': use_ollama,
-                        'ollama_base_url': ollama_base_url,
-                        'max_tokens': 4096
-                    }
                 
                 # Write result
                 output_path = output_manager.write_question_result(

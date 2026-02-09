@@ -18,7 +18,7 @@ AGENT_COLUMN_MAPPING = {
     "mcp-clickhouse": "DBBot Expected Answer",
     "cbio-nav-null": "Navbot Expected Link(s)",
     "cbio-qa-null": "DBBot Expected Answer",
-    "cbio-mcp-agent": "DBBot Expected Answer",
+    "mcp-navigator-agent": "Navbot Expected Link(s)",
     # Add other agents here
 }
 
@@ -44,6 +44,8 @@ async def run_benchmark(
     enable_open_telemetry_tracing: bool,
     delay: int,
     batch_size: int,
+    skip_eval: bool = False,
+    eval_only: bool = False,
 ):
     """
     Runs the benchmark for a specific agent type.
@@ -67,52 +69,59 @@ async def run_benchmark(
 
     print(f"--- Starting Benchmark for {agent_type} ---")
     print(f"Output Directory: {base_results_dir}")
+
     # 2. Run Batch Generation
-    print("Step 1: Generating Answers...")
-    await async_batch_main(
-        csv_file=csv_file,
-        questions=questions,
-        output_dir=answers_dir,
-        agent_type=agent_type,
-        api_key=api_key,
-        clickhouse_host=clickhouse_host,
-        clickhouse_database=clickhouse_database,
-        clickhouse_port=clickhouse_port,
-        clickhouse_user=clickhouse_user,
-        clickhouse_password=clickhouse_password,
-        clickhouse_secure=clickhouse_secure,
-        clickhouse_verify=clickhouse_verify,
-        clickhouse_connect_timeout=clickhouse_connect_timeout,
-        clickhouse_send_receive_timeout=clickhouse_send_receive_timeout,
-        model=model,
-        use_ollama=use_ollama,
-        ollama_base_url=ollama_base_url,
-        use_bedrock=use_bedrock,
-        aws_profile=aws_profile,
-        include_sql=include_sql,
-        enable_open_telemetry_tracing=enable_open_telemetry_tracing,
-        delay=delay,
-        batch_size=batch_size,
-    )
+    if not eval_only:
+        print("Step 1: Generating Answers...")
+        await async_batch_main(
+            csv_file=csv_file,
+            questions=questions,
+            output_dir=answers_dir,
+            agent_type=agent_type,
+            api_key=api_key,
+            clickhouse_host=clickhouse_host,
+            clickhouse_database=clickhouse_database,
+            clickhouse_port=clickhouse_port,
+            clickhouse_user=clickhouse_user,
+            clickhouse_password=clickhouse_password,
+            clickhouse_secure=clickhouse_secure,
+            clickhouse_verify=clickhouse_verify,
+            clickhouse_connect_timeout=clickhouse_connect_timeout,
+            clickhouse_send_receive_timeout=clickhouse_send_receive_timeout,
+            model=model,
+            use_ollama=use_ollama,
+            ollama_base_url=ollama_base_url,
+            use_bedrock=use_bedrock,
+            aws_profile=aws_profile,
+            include_sql=include_sql,
+            enable_open_telemetry_tracing=enable_open_telemetry_tracing,
+            delay=delay,
+            batch_size=batch_size,
+        )
+    else:
+        print("Step 1: Skipping generation (eval-only mode)")
 
     # 3. Run Evaluation
-    print("Step 2: Evaluating Answers...")
-    
-    expected_answer_col = AGENT_COLUMN_MAPPING.get(agent_type, "Expected Answer")
-    
-    # Calling the refactored function
-    metrics = run_evaluation_logic(
-        input_csv=str(csv_file),
-        answers_dir=str(answers_dir),
-        output_dir=str(eval_dir),
-        answer_column=expected_answer_col,
-        use_bedrock=use_bedrock,
-        aws_profile=aws_profile,
-    )
+    if not skip_eval:
+        print("Step 2: Evaluating Answers...")
 
-    # 4. Update Leaderboard
-    print("Step 3: Updating Leaderboard...")
-    regenerate_leaderboard()
+        expected_answer_col = AGENT_COLUMN_MAPPING.get(agent_type, "Expected Answer")
+
+        # Calling the refactored function
+        metrics = run_evaluation_logic(
+            input_csv=str(csv_file),
+            answers_dir=str(answers_dir),
+            output_dir=str(eval_dir),
+            answer_column=expected_answer_col,
+            use_bedrock=use_bedrock,
+            aws_profile=aws_profile,
+        )
+
+        # 4. Update Leaderboard
+        print("Step 3: Updating Leaderboard...")
+        regenerate_leaderboard()
+    else:
+        print("Step 2: Skipping evaluation (skip-eval mode)")
 
     print(f"Benchmark Complete. Results in {base_results_dir}")
 
@@ -190,8 +199,8 @@ def regenerate_leaderboard():
     # Create DataFrame
     df_leaderboard = pd.DataFrame(aggregated_data)
     
-    # Sort by Date (descending) and Agent Type
-    df_leaderboard.sort_values(by=["Date", "Agent Type"], ascending=[False, True], inplace=True)
+    # Sort by Date (descending), then Correctness Score (descending)
+    df_leaderboard.sort_values(by=["Date", "correctness_score"], ascending=[False, False], inplace=True)
     
     # Format headers: 'correctness_score' -> 'Correctness Score'
     df_leaderboard.columns = [c.replace('_', ' ').title() if c.endswith('_score') else c for c in df_leaderboard.columns]
