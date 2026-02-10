@@ -1,8 +1,8 @@
 import datetime
 import json
 import os
-import time
 import re
+import time
 from itertools import combinations
 import pandas as pd
 from anthropic import Anthropic, AnthropicBedrock
@@ -37,34 +37,42 @@ def get_anthropic_client(use_bedrock: bool = False, aws_profile: str = None):
         return Anthropic()
 
 
-def extract_answer_content(llm_output: str) -> str:
-    """
-    Extract just the answer content from the LLM output markdown file.
-    Removes metadata sections like SQL queries and model information.
+def extract_answer_content(markdown_text: str) -> str:
+    '''
+    Extract only the answer content from markdown answer files,
+    stripping metadata, SQL queries, timestamps, and model information.
 
     Args:
-        llm_output: Full markdown content from answer file
+        markdown_text: The full markdown content from an answer file.
 
     Returns:
-        Just the answer portion
-    """
-    # Split on common markdown separators
-    lines = llm_output.split('\n')
-    answer_lines = []
-    in_answer = False
+        Just the answer text, cleaned of boilerplate.
+    '''
+    # Find the "**Answer:**" section
+    answer_match = re.search(r'\*\*Answer:\*\*\s*\n+(.*?)(?=\n---|\Z)',
+                             markdown_text, re.DOTALL)
 
-    for line in lines:
-        # Stop at metadata sections
-        if line.startswith('---') or line.startswith('## SQL Queries') or line.startswith('## Model Information'):
-            break
-        # Start collecting after "Answer:" header if present
-        if '**Answer:**' in line:
-            in_answer = True
-            continue
-        if in_answer or (not line.startswith('#') and not line.startswith('**Question:**')):
-            answer_lines.append(line)
+    if not answer_match:
+        # Fallback: return the whole text if we can't find the answer section
+        return markdown_text.strip()
 
-    return '\n'.join(answer_lines).strip()
+    answer_section = answer_match.group(1).strip()
+
+    # Remove SQL query blocks (everything from "Calling `" to the result)
+    answer_section = re.sub(
+        r'Calling `[^`]+` with args:\s*```json.*?```\s*Result from `[^`]+`:\s*```json.*?```',
+        '',
+        answer_section,
+        flags=re.DOTALL
+    )
+
+    # Remove any remaining code blocks that might be SQL or JSON
+    answer_section = re.sub(r'```[a-z]*\n.*?```', '', answer_section, flags=re.DOTALL)
+
+    # Remove extra whitespace and blank lines
+    answer_section = re.sub(r'\n\s*\n\s*\n+', '\n\n', answer_section)
+
+    return answer_section.strip()
 
 
 def evaluate(client, question: str, expected: str,
@@ -169,7 +177,7 @@ def extract_response_time_seconds(llm_output: str) -> float | None:
 
 
 def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answer_column: str,
-                         use_bedrock: bool = False, aws_profile: str = None) -> dict:
+                         use_bedrock: bool = False, aws_profile: str = None, model: str = None) -> dict:
     '''
     Programmatic entry point for evaluation.
     Returns a dictionary of average scores.
@@ -181,6 +189,7 @@ def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answ
         answer_column: Column name containing expected answers
         use_bedrock: Whether to use AWS Bedrock instead of Anthropic API
         aws_profile: AWS profile name for Bedrock authentication
+        model: The model to use for evaluation (optional, defaults based on use_bedrock)
     '''
     load_dotenv()
     client = get_anthropic_client(use_bedrock=use_bedrock, aws_profile=aws_profile)
@@ -197,10 +206,6 @@ def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answ
     for qidx, (_, row) in enumerate(data.iterrows(), start=1):
 
         # check to make sure we have an answer for this question
-        # We assume filenames are 1.md, 2.md, etc. corresponding to row index + 1 or Question ID
-        # Since input CSV usually has explicit IDs, relying on 1-based index is risky if rows are skipped.
-        # But for benchmark on base-set, we assume row 1 = Question 1.
-
         # Try to find Question ID if available, else index
         if 'Question ID' in row:
              qid = row['Question ID']
@@ -224,7 +229,7 @@ def run_evaluation_logic(input_csv: str, answers_dir: str, output_dir: str, answ
             continue
 
         response = evaluate(client, row['Question'],
-                            str(expected_val), llm_output, use_bedrock=use_bedrock)
+                            str(expected_val), llm_output, use_bedrock=use_bedrock, model=model)
 
         input_tokens, output_tokens = extract_tokens(llm_output)
         response_time_seconds = extract_response_time_seconds(llm_output)
@@ -301,17 +306,25 @@ Output B:
 {output2}
 
 Instructions:
-Compare these two LLM outputs for semantic consistency. Evaluate whether they convey the same information and reach the same conclusions.
+Compare these two LLM outputs for SEMANTIC consistency. Evaluate whether they convey the SAME INFORMATION and reach the SAME CONCLUSIONS, even if worded differently.
+
+IMPORTANT: Focus on semantic equivalence, NOT exact string matching. Two answers should be considered equivalent if they convey the same facts, numbers, and conclusions, even if the wording, structure, or level of detail differs.
+
+Examples of EQUIVALENT answers:
+- "10564 patients who have glioblastoma" vs "Glioblastoma patients total 10564"
+- "TP53 is mutated in 50% of samples" vs "Half of the samples show TP53 mutations (50%)"
+- "The study contains 5 cancer types" vs "There are 5 different cancer types in the study"
 
 Scoring rubric:
-- **Score 3 (Highly Consistent)**: Both outputs convey identical core information. Numerical answers match exactly. Conclusions are the same. Minor formatting or wording differences are acceptable.
-- **Score 2 (Somewhat Consistent)**: Key facts overlap but some details differ. Format may vary but the substance is similar. One output may include additional context the other omits.
-- **Score 1 (Inconsistent)**: Contradictory conclusions, different numerical answers, or substantial factual divergence between the outputs.
+- **Score 3 (Highly Consistent)**: Both outputs convey the SAME core facts and conclusions. Numerical values match. Key entities (genes, mutations, studies, counts, percentages) are identical. Minor differences in wording, formatting, or additional context are acceptable.
+- **Score 2 (Somewhat Consistent)**: Key facts mostly align but some details differ. Numbers may be slightly different or presented differently (e.g., counts vs percentages from same data). One output may include additional context or observations the other omits, but core answer is similar.
+- **Score 1 (Inconsistent)**: Contradictory conclusions, different numerical values, or substantial factual divergence. The outputs provide different answers to the question.
 
 Focus on:
 1. Numerical accuracy: Do both outputs report the same numbers/percentages/counts?
 2. Factual alignment: Do they identify the same entities (genes, mutations, studies, treatments)?
 3. Logical consistency: Do they reach the same conclusions?
+4. Semantic meaning: Do they convey the same information, even if worded differently?
 
 Provide your output as a JSON object:
 ```json
@@ -353,7 +366,8 @@ Provide your output as a JSON object:
 
 def run_reproducibility_evaluation(input_csv: str, reproducibility_dir: str,
                                     output_dir: str, num_runs: int,
-                                    use_bedrock: bool = False, aws_profile: str = None) -> dict:
+                                    use_bedrock: bool = False, aws_profile: str = None,
+                                    model: str = None) -> dict:
     '''
     Evaluate reproducibility across multiple runs by comparing pairwise consistency.
 
@@ -364,6 +378,7 @@ def run_reproducibility_evaluation(input_csv: str, reproducibility_dir: str,
         num_runs: Number of runs that were performed.
         use_bedrock: Whether to use AWS Bedrock instead of Anthropic API.
         aws_profile: AWS profile name for Bedrock authentication.
+        model: The model to use for evaluation (optional, defaults based on use_bedrock).
 
     Returns:
         A dictionary of average reproducibility scores.
@@ -396,9 +411,9 @@ def run_reproducibility_evaluation(input_csv: str, reproducibility_dir: str,
 
             if os.path.isfile(answer_file):
                 with open(answer_file, 'r') as f:
-                    raw_output = f.read()
-                    # Extract just the answer content, removing metadata
-                    outputs[run_idx] = extract_answer_content(raw_output)
+                    full_content = f.read()
+                    # Extract just the answer content, stripping markdown boilerplate
+                    outputs[run_idx] = extract_answer_content(full_content)
 
         # Skip if we don't have enough outputs to compare
         if len(outputs) < 2:
@@ -413,7 +428,7 @@ def run_reproducibility_evaluation(input_csv: str, reproducibility_dir: str,
             if run_a in outputs and run_b in outputs:
                 result = evaluate_pairwise_consistency(
                     client, row['Question'], outputs[run_a], outputs[run_b],
-                    use_bedrock=use_bedrock
+                    use_bedrock=use_bedrock, model=model
                 )
                 score = result.get('consistency_score', 1)
                 pairwise_scores.append(score)

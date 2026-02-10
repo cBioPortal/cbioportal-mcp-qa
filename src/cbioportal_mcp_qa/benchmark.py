@@ -111,8 +111,17 @@ async def run_benchmark(
     if reproducibility_runs > 1 and not eval_only:
         print(f"Step 1b: Generating {reproducibility_runs} runs for reproducibility testing...")
         repro_base_dir = base_results_dir / "reproducibility"
+        repro_base_dir.mkdir(parents=True, exist_ok=True)
 
-        for run_idx in range(1, reproducibility_runs + 1):
+        # Reuse the main answers as run1 (via symlink)
+        run1_dir = repro_base_dir / "run1"
+        if run1_dir.exists():
+            run1_dir.unlink()  # Remove if exists
+        run1_dir.symlink_to(answers_dir, target_is_directory=True)
+        print(f"  Run 1/{reproducibility_runs}: Reusing main answers (symlinked)")
+
+        # Generate runs 2 through N
+        for run_idx in range(2, reproducibility_runs + 1):
             run_dir = repro_base_dir / f"run{run_idx}"
             run_dir.mkdir(parents=True, exist_ok=True)
 
