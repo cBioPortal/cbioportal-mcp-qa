@@ -56,10 +56,14 @@ class TestRunBenchmark:
                 model="claude-sonnet-4",
                 use_ollama=False,
                 ollama_base_url="http://localhost:11434",
+                use_bedrock=False,
+                aws_profile=None,
                 include_sql=False,
                 enable_open_telemetry_tracing=False,
                 delay=0,
                 batch_size=5,
+                skip_eval=False,
+                eval_only=False,
                 reproducibility_runs=0
             )
 
@@ -117,10 +121,14 @@ class TestRunBenchmark:
                 model="claude-sonnet-4",
                 use_ollama=False,
                 ollama_base_url="http://localhost:11434",
+                use_bedrock=False,
+                aws_profile=None,
                 include_sql=False,
                 enable_open_telemetry_tracing=False,
                 delay=0,
                 batch_size=5,
+                skip_eval=False,
+                eval_only=False,
                 reproducibility_runs=3
             )
 
@@ -172,10 +180,14 @@ class TestRunBenchmark:
                 model="claude-sonnet-4",
                 use_ollama=False,
                 ollama_base_url="http://localhost:11434",
+                use_bedrock=False,
+                aws_profile=None,
                 include_sql=False,
                 enable_open_telemetry_tracing=False,
                 delay=0,
                 batch_size=5,
+                skip_eval=False,
+                eval_only=False,
                 reproducibility_runs=3
             )
 

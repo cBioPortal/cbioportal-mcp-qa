@@ -57,9 +57,9 @@ class TestOutputManager:
 
         content = filepath.read_text()
         assert "## Model Information" in content
-        assert "**Model:** claude-sonnet-4-5-20250929" in content
-        assert "**Provider:** Anthropic" in content
-        assert "**Max Tokens:** 4096" in content
+        assert "- **model**: claude-sonnet-4-5-20250929" in content
+        assert "- **use_ollama**: False" in content
+        assert "- **max_tokens**: 4096" in content
 
     def test_write_question_result_with_ollama(self, temp_dir):
         """Test writing question result with Ollama provider."""
@@ -80,7 +80,8 @@ class TestOutputManager:
         )
 
         content = filepath.read_text()
-        assert "**Provider:** Ollama (http://localhost:11434)" in content
+        assert "- **use_ollama**: True" in content
+        assert "- **ollama_base_url**: http://localhost:11434" in content
 
     def test_write_question_result_includes_timestamp(self, temp_dir):
         """Test that written files include timestamp."""

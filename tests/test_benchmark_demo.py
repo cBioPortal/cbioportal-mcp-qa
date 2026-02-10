@@ -23,9 +23,9 @@ class TestBenchmarkDemo:
     @pytest.mark.asyncio
     @patch('cbioportal_mcp_qa.benchmark.AGENT_COLUMN_MAPPING', {"demo-agent": "DBBot Expected Answer"})
     @patch('cbioportal_mcp_qa.benchmark.async_batch_main')
-    @patch('cbioportal_mcp_qa.evaluation.Client')
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
     async def test_full_benchmark_pipeline_with_reproducibility(
-        self, mock_client_class, mock_batch, temp_dir, capsys
+        self, mock_get_client, mock_batch, temp_dir, capsys
     ):
         """
         End-to-end benchmark demonstration using real fixture data.
@@ -43,7 +43,7 @@ class TestBenchmarkDemo:
 
         # Setup: Create mock Anthropic client for evaluation
         mock_client = MagicMock()
-        mock_client_class.return_value = mock_client
+        mock_get_client.return_value = mock_client
 
         def mock_anthropic_evaluation(**kwargs):
             """Mock Anthropic API calls for evaluation and reproducibility."""
@@ -192,10 +192,14 @@ Clinical Data,msk_chord_2024,How many primary samples are in the MSK-CHORD Study
                 model="claude-sonnet-4",
                 use_ollama=False,
                 ollama_base_url="http://localhost:11434",
+                use_bedrock=False,
+                aws_profile=None,
                 include_sql=False,
                 enable_open_telemetry_tracing=False,
                 delay=0,
                 batch_size=5,
+                skip_eval=False,
+                eval_only=False,
                 reproducibility_runs=3  # Enable reproducibility testing
             )
 
@@ -342,9 +346,9 @@ Clinical Data,msk_chord_2024,How many primary samples are in the MSK-CHORD Study
     @pytest.mark.asyncio
     @patch('cbioportal_mcp_qa.benchmark.AGENT_COLUMN_MAPPING', {"quick-demo": "DBBot Expected Answer"})
     @patch('cbioportal_mcp_qa.benchmark.async_batch_main')
-    @patch('cbioportal_mcp_qa.evaluation.Client')
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
     async def test_quick_benchmark_no_reproducibility(
-        self, mock_client_class, mock_batch, temp_dir
+        self, mock_get_client, mock_batch, temp_dir
     ):
         """
         Quick benchmark test without reproducibility (faster variant).
@@ -355,7 +359,7 @@ Clinical Data,msk_chord_2024,How many primary samples are in the MSK-CHORD Study
 
         # Setup mock clients
         mock_client = MagicMock()
-        mock_client_class.return_value = mock_client
+        mock_get_client.return_value = mock_client
 
         def mock_evaluation(**kwargs):
             response = MagicMock()
@@ -411,10 +415,14 @@ Clinical Data,msk_chord_2024,How many primary samples are in the MSK-CHORD Study
                 model="claude-sonnet-4",
                 use_ollama=False,
                 ollama_base_url="http://localhost:11434",
+                use_bedrock=False,
+                aws_profile=None,
                 include_sql=False,
                 enable_open_telemetry_tracing=False,
                 delay=0,
                 batch_size=5,
+                skip_eval=False,
+                eval_only=False,
                 reproducibility_runs=0  # No reproducibility
             )
 

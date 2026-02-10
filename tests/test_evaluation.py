@@ -131,10 +131,10 @@ class TestEvaluate:
 class TestRunEvaluationLogic:
     """Test the run_evaluation_logic function."""
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_run_evaluation_basic(self, mock_client_class, sample_csv_path, sample_answers_dir, temp_dir, mock_anthropic_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_run_evaluation_basic(self, mock_get_client, sample_csv_path, sample_answers_dir, temp_dir, mock_anthropic_client):
         """Test basic evaluation logic."""
-        mock_client_class.return_value = mock_anthropic_client
+        mock_get_client.return_value = mock_anthropic_client
 
         output_dir = temp_dir / "eval"
 
@@ -151,10 +151,10 @@ class TestRunEvaluationLogic:
         assert "conciseness_score" in metrics
         assert "faithfulness_score" in metrics
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_run_evaluation_creates_csv(self, mock_client_class, sample_csv_path, sample_answers_dir, temp_dir, mock_anthropic_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_run_evaluation_creates_csv(self, mock_get_client, sample_csv_path, sample_answers_dir, temp_dir, mock_anthropic_client):
         """Test that evaluation creates output CSV."""
-        mock_client_class.return_value = mock_anthropic_client
+        mock_get_client.return_value = mock_anthropic_client
 
         output_dir = temp_dir / "eval"
 
@@ -175,10 +175,10 @@ class TestRunEvaluationLogic:
         assert "correctness_score" in df.columns
         assert "completeness_score" in df.columns
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_run_evaluation_with_missing_answer_column(self, mock_client_class, sample_csv_path, sample_answers_dir, temp_dir, mock_anthropic_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_run_evaluation_with_missing_answer_column(self, mock_get_client, sample_csv_path, sample_answers_dir, temp_dir, mock_anthropic_client):
         """Test evaluation with missing answer column."""
-        mock_client_class.return_value = mock_anthropic_client
+        mock_get_client.return_value = mock_anthropic_client
 
         output_dir = temp_dir / "eval"
 
@@ -192,10 +192,10 @@ class TestRunEvaluationLogic:
         # Should return empty dict when column doesn't exist
         assert metrics == {}
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_run_evaluation_calculates_averages(self, mock_client_class, sample_csv_path, sample_answers_dir, temp_dir, mock_anthropic_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_run_evaluation_calculates_averages(self, mock_get_client, sample_csv_path, sample_answers_dir, temp_dir, mock_anthropic_client):
         """Test that evaluation calculates average scores correctly."""
-        mock_client_class.return_value = mock_anthropic_client
+        mock_get_client.return_value = mock_anthropic_client
 
         output_dir = temp_dir / "eval"
 
@@ -255,10 +255,10 @@ class TestEvaluatePairwiseConsistency:
 class TestRunReproducibilityEvaluation:
     """Test reproducibility evaluation."""
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_reproducibility_evaluation_basic(self, mock_client_class, sample_csv_path, sample_reproducibility_runs, temp_dir, mock_semantic_consistency_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_reproducibility_evaluation_basic(self, mock_get_client, sample_csv_path, sample_reproducibility_runs, temp_dir, mock_semantic_consistency_client):
         """Test basic reproducibility evaluation."""
-        mock_client_class.return_value = mock_semantic_consistency_client
+        mock_get_client.return_value = mock_semantic_consistency_client
 
         output_dir = temp_dir / "eval"
 
@@ -272,10 +272,10 @@ class TestRunReproducibilityEvaluation:
         assert isinstance(metrics, dict)
         assert "reproducibility_score" in metrics
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_reproducibility_creates_csv(self, mock_client_class, sample_csv_path, sample_reproducibility_runs, temp_dir, mock_semantic_consistency_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_reproducibility_creates_csv(self, mock_get_client, sample_csv_path, sample_reproducibility_runs, temp_dir, mock_semantic_consistency_client):
         """Test that reproducibility evaluation creates CSV."""
-        mock_client_class.return_value = mock_semantic_consistency_client
+        mock_get_client.return_value = mock_semantic_consistency_client
 
         output_dir = temp_dir / "eval"
 
@@ -294,10 +294,10 @@ class TestRunReproducibilityEvaluation:
         assert "question" in df.columns
         assert "reproducibility_score" in df.columns
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_reproducibility_semantic_equivalence(self, mock_client_class, sample_csv_path, sample_reproducibility_runs, temp_dir, mock_semantic_consistency_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_reproducibility_semantic_equivalence(self, mock_get_client, sample_csv_path, sample_reproducibility_runs, temp_dir, mock_semantic_consistency_client):
         """Test that reproducibility correctly identifies semantic equivalence."""
-        mock_client_class.return_value = mock_semantic_consistency_client
+        mock_get_client.return_value = mock_semantic_consistency_client
 
         output_dir = temp_dir / "eval"
 
@@ -312,8 +312,8 @@ class TestRunReproducibilityEvaluation:
         # (Each pairwise comparison should score 3, average = 3.0)
         assert metrics["reproducibility_score"] >= 2.5
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_reproducibility_with_different_wordings(self, mock_client_class, temp_dir, sample_csv_path, mock_semantic_consistency_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_reproducibility_with_different_wordings(self, mock_get_client, temp_dir, sample_csv_path, mock_semantic_consistency_client):
         """Test reproducibility with various phrasings of same fact."""
         # Create runs with different wordings
         repro_dir = temp_dir / "repro_test"
@@ -331,7 +331,7 @@ class TestRunReproducibilityEvaluation:
             for filename, content in answers.items():
                 (run_dir / filename).write_text(content)
 
-        mock_client_class.return_value = mock_semantic_consistency_client
+        mock_get_client.return_value = mock_semantic_consistency_client
 
         output_dir = temp_dir / "eval"
 
@@ -345,10 +345,10 @@ class TestRunReproducibilityEvaluation:
         # Should recognize semantic equivalence despite different wording
         assert metrics["reproducibility_score"] >= 2.5
 
-    @patch('cbioportal_mcp_qa.evaluation.Client')
-    def test_reproducibility_pairwise_comparisons(self, mock_client_class, sample_csv_path, sample_reproducibility_runs, temp_dir, mock_semantic_consistency_client):
+    @patch('cbioportal_mcp_qa.evaluation.get_anthropic_client')
+    def test_reproducibility_pairwise_comparisons(self, mock_get_client, sample_csv_path, sample_reproducibility_runs, temp_dir, mock_semantic_consistency_client):
         """Test that reproducibility performs all pairwise comparisons."""
-        mock_client_class.return_value = mock_semantic_consistency_client
+        mock_get_client.return_value = mock_semantic_consistency_client
 
         output_dir = temp_dir / "eval"
 
