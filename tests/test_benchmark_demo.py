@@ -31,7 +31,7 @@ class TestBenchmarkDemo:
         End-to-end benchmark demonstration using real fixture data.
 
         This test:
-        1. Uses pre-recorded answers from results/cbio-mcp-agent/20260128/
+        1. Uses pre-recorded answers from results/mcp-clickhouse/20260128/
         2. Mocks the QA client (batch processor) to copy fixture answers
         3. Mocks the Anthropic client for evaluation
         4. Runs full pipeline including 3 reproducibility runs
@@ -115,7 +115,7 @@ class TestBenchmarkDemo:
         mock_client.messages.create = mock_anthropic_evaluation
 
         # Setup: Create fixture answer directory
-        fixture_source = Path(__file__).parent.parent / "results" / "cbio-mcp-agent" / "20260128" / "answers"
+        fixture_source = Path(__file__).parent.parent / "results" / "mcp-clickhouse" / "20260128" / "answers"
 
         # Mock batch processor to copy real fixture files instead of calling agent
         run_counter = {"count": 0}  # Track which run we're on
