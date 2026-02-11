@@ -1,10 +1,7 @@
 """Tests for benchmark functionality."""
 
-import asyncio
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
-import pandas as pd
 import pytest
 
 from cbioportal_mcp_qa.benchmark import run_benchmark, regenerate_leaderboard

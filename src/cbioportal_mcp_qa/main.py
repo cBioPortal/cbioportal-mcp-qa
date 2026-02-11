@@ -672,7 +672,7 @@ async def async_ask_main(
 @click.option(
     "--clickhouse-send-receive-timeout",
     envvar="CLICKHOUSE_SEND_RECEIVE_TIMEOUT",
-    help="ClickHouse send/receive timeout (or set CLICKHOUSE_SEND_RECEIVE_timeout env var)",
+    help="ClickHouse send/receive timeout (or set CLICKHOUSE_SEND_RECEIVE_TIMEOUT env var)",
 )
 @click.option(
     "--model",

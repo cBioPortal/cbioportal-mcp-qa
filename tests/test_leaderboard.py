@@ -1,10 +1,6 @@
 """Tests for leaderboard generation functionality."""
 
 import os
-from pathlib import Path
-
-import pandas as pd
-import pytest
 
 from cbioportal_mcp_qa.benchmark import regenerate_leaderboard
 
@@ -239,8 +235,8 @@ Q2,2
             csv1_path = eval_dir / "evaluation_20260210_old.csv"
             csv1_path.write_text(csv1_content)
 
-            import time
-            time.sleep(0.1)  # Ensure different modification times
+            # Set older mtime to ensure deterministic ordering
+            os.utime(csv1_path, (1000000, 1000000))
 
             # Create newer CSV
             csv2_content = """# Average correctness_score: 2.50,,,,,,,,
@@ -250,6 +246,8 @@ Q2,3
 """
             csv2_path = eval_dir / "evaluation_20260210.csv"
             csv2_path.write_text(csv2_content)
+
+            os.utime(csv2_path, (2000000, 2000000))
 
             regenerate_leaderboard()
 

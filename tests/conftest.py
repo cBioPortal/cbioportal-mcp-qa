@@ -5,10 +5,8 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import List
 from unittest.mock import AsyncMock, MagicMock
 
-import pandas as pd
 import pytest
 
 

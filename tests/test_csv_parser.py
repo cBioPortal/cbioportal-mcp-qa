@@ -1,8 +1,5 @@
 """Tests for CSV parsing functionality."""
 
-import pytest
-from pathlib import Path
-
 from cbioportal_mcp_qa.csv_parser import (
     parse_question_selection,
     load_questions,

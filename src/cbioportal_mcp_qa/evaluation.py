@@ -76,7 +76,7 @@ def extract_answer_content(markdown_text: str) -> str:
 
 
 def evaluate(client, question: str, expected: str,
-             output: str, use_bedrock: bool = False, model: str = None) -> str:
+             output: str, use_bedrock: bool = False, model: str = None) -> dict:
     '''
     Evaluate the LLM output against the expected answer using multiple criteria.
         client: Initialized Anthropic Client.
