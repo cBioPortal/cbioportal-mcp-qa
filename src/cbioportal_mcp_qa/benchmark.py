@@ -115,25 +115,18 @@ async def run_benchmark(
 
         # Reuse the main answers as run1 (via symlink)
         run1_dir = repro_base_dir / "run1"
-        if run1_dir.exists():
-            run1_dir.unlink()  # Remove if exists
-        run1_dir.symlink_to(answers_dir, target_is_directory=True)
+        if run1_dir.is_symlink():
+            run1_dir.unlink()
+        elif run1_dir.is_dir():
+            import shutil
+            shutil.rmtree(run1_dir)
+        run1_dir.symlink_to(answers_dir.resolve())
         print(f"  Run 1/{reproducibility_runs}: Reusing main answers (symlinked)")
 
         # Generate runs 2 through N
         for run_idx in range(2, reproducibility_runs + 1):
             run_dir = repro_base_dir / f"run{run_idx}"
             run_dir.mkdir(parents=True, exist_ok=True)
-
-            # Optimization: Use symlink for run1 to point to main answers
-            if run_idx == 1:
-                print(f"  Creating symlink for run1 -> answers/")
-                # Remove directory if it exists and create symlink
-                import shutil
-                if run_dir.exists():
-                    shutil.rmtree(run_dir)
-                run_dir.symlink_to(answers_dir.absolute(), target_is_directory=True)
-                continue
 
             print(f"  Generating run {run_idx}/{reproducibility_runs}...")
 

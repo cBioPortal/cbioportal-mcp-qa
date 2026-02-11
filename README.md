@@ -16,7 +16,7 @@ The system provides a modular CLI to:
 The system currently supports the following agent types via the `--agent-type` flag:
 
 1.  `mcp-clickhouse`: The original Model Context Protocol (MCP) agent connected to a ClickHouse database.
-2.  `mcp-navigator-agent`: cBioPortal MCP agent service (HTTP API wrapper around MCP).
+2.  `cbio-mcp-agent`: cBioPortal MCP agent service (HTTP API wrapper around MCP).
 3.  `cbio-nav-null`: A baseline/testing agent (or a specific implementation hosted at a URL).
 4.  `cbio-qa-null`: Another baseline/testing agent, similar to `cbio-nav-null` but using a different configuration.
 
@@ -36,9 +36,9 @@ uv sync --editable
 Create a `.env` file or export the following environment variables:
 
 **General:**
-*   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation). Alternatively, use AWS Bedrock with `--use-bedrock` and `--aws-profile`.
+*   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation) and the `mcp-clickhouse` agent.
 
-**For `mcp-navigator-agent`:**
+**For `cbio-mcp-agent`:**
 *   `CBIOPORTAL_MCP_AGENT_URL`: URL of the cBioPortal MCP agent API (e.g., `http://localhost:8080`).
 
 **For `cbio-nav-null`:**
@@ -48,7 +48,7 @@ Create a `.env` file or export the following environment variables:
 *   `NULL_QA_URL`: URL of the agent API (e.g., `http://localhost:5002`).
 
 **For `mcp-clickhouse`:**
-*   `MCP_CLICKHOUSE_AGENT_URL`: URL of the MCP ClickHouse agent API (e.g., `http://localhost:8080`).
+*   `CLICKHOUSE_HOST`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`: Connection details.
 
 **Optional (Tracing):**
 *   `PHOENIX_API_KEY`: For Arize Phoenix tracing.
@@ -60,7 +60,7 @@ The `benchmark` command is the main way to evaluate an agent. It automates gener
 
 ```bash
 # Run benchmark for the cBioPortal MCP agent
-cbioportal-mcp-qa benchmark --agent-type mcp-navigator-agent --questions 1-5
+cbioportal-mcp-qa benchmark --agent-type cbio-mcp-agent --questions 1-5
 
 # Run benchmark for the null agent
 cbioportal-mcp-qa benchmark --agent-type cbio-nav-null --questions 1-5
@@ -77,6 +77,24 @@ cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse
 5.  Results are saved to `results/{agent_type}/{YYYYMMDD}/eval/`.
 6.  `LEADERBOARD.md` is updated with the latest scores.
 
+### Reproducibility Testing
+
+Reproducibility testing measures how consistently an agent answers the same questions across multiple runs. Answers are compared using **semantic equivalence** -- two answers are considered equivalent if they convey the same factual information, even if worded differently.
+
+```bash
+# Run benchmark with 3 reproducibility runs (recommended)
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --questions 1-5 --reproducibility-runs 3
+
+# Run with 5 reproducibility runs for more statistical confidence
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --questions 1-10 -r 5
+```
+
+**How it works:**
+1.  The first run's answers are reused from the main benchmark (no extra API call).
+2.  Additional runs (2 through N) generate fresh answers for the same questions.
+3.  All pairwise combinations of runs are compared using an LLM judge for semantic equivalence.
+4.  A `reproducibility_score` is added to the evaluation results and leaderboard.
+
 ## Manual Usage (CLI Reference)
 
 You can also run individual components manually.
@@ -84,7 +102,7 @@ You can also run individual components manually.
 ### 1. Ask a Question
 ```bash
 # Ask using the cBioPortal MCP agent
-cbioportal-mcp-qa ask "How many studies are there?" --agent-type mcp-navigator-agent
+cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-mcp-agent
 
 # Ask using a null agent
 cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-nav-null
@@ -135,7 +153,7 @@ To integrate a new agent into the benchmarking system:
     ```python
     # Example in src/cbioportal_mcp_qa/benchmark.py
     AGENT_COLUMN_MAPPING = {
-        "mcp-clickhouse": "DBBot Expected Answer",
+        "mcp-clickhouse": "Navbot Expected Link",
         "cbio-nav-null": "Navbot Expected Link",
         "my-new-agent": "My New Agent Expected Answer Column", # Your agent's expected answer column
     }
