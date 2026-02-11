@@ -4,8 +4,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Tuple, Optional
 
-from .sql_logger import sql_query_logger
-
 
 class OutputManager:
     """Manages output generation for QA results."""
@@ -58,13 +56,7 @@ class OutputManager:
             "",
             answer
         ]
-        
-        # Add SQL queries section if requested and available
-        if include_sql and sql_query_logger.enabled:
-            sql_markdown = sql_query_logger.get_queries_markdown()
-            if sql_markdown:
-                content_parts.extend(["", "---", "", sql_markdown])
-        
+
         # Add model information section
         if model_info:
             content_parts.extend(["", "---", "", "## Model Information"])

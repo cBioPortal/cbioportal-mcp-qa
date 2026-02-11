@@ -6,31 +6,10 @@ from typing import Optional
 import click
 from tqdm import tqdm
 
-from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace import TracerProvider
-from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-
 from .csv_parser import load_questions, parse_question_selection
 from .llm_client import get_qa_client
 from .base_client import BaseQAClient
 from .output_manager import OutputManager
-
-
-def setup_open_telemetry_tracing():
-    # Set up the tracer provider
-    tracer_provider = TracerProvider()
-    trace.set_tracer_provider(tracer_provider)
-
-    # Add the OpenInference span processor
-    endpoint = f"{os.environ['PHOENIX_COLLECTOR_ENDPOINT']}/v1/traces"
-
-    headers = {"Authorization": f"Bearer {os.environ['PHOENIX_API_KEY']}"}
-    exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers)
-
-    tracer_provider.add_span_processor(OpenInferenceSpanProcessor())
-    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
 
 
 async def async_batch_main(
@@ -54,15 +33,11 @@ async def async_batch_main(
     use_bedrock: bool,
     aws_profile: Optional[str],
     include_sql: bool,
-    enable_open_telemetry_tracing: bool,
     delay: int,
     batch_size: int,
 ):
     """Async main function for batch processing questions."""
     try:
-        if enable_open_telemetry_tracing:
-            setup_open_telemetry_tracing()
-
         # Parse question selection
         selected_questions = parse_question_selection(questions, csv_file)
         click.echo(f"Processing {len(selected_questions)} questions...")
@@ -84,7 +59,6 @@ async def async_batch_main(
             use_bedrock=use_bedrock,
             aws_profile=aws_profile,
             include_sql=include_sql,
-            enable_open_telemetry_tracing=enable_open_telemetry_tracing,
             clickhouse_host=clickhouse_host,
             clickhouse_database=clickhouse_database,
             clickhouse_port=clickhouse_port,
