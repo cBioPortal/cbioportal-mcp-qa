@@ -16,7 +16,7 @@ The system provides a modular CLI to:
 The system currently supports the following agent types via the `--agent-type` flag:
 
 1.  `mcp-clickhouse`: The original Model Context Protocol (MCP) agent connected to a ClickHouse database.
-2.  `cbio-mcp-agent`: cBioPortal MCP agent service (HTTP API wrapper around MCP).
+2.  `mcp-navigator-agent`: cBioPortal MCP agent service (HTTP API wrapper around MCP).
 3.  `cbio-nav-null`: A baseline/testing agent (or a specific implementation hosted at a URL).
 4.  `cbio-qa-null`: Another baseline/testing agent, similar to `cbio-nav-null` but using a different configuration.
 
@@ -36,9 +36,9 @@ uv sync --editable
 Create a `.env` file or export the following environment variables:
 
 **General:**
-*   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation) and the `mcp-clickhouse` agent.
+*   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation). Alternatively, use AWS Bedrock with `--use-bedrock` and `--aws-profile`.
 
-**For `cbio-mcp-agent`:**
+**For `mcp-navigator-agent`:**
 *   `CBIOPORTAL_MCP_AGENT_URL`: URL of the cBioPortal MCP agent API (e.g., `http://localhost:8080`).
 
 **For `cbio-nav-null`:**
@@ -48,7 +48,7 @@ Create a `.env` file or export the following environment variables:
 *   `NULL_QA_URL`: URL of the agent API (e.g., `http://localhost:5002`).
 
 **For `mcp-clickhouse`:**
-*   `CLICKHOUSE_HOST`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`: Connection details.
+*   `MCP_CLICKHOUSE_AGENT_URL`: URL of the MCP ClickHouse agent API (e.g., `http://localhost:8080`).
 
 **Optional (Tracing):**
 *   `PHOENIX_API_KEY`: For Arize Phoenix tracing.
@@ -60,7 +60,7 @@ The `benchmark` command is the main way to evaluate an agent. It automates gener
 
 ```bash
 # Run benchmark for the cBioPortal MCP agent
-cbioportal-mcp-qa benchmark --agent-type cbio-mcp-agent --questions 1-5
+cbioportal-mcp-qa benchmark --agent-type mcp-navigator-agent --questions 1-5
 
 # Run benchmark for the null agent
 cbioportal-mcp-qa benchmark --agent-type cbio-nav-null --questions 1-5
@@ -102,7 +102,7 @@ You can also run individual components manually.
 ### 1. Ask a Question
 ```bash
 # Ask using the cBioPortal MCP agent
-cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-mcp-agent
+cbioportal-mcp-qa ask "How many studies are there?" --agent-type mcp-navigator-agent
 
 # Ask using a null agent
 cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-nav-null

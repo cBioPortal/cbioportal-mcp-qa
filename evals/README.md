@@ -103,10 +103,10 @@ The reproducibility metric measures how consistently the model responds to the s
 
 ```bash
 # Run benchmark with reproducibility testing (3 runs)
-cbioportal-mcp-qa benchmark --agent-type cbio-mcp-agent --reproducibility-runs 3
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --reproducibility-runs 3
 
 # Run with 5 runs for higher confidence
-cbioportal-mcp-qa benchmark --agent-type cbio-mcp-agent --reproducibility-runs 5
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --reproducibility-runs 5
 ```
 
 ### Output
