@@ -81,3 +81,48 @@ python steps_eval.py --input-rubrics <path_to_rubrics.json> \
 ### Output
 1. **Evaluation Results**: A JSON file containing detailed evaluation results for each question.
 2. **Average Scores**: A text file summarizing average scores for completeness, conciseness, and correctness.
+
+## Reproducibility Evaluation
+
+The reproducibility metric measures how consistently the model responds to the same question across multiple runs. This is inspired by the HELM (Holistic Evaluation of Language Models) robustness framework.
+
+### How It Works
+
+1. Each question is prompted N times (default: 3 when enabled)
+2. All pairwise combinations of outputs are compared for semantic similarity
+3. An LLM judge evaluates whether outputs convey the same information
+4. The final score is the average of all pairwise consistency scores
+
+### Scoring Rubric
+
+- **3 (Highly Consistent)**: All runs produce semantically identical outputs. Numerical values match exactly. Conclusions are the same.
+- **2 (Somewhat Consistent)**: Key facts overlap but some details differ. Minor variations in format or additional context.
+- **1 (Inconsistent)**: Contradictory conclusions, different numerical answers, or substantial factual divergence.
+
+### Usage
+
+```bash
+# Run benchmark with reproducibility testing (3 runs)
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --reproducibility-runs 3
+
+# Run with 5 runs for higher confidence
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --reproducibility-runs 5
+```
+
+### Output
+
+Results are saved to:
+- `results/{agent_type}/{date}/reproducibility/run{N}/` - Individual run outputs
+- `results/{agent_type}/{date}/eval/reproducibility_{date}.csv` - Reproducibility scores
+
+The `reproducibility_score` is automatically included in LEADERBOARD.md.
+
+### Cost Considerations
+
+Running with `--reproducibility-runs N` will:
+- Generate N times as many answers (N API calls per question)
+- Run C(N,2) = N*(N-1)/2 pairwise comparisons per question
+
+Example costs for 10 questions:
+- N=3: 30 answer calls + 30 comparison calls = 60 total API calls
+- N=5: 50 answer calls + 100 comparison calls = 150 total API calls

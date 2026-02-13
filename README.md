@@ -77,6 +77,24 @@ cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse
 5.  Results are saved to `results/{agent_type}/{YYYYMMDD}/eval/`.
 6.  `LEADERBOARD.md` is updated with the latest scores.
 
+### Reproducibility Testing
+
+Reproducibility testing measures how consistently an agent answers the same questions across multiple runs. Answers are compared using **semantic equivalence** -- two answers are considered equivalent if they convey the same factual information, even if worded differently.
+
+```bash
+# Run benchmark with 3 reproducibility runs (recommended)
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --questions 1-5 --reproducibility-runs 3
+
+# Run with 5 reproducibility runs for more statistical confidence
+cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --questions 1-10 -r 5
+```
+
+**How it works:**
+1.  The first run's answers are reused from the main benchmark (no extra API call).
+2.  Additional runs (2 through N) generate fresh answers for the same questions.
+3.  All pairwise combinations of runs are compared using an LLM judge for semantic equivalence.
+4.  A `reproducibility_score` is added to the evaluation results and leaderboard.
+
 ## Manual Usage (CLI Reference)
 
 You can also run individual components manually.

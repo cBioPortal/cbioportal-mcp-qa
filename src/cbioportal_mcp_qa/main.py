@@ -124,7 +124,7 @@ def shared_options(f):
             help="Trace calls to Arize Phoenix",
         ),
     ]
-    
+
     for option in reversed(options):
         f = option(f)
     return f
@@ -320,6 +320,13 @@ def ask(
     is_flag=True,
     help="Skip generation step (only run evaluation on existing answers)",
 )
+@click.option(
+    "--reproducibility-runs",
+    "-r",
+    default=0,
+    type=int,
+    help="Number of runs for reproducibility testing (0=disabled, recommended: 3)",
+)
 @shared_options
 def benchmark(
     questions: str,
@@ -327,6 +334,7 @@ def benchmark(
     batch_size: int,
     skip_eval: bool,
     eval_only: bool,
+    reproducibility_runs: int,
     agent_type: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
@@ -352,6 +360,8 @@ def benchmark(
     1. Generates answers for the specified questions (default: all)
     2. Runs evaluation against the expected answers
     3. Updates the LEADERBOARD.md file
+
+    Use --reproducibility-runs N to also measure answer consistency across N runs.
     """
 
     asyncio.run(run_benchmark(
@@ -378,6 +388,7 @@ def benchmark(
         batch_size,
         skip_eval,
         eval_only,
+        reproducibility_runs,
     ))
 
 
@@ -414,14 +425,14 @@ async def async_batch_main(
         # Parse question selection
         selected_questions = parse_question_selection(questions, csv_file)
         click.echo(f"Processing {len(selected_questions)} questions...")
-        
+
         # Load questions from CSV
         question_data = load_questions(csv_file, selected_questions)
-        
+
         if not question_data:
             click.echo("No questions found matching the selection criteria.")
             return
-        
+
         # Initialize clients
         qa_client: BaseQAClient = get_qa_client(
             agent_type=agent_type,
@@ -462,12 +473,12 @@ async def async_batch_main(
                 output_path = output_manager.write_question_result(
                     question_num, question_type, question_text, answer, include_sql, model_info
                 )
-                
+
                 click.echo(f"Question {question_num} -> {output_path}")
-        
+
         click.echo(f"✅ Completed processing {len(question_data)} questions")
         click.echo(f"📁 Results saved to: {output_dir}")
-        
+
     except Exception as e:
         click.echo(f"❌ Error: {e}", err=True)
         raise click.Abort()
@@ -522,7 +533,7 @@ async def async_ask_main(
             clickhouse_connect_timeout=clickhouse_connect_timeout,
             clickhouse_send_receive_timeout=clickhouse_send_receive_timeout,
         )
-        
+
         # Get answer from LLM
         with click.progressbar(length=1, label="Processing question") as bar:
             result = await qa_client.ask_question(question)
@@ -588,14 +599,14 @@ async def async_ask_main(
                 formatted_output += f"\n\nUsage: {usage.get('input_tokens', 0)} input + {usage.get('output_tokens', 0)} output tokens"
                 if "response_time_seconds" in model_info:
                     formatted_output += f" ({model_info['response_time_seconds']:.2f}s)"
-        
+
         # Output to file or stdout
         if output_file:
             output_file.write_text(formatted_output, encoding="utf-8")
             click.echo(f"✅ Answer saved to: {output_file}")
         else:
             click.echo(formatted_output)
-            
+
     except Exception as e:
         click.echo(f"❌ Error: {e}", err=True)
         raise click.Abort()
@@ -725,13 +736,13 @@ def legacy_cli(
     batch_size: int,
 ):
     """Process cBioPortal QA questions using MCP integration.
-    
+
     CSV_FILE: Path to the CSV file containing questions
-    
+
     Note: This interface is deprecated. Use 'cbioportal-mcp-qa batch' instead.
     """
     click.echo("⚠️  Warning: This interface is deprecated. Use 'cbioportal-mcp-qa batch' instead.", err=True)
-    
+
     asyncio.run(async_batch_main(
         csv_file,
         questions,
@@ -750,6 +761,8 @@ def legacy_cli(
         model,
         use_ollama,
         ollama_base_url,
+        False, # use_bedrock
+        None, # aws_profile
         include_sql,
         enable_open_telemetry_tracing,
         delay,
