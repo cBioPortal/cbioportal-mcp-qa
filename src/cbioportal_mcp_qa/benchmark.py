@@ -1,8 +1,6 @@
-import asyncio
 import datetime
-import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import pandas as pd
 
@@ -18,7 +16,7 @@ AGENT_COLUMN_MAPPING = {
     "mcp-clickhouse": "DBBot Expected Answer",
     "cbio-nav-null": "Navbot Expected Link(s)",
     "cbio-qa-null": "DBBot Expected Answer",
-    "cbio-mcp-agent": "DBBot Expected Answer",
+    "mcp-navigator-agent": "Navbot Expected Link(s)",
     # Add other agents here
 }
 
@@ -67,6 +65,7 @@ async def run_benchmark(
 
     print(f"--- Starting Benchmark for {agent_type} ---")
     print(f"Output Directory: {base_results_dir}")
+
     # 2. Run Batch Generation
     print("Step 1: Generating Answers...")
     await async_batch_main(
@@ -97,9 +96,9 @@ async def run_benchmark(
 
     # 3. Run Evaluation
     print("Step 2: Evaluating Answers...")
-    
+
     expected_answer_col = AGENT_COLUMN_MAPPING.get(agent_type, "Expected Answer")
-    
+
     # Calling the refactored function
     metrics = run_evaluation_logic(
         input_csv=str(csv_file),
@@ -190,8 +189,8 @@ def regenerate_leaderboard():
     # Create DataFrame
     df_leaderboard = pd.DataFrame(aggregated_data)
     
-    # Sort by Date (descending) and Agent Type
-    df_leaderboard.sort_values(by=["Date", "Agent Type"], ascending=[False, True], inplace=True)
+    # Sort by Date (descending), then Correctness Score (descending)
+    df_leaderboard.sort_values(by=["Date", "correctness_score"], ascending=[False, False], inplace=True)
     
     # Format headers: 'correctness_score' -> 'Correctness Score'
     df_leaderboard.columns = [c.replace('_', ' ').title() if c.endswith('_score') else c for c in df_leaderboard.columns]

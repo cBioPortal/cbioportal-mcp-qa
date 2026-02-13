@@ -310,11 +310,23 @@ def ask(
     type=int,
     help="Number of questions to process before longer pause (default: 5)",
 )
+@click.option(
+    "--skip-eval",
+    is_flag=True,
+    help="Skip evaluation step (only generate answers)",
+)
+@click.option(
+    "--eval-only",
+    is_flag=True,
+    help="Skip generation step (only run evaluation on existing answers)",
+)
 @shared_options
 def benchmark(
     questions: str,
     delay: int,
     batch_size: int,
+    skip_eval: bool,
+    eval_only: bool,
     agent_type: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
@@ -364,6 +376,8 @@ def benchmark(
         enable_open_telemetry_tracing,
         delay,
         batch_size,
+        skip_eval,
+        eval_only,
     ))
 
 
@@ -444,15 +458,6 @@ async def async_batch_main(
                 else:
                     answer, model_info = result, dict()
 
-                if agent_type == "mcp-clickhouse":
-                    model_info = {
-                        'agent_type': agent_type,
-                        'model': model,
-                        'use_ollama': use_ollama,
-                        'ollama_base_url': ollama_base_url,
-                        'max_tokens': 4096
-                    }
-
                 # Write result
                 output_path = output_manager.write_question_result(
                     question_num, question_type, question_text, answer, include_sql, model_info
@@ -520,13 +525,19 @@ async def async_ask_main(
         
         # Get answer from LLM
         with click.progressbar(length=1, label="Processing question") as bar:
-            answer = await qa_client.ask_question(question)
+            result = await qa_client.ask_question(question)
             bar.update(1)
-        
+
+        # Handle both tuple and string returns
+        if isinstance(result, tuple):
+            answer, model_info = result
+        else:
+            answer, model_info = result, {}
+
         # Format output
         if format == "markdown":
             from datetime import datetime
-            
+
             output_parts = [
                 f"# Question",
                 "",
@@ -536,13 +547,13 @@ async def async_ask_main(
                 "",
                 answer,
             ]
-            
+
             # Add SQL queries if enabled and available
             if include_sql:
                 sql_markdown = qa_client.get_sql_queries_markdown()
                 if sql_markdown:
                     output_parts.extend(["", "---", "", sql_markdown])
-            
+
             # Add model information section
             output_parts.extend(["", "---", "", "## Model Information"])
             output_parts.append(f"**Agent Type:** {agent_type}")
@@ -554,12 +565,29 @@ async def async_ask_main(
             else:
                 output_parts.append("**Provider:** Anthropic")
             output_parts.append("**Max Tokens:** 4096")
-            
+
+            # Add usage information if available
+            if "usage" in model_info:
+                output_parts.extend(["", "### Usage"])
+                usage = model_info["usage"]
+                for usage_key, usage_value in usage.items():
+                    output_parts.append(f"- **{usage_key}**: {usage_value}")
+
+            # Add response time if available
+            if "response_time_seconds" in model_info:
+                output_parts.extend(["", f"**Response Time:** {model_info['response_time_seconds']:.2f} seconds"])
+
             output_parts.extend(["", "---", "", f"*Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*"])
-            
+
             formatted_output = "\n".join(output_parts)
         else:
+            # For plain format, just show answer and usage summary
             formatted_output = answer
+            if model_info.get("usage"):
+                usage = model_info["usage"]
+                formatted_output += f"\n\nUsage: {usage.get('input_tokens', 0)} input + {usage.get('output_tokens', 0)} output tokens"
+                if "response_time_seconds" in model_info:
+                    formatted_output += f" ({model_info['response_time_seconds']:.2f}s)"
         
         # Output to file or stdout
         if output_file:
