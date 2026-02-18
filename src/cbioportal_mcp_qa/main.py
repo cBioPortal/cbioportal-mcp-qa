@@ -114,7 +114,7 @@ def shared_options(f):
             help="Trace calls to Arize Phoenix",
         ),
     ]
-    
+
     for option in reversed(options):
         f = option(f)
     return f
@@ -300,11 +300,31 @@ def ask(
     type=int,
     help="Number of questions to process before longer pause (default: 5)",
 )
+@click.option(
+    "--skip-eval",
+    is_flag=True,
+    help="Skip evaluation step (only generate answers)",
+)
+@click.option(
+    "--eval-only",
+    is_flag=True,
+    help="Skip generation step (only run evaluation on existing answers)",
+)
+@click.option(
+    "--reproducibility-runs",
+    "-r",
+    default=0,
+    type=int,
+    help="Number of runs for reproducibility testing (0=disabled, recommended: 3)",
+)
 @shared_options
 def benchmark(
     questions: str,
     delay: int,
     batch_size: int,
+    skip_eval: bool,
+    eval_only: bool,
+    reproducibility_runs: int,
     agent_type: str,
     api_key: Optional[str],
     clickhouse_host: Optional[str],
@@ -330,6 +350,8 @@ def benchmark(
     1. Generates answers for the specified questions (default: all)
     2. Runs evaluation against the expected answers
     3. Updates the LEADERBOARD.md file
+
+    Use --reproducibility-runs N to also measure answer consistency across N runs.
     """
 
     asyncio.run(run_benchmark(
@@ -354,6 +376,9 @@ def benchmark(
         enable_open_telemetry_tracing,
         delay,
         batch_size,
+        skip_eval,
+        eval_only,
+        reproducibility_runs,
     ))
 
 
@@ -406,7 +431,7 @@ async def async_ask_main(
             clickhouse_connect_timeout=clickhouse_connect_timeout,
             clickhouse_send_receive_timeout=clickhouse_send_receive_timeout,
         )
-        
+
         # Get answer from LLM
         with click.progressbar(length=1, label="Processing question") as bar:
             result = await qa_client.ask_question(question)
@@ -472,14 +497,14 @@ async def async_ask_main(
                 formatted_output += f"\n\nUsage: {usage.get('input_tokens', 0)} input + {usage.get('output_tokens', 0)} output tokens"
                 if "response_time_seconds" in model_info:
                     formatted_output += f" ({model_info['response_time_seconds']:.2f}s)"
-        
+
         # Output to file or stdout
         if output_file:
             output_file.write_text(formatted_output, encoding="utf-8")
             click.echo(f"✅ Answer saved to: {output_file}")
         else:
             click.echo(formatted_output)
-            
+
     except Exception as e:
         click.echo(f"❌ Error: {e}", err=True)
         raise click.Abort()
