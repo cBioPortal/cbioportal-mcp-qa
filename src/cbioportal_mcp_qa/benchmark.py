@@ -1,8 +1,6 @@
-import asyncio
 import datetime
-import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import pandas as pd
 
@@ -219,29 +217,24 @@ def regenerate_leaderboard():
         if not agent_dir.is_dir():
             continue
         agent_type = agent_dir.name
-        # print(f"Found agent dir: {agent_type}")
 
         for date_dir in agent_dir.iterdir():
             if not date_dir.is_dir():
                 continue
             date_str = date_dir.name
-            # print(f"  Found date dir: {date_str}")
 
             eval_dir = date_dir / "eval"
             if not eval_dir.exists():
-                # print(f"    No eval dir in {date_dir}")
                 continue
 
             # Find the latest evaluation CSV in this folder
             csv_files = list(eval_dir.glob("evaluation_*.csv"))
             if not csv_files:
-                # print(f"    No CSVs in {eval_dir}")
                 continue
 
             # Use the most recent CSV if multiple exist (though usually one per run)
             csv_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             latest_csv = csv_files[0]
-            # print(f"    Processing {latest_csv}")
 
             try:
                 df = pd.read_csv(latest_csv, comment='#')

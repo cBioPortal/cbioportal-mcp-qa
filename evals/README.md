@@ -70,7 +70,7 @@ python steps_eval.py --input-rubrics <path_to_rubrics.json> \
                 },
                 "brief": {
                     "<step_number>": "<expected_brief_step>"
-                }    
+                }
             }
         }
     }
