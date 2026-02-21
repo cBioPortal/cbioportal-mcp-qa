@@ -8,10 +8,11 @@ import click
 
 from dotenv import load_dotenv
 
+from .csv_parser import load_questions, parse_question_selection
 from .llm_client import get_qa_client
 from .base_client import BaseQAClient
 from .benchmark import run_benchmark
-from .batch_processor import async_batch_main, setup_open_telemetry_tracing
+from .batch_processor import async_batch_main
 
 
 load_dotenv()  # Load environment variables from .env
@@ -106,12 +107,7 @@ def shared_options(f):
         click.option(
             "--include-sql",
             is_flag=True,
-            help="Include SQL queries in the output",
-        ),
-        click.option(
-            "--enable-open-telemetry-tracing",
-            is_flag=True,
-            help="Trace calls to Arize Phoenix",
+            help="Include SQL queries in the output (legacy option, no longer functional)",
         ),
     ]
 
@@ -178,7 +174,6 @@ def batch(
     use_bedrock: bool,
     aws_profile: Optional[str],
     include_sql: bool,
-    enable_open_telemetry_tracing: bool,
 ):
     """Process multiple cBioPortal QA questions from a CSV file.
 
@@ -205,7 +200,6 @@ def batch(
         use_bedrock,
         aws_profile,
         include_sql,
-        enable_open_telemetry_tracing,
         delay,
         batch_size,
     ))
@@ -248,7 +242,6 @@ def ask(
     use_bedrock: bool,
     aws_profile: Optional[str],
     include_sql: bool,
-    enable_open_telemetry_tracing: bool,
 ):
     """Ask a single question about cBioPortal data.
 
@@ -275,7 +268,6 @@ def ask(
         use_bedrock,
         aws_profile,
         include_sql,
-        enable_open_telemetry_tracing,
     ))
 
 
@@ -342,7 +334,6 @@ def benchmark(
     use_bedrock: bool,
     aws_profile: Optional[str],
     include_sql: bool,
-    enable_open_telemetry_tracing: bool,
 ):
     """Run a standard benchmark for a specific agent type.
 
@@ -373,7 +364,6 @@ def benchmark(
         use_bedrock,
         aws_profile,
         include_sql,
-        enable_open_telemetry_tracing,
         delay,
         batch_size,
         skip_eval,
@@ -403,13 +393,9 @@ async def async_ask_main(
     use_bedrock: bool,
     aws_profile: Optional[str],
     include_sql: bool,
-    enable_open_telemetry_tracing: bool,
 ):
     """Async main function for asking a single question."""
     try:
-        if enable_open_telemetry_tracing:
-            setup_open_telemetry_tracing()
-
         # Initialize LLM client
         qa_client: BaseQAClient = get_qa_client(
             agent_type=agent_type,
@@ -420,7 +406,6 @@ async def async_ask_main(
             use_bedrock=use_bedrock,
             aws_profile=aws_profile,
             include_sql=include_sql,
-            enable_open_telemetry_tracing=enable_open_telemetry_tracing,
             clickhouse_host=clickhouse_host,
             clickhouse_database=clickhouse_database,
             clickhouse_port=clickhouse_port,
@@ -457,23 +442,18 @@ async def async_ask_main(
                 answer,
             ]
 
-            # Add SQL queries if enabled and available
-            if include_sql:
-                sql_markdown = qa_client.get_sql_queries_markdown()
-                if sql_markdown:
-                    output_parts.extend(["", "---", "", sql_markdown])
-
             # Add model information section
             output_parts.extend(["", "---", "", "## Model Information"])
             output_parts.append(f"**Agent Type:** {agent_type}")
-            output_parts.append(f"**Model:** {model}")
             if use_ollama:
                 output_parts.append(f"**Provider:** Ollama ({ollama_base_url})")
             elif use_bedrock:
                 output_parts.append(f"**Provider:** AWS Bedrock (profile: {aws_profile or 'default'})")
             else:
                 output_parts.append("**Provider:** Anthropic")
-            output_parts.append("**Max Tokens:** 4096")
+            for key, value in model_info.items():
+                if key not in ("usage", "response_time_seconds"):
+                    output_parts.append(f"**{key}:** {value}")
 
             # Add usage information if available
             if "usage" in model_info:
@@ -501,12 +481,12 @@ async def async_ask_main(
         # Output to file or stdout
         if output_file:
             output_file.write_text(formatted_output, encoding="utf-8")
-            click.echo(f"✅ Answer saved to: {output_file}")
+            click.echo(f"Answer saved to: {output_file}")
         else:
             click.echo(formatted_output)
 
     except Exception as e:
-        click.echo(f"❌ Error: {e}", err=True)
+        click.echo(f"Error: {e}", err=True)
         raise click.Abort()
 
 

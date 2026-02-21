@@ -4,7 +4,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .batch_processor import async_batch_main, setup_open_telemetry_tracing
+from .batch_processor import async_batch_main
 from .evaluation import run_evaluation_logic, run_reproducibility_evaluation
 
 # Hardcoded mapping of agent-type to the expected answer column in the input CSV
@@ -39,7 +39,6 @@ async def run_benchmark(
     use_bedrock: bool,
     aws_profile: Optional[str],
     include_sql: bool,
-    enable_open_telemetry_tracing: bool,
     delay: int,
     batch_size: int,
     skip_eval: bool = False,
@@ -55,9 +54,6 @@ async def run_benchmark(
     """
 
     # 1. Setup Paths
-    if enable_open_telemetry_tracing:
-        setup_open_telemetry_tracing()
-
     # Hardcoded input CSV
     csv_file = Path("input/benchmark-testing.csv")
 
@@ -97,7 +93,6 @@ async def run_benchmark(
             use_bedrock=use_bedrock,
             aws_profile=aws_profile,
             include_sql=include_sql,
-            enable_open_telemetry_tracing=enable_open_telemetry_tracing,
             delay=delay,
             batch_size=batch_size,
         )
