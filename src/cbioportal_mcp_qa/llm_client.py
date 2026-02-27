@@ -14,7 +14,6 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from .base_client import BaseQAClient
 from .null_agent_client import CBioAgentNullClient
-from .mcp_agent_client import CBioPortalMCPAgentClient
 from .librechat_agent_client import LibreChatAgentClient
 from .prompts import DEFAULT_SYSTEM_PROMPT
 from .sql_logger import sql_query_logger, MCPServerStdioWithSQLCapture
@@ -210,14 +209,10 @@ def get_qa_client(agent_type: str = "mcp-clickhouse", **kwargs) -> BaseQAClient:
     Raises:
         ValueError: If agent_type is unknown.
     """
-    if agent_type == "mcp-clickhouse":
-        return CBioPortalMCPAgentClient(env_var_name="MCP_CLICKHOUSE_AGENT_URL", **kwargs)
-    elif agent_type == "cbio-nav-null":
+    if agent_type == "cbio-nav-null":
         return CBioAgentNullClient(env_var_name="NULL_NAV_URL", **kwargs)
     elif agent_type == "cbio-qa-null":
         return CBioAgentNullClient(env_var_name="NULL_QA_URL", **kwargs)
-    elif agent_type == "mcp-navigator-agent":
-        return CBioPortalMCPAgentClient(env_var_name="CBIOPORTAL_MCP_AGENT_URL", **kwargs)
     elif agent_type == "librechat-dbagent":
         return LibreChatAgentClient(agent_id_env_var="LIBRECHAT_DBAGENT_ID", **kwargs)
     elif agent_type == "librechat-navigator":
