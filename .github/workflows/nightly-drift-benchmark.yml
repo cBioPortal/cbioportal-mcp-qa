@@ -1,0 +1,104 @@
+name: Nightly Drift Benchmark
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      agent_types:
+        description: "Comma-separated agent types to benchmark"
+        required: false
+        default: "mcp-clickhouse,mcp-navigator-agent"
+      questions:
+        description: "Question selection, e.g. all, 1-20, 1,3,5"
+        required: false
+        default: "1-20"
+      reproducibility_runs:
+        description: "Number of reproducibility runs; 0 disables reproducibility"
+        required: false
+        default: "0"
+      drop_threshold:
+        description: "Per-question score drop that counts as drift"
+        required: false
+        default: "1.0"
+      fail_on_regression:
+        description: "Fail workflow when drift report detects regressions"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      AGENT_TYPES: ${{ github.event.inputs.agent_types || 'mcp-clickhouse,mcp-navigator-agent' }}
+      QUESTIONS: ${{ github.event.inputs.questions || '1-20' }}
+      REPRODUCIBILITY_RUNS: ${{ github.event.inputs.reproducibility_runs || '0' }}
+      DROP_THRESHOLD: ${{ github.event.inputs.drop_threshold || '1.0' }}
+      FAIL_ON_REGRESSION: ${{ github.event.inputs.fail_on_regression || 'false' }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MCP_CLICKHOUSE_AGENT_URL: ${{ secrets.MCP_CLICKHOUSE_AGENT_URL }}
+      CBIOPORTAL_MCP_AGENT_URL: ${{ secrets.CBIOPORTAL_MCP_AGENT_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run nightly benchmark and drift reports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_date="$(date -u +%Y%m%d)"
+          mkdir -p drift-reports
+
+          IFS=',' read -ra agents <<< "$AGENT_TYPES"
+          for raw_agent in "${agents[@]}"; do
+            agent="$(echo "$raw_agent" | xargs)"
+            if [[ -z "$agent" ]]; then
+              continue
+            fi
+
+            echo "## Benchmark: ${agent}" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "" | tee -a "$GITHUB_STEP_SUMMARY"
+
+            uv run cbioportal-mcp-qa benchmark \
+              --agent-type "$agent" \
+              --questions "$QUESTIONS" \
+              --delay 5 \
+              --batch-size 5 \
+              --reproducibility-runs "$REPRODUCIBILITY_RUNS"
+
+            fail_args=()
+            if [[ "$FAIL_ON_REGRESSION" == "true" ]]; then
+              fail_args+=(--fail-on-regression)
+            fi
+
+            uv run python -m cbioportal_mcp_qa.drift_report \
+              --agent-type "$agent" \
+              --current-eval-dir "results/${agent}/${run_date}/eval" \
+              --baseline-eval-dir "results/${agent}/latest/eval" \
+              --output-markdown "drift-reports/${agent}.md" \
+              --output-json "drift-reports/${agent}.json" \
+              --drop-threshold "$DROP_THRESHOLD" \
+              "${fail_args[@]}"
+
+            cat "drift-reports/${agent}.md" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-drift-benchmark-${{ github.run_id }}
+          path: |
+            results/
+            drift-reports/
+            LEADERBOARD.md

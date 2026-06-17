@@ -44,6 +44,7 @@ async def run_benchmark(
     skip_eval: bool = False,
     eval_only: bool = False,
     reproducibility_runs: int = 0,
+    enable_open_telemetry_tracing: bool = False,
 ):
     """
     Runs the benchmark for a specific agent type.
@@ -144,7 +145,6 @@ async def run_benchmark(
                 use_bedrock=use_bedrock,
                 aws_profile=aws_profile,
                 include_sql=include_sql,
-                enable_open_telemetry_tracing=enable_open_telemetry_tracing,
                 delay=delay,
                 batch_size=batch_size,
             )
