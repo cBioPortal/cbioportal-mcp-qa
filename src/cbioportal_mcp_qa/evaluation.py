@@ -132,9 +132,9 @@ def evaluate(client, question: str, expected: str,
     # Select model based on client type if not explicitly provided
     if model is None:
         if use_bedrock:
-            model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+            model = "global.anthropic.claude-sonnet-5"
         else:
-            model = "claude-sonnet-4-5-20250929"
+            model = "claude-sonnet-5"
 
     max_retries = 3
     for attempt in range(max_retries):
@@ -338,9 +338,9 @@ Provide your output as a JSON object:
     # Select model based on client type if not explicitly provided
     if model is None:
         if use_bedrock:
-            model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+            model = "global.anthropic.claude-sonnet-5"
         else:
-            model = "claude-sonnet-4-5-20250929"
+            model = "claude-sonnet-5"
 
     max_retries = 3
     for attempt in range(max_retries):

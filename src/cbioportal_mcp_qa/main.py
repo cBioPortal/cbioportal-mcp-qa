@@ -81,8 +81,8 @@ def shared_options(f):
         click.option(
             "--model",
             "-m",
-            default="anthropic:claude-sonnet-4-5-20250929",
-            help="Model to use (default: claude-sonnet-4-5-20250929 for Anthropic, e.g., qwen3:8b for Ollama)",
+            default="anthropic:claude-sonnet-5",
+            help="Model to use (default: claude-sonnet-5 for Anthropic, e.g., qwen3:8b for Ollama)",
         ),
         click.option(
             "--use-ollama",
