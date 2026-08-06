@@ -95,6 +95,47 @@ cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --questions 1-10 -r 5
 3.  All pairwise combinations of runs are compared using an LLM judge for semantic equivalence.
 4.  A `reproducibility_score` is added to the evaluation results and leaderboard.
 
+## Nightly Drift Monitoring
+
+The `Nightly Drift Benchmark` GitHub Actions workflow runs the benchmark on a
+schedule and compares each run against the checked-in `results/{agent}/latest`
+baseline.
+
+By default it runs the canary range `1-20` against:
+
+- `mcp-clickhouse`
+- `mcp-navigator-agent`
+
+Required repository secrets:
+
+- `ANTHROPIC_API_KEY`: LLM judge key.
+- `MCP_CLICKHOUSE_AGENT_URL`: Base URL for the DB MCP agent wrapper.
+- `CBIOPORTAL_MCP_AGENT_URL`: Base URL for the navigator MCP agent wrapper.
+
+Manual runs can override the target agents, questions, reproducibility count,
+and regression threshold from the Actions UI. Example agent list:
+
+```text
+mcp-clickhouse,mcp-navigator-agent
+```
+
+Each nightly run uploads:
+
+- `results/`: generated answers and evaluation CSVs.
+- `drift-reports/*.md`: human-readable score deltas and per-question regressions.
+- `drift-reports/*.json`: machine-readable drift summaries.
+- `LEADERBOARD.md`: regenerated aggregate leaderboard for the run artifact.
+
+Interpret target-specific drift as follows:
+
+- Fails only on one MCP target: likely an isolated agent/service issue.
+- Fails on multiple MCP targets: likely shared data, evaluator, or model drift.
+- Fails in reproducibility only: likely nondeterministic agent/model behavior.
+
+The workflow is monitoring-first. It does not fail on regressions unless
+`fail_on_regression` is enabled for a manual run or the workflow default is
+changed.
+
 ## Manual Usage (CLI Reference)
 
 You can also run individual components manually.
