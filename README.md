@@ -1,176 +1,110 @@
-# cBioPortal MCP QA & Benchmarking
+# cBioPortalChat benchmark
 
-This repository serves as the benchmarking system for efforts to provide an agentic interface to cBioPortal.org. It is designed to evaluate various "agents" (like MCP servers or standalone APIs) that answer questions about cancer genomics data.
+Benchmarks the deployed cBioPortalChat agent by asking it every question in
+[`input/questions.yaml`](input/questions.yaml) through LibreChat's Agents API, then grading the answers.
+Because it calls the real deployment, a run measures what users get: the same system prompt, MCP tools
+(cbioportal-database, cbioportal-navigator), prompt caching and model.
 
-**🏆 [View the Leaderboard](LEADERBOARD.md)** to see current benchmark results.
+**[Results](results/index.html)** — one HTML report per run.
 
-## Overview
+## What a run records
 
-The system provides a modular CLI to:
-1.  **Ask** single questions to different agents.
-2.  **Batch** process a set of questions.
-3.  **Benchmark** agents against a gold-standard dataset, automatically evaluating their accuracy using an LLM judge.
+For every question × model (× repeat):
 
-## Supported Agents
+- **Answer** from `POST /api/agents/v1/chat/completions`, with latency and token usage
+  (input, cache read, cache write, output) → estimated cost at Anthropic list prices.
+- **Execution trace** from Langfuse, matched by response id: number of LLM calls, every tool call, and
+  tool errors (e.g. navigator schema errors).
+- **Grade**, pass/fail: an LLM judge (default Sonnet 4.6 on Bedrock, deliberately not one of the models under
+  test) checks the answer against the reference answer, expected links and the `notes` rubric, using the
+  criterion for the question's track (below). It also records whether the answer *declined*, so the report
+  can separate precision (right when it answers) from coverage (how often it answers).
+- **Objective checks**: when the reference is a single number, whether the answer contains it (exact for
+  counts, within rounding for decimals/percentages) — shown where it disagrees with the judge; and whether
+  every study id in the answer's cBioPortal links exists (a hallucination signal).
 
-The system currently supports the following agent types via the `--agent-type` flag:
+Every question has a **track**, and the report shows pass rates per track and model:
 
-1.  `mcp-clickhouse`: The original Model Context Protocol (MCP) agent connected to a ClickHouse database.
-2.  `mcp-navigator-agent`: cBioPortal MCP agent service (HTTP API wrapper around MCP).
-3.  `cbio-nav-null`: A baseline/testing agent (or a specific implementation hosted at a URL).
-4.  `cbio-qa-null`: Another baseline/testing agent, similar to `cbio-nav-null` but using a different configuration.
+| Track | Passes when |
+|---|---|
+| `data` | it states the fact in the reference (a count, frequency, list) |
+| `navigation` | it gives a cBioPortal link to the right view: page, study, genes, filters |
+| `analysis` | it uses the right cohort and method and doesn't invent statistics |
+| `out_of_scope` | it clearly declines instead of making something up |
+
+Questions without any reference are still asked and reported, but not graded.
 
 ## Setup
 
 ```bash
-# Create Python 3.13 virtual environment
-uv venv .venv --python 3.13
-source .venv/bin/activate
-
-# Install dependencies in editable mode
-uv sync --editable
+uv sync
+cp .env.example .env   # then fill it in
 ```
 
-## Configuration
+- `LIBRECHAT_API_KEY`: create under **Settings → Agent API Keys** on beta.chat.cbioportal.org. Beta and prod
+  share a database, so the key works on both. Runs are billed to that account's token balance.
+- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`: for tool-call stats (optional; runs work without).
+- AWS credentials for the judge: `AWS_PROFILE` with Bedrock access (e.g. `cdsi-imagine-490004633549`).
 
-Create a `.env` file or export the following environment variables:
+Choosing the model per request requires cbioportal/librechat `v0.8.7-custom-v3` or later on the target, where
+the Agents API accepts a `spec` (modelSpec name) alongside the agent id.
 
-**General:**
-*   `ANTHROPIC_API_KEY`: Required for the LLM judge (evaluation). Alternatively, use AWS Bedrock with `--use-bedrock` and `--aws-profile`.
-
-**For `mcp-navigator-agent`:**
-*   `CBIOPORTAL_MCP_AGENT_URL`: URL of the cBioPortal MCP agent API (e.g., `http://localhost:8080`).
-
-**For `cbio-nav-null`:**
-*   `NULL_NAV_URL`: URL of the agent API (e.g., `http://localhost:5000`).
-
-**For `cbio-qa-null`:**
-*   `NULL_QA_URL`: URL of the agent API (e.g., `http://localhost:5002`).
-
-**For `mcp-clickhouse`:**
-*   `MCP_CLICKHOUSE_AGENT_URL`: URL of the MCP ClickHouse agent API (e.g., `http://localhost:8080`).
-
-**Optional (Tracing):**
-*   `PHOENIX_API_KEY`: For Arize Phoenix tracing.
-*   `PHOENIX_COLLECTOR_ENDPOINT`: Tracing endpoint.
-
-## Benchmarking (Primary Workflow)
-
-The `benchmark` command is the main way to evaluate an agent. It automates generation, evaluation, and leaderboard updates.
+## Usage
 
 ```bash
-# Run benchmark for the cBioPortal MCP agent
-cbioportal-mcp-qa benchmark --agent-type mcp-navigator-agent --questions 1-5
+# One question, to check the setup
+uv run cbioportal-mcp-qa ask "How many studies are in cBioPortal?" --model haiku
 
-# Run benchmark for the null agent
-cbioportal-mcp-qa benchmark --agent-type cbio-nav-null --questions 1-5
+# Full benchmark, Haiku vs Sonnet on beta
+uv run cbioportal-mcp-qa run --models haiku,sonnet
 
-# Run benchmark for the direct MCP connection
-cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse
+# A subset, three repeats each to measure consistency
+uv run cbioportal-mcp-qa run --questions 1-10 --repeats 3
+
+# Continue an interrupted run (re-asks only missing or failed answers)
+uv run cbioportal-mcp-qa run --resume 20260923-1800
+
+# Re-attach traces (Langfuse ingestion can lag), regrade, or re-render
+uv run cbioportal-mcp-qa traces 20260923-1800
+uv run cbioportal-mcp-qa grade 20260923-1800 --regrade
+
+# After fixing references in input/questions.yaml, regrade an existing run against them
+uv run cbioportal-mcp-qa grade 20260923-1800 --refresh-questions
+uv run cbioportal-mcp-qa report 20260923-1800
 ```
 
-**What happens:**
-1.  Questions are loaded from `input/autosync-public.csv`.
-2.  The specified agent generates answers.
-3.  Answers are saved to `results/{agent_type}/{YYYYMMDD}/answers/`.
-4.  `simple_eval.py` evaluates the answers against the expected output (using `Navbot Expected Link` as the ground truth).
-5.  Results are saved to `results/{agent_type}/{YYYYMMDD}/eval/`.
-6.  `LEADERBOARD.md` is updated with the latest scores.
+Output goes to `results/<run-id>/`: `run.json` (every answer, trace and grade), `report.html`, and
+`summary.json`, plus `results/index.html` listing all runs. Commit the run directory to publish it.
 
-### Reproducibility Testing
+Keep `--concurrency` low (default 2, at most ~3): the beta pod is small and shared with real users. A full run
+(146 questions × Haiku + Sonnet) takes about 1.5 hours and ~35M LibreChat credits (~$35 at list prices).
 
-Reproducibility testing measures how consistently an agent answers the same questions across multiple runs. Answers are compared using **semantic equivalence** -- two answers are considered equivalent if they convey the same factual information, even if worded differently.
+## Adding questions
+
+Append to `input/questions.yaml` with the next unused `id` (ids are stable; never renumber or reuse):
+
+```yaml
+- id: 147
+  track: data
+  type: Clinical Data
+  study: msk_chord_2024
+  question: How many patients in MSK-CHORD received immunotherapy?
+  expected_answer: "4,721"          # or leave "" and give links / a rubric
+  expected_links: []
+  notes: |
+    A correct answer must use the treatment table; must not count planned treatments.
+  checked: 2026-09-23               # when the reference was last verified
+  source: https://github.com/cBioPortal/cbioportal-mcp/issues/24
+```
+
+Questions from user-feedback issues set `source` to the issue URL and usually carry a rubric in `notes`.
+
+## Development
 
 ```bash
-# Run benchmark with 3 reproducibility runs (recommended)
-cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --questions 1-5 --reproducibility-runs 3
-
-# Run with 5 reproducibility runs for more statistical confidence
-cbioportal-mcp-qa benchmark --agent-type mcp-clickhouse --questions 1-10 -r 5
+uv run pytest
+uv run ruff check src tests && uv run ruff format src tests
 ```
 
-**How it works:**
-1.  The first run's answers are reused from the main benchmark (no extra API call).
-2.  Additional runs (2 through N) generate fresh answers for the same questions.
-3.  All pairwise combinations of runs are compared using an LLM judge for semantic equivalence.
-4.  A `reproducibility_score` is added to the evaluation results and leaderboard.
-
-## Manual Usage (CLI Reference)
-
-You can also run individual components manually.
-
-### 1. Ask a Question
-```bash
-# Ask using the cBioPortal MCP agent
-cbioportal-mcp-qa ask "How many studies are there?" --agent-type mcp-navigator-agent
-
-# Ask using a null agent
-cbioportal-mcp-qa ask "How many studies are there?" --agent-type cbio-nav-null
-```
-
-### 2. Batch Processing
-Generate answers without running the full benchmark evaluation.
-```bash
-cbioportal-mcp-qa batch input/autosync-public.csv --questions 1-10 --output-dir my_results/
-```
-
-### 3. Manual Evaluation
-Run the evaluation script on existing output files.
-```bash
-python simple_eval.py \
-  --input-csv input/autosync-public.csv \
-  --answers-dir my_results/ \
-  --answer-column "Navbot Expected Link"
-```
-
-## Adding New Agents
-
-To integrate a new agent into the benchmarking system:
-
-1.  **Create a new client class**: In `src/cbioportal_mcp_qa/`, create a new Python file (e.g., `my_new_agent_client.py`) with a class that inherits from `BaseQAClient` and implements the `ask_question` and `get_sql_queries_markdown` methods.
-
-2.  **Register the client in `llm_client.py`**: Open `src/cbioportal_mcp_qa/llm_client.py`:
-    *   Import your new client class.
-    *   Add a new `elif` condition in the `get_qa_client` factory function to return an instance of your new client when a specific `--agent-type` string is provided.
-
-    ```python
-    # Example in src/cbioportal_mcp_qa/llm_client.py
-    from .my_new_agent_client import MyNewAgentClient
-    # ...
-    def get_qa_client(agent_type: str = "mcp-clickhouse", **kwargs) -> BaseQAClient:
-        if agent_type == "mcp-clickhouse":
-            return MCPClickHouseClient(**kwargs)
-        elif agent_type == "cbio-nav-null":
-            return CBioAgentNullClient(**kwargs)
-        elif agent_type == "my-new-agent": # Your new agent type
-            return MyNewAgentClient(**kwargs)
-        else:
-            raise ValueError(f"Unknown agent type: {agent_type}")
-    ```
-
-3.  **Update `AGENT_COLUMN_MAPPING` in `benchmark.py`**: In `src/cbioportal_mcp_qa/benchmark.py`, add an entry to the `AGENT_COLUMN_MAPPING` dictionary. This maps your new `agent_type` to the corresponding column in your `input/autosync-public.csv` (or other benchmark CSV) that contains the *expected answer* for evaluation.
-
-    ```python
-    # Example in src/cbioportal_mcp_qa/benchmark.py
-    AGENT_COLUMN_MAPPING = {
-        "mcp-clickhouse": "Navbot Expected Link",
-        "cbio-nav-null": "Navbot Expected Link",
-        "my-new-agent": "My New Agent Expected Answer Column", # Your agent's expected answer column
-    }
-    ```
-
-4.  **Add Configuration (if any)**: If your new agent requires specific environment variables or CLI options, update the `Configuration` section in `README.md` and add `click.option` decorators in `src/cbioportal_mcp_qa/main.py` if needed.
-
-## Project Structure
-
-*   `src/cbioportal_mcp_qa/`: Source code.
-    *   `main.py`: CLI entry point.
-    *   `benchmark.py`: Benchmarking workflow logic.
-    *   `evaluation.py`: Core evaluation logic (LLM judge).
-    *   `base_client.py`: Abstract base class for agents.
-    *   `null_agent_client.py`: Client for `cbio-nav-null`.
-    *   `llm_client.py`: Client for `mcp-clickhouse`.
-*   `input/`: Benchmark datasets (e.g., `autosync-public.csv`).
-*   `results/`: Generated answers and evaluation reports.
-*   `simple_eval.py`: Wrapper script for running evaluation manually.
-*   `agents/`: Contains Docker Compose configurations for running external agent services, such as `docker-compose.yml` for `cbio-null-agent`.
+`agents/cbioportal-mcp-prompt.txt` is the source of truth for the agent's system prompt; the deployed copy
+lives in the agent's instructions in MongoDB and the LibreChat modelSpec.
