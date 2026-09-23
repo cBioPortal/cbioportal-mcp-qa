@@ -11,7 +11,8 @@ from tqdm import tqdm
 
 from .agent import AgentClient
 from .dataset import Question
-from .grade import Judge, StudyValidator
+from .grade import Judge, StudyValidator, cbio_links
+from .render import render_links
 from .traces import Langfuse
 
 RESULTS_DIR = Path("results")
@@ -133,8 +134,28 @@ def grade_answers(run: Run, judge: Judge) -> None:
     ]
     for rec in tqdm(pending, desc="grading", unit="ans"):
         q = Question.from_dict(rec["question"])
-        rec["grade"] = judge.grade(q, rec["reply"]["answer"], studies).to_dict()
+        rec["grade"] = judge.grade(q, rec["reply"]["answer"], studies, run.data.get("renders", {})).to_dict()
         run.save()
+
+
+def render_navigation_links(run: Run, executable: str | None, concurrency: int = 3) -> int:
+    """Open the cBioPortal links in navigation answers and record what each page shows. Returns the number rendered."""
+    renders = run.data.setdefault("renders", {})
+    urls = sorted(
+        {
+            url
+            for rec in run.records.values()
+            if rec["question"].get("track") == "navigation" and rec["reply"].get("status") == 200
+            for url in cbio_links(rec["reply"]["answer"])
+        }
+        - renders.keys()
+    )
+    if not urls:
+        return 0
+    results = asyncio.run(render_links(urls, run.dir / "shots", "shots", executable, concurrency))
+    renders.update({url: r.to_dict() for url, r in results.items()})
+    run.save()
+    return len(results)
 
 
 def wait_for_ingestion(seconds: int = 60) -> None:

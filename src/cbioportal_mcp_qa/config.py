@@ -83,6 +83,7 @@ class Settings:
     judge_model: str
     aws_region: str
     aws_profile: str | None
+    chromium_path: str | None
 
 
 def load_settings() -> Settings:
@@ -95,4 +96,5 @@ def load_settings() -> Settings:
         judge_model=os.environ.get("JUDGE_MODEL", MODELS["sonnet-4.6"].bedrock_id),
         aws_region=os.environ.get("AWS_REGION", "us-east-1"),
         aws_profile=os.environ.get("AWS_PROFILE") or None,
+        chromium_path=os.environ.get("CHROMIUM_PATH") or None,
     )
