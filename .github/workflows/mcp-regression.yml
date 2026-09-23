@@ -1,0 +1,167 @@
+# Reusable workflow: differential regression test of a cBioPortal MCP server.
+#
+# Builds the calling repo's PR as a Docker image, runs it next to the released image (the baseline)
+# against the same data, makes the fixed tool calls in mcp_tests/calls/<server>.yaml on both, and fails
+# on differences. Add the `mcp-behavior-change` label to a PR whose change is intended: the diffs are
+# still shown in the job summary but no longer fail the check.
+#
+# Called from cBioPortal/cbioportal-mcp and cBioPortal/cbioportal-navigator, e.g.
+#   jobs:
+#     mcp-regression:
+#       uses: cBioPortal/cbioportal-mcp-qa/.github/workflows/mcp-regression.yml@v1
+#       with: {server: navigator, qa-ref: v1}
+name: MCP regression
+
+on:
+  workflow_call:
+    inputs:
+      server:
+        description: "Server under test: mcp or navigator"
+        required: true
+        type: string
+      qa-ref:
+        description: "Ref of cbioportal-mcp-qa to take the tests from (keep in sync with the @ref in `uses:`)"
+        required: false
+        type: string
+        default: v1
+      baseline-image:
+        description: "Image to compare against (default: the released image for the server)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CLICKHOUSE_HOST:
+        required: false
+      CLICKHOUSE_PORT:
+        required: false
+      CLICKHOUSE_USER:
+        required: false
+      CLICKHOUSE_PASSWORD:
+        required: false
+      CLICKHOUSE_DATABASE:
+        required: false
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the server under test
+        uses: actions/checkout@v4
+        with:
+          path: server
+
+      - name: Check out the regression tests
+        uses: actions/checkout@v4
+        with:
+          repository: cBioPortal/cbioportal-mcp-qa
+          ref: ${{ inputs.qa-ref }}
+          path: qa
+
+      - name: Configure
+        id: cfg
+        shell: bash
+        env:
+          SERVER: ${{ inputs.server }}
+          BASELINE_IMAGE: ${{ inputs.baseline-image }}
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          CLICKHOUSE_DATABASE: ${{ secrets.CLICKHOUSE_DATABASE }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'mcp-behavior-change') }}
+        run: |
+          set -euo pipefail
+          env_file="$RUNNER_TEMP/server.env"
+          : > "$env_file"
+          skip=false
+          case "$SERVER" in
+            mcp)
+              dockerfile=docker/Dockerfile; port=8000; path=/mcp
+              baseline="${BASELINE_IMAGE:-cbioportal/mcp:latest}"
+              if [ -z "$CLICKHOUSE_HOST" ]; then
+                # The server refuses to start without a working read-only ClickHouse user, and PRs from forks
+                # don't receive secrets.
+                echo "::notice::No ClickHouse credentials available (e.g. a PR from a fork); skipping MCP regression tests."
+                echo "MCP regression tests skipped: no ClickHouse credentials available to this run." >> "$GITHUB_STEP_SUMMARY"
+                skip=true
+              fi
+              {
+                echo "CLICKHOUSE_HOST=$CLICKHOUSE_HOST"
+                echo "CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}"
+                echo "CLICKHOUSE_USER=$CLICKHOUSE_USER"
+                echo "CLICKHOUSE_PASSWORD=$CLICKHOUSE_PASSWORD"
+                echo "CLICKHOUSE_DATABASE=$CLICKHOUSE_DATABASE"
+                echo "CLICKHOUSE_SECURE=true"
+                echo "CLICKHOUSE_VERIFY=true"
+                echo "CLICKHOUSE_MCP_SERVER_TRANSPORT=http"
+                echo "CLICKHOUSE_MCP_BIND_HOST=0.0.0.0"
+                echo "CLICKHOUSE_MCP_BIND_PORT=$port"
+              } >> "$env_file"
+              ;;
+            navigator)
+              dockerfile=Dockerfile; port=8002; path=/mcp
+              baseline="${BASELINE_IMAGE:-ghcr.io/cbioportal/cbioportal-navigator:latest}"
+              {
+                echo "MCP_TRANSPORT=http"
+                echo "PORT=$port"
+                echo "CBIOPORTAL_BASE_URL=https://www.cbioportal.org"
+              } >> "$env_file"
+              ;;
+            *)
+              echo "::error::server must be 'mcp' or 'navigator', got '$SERVER'"; exit 1 ;;
+          esac
+          allow=""
+          if [ "$HAS_LABEL" = "true" ]; then allow="--allow-changes"; fi
+          {
+            echo "env_file=$env_file"
+            echo "dockerfile=$dockerfile"
+            echo "port=$port"
+            echo "path=$path"
+            echo "baseline=$baseline"
+            echo "skip=$skip"
+            echo "allow=$allow"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build the server under test
+        if: steps.cfg.outputs.skip != 'true'
+        run: docker build -t mcp-candidate -f "server/${{ steps.cfg.outputs.dockerfile }}" server
+
+      - name: Start candidate and baseline
+        if: steps.cfg.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull -q "${{ steps.cfg.outputs.baseline }}"
+          docker run -d --name candidate --env-file "${{ steps.cfg.outputs.env_file }}" -p 8001:${{ steps.cfg.outputs.port }} mcp-candidate
+          docker run -d --name baseline --env-file "${{ steps.cfg.outputs.env_file }}" -p 8002:${{ steps.cfg.outputs.port }} "${{ steps.cfg.outputs.baseline }}"
+          for host_port in 8001 8002; do
+            for _ in $(seq 60); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${host_port}${{ steps.cfg.outputs.path }}" || true)
+              [ "$code" != "000" ] && break
+              sleep 2
+            done
+            [ "$code" != "000" ] || { echo "::error::server on port $host_port did not start"; exit 1; }
+          done
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.cfg.outputs.skip != 'true'
+
+      - name: Run regression tests
+        if: steps.cfg.outputs.skip != 'true'
+        working-directory: qa
+        shell: bash
+        env:
+          ALLOW: ${{ steps.cfg.outputs.allow }}
+        run: |
+          args=(--server "${{ inputs.server }}"
+                --url "http://localhost:8001${{ steps.cfg.outputs.path }}"
+                --baseline-url "http://localhost:8002${{ steps.cfg.outputs.path }}")
+          [ -n "$ALLOW" ] && args+=("$ALLOW")
+          uv run --group mcp-tests pytest mcp_tests -v -p no:cacheprovider "${args[@]}"
+
+      - name: Server logs
+        if: failure() && steps.cfg.outputs.skip != 'true'
+        run: |
+          echo "::group::candidate"; docker logs candidate 2>&1 | tail -200; echo "::endgroup::"
+          echo "::group::baseline"; docker logs baseline 2>&1 | tail -200; echo "::endgroup::"
