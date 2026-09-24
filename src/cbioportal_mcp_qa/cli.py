@@ -51,7 +51,7 @@ runner_option = click.option(
 )
 
 
-def _agent_prompt(settings, target: str) -> str:
+def _agent_prompt(settings, target: str) -> dict:
     try:
         return fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
     except Exception as exc:
@@ -63,9 +63,10 @@ def _client(
 ):
     if runner == "claude-code":
         return ClaudeCodeClient(
-            prompt or _agent_prompt(settings, target),
+            prompt or _agent_prompt(settings, target)["instructions"],
             settings.database_mcp_url,
             settings.navigator_mcp_url,
+            database_connector=settings.database_connector,
             transcript_dir=transcript_dir,
         )
     return AgentClient(TARGETS[target], settings.api_key)
@@ -142,25 +143,39 @@ def run(
         bench = Run.load(resume)
         target = bench.data["target"]
         runner = bench.data.get("runner", "agents-api")
-    prompt = _agent_prompt(settings, target) if runner == "claude-code" else None
+    agent = None
+    if runner == "claude-code" or not resume:
+        try:
+            agent = fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
+        except Exception as exc:  # noqa: BLE001 - only the claude-code runner needs the prompt itself
+            if runner == "claude-code":
+                raise click.ClickException(
+                    f"could not read the {target} agent's prompt via kubectl: {exc}"
+                ) from exc
+            agent_error = f"{type(exc).__name__}: {exc}"[:200]
+    prompt = agent["instructions"] if agent and runner == "claude-code" else None
     if resume:
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
         if prompt and recorded and prompt_fingerprint(prompt)["sha256"] != recorded:
             click.echo("Warning: the agent's prompt changed since this run started", err=True)
     else:
-        try:
-            fingerprint = prompt_fingerprint(
-                prompt or fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
-            )
-        except Exception as exc:  # noqa: BLE001 - the Agents API runner doesn't need the prompt itself
-            fingerprint = {"error": f"{type(exc).__name__}: {exc}"[:200]}
-        extra = {
-            "agent_prompt": {"agent_id": TARGETS[target].agent_id, **fingerprint},
-            "versions": collect_versions(settings, runner, target),
-        }
+        prompt_info = {"agent_id": TARGETS[target].agent_id, "target": target}
+        if agent:
+            prompt_info |= prompt_fingerprint(agent["instructions"]) | {
+                "agent_updated_at": agent.get("updated_at")
+            }
+        else:
+            prompt_info["error"] = agent_error
+        extra = {"agent_prompt": prompt_info, "versions": collect_versions(settings, runner, target)}
+        if runner == "claude-code":
+            extra["database_mcp"] = settings.database_connector or settings.database_mcp_url
+            extra["navigator_mcp"] = settings.navigator_mcp_url
         bench = Run.create(
             target, _models(models_arg), repeats, settings.judge_model, str(questions_file), runner, extra
         )
+        if agent:
+            # A record of the prompt this run tested (the benchmark itself always reads the live agent).
+            (bench.dir / "agent-prompt.md").write_text(agent["instructions"])
     click.echo(
         f"Run {bench.data['run_id']} ({runner}): {len(questions)} questions × {bench.data['models']} × "
         f"{bench.data['repeats']} against {TARGETS[target].agent_id} ({target})"

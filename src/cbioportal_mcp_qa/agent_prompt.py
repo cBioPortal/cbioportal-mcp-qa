@@ -18,7 +18,8 @@ def _kubectl(args: list[str], context: str | None) -> str:
     return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120).stdout
 
 
-def fetch_agent_prompt(agent_id: str, context: str | None = None) -> str:
+def fetch_agent_prompt(agent_id: str, context: str | None = None) -> dict:
+    """The agent's `instructions` and when the agent was last updated."""
     pods = _kubectl(["get", "pods", "-o", "name"], context).split()
     pod = next((p for p in pods if p.startswith("pod/cbioagent-mongodb-")), None)
     if pod is None:
@@ -26,7 +27,10 @@ def fetch_agent_prompt(agent_id: str, context: str | None = None) -> str:
     password = base64.b64decode(
         _kubectl(["get", "secret", MONGO_SECRET, "-o", f"jsonpath={{.data.{MONGO_SECRET_KEY}}}"], context)
     ).decode()
-    script = f"const a = db.agents.findOne({{id: {json.dumps(agent_id)}}}); print(JSON.stringify(a ? a.instructions : null))"
+    script = (
+        f"const a = db.agents.findOne({{id: {json.dumps(agent_id)}}}); "
+        "print(JSON.stringify(a ? {instructions: a.instructions, updated_at: a.updatedAt} : null))"
+    )
     out = _kubectl(
         [
             "exec",
@@ -42,10 +46,10 @@ def fetch_agent_prompt(agent_id: str, context: str | None = None) -> str:
         ],
         context,
     )
-    instructions = json.loads(out.strip().splitlines()[-1])
-    if not instructions:
+    agent = json.loads(out.strip().splitlines()[-1])
+    if not agent or not agent.get("instructions"):
         raise RuntimeError(f"agent {agent_id} not found or has no instructions")
-    return instructions
+    return agent
 
 
 def prompt_fingerprint(prompt: str) -> dict:

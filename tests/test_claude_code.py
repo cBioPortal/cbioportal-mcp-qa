@@ -6,10 +6,13 @@ from cbioportal_mcp_qa import versions
 from cbioportal_mcp_qa.agent_prompt import prompt_fingerprint
 from cbioportal_mcp_qa.claude_code import (
     ClaudeCodeClient,
+    ToolSetup,
     claude_args,
+    connector_tool_prefix,
     format_transcript,
-    mcp_config,
     parse_stream,
+    short_tool_name,
+    tool_setup,
 )
 from cbioportal_mcp_qa.mcp_http import _message
 
@@ -97,13 +100,14 @@ def test_parse_stream_reports_errors_and_missing_results():
 
 
 def test_claude_args_expose_only_the_mcp_servers():
-    args = claude_args("q?", "haiku", "PROMPT", "/tmp/mcp.json")
+    setup = ToolSetup({"cbioportal-database": "http://db/mcp", "cbioportal-navigator": "http://nav/mcp"})
+    args = claude_args("q?", "haiku", "PROMPT", setup, "/tmp/mcp.json")
 
     assert args[:3] == ["claude", "-p", "q?"]
     assert args[args.index("--model") + 1] == "claude-haiku-4-5-20251001"
     assert args[args.index("--system-prompt") + 1] == "PROMPT"
     assert args[args.index("--tools") + 1] == ""
-    assert "--strict-mcp-config" in args
+    assert "--strict-mcp-config" in args and "--disallowedTools" not in args
     assert args[args.index("--allowedTools") + 1 : args.index("--allowedTools") + 3] == [
         "mcp__cbioportal-database",
         "mcp__cbioportal-navigator",
@@ -111,14 +115,60 @@ def test_claude_args_expose_only_the_mcp_servers():
     assert args[args.index("--output-format") + 1] == "stream-json"
 
 
+def test_database_through_a_claude_ai_connector_hides_other_connectors(monkeypatch):
+    loaded = {
+        "cbioportal-navigator",
+        "claude_ai_cBioPortal_MCP",
+        "claude_ai_Google_Drive",
+        "claude_ai_Claude_Docs",
+    }
+    monkeypatch.setattr("cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: loaded)
+    setup = tool_setup("unused", "https://nav/mcp", "claude.ai cBioPortal MCP", "/tmp", {})
+    args = claude_args("q?", "sonnet", "PROMPT", setup, "/tmp/mcp.json")
+
+    assert setup.mcp_config() == {
+        "mcpServers": {
+            "cbioportal-navigator": {
+                "type": "http",
+                "url": "https://nav/mcp",
+                "headers": setup.mcp_config()["mcpServers"]["cbioportal-navigator"]["headers"],
+            }
+        }
+    }
+    assert "--strict-mcp-config" not in args
+    assert setup.allowed == ["mcp__cbioportal-navigator", "mcp__claude_ai_cBioPortal_MCP"]
+    assert args[args.index("--disallowedTools") + 1 :] == [
+        "mcp__claude_ai_Claude_Docs",
+        "mcp__claude_ai_Google_Drive",
+    ]
+
+
+def test_missing_connector_is_an_error(monkeypatch):
+    monkeypatch.setattr(
+        "cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: {"cbioportal-navigator"}
+    )
+    try:
+        tool_setup("unused", "https://nav/mcp", "claude.ai cBioPortal MCP", "/tmp", {})
+    except RuntimeError as exc:
+        assert "not connected" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_tool_names_are_shortened_for_urls_and_connectors():
+    assert connector_tool_prefix("claude.ai cBioPortal MCP") == "claude_ai_cBioPortal_MCP"
+    assert short_tool_name("mcp__claude_ai_cBioPortal_MCP__read_guide") == "read_guide"
+    assert short_tool_name("mcp__cbioportal-navigator__resolve_and_route") == "resolve_and_route"
+
+
 def test_client_writes_mcp_config_and_disables_thinking(monkeypatch):
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/x/.claude-work")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/x/.claude")
     client = ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp")
     try:
         with open(client.mcp_config_path) as f:
-            assert json.load(f) == mcp_config("http://db/mcp", "http://nav/mcp")
+            assert set(json.load(f)["mcpServers"]) == {"cbioportal-database", "cbioportal-navigator"}
         assert client.env["MAX_THINKING_TOKENS"] == "0"
-        assert client.env["CLAUDE_CONFIG_DIR"] == "/home/x/.claude-work"
+        assert client.env["CLAUDE_CONFIG_DIR"] == "/home/x/.claude"
     finally:
         import asyncio
 
