@@ -8,6 +8,14 @@ from pathlib import Path
 
 NAV_END = "Login\n"
 TEXT_CHARS = 1500
+# The single-page app goes network-idle before it draws anything below the site header, so wait for page text
+# past the header instead.
+CONTENT_READY_JS = """() => {
+    const text = document.body.innerText;
+    const i = text.indexOf('Login\\n');
+    return i >= 0 && text.slice(i + 6).trim().length > 200;
+}"""
+LOADING_SELECTOR = ".loadingIndicator, [data-test='LoadingIndicator'], .fa-spinner"
 
 
 @dataclass
@@ -40,7 +48,16 @@ async def _render_one(browser, url: str, shots_dir: Path, rel_dir: str) -> Rende
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         try:
+            await page.wait_for_function(CONTENT_READY_JS, timeout=60_000)
+        except PlaywrightTimeout:
+            name = screenshot_name(url)
+            await page.screenshot(path=shots_dir / name, type="jpeg", quality=60)
+            return Render(
+                url, False, "", "page content did not render within 60s", f"{rel_dir}/{name}", time.monotonic() - started
+            )
+        try:
             await page.wait_for_load_state("networkidle", timeout=30_000)
+            await page.locator(LOADING_SELECTOR).first.wait_for(state="hidden", timeout=30_000)
         except PlaywrightTimeout:
             pass
         text = visible_text(await page.inner_text("body"))
