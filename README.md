@@ -106,5 +106,5 @@ uv run pytest
 uv run ruff check src tests && uv run ruff format src tests
 ```
 
-`agents/cbioportal-mcp-prompt.txt` is the source of truth for the agent's system prompt; the deployed copy
-lives in the agent's instructions in MongoDB and the LibreChat modelSpec.
+The benchmark tests the agent as deployed: its system prompt lives in the agent's instructions in the
+cBioAgent MongoDB and the LibreChat config, not in this repo.
