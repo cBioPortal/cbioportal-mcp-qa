@@ -5,7 +5,7 @@ Benchmarks the deployed cBioPortalChat agent by asking it every question in
 Because it calls the real deployment, a run measures what users get: the same system prompt, MCP tools
 (cbioportal-database, cbioportal-navigator), prompt caching and model.
 
-**[Results](results/index.html)** — one HTML report per run.
+**[Results](https://cbioportal.github.io/cbioportal-mcp-qa/results/)** — one HTML report per run, published with GitHub Pages.
 
 ## What a run records
 
