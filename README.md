@@ -104,6 +104,35 @@ Scores are close to, not identical with, the deployed agent (different harness: 
 or eager tool execution). Compare claude-code runs with each other; confirm on beta with the Agents API
 runner before changing prod. Reports and the results index label the runner.
 
+The MCP servers are the deployed ones, with nothing to configure in the usual case:
+
+- **Navigator:** its public endpoint `https://mcp.cbioportal.org/navigator/mcp` (no login needed).
+- **Database:** its public endpoint `https://mcp.cbioportal.org/db/mcp` needs an OAuth login, so the runner
+  uses your claude.ai connector for it — found by that URL in `claude mcp list`, whatever you named it — and
+  hides every other claude.ai connector from the model. Add the connector in claude.ai once.
+
+```bash
+uv run cbioportal-mcp-qa run --runner claude-code --questions 1-20
+uv run cbioportal-mcp-qa ask "what is the median age in os target gdc" --runner claude-code
+```
+
+Optional: `DATABASE_MCP_URL` points the runner at a database MCP by URL instead — e.g. a locally built,
+unmerged cbioportal-mcp branch (below) or a `kubectl port-forward svc/cbioagent-clickhouse-mcp 18080:80`
+(`http://localhost:18080/db/mcp`) if you don't have the connector. `CLAUDE_AI_DATABASE_CONNECTOR` names a
+connector explicitly.
+
+With a port-forward, dropped connections show up as tool errors such as `ECONNRESET` that the deployed agent
+wouldn't have hit — prefer the connector. The prompt the run tested is saved as `results/<run>/agent-prompt.md`
+(a record; runs always read the live agent) and named in the report header with the agent, its hash and when
+the agent was last updated. Each answer's transcript (tool calls with their SQL
+and results, then the answer) is saved under `results/<run>/transcripts/` and linked from the report, in
+place of the Langfuse trace link. Costs in claude-code reports are list-price equivalents; nothing is billed
+per token.
+
+Scores are close to, not identical with, the deployed agent (different harness: no LibreChat recursion limit
+or eager tool execution). Compare claude-code runs with each other; confirm on beta with the Agents API
+runner before changing prod. Reports and the results index label the runner.
+
 The MCP servers are the deployed ones:
 
 - **Navigator:** the public endpoint `https://mcp.cbioportal.org/navigator/mcp` (default `NAVIGATOR_MCP_URL`).

@@ -9,6 +9,7 @@ from cbioportal_mcp_qa.claude_code import (
     ToolSetup,
     claude_args,
     connector_tool_prefix,
+    find_connector,
     format_transcript,
     loaded_servers,
     parse_stream,
@@ -281,3 +282,21 @@ def test_answers_without_the_connector_are_retried(monkeypatch):
     finally:
         asyncio.run(client.aclose())
     assert reply.error is None and reply.answer == "Median age: 15.2 years"
+
+
+def test_find_connector_matches_by_url_not_name(monkeypatch):
+    listing = "\n".join(
+        [
+            "Checking MCP server health…",
+            "claude.ai MSK cBioPortal DB: https://chat.cbioportal.aws.mskcc.org/db/mcp - ✘ Failed to connect",
+            "claude.ai My cBio DB: https://mcp.cbioportal.org/db/mcp - ✔ Connected",
+            "claude.ai cBioPortal Navigator: https://mcp.cbioportal.org/navigator/mcp - ✔ Connected",
+        ]
+    )
+
+    class Out:
+        stdout = listing
+
+    monkeypatch.setattr("cbioportal_mcp_qa.claude_code.subprocess.run", lambda *a, **k: Out())
+    assert find_connector("https://mcp.cbioportal.org/db/mcp") == "claude.ai My cBio DB"
+    assert find_connector("https://example.org/mcp") is None

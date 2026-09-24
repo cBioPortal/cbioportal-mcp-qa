@@ -6,7 +6,7 @@ import click
 
 from .agent import AgentClient
 from .agent_prompt import fetch_agent_prompt, prompt_fingerprint
-from .claude_code import ClaudeCodeClient
+from .claude_code import ClaudeCodeClient, find_connector
 from .config import MODELS, TARGETS, load_settings
 from .dataset import DEFAULT_QUESTIONS, load_questions, parse_selection
 from .grade import Judge
@@ -58,6 +58,20 @@ def _agent_prompt(settings, target: str) -> dict:
         raise click.ClickException(f"could not read the {target} agent's prompt via kubectl: {exc}") from exc
 
 
+def _database_connector(settings) -> str | None:
+    """How the claude-code runner reaches the database MCP: an explicitly named claude.ai connector, else a
+    DATABASE_MCP_URL (e.g. a port-forward), else the claude.ai connector pointing at DATABASE_CONNECTOR_URL."""
+    if settings.database_connector or settings.database_mcp_url:
+        return settings.database_connector
+    connector = find_connector(settings.database_connector_url)
+    if connector is None:
+        raise click.ClickException(
+            f"no claude.ai connector points at {settings.database_connector_url}; add it in claude.ai, set "
+            "CLAUDE_AI_DATABASE_CONNECTOR to its name, or set DATABASE_MCP_URL (e.g. a port-forward)"
+        )
+    return connector
+
+
 def _client(
     settings, target: str, runner: str, prompt: str | None = None, transcript_dir: Path | None = None
 ):
@@ -66,7 +80,7 @@ def _client(
             prompt or _agent_prompt(settings, target)["instructions"],
             settings.database_mcp_url,
             settings.navigator_mcp_url,
-            database_connector=settings.database_connector,
+            database_connector=_database_connector(settings),
             transcript_dir=transcript_dir,
         )
     return AgentClient(TARGETS[target], settings.api_key)
@@ -168,7 +182,7 @@ def run(
             prompt_info["error"] = agent_error
         extra = {"agent_prompt": prompt_info, "versions": collect_versions(settings, runner, target)}
         if runner == "claude-code":
-            extra["database_mcp"] = settings.database_connector or settings.database_mcp_url
+            extra["database_mcp"] = _database_connector(settings) or settings.database_mcp_url
             extra["navigator_mcp"] = settings.navigator_mcp_url
         bench = Run.create(
             target, _models(models_arg), repeats, settings.judge_model, str(questions_file), runner, extra

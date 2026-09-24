@@ -48,6 +48,27 @@ class ToolSetup:
         return prefixes + ([f"mcp__{connector_tool_prefix(self.connector)}"] if self.connector else [])
 
 
+def find_connector(url: str, env: dict | None = None) -> str | None:
+    """The claude.ai connector (by whatever name it has in this Claude home) that points at `url`."""
+    out = subprocess.run(
+        ["claude", "mcp", "list"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    ).stdout
+    for line in out.splitlines():
+        name, sep, rest = line.partition(": ")
+        if (
+            sep
+            and name.startswith("claude.ai ")
+            and rest.split(" - ")[0].strip().rstrip("/") == url.rstrip("/")
+        ):
+            return name
+    return None
+
+
 def connector_tool_prefix(connector: str) -> str:
     """'claude.ai cBioPortal MCP' → 'claude_ai_cBioPortal_MCP', the server segment of its tool names."""
     return re.sub(r"[^A-Za-z0-9_-]", "_", connector)

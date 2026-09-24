@@ -88,7 +88,8 @@ class Settings:
     aws_region: str
     aws_profile: str | None
     chromium_path: str | None
-    database_mcp_url: str
+    database_mcp_url: str | None
+    database_connector_url: str
     navigator_mcp_url: str
     database_connector: str | None
     kube_context: str | None
@@ -105,7 +106,8 @@ def load_settings() -> Settings:
         aws_region=os.environ.get("AWS_REGION", "us-east-1"),
         aws_profile=os.environ.get("AWS_PROFILE") or None,
         chromium_path=os.environ.get("CHROMIUM_PATH") or None,
-        database_mcp_url=os.environ.get("DATABASE_MCP_URL", "http://localhost:18080/db/mcp"),
+        database_mcp_url=os.environ.get("DATABASE_MCP_URL") or None,
+        database_connector_url=os.environ.get("DATABASE_CONNECTOR_URL", "https://mcp.cbioportal.org/db/mcp"),
         navigator_mcp_url=os.environ.get("NAVIGATOR_MCP_URL", "https://mcp.cbioportal.org/navigator/mcp"),
         database_connector=os.environ.get("CLAUDE_AI_DATABASE_CONNECTOR") or None,
         kube_context=os.environ.get("KUBE_CONTEXT") or None,
