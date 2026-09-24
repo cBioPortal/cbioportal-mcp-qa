@@ -156,7 +156,7 @@ def run(
             fingerprint = {"error": f"{type(exc).__name__}: {exc}"[:200]}
         extra = {
             "agent_prompt": {"agent_id": TARGETS[target].agent_id, **fingerprint},
-            "versions": collect_versions(settings, runner),
+            "versions": collect_versions(settings, runner, target),
         }
         bench = Run.create(
             target, _models(models_arg), repeats, settings.judge_model, str(questions_file), runner, extra

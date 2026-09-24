@@ -9,6 +9,7 @@ from .mcp_http import MCPSession
 
 CBIOPORTAL_INFO_URL = "https://www.cbioportal.org/api/info"
 DEPLOYMENTS = {"cbioportal_mcp": "cbioagent-clickhouse-mcp", "cbioportal_navigator": "cbioportal-navigator"}
+LIBRECHAT_DEPLOYMENTS = {"beta": "cbioagent-librechat-beta", "prod": "cbioagent-librechat"}
 
 
 def _probe(fn):
@@ -64,11 +65,24 @@ def image_digests(context: str | None) -> dict:
     return out
 
 
+def librechat_image(target: str, context: str | None) -> str:
+    """The LibreChat image (fork tag) that serves the target's Agents API."""
+    cmd = [
+        "kubectl",
+        *(["--context", context] if context else []),
+        "get",
+        "deployment",
+        LIBRECHAT_DEPLOYMENTS[target],
+    ]
+    cmd += ["-o", "jsonpath={.spec.template.spec.containers[0].image}"]
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60).stdout.strip()
+
+
 def claude_code() -> str:
     return subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
 
 
-def collect(settings, runner: str) -> dict:
+def collect(settings, runner: str, target: str) -> dict:
     versions = {
         "cbioportal_api": _probe(cbioportal_api),
         "image_digests": _probe(lambda: image_digests(settings.kube_context)),
@@ -78,4 +92,6 @@ def collect(settings, runner: str) -> dict:
     }
     if runner == "claude-code":
         versions["claude_code"] = _probe(claude_code)
+    else:
+        versions["librechat"] = _probe(lambda: librechat_image(target, settings.kube_context))
     return versions
