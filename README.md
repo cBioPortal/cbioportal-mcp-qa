@@ -86,7 +86,7 @@ Claude Code (`claude -p`) instead of the deployed agent:
 
 - **System prompt:** the deployed agent's instructions, read from the cBioAgent MongoDB via `kubectl` at the
   start of the run (`--target beta` → the beta agent). Only its hash is stored in `run.json`.
-- **Tools:** only the two MCP servers (`cbioportal-database`, `cbioportal-navigator`); Claude Code's built-in
+- **Tools:** only the two MCP servers (the database MCP and the navigator); Claude Code's built-in
   tools are disabled and extended thinking is off, matching the deployment.
 - **Models:** the same Haiku 4.5 / Sonnet 5.
 - **Cost:** runs on the Claude subscription of the Claude home it's started with, so point

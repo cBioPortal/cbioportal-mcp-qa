@@ -51,7 +51,7 @@ STREAM = _events(
     _tool_result("t1", False, "# Clinical Data Query Guide"),
     _tool_use("m2", "t2", "mcp__cbioportal-database__clickhouse_run_select_query"),
     _tool_result("t2", True, "Code: 47. Unknown identifier"),
-    _tool_use("m3", "t3", "mcp__cbioportal-navigator__navigate_to_study_view"),
+    _tool_use("m3", "t3", "mcp__navigator__navigate_to_study_view"),
     _tool_result("t3", False, "{}"),
     {
         "type": "assistant",
@@ -102,7 +102,7 @@ def test_parse_stream_reports_errors_and_missing_results():
 
 
 def test_claude_args_expose_only_the_mcp_servers():
-    setup = ToolSetup({"cbioportal-database": "http://db/mcp", "cbioportal-navigator": "http://nav/mcp"})
+    setup = ToolSetup({"cbioportal-database": "http://db/mcp", "navigator": "http://nav/mcp"})
     args = claude_args("q?", "haiku", "PROMPT", setup, "/tmp/mcp.json")
 
     assert args[:3] == ["claude", "-p", "q?"]
@@ -112,14 +112,14 @@ def test_claude_args_expose_only_the_mcp_servers():
     assert "--strict-mcp-config" in args and "--disallowedTools" not in args
     assert args[args.index("--allowedTools") + 1 : args.index("--allowedTools") + 3] == [
         "mcp__cbioportal-database",
-        "mcp__cbioportal-navigator",
+        "mcp__navigator",
     ]
     assert args[args.index("--output-format") + 1] == "stream-json"
 
 
 def test_database_through_a_claude_ai_connector_hides_other_connectors(monkeypatch):
     loaded = {
-        "cbioportal-navigator",
+        "navigator",
         "claude_ai_cBioPortal_MCP",
         "claude_ai_Google_Drive",
         "claude_ai_Claude_Docs",
@@ -130,15 +130,15 @@ def test_database_through_a_claude_ai_connector_hides_other_connectors(monkeypat
 
     assert setup.mcp_config() == {
         "mcpServers": {
-            "cbioportal-navigator": {
+            "navigator": {
                 "type": "http",
                 "url": "https://nav/mcp",
-                "headers": setup.mcp_config()["mcpServers"]["cbioportal-navigator"]["headers"],
+                "headers": setup.mcp_config()["mcpServers"]["navigator"]["headers"],
             }
         }
     }
     assert "--strict-mcp-config" not in args
-    assert setup.allowed == ["mcp__cbioportal-navigator", "mcp__claude_ai_cBioPortal_MCP"]
+    assert setup.allowed == ["mcp__navigator", "mcp__claude_ai_cBioPortal_MCP"]
     assert args[args.index("--disallowedTools") + 1 :] == [
         "mcp__claude_ai_Claude_Docs",
         "mcp__claude_ai_Google_Drive",
@@ -146,9 +146,7 @@ def test_database_through_a_claude_ai_connector_hides_other_connectors(monkeypat
 
 
 def test_missing_connector_is_an_error(monkeypatch):
-    monkeypatch.setattr(
-        "cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: {"cbioportal-navigator"}
-    )
+    monkeypatch.setattr("cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: {"navigator"})
     try:
         tool_setup("unused", "https://nav/mcp", "claude.ai cBioPortal MCP", "/tmp", {})
     except RuntimeError as exc:
@@ -160,7 +158,7 @@ def test_missing_connector_is_an_error(monkeypatch):
 def test_tool_names_are_shortened_for_urls_and_connectors():
     assert connector_tool_prefix("claude.ai cBioPortal MCP") == "claude_ai_cBioPortal_MCP"
     assert short_tool_name("mcp__claude_ai_cBioPortal_MCP__read_guide") == "read_guide"
-    assert short_tool_name("mcp__cbioportal-navigator__resolve_and_route") == "resolve_and_route"
+    assert short_tool_name("mcp__navigator__resolve_and_route") == "resolve_and_route"
 
 
 def test_client_writes_mcp_config_and_disables_thinking(monkeypatch):
@@ -168,7 +166,7 @@ def test_client_writes_mcp_config_and_disables_thinking(monkeypatch):
     client = ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp")
     try:
         with open(client.mcp_config_path) as f:
-            assert set(json.load(f)["mcpServers"]) == {"cbioportal-database", "cbioportal-navigator"}
+            assert set(json.load(f)["mcpServers"]) == {"cbioportal-database", "navigator"}
         assert client.env["MAX_THINKING_TOKENS"] == "0"
         assert client.env["CLAUDE_CONFIG_DIR"] == "/home/x/.claude"
     finally:
@@ -241,11 +239,11 @@ def test_loaded_servers_reads_the_init_event():
         {
             "type": "system",
             "subtype": "init",
-            "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide", "mcp__cbioportal-navigator__x"],
+            "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide", "mcp__navigator__x"],
         },
         {"type": "result", "subtype": "success", "result": "ok"},
     )
-    assert loaded_servers(lines) == {"claude_ai_cBioPortal_MCP", "cbioportal-navigator"}
+    assert loaded_servers(lines) == {"claude_ai_cBioPortal_MCP", "navigator"}
     assert loaded_servers(_events({"type": "result"})) is None
 
 

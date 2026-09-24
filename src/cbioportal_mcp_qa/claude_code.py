@@ -21,6 +21,9 @@ from .agent import AgentReply
 from .config import MODELS
 from .traces import ToolCall, TraceStats
 
+# Deliberately unlike the database connector's "claude_ai_cBioPortal_MCP": with two cBioPortal-looking tool
+# prefixes the model mixes them up and calls navigator tools under the connector's name.
+NAVIGATOR_SERVER = "navigator"
 PROBE_ATTEMPTS = 4
 CONNECTOR_ATTEMPTS = 4
 HEADERS = {"x-user-id": "cbioportal-mcp-qa", "x-user-email": "cbioportal-mcp-qa@localhost"}
@@ -78,8 +81,8 @@ def tool_setup(
     database_url: str, navigator_url: str, connector: str | None, workdir: str, env: dict
 ) -> ToolSetup:
     if not connector:
-        return ToolSetup({"cbioportal-database": database_url, "cbioportal-navigator": navigator_url})
-    setup = ToolSetup({"cbioportal-navigator": navigator_url}, connector)
+        return ToolSetup({"cbioportal-database": database_url, NAVIGATOR_SERVER: navigator_url})
+    setup = ToolSetup({NAVIGATOR_SERVER: navigator_url}, connector)
     wanted = connector_tool_prefix(connector)
     loaded = probe_mcp_servers(setup, workdir, env)
     if wanted not in loaded:
