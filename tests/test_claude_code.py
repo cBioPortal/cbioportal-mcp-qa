@@ -4,7 +4,13 @@ import httpx
 
 from cbioportal_mcp_qa import versions
 from cbioportal_mcp_qa.agent_prompt import prompt_fingerprint
-from cbioportal_mcp_qa.claude_code import ClaudeCodeClient, claude_args, mcp_config, parse_stream
+from cbioportal_mcp_qa.claude_code import (
+    ClaudeCodeClient,
+    claude_args,
+    format_transcript,
+    mcp_config,
+    parse_stream,
+)
 from cbioportal_mcp_qa.mcp_http import _message
 
 
@@ -139,3 +145,40 @@ def test_prompt_fingerprint_and_failed_version_probe():
         raise ConnectionError("refused")
 
     assert versions._probe(boom) == {"error": "ConnectionError: refused"}
+
+
+def test_format_transcript_shows_calls_results_and_answer():
+    text = format_transcript(
+        _events(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "mcp__cbioportal-database__clickhouse_run_select_query",
+                            "input": {"query": "SELECT 1\nFROM x"},
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": [{"type": "text", "text": "a\nb"}],
+                        }
+                    ]
+                },
+            },
+            {"type": "result", "subtype": "success", "result": "done"},
+        )
+    )
+    assert "▶ clickhouse_run_select_query" in text
+    assert "SELECT 1\nFROM x" in text
+    assert "◀ result\na\nb" in text
+    assert text.rstrip().endswith("═ answer (success)\ndone")

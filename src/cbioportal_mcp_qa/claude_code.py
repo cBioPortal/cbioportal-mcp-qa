@@ -7,10 +7,12 @@ is the cheap loop for iterating on prompts and guides; the Agents API runner rem
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
 import time
+from pathlib import Path
 
 from .agent import AgentReply
 from .config import MODELS
@@ -56,6 +58,43 @@ def short_tool_name(name: str) -> str:
     for server in SERVER_NAMES:
         name = name.removeprefix(f"mcp__{server}__")
     return name
+
+
+RESULT_CHARS = 3000
+
+
+def format_transcript(lines: list[str]) -> str:
+    """A readable transcript: every tool call with its arguments and (truncated) result, then the answer."""
+    out: list[str] = []
+    for line in lines:
+        if not line.strip().startswith("{"):
+            continue
+        event = json.loads(line)
+        message = event.get("message") or {}
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                args = json.dumps(block.get("input"), indent=1, ensure_ascii=False)
+                out.append(f"▶ {short_tool_name(block['name'])}\n{args.replace(chr(92) + 'n', chr(10))}\n")
+            elif block.get("type") == "tool_result":
+                content = block.get("content")
+                if isinstance(content, list):
+                    text = "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
+                else:
+                    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+                try:
+                    wrapped = json.loads(text)
+                    if isinstance(wrapped, dict) and isinstance(wrapped.get("result"), str):
+                        text = wrapped["result"]
+                except ValueError:
+                    pass
+                label = "✗ error" if block.get("is_error") else "◀ result"
+                more = f" … ({len(text) - RESULT_CHARS} more chars)" if len(text) > RESULT_CHARS else ""
+                out.append(f"{label}\n{text[:RESULT_CHARS]}{more}\n")
+        if event.get("type") == "result":
+            out.append(f"═ answer ({event.get('subtype')})\n{event.get('result') or ''}\n")
+    return "\n".join(out)
 
 
 def parse_stream(lines: list[str], started: float, latency_s: float) -> AgentReply:
@@ -117,8 +156,10 @@ class ClaudeCodeClient:
         navigator_url: str,
         timeout_s: float = 900.0,
         retries: int = 1,
+        transcript_dir: Path | None = None,
     ):
         self.system_prompt = system_prompt
+        self.transcript_dir = transcript_dir
         self.timeout_s = timeout_s
         self.retries = retries
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
@@ -160,7 +201,13 @@ class ClaudeCodeClient:
             return AgentReply(
                 "", None, None, f"timed out after {self.timeout_s:.0f}s", time.monotonic() - t0, started
             )
-        reply = parse_stream(stdout.decode().splitlines(), started, time.monotonic() - t0)
+        lines = stdout.decode().splitlines()
+        reply = parse_stream(lines, started, time.monotonic() - t0)
+        if self.transcript_dir is not None and reply.trace is not None:
+            self.transcript_dir.mkdir(parents=True, exist_ok=True)
+            name = hashlib.sha1(f"{model}:{question}:{started}".encode()).hexdigest()[:12] + ".txt"
+            (self.transcript_dir / name).write_text(f"Q ({model}): {question}\n\n{format_transcript(lines)}")
+            reply.trace["url"] = f"{self.transcript_dir.name}/{name}"
         if reply.error and proc.returncode:
             reply.error = f"{reply.error} (exit {proc.returncode}: {stderr.decode()[-500:]})"
         return reply

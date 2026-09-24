@@ -58,10 +58,15 @@ def _agent_prompt(settings, target: str) -> str:
         raise click.ClickException(f"could not read the {target} agent's prompt via kubectl: {exc}") from exc
 
 
-def _client(settings, target: str, runner: str, prompt: str | None = None):
+def _client(
+    settings, target: str, runner: str, prompt: str | None = None, transcript_dir: Path | None = None
+):
     if runner == "claude-code":
         return ClaudeCodeClient(
-            prompt or _agent_prompt(settings, target), settings.database_mcp_url, settings.navigator_mcp_url
+            prompt or _agent_prompt(settings, target),
+            settings.database_mcp_url,
+            settings.navigator_mcp_url,
+            transcript_dir=transcript_dir,
         )
     return AgentClient(TARGETS[target], settings.api_key)
 
@@ -162,7 +167,7 @@ def run(
     )
 
     async def go():
-        client = _client(settings, target, runner, prompt)
+        client = _client(settings, target, runner, prompt, bench.dir / "transcripts")
         try:
             await collect_answers(bench, questions, client, concurrency)
         finally:

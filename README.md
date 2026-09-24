@@ -92,6 +92,12 @@ Claude Code (`claude -p`) instead of the deployed agent:
 - **Cost:** runs on the Claude subscription of the Claude home it's started with, so point
   `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock.
 
+`kubectl port-forward` occasionally drops a connection; the answer then shows a tool error such as
+`ECONNRESET` that the deployed agent wouldn't have hit. Each answer's transcript (tool calls with their SQL
+and results, then the answer) is saved under `results/<run>/transcripts/` and linked from the report, in
+place of the Langfuse trace link. Costs in claude-code reports are list-price equivalents; nothing is billed
+per token.
+
 Scores are close to, not identical with, the deployed agent (different harness: no LibreChat recursion limit
 or eager tool execution). Compare claude-code runs with each other; confirm on beta with the Agents API
 runner before changing prod. Reports and the results index label the runner.
