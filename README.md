@@ -155,9 +155,8 @@ To test an unmerged cbioportal-mcp branch, run its image locally instead and poi
 `docker run --rm -p 18080:8000 --env-file <clickhouse.env> -e CLICKHOUSE_MCP_SERVER_TRANSPORT=http
 -e CLICKHOUSE_MCP_BIND_HOST=0.0.0.0 -e CLICKHOUSE_MCP_BIND_PORT=8000 <image>` (URL `http://localhost:18080/mcp`).
 
-Every run also records versions (both runners): cBioPortal portal / DB schema / gene table versions, the
-cbioportal-mcp and navigator server versions and image digests, and the ClickHouse database the MCP server
-is using and when it was built.
+Every run also records versions (both runners): cBioPortal portal / DB schema / gene table versions from
+`https://www.cbioportal.org/api/info`, and the cbioportal-mcp and navigator server versions and image digests.
 
 ## Adding questions
 

@@ -36,19 +36,6 @@ def mcp_server(url: str) -> dict:
     return {"name": info.get("name"), "version": info.get("version")}
 
 
-def clickhouse_database(database_mcp_url: str) -> dict:
-    """The database the MCP server actually queries, and when its tables were built (the daily clone)."""
-    query = (
-        "SELECT currentDatabase() AS database, toString(max(metadata_modification_time)) AS built "
-        "FROM system.tables WHERE database = currentDatabase()"
-    )
-    with MCPSession(database_mcp_url) as mcp:
-        mcp.initialize()
-        text = mcp.call_tool("clickhouse_run_select_query", {"query": query})
-    rows = json.loads(text).get("rows") or [{}]
-    return rows[0]
-
-
 def image_digests(context: str | None) -> dict:
     """Running image of each MCP deployment in the cluster (cbioportal/mcp images carry no git labels)."""
     cmd = ["kubectl", *(["--context", context] if context else []), "get", "pods", "-o", "json"]
@@ -78,21 +65,6 @@ def librechat_image(target: str, context: str | None) -> str:
     return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60).stdout.strip()
 
 
-def active_database(context: str | None) -> dict:
-    """The database the MCP deployments are pointed at (the clickhouse-mcp-active ConfigMap)."""
-    cmd = [
-        "kubectl",
-        *(["--context", context] if context else []),
-        "get",
-        "configmap",
-        "clickhouse-mcp-active",
-    ]
-    cmd += ["-o", "jsonpath={.data.CLICKHOUSE_DATABASE}"]
-    return {
-        "database": subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60).stdout.strip()
-    }
-
-
 def claude_code() -> str:
     return subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
 
@@ -105,10 +77,6 @@ def collect(settings, runner: str, target: str) -> dict:
     }
     if settings.database_mcp_url:
         versions["cbioportal_mcp"] = _probe(lambda: mcp_server(settings.database_mcp_url))
-        versions["clickhouse"] = _probe(lambda: clickhouse_database(settings.database_mcp_url))
-    else:
-        # The database MCP's public endpoint needs OAuth; read the active database from the cluster instead.
-        versions["clickhouse"] = _probe(lambda: active_database(settings.kube_context))
     if runner == "claude-code":
         versions["claude_code"] = _probe(claude_code)
     else:
