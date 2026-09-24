@@ -34,6 +34,7 @@ class Question:
     notes: str = ""
     checked: str | None = None
     source: str = "curated"
+    technical: bool = False  # asks for code, schema or how the agent works: technical detail is expected
 
     @property
     def has_reference(self) -> bool:
@@ -52,6 +53,7 @@ class Question:
             notes=(d.get("notes") or "").strip(),
             checked=str(d["checked"]) if d.get("checked") else None,
             source=d.get("source") or "curated",
+            technical=bool(d.get("technical")),
         )
 
 

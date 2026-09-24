@@ -177,6 +177,8 @@ Append to `input/questions.yaml` with the next unused `id` (ids are stable; neve
 ```
 
 Questions from user-feedback issues set `source` to the issue URL and usually carry a rubric in `notes`.
+Add `technical: true` when the question asks for code, the schema, or how the agent works: answers are then
+expected to be technical and are exempt from the "exposes internals" check.
 
 ## Development
 
