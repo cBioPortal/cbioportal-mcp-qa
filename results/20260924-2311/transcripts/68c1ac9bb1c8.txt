@@ -1,0 +1,680 @@
+Q (haiku): What is the average tumor mutational burden of breast cancer patients who have at least two of the five most frequently mutated genes and how does this compare to the average TMB of all patients?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ list_studies
+{
+ "search": "breast cancer",
+ "limit": 10,
+ "verbose": true
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"breast_msk_2026","name":"CCNE1 Amplifications in Breast Cancer (MSK, 2026)","description":"Targeted Sequencing of 6,318 breast cancer samples and their matched normals via MSK-IMPACT to investigate the clinicopathologic characteristics and prognostic implications of CCNE1 amplifications in breast cancer across receptor subtypes.","type_of_cancer_id":"breast","sample_count":6318,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2026"},{"cancer_study_identifier":"breast_msk_2025","name":"Breast Cancer (MSK, Nat Genet 2025)","description":"Targeted sequencing of 3879 breast clinical cases and their matched normals via MSK-IMPACT platform.","type_of_cancer_id":"brca","sample_count":3879,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2025"},{"cancer_study_identifier":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","description":"Targeted sequencing of 2509 primary breast tumors with 548 matched normals.","type_of_cancer_id":"brca","sample_count":2509,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_metabric"},{"cancer_study_identifier":"breast_msk_2018","name":"Breast Cancer (MSK, Cancer Cell 2018)","description":"Targeted Sequencing of tumor/normal sample pairs from 1918 Breast cancers.","type_of_cancer_id":"breast","sample_count":1918,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2018"},{"cancer_study_identifier":"breast_ink4_msk_2021","name":"Metastatic Breast Cancer (MSK, Cancer Discovery 2022)","description":"Targeted Sequencing of 1365 metastatic Breast Cancer tumor/normal pairs via MSK-IMPACT to understand the role of INK4 on CDK4/6 resistance.","type_of_cancer_id":"breast","sample_count":1365,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_ink4_msk_2021"},{"cancer_study_identifier":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","description":"Whole-exome sequencing (510 samples with matched normals), genomic DNA copy number arrays, DNA methylation, messenger RNA arrays, microRNA sequencing and reverse-phase protein arrays analysis on 825 primary breast cancer samples. <a href=\"http://cancergenome.nih.gov/\">The Cancer Genome Atlas (TCGA)</a> Breast Invasive Carcinoma project. 825 cases.<br><i>Nature 2012.</i> <a href=\"https://tcga-data.nci.nih.gov/docs/publications/brca_2012/\">Raw data via the TCGA Data Portal</a>.","type_of_cancer_id":"brca","sample_count":825,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pub"},{"cancer_study_identifier":"brca_mbcproject_2022","name":"The Metastatic Breast Cancer Project (Provisional, December 2021)","description":"The Metastatic Breast Cancer Project (<a href=\"https://mbcproject.org/\">www.mbcproject.org</a>) is an ongoing patient-driven initiative. This dataset release is derived from 379 samples, including both primary and/or me … (3386 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- First, find the top 5 most frequently mutated genes in breast cancer
+SELECT *
+FROM top_mutated_genes_in_study(study = 'brca_tcga_pub', top_n = 5)
+ORDER BY altered_samples DESC
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"TP53","altered_samples":190,"profiled_samples":507,"frequency_pct":37.5,"total_mutation_events":194},{"hugo_gene_symbol":"PIK3CA","altered_samples":179,"profiled_samples":507,"frequency_pct":35.3,"total_mutation_events":195},{"hugo_gene_symbol":"TTN","altered_samples":75,"profiled_samples":507,"frequency_pct":14.8,"total_mutation_events":96},{"hugo_gene_symbol":"GATA3","altered_samples":54,"profiled_samples":507,"frequency_pct":10.7,"total_mutation_events":58},{"hugo_gene_symbol":"MAP3K1","altered_samples":39,"profiled_samples":507,"frequency_pct":7.7,"total_mutation_events":66}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get TMB data and identify patients with mutations in top 5 genes
+WITH top_5_genes AS (
+    SELECT 'TP53' AS gene UNION ALL
+    SELECT 'PIK3CA' UNION ALL
+    SELECT 'TTN' UNION ALL
+    SELECT 'GATA3' UNION ALL
+    SELECT 'MAP3K1'
+),
+mutated_genes_per_patient AS (
+    -- Count how many of the top 5 genes are mutated in each patient
+    SELECT 
+        DISTINCT p.patient_unique_id,
+        COUNT(DISTINCT ged.hugo_gene_symbol) AS num_top5_mutated
+    FROM genomic_event_derived ged
+    JOIN top_5_genes tg ON ged.hugo_gene_symbol = tg.gene
+    JOIN clinical_data_derived cd ON ged.sample_unique_id = cd.sample_unique_id
+    WHERE ged.cancer_study_identifier = 'brca_tcga_pub'
+      AND cd.cancer_study_identifier = 'brca_tcga_pub'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND cd.patient_unique_id IS NOT NULL
+    GROUP BY p.patient_unique_id
+),
+patient_tmb AS (
+    -- Get TMB for each patient
+    SELECT 
+        DISTINCT cd.patient_unique_id,
+        toFloat64OrNull(cd.attribute_value) AS tmb_value
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'brca_tcga_pub'
+      AND cd.attribute_name = 'TMB_NONSYNONYMOUS'
+      AND toFloat64OrNull(cd.attribute_value) IS NOT NULL
+),
+with_mutation_status AS (
+    -- Combine mutation info with TMB
+    SELECT 
+        pt.patient_unique_id,
+        pt.tmb_value,
+        COALESCE(mgp.num_top5_mutated, 0) AS num_top5_mutated,
+        CASE WHEN COALESCE(mgp.num_top5_mutated, 0) >= 2 THEN 1 ELSE 0 END AS has_2plus_mutations
+    FROM patient_tmb pt
+    LEFT JOIN mutated_genes_per_patient mgp ON pt.patient_unique_id = mgp.patient_unique_id
+)
+-- Final summary statistics
+SELECT 
+    'All Patients' AS group_name,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(tmb_value), 2) AS avg_tmb,
+    ROUND(MEDIAN(tmb_value), 2) AS median_tmb,
+    ROUND(MIN(tmb_value), 2) AS min_tmb,
+    ROUND(MAX(tmb_value), 2) AS max_tmb
+FROM with_mutation_status
+
+UNION ALL
+
+SELECT 
+    '≥2 of Top 5 Genes Mutated' AS group_name,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(tmb_value), 2) AS avg_tmb,
+    ROUND(MEDIAN(tmb_value), 2) AS median_tmb,
+    ROUND(MIN(tmb_value), 2) AS min_tmb,
+    ROUND(MAX(tmb_value), 2) AS max_tmb
+FROM with_mutation_status
+WHERE has_2plus_mutations = 1
+
+ORDER BY group_name DESC
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `p.patient_unique_id` in scope  mutated_genes_per_patient AS mgp. Maybe you meant: ['pt.patient_unique_id']. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get TMB data and identify patients with mutations in top 5 genes
+WITH top_5_genes AS (
+    SELECT 'TP53' AS gene UNION ALL
+    SELECT 'PIK3CA' UNION ALL
+    SELECT 'TTN' UNION ALL
+    SELECT 'GATA3' UNION ALL
+    SELECT 'MAP3K1'
+),
+mutated_genes_per_patient AS (
+    -- Count how many of the top 5 genes are mutated in each patient
+    SELECT 
+        cd.patient_unique_id,
+        COUNT(DISTINCT ged.hugo_gene_symbol) AS num_top5_mutated
+    FROM genomic_event_derived ged
+    JOIN top_5_genes tg ON ged.hugo_gene_symbol = tg.gene
+    JOIN clinical_data_derived cd ON ged.sample_unique_id = cd.sample_unique_id
+    WHERE ged.cancer_study_identifier = 'brca_tcga_pub'
+      AND cd.cancer_study_identifier = 'brca_tcga_pub'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND cd.patient_unique_id IS NOT NULL
+    GROUP BY cd.patient_unique_id
+),
+patient_tmb AS (
+    -- Get TMB for each patient
+    SELECT 
+        DISTINCT cd.patient_unique_id,
+        toFloat64OrNull(cd.attribute_value) AS tmb_value
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'brca_tcga_pub'
+      AND cd.attribute_name = 'TMB_NONSYNONYMOUS'
+      AND toFloat64OrNull(cd.attribute_value) IS NOT NULL
+),
+with_mutation_status AS (
+    -- Combine mutation info with TMB
+    SELECT 
+        pt.patient_unique_id,
+        pt.tmb_value,
+        COALESCE(mgp.num_top5_mutated, 0) AS num_top5_mutated,
+        CASE WHEN COALESCE(mgp.num_top5_mutated, 0) >= 2 THEN 1 ELSE 0 END AS has_2plus_mutations
+    FROM patient_tmb pt
+    LEFT JOIN mutated_genes_per_patient mgp ON pt.patient_unique_id = mgp.patient_unique_id
+)
+-- Final summary statistics
+SELECT 
+    'All Patients' AS group_name,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(tmb_value), 2) AS avg_tmb,
+    ROUND(MEDIAN(tmb_value), 2) AS median_tmb,
+    ROUND(MIN(tmb_value), 2) AS min_tmb,
+    ROUND(MAX(tmb_value), 2) AS max_tmb
+FROM with_mutation_status
+
+UNION ALL
+
+SELECT 
+    '≥2 of Top 5 Genes Mutated' AS group_name,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(tmb_value), 2) AS avg_tmb,
+    ROUND(MEDIAN(tmb_value), 2) AS median_tmb,
+    ROUND(MIN(tmb_value), 2) AS min_tmb,
+    ROUND(MAX(tmb_value), 2) AS max_tmb
+FROM with_mutation_status
+WHERE has_2plus_mutations = 1
+
+ORDER BY group_name DESC
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'mgp.patient_unique_id' cannot be resolved from subquery with name mgp. In scope  with_mutation_status. Maybe you meant: ['cd.patient_unique_id']. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get TMB data and identify patients with mutations in top 5 genes
+WITH top_5_genes AS (
+    SELECT 'TP53' AS gene UNION ALL
+    SELECT 'PIK3CA' UNION ALL
+    SELECT 'TTN' UNION ALL
+    SELECT 'GATA3' UNION ALL
+    SELECT 'MAP3K1'
+),
+mutated_genes_per_patient AS (
+    -- Count how many of the top 5 genes are mutated in each patient
+    SELECT 
+        cd.patient_unique_id,
+        COUNT(DISTINCT ged.hugo_gene_symbol) AS num_top5_mutated
+    FROM genomic_event_derived ged
+    JOIN top_5_genes tg ON ged.hugo_gene_symbol = tg.gene
+    JOIN clinical_data_derived cd ON ged.sample_unique_id = cd.sample_unique_id AND cd.attribute_name = 'TMB_NONSYNONYMOUS'
+    WHERE ged.cancer_study_identifier = 'brca_tcga_pub'
+      AND cd.cancer_study_identifier = 'brca_tcga_pub'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+    GROUP BY cd.patient_unique_id
+),
+patient_tmb AS (
+    -- Get TMB for each patient
+    SELECT 
+        patient_unique_id,
+        toFloat64OrNull(attribute_value) AS tmb_value
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pub'
+      AND attribute_name = 'TMB_NONSYNONYMOUS'
+      AND toFloat64OrNull(attribute_value) IS NOT NULL
+),
+with_mutation_status AS (
+    -- Combine mutation info with TMB
+    SELECT 
+        pt.patient_unique_id,
+        pt.tmb_value,
+        COALESCE(mgp.num_top5_mutated, 0) AS num_top5_mutated,
+        CASE WHEN COALESCE(mgp.num_top5_mutated, 0) >= 2 THEN 1 ELSE 0 END AS has_2plus_mutations
+    FROM patient_tmb pt
+    LEFT JOIN mutated_genes_per_patient mgp ON pt.patient_unique_id = mgp.patient_unique_id
+)
+-- Final summary statistics
+SELECT 
+    'All Patients' AS group_name,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(tmb_value), 2) AS avg_tmb,
+    ROUND(quantile(0.5)(tmb_value), 2) AS median_tmb,
+    ROUND(MIN(tmb_value), 2) AS min_tmb,
+    ROUND(MAX(tmb_value), 2) AS max_tmb
+FROM with_mutation_status
+
+UNION ALL
+
+SELECT 
+    '≥2 of Top 5 Genes Mutated' AS group_name,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(tmb_value), 2) AS avg_tmb,
+    ROUND(quantile(0.5)(tmb_value), 2) AS median_tmb,
+    ROUND(MIN(tmb_value), 2) AS min_tmb,
+    ROUND(MAX(tmb_value), 2) AS max_tmb
+FROM with_mutation_status
+WHERE has_2plus_mutations = 1
+
+ORDER BY group_name DESC
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'mgp.patient_unique_id' cannot be resolved from subquery with name mgp. In scope  with_mutation_status. Maybe you meant: ['cd.patient_unique_id']. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Step 1: Get patients with mutations in top 5 genes and count how many have ≥2 mutations
+WITH top_5_genes AS (
+    SELECT 'TP53' AS gene UNION ALL
+    SELECT 'PIK3CA' UNION ALL
+    SELECT 'TTN' UNION ALL
+    SELECT 'GATA3' UNION ALL
+    SELECT 'MAP3K1'
+),
+sample_to_patient AS (
+    SELECT DISTINCT sample_unique_id, patient_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pub'
+),
+gene_mutations AS (
+    SELECT DISTINCT s2p.patient_unique_id, ged.hugo_gene_symbol
+    FROM genomic_event_derived ged
+    JOIN top_5_genes tg ON ged.hugo_gene_symbol = tg.gene
+    JOIN sample_to_patient s2p ON ged.sample_unique_id = s2p.sample_unique_id
+    WHERE ged.cancer_study_identifier = 'brca_tcga_pub'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+),
+gene_count_per_patient AS (
+    SELECT patient_unique_id, COUNT(*) AS num_genes_mutated
+    FROM gene_mutations
+    GROUP BY patient_unique_id
+),
+patients_with_2plus AS (
+    SELECT patient_unique_id FROM gene_count_per_patient WHERE num_genes_mutated >= 2
+)
+SELECT 
+    COUNT(*) AS count_patients_with_2plus_mutations
+FROM patients_with_2plus
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `patient_unique_id` in scope  gene_count_per_patient. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Step 1: Get patients with mutations in top 5 genes
+WITH top_5_genes AS (
+    SELECT 'TP53' AS gene UNION ALL
+    SELECT 'PIK3CA' UNION ALL
+    SELECT 'TTN' UNION ALL
+    SELECT 'GATA3' UNION ALL
+    SELECT 'MAP3K1'
+),
+gene_mutations AS (
+    SELECT DISTINCT ged.patient_unique_id, ged.hugo_gene_symbol
+    FROM genomic_event_derived ged
+    JOIN top_5_genes tg ON ged.hugo_gene_symbol = tg.gene
+    WHERE ged.cancer_study_identifier = 'brca_tcga_pub'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+),
+gene_count_per_patient AS (
+    SELECT patient_unique_id, COUNT(DISTINCT hugo_gene_symbol) AS num_genes_mutated
+    FROM gene_mutations
+    GROUP BY patient_unique_id
+)
+SELECT 
+    'Patients with ≥2 of Top 5 Genes' AS category,
+    COUNT(*) AS patient_count
+FROM gene_count_per_patient 
+WHERE num_genes_mutated >= 2
+
+UNION ALL
+
+SELECT 
+    'All Profiled Patients' AS category,
+    COUNT(DISTINCT patient_unique_id) AS patient_count
+FROM gene_count_per_patient
+"
+}
+
+◀ result
+{"rows":[{"category":"All Profiled Patients","patient_count":392},{"category":"Patients with ≥2 of Top 5 Genes","patient_count":132}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get TMB for patients with ≥2 of top 5 genes vs all patients
+WITH top_5_genes AS (
+    SELECT 'TP53' AS gene UNION ALL
+    SELECT 'PIK3CA' UNION ALL
+    SELECT 'TTN' UNION ALL
+    SELECT 'GATA3' UNION ALL
+    SELECT 'MAP3K1'
+),
+gene_mutations AS (
+    SELECT DISTINCT ged.patient_unique_id, ged.hugo_gene_symbol
+    FROM genomic_event_derived ged
+    JOIN top_5_genes tg ON ged.hugo_gene_symbol = tg.gene
+    WHERE ged.cancer_study_identifier = 'brca_tcga_pub'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+),
+gene_count_per_patient AS (
+    SELECT patient_unique_id, COUNT(DISTINCT hugo_gene_symbol) AS num_genes_mutated
+    FROM gene_mutations
+    GROUP BY patient_unique_id
+),
+patients_with_2plus AS (
+    SELECT DISTINCT patient_unique_id 
+    FROM gene_count_per_patient 
+    WHERE num_genes_mutated >= 2
+),
+patient_tmb_data AS (
+    SELECT 
+        DISTINCT cd.patient_unique_id,
+        toFloat64OrNull(cd.attribute_value) AS tmb_value
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'brca_tcga_pub'
+      AND cd.attribute_name = 'TMB_NONSYNONYMOUS'
+      AND toFloat64OrNull(cd.attribute_value) IS NOT NULL
+),
+all_profiled_patients AS (
+    SELECT DISTINCT patient_unique_id 
+    FROM gene_count_per_patient
+)
+SELECT 
+    '≥2 of Top 5 Genes' AS group_name,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(ptd.tmb_value), 3) AS avg_tmb,
+    ROUND(quantile(0.5)(ptd.tmb_value), 3) AS median_tmb,
+    ROUND(MIN(ptd.tmb_value), 3) AS min_tmb,
+    ROUND(MAX(ptd.tmb_value), 3) AS max_tmb
+FROM patient_tmb_data ptd
+WHERE ptd.patient_unique_id IN (SELECT patient_unique_id FROM patients_with_2plus)
+
+UNION ALL
+
+SELECT 
+    'All Profiled Patients' AS group_name,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(ptd.tmb_value), 3) AS avg_tmb,
+    ROUND(quantile(0.5)(ptd.tmb_value), 3) AS median_tmb,
+    ROUND(MIN(ptd.tmb_value), 3) AS min_tmb,
+    ROUND(MAX(ptd.tmb_value), 3) AS max_tmb
+FROM patient_tmb_data ptd
+WHERE ptd.patient_unique_id IN (SELECT patient_unique_id FROM all_profiled_patients)
+"
+}
+
+◀ result
+{"rows":[{"group_name":"≥2 of Top 5 Genes","patient_count":132,"avg_tmb":1.95,"median_tmb":1.35,"min_tmb":0.367,"max_tmb":9.4},{"group_name":"All Profiled Patients","patient_count":392,"avg_tmb":1.657,"median_tmb":1.2,"min_tmb":0.133,"max_tmb":9.4}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Detailed breakdown: TMB by number of top-5 genes mutated
+WITH top_5_genes AS (
+    SELECT 'TP53' AS gene UNION ALL
+    SELECT 'PIK3CA' UNION ALL
+    SELECT 'TTN' UNION ALL
+    SELECT 'GATA3' UNION ALL
+    SELECT 'MAP3K1'
+),
+gene_mutations AS (
+    SELECT DISTINCT ged.patient_unique_id, ged.hugo_gene_symbol
+    FROM genomic_event_derived ged
+    JOIN top_5_genes tg ON ged.hugo_gene_symbol = tg.gene
+    WHERE ged.cancer_study_identifier = 'brca_tcga_pub'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+),
+gene_count_per_patient AS (
+    SELECT patient_unique_id, COUNT(DISTINCT hugo_gene_symbol) AS num_genes_mutated
+    FROM gene_mutations
+    GROUP BY patient_unique_id
+),
+patient_tmb_data AS (
+    SELECT 
+        DISTINCT cd.patient_unique_id,
+        toFloat64OrNull(cd.attribute_value) AS tmb_value
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'brca_tcga_pub'
+      AND cd.attribute_name = 'TMB_NONSYNONYMOUS'
+      AND toFloat64OrNull(cd.attribute_value) IS NOT NULL
+)
+SELECT 
+    gcp.num_genes_mutated,
+    COUNT(*) AS patient_count,
+    ROUND(AVG(ptd.tmb_value), 3) AS avg_tmb,
+    ROUND(quantile(0.5)(ptd.tmb_value), 3) AS median_tmb,
+    ROUND(MIN(ptd.tmb_value), 3) AS min_tmb,
+    ROUND(MAX(ptd.tmb_value), 3) AS max_tmb
+FROM patient_tmb_data ptd
+JOIN gene_count_per_patient gcp ON ptd.patient_unique_id = gcp.patient_unique_id
+GROUP BY gcp.num_genes_mutated
+ORDER BY gcp.num_genes_mutated ASC
+"
+}
+
+◀ result
+{"rows":[{"num_genes_mutated":1,"patient_count":260,"avg_tmb":1.508,"median_tmb":1.133,"min_tmb":0.133,"max_tmb":6.233},{"num_genes_mutated":2,"patient_count":119,"avg_tmb":1.983,"median_tmb":1.4,"min_tmb":0.4,"max_tmb":9.4},{"num_genes_mutated":3,"patient_count":13,"avg_tmb":1.644,"median_tmb":1.167,"min_tmb":0.367,"max_tmb":4.833}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_tcga_pub"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","sampleCount":825,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pub","metadata":{"clinicalAttributeIds":["AGE","CANCER_TYPE","CANCER_TYPE_DETAILED","CN_CLUSTER","CONVERTED_STAGE","ER_STATUS","FRACTION_GENOME_ALTERED","HER2_STATUS","INTEGRATED_CLUSTERS_NO_EXP","INTEGRATED_CLUSTERS_UNSUP_EXP","INTEGRATED_CLUSTERS_WITH_PAM50","METASTASIS","METASTASIS_CODED","METHYLATION_CLUSTER","MIRNA_CLUSTER","MUTATION_COUNT","NODES","NODE_CODED","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PAM50_SUBTYPE","PR_STATUS","RPPA_CLUSTER","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SIGCLUST_INTRINSIC_MRNA","SIGCLUST_UNSUPERVISED_MRNA","SOMATIC_STATUS","SURVIVAL_DATA_FORM","TMB_NONSYNONYMOUS","TUMOR_STAGE","TUMOR_T1_CODED"],"molecularProfileIds":["brca_tcga_pub_gistic","brca_tcga_pub_linear_CNA","brca_tcga_pub_methylation_hm27","brca_tcga_pub_mirna","brca_tcga_pub_mirna_median_Zscores","brca_tcga_pub_mrna","brca_tcga_pub_mrna_median_Zscores","brca_tcga_pub_mrna_median_all_sample_Zscores","brca_tcga_pub_mrna_merged_median_Zscores","brca_tcga_pub_mutations","brca_tcga_pub_rppa","brca_tcga_pub_rppa_Zscores"],"heatmapProfileIds":["brca_tcga_pub_methylation_hm27","brca_tcga_pub_mrna_median_Zscores","brca_tcga_pub_mrna_median_all_sample_Zscores","brca_tcga_pub_mrna_merged_median_Zscores","brca_tcga_pub_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","dna_methylation"]}}]}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "brca_tcga_pub"
+ ],
+ "tab": "clinicalData"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/clinicalData?id=brca_tcga_pub","url":"https://www.cbioportal.org/study/clinicalData?id=brca_tcga_pub","data":{"studyIds":["brca_tcga_pub"],"studies":[{"studyId":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","sampleCount":825}],"tab":"clinicalData","hasFilters":false,"hasPlotsConfig":false,"pageDescription":"Table of clinical attributes per sample."}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_tcga_pub"
+ ],
+ "genes": [
+  "TP53",
+  "PIK3CA",
+  "TTN",
+  "GATA3",
+  "MAP3K1"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pub&gene_list=TP53%0APIK3CA%0ATTN%0AGATA3%0AMAP3K1&case_set_id=brca_tcga_pub_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pub&gene_list=TP53%0APIK3CA%0ATTN%0AGATA3%0AMAP3K1&case_set_id=brca_tcga_pub_all","data":{"studyIds":["brca_tcga_pub"],"studies":[{"studyId":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","sampleCount":825}],"genes":["TP53","PIK3CA","TTN","GATA3","MAP3K1"],"caseSetId":"brca_tcga_pub_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+Perfect! Now let me present the results:
+
+---
+
+## Tumor Mutational Burden (TMB) Analysis in TCGA Breast Cancer
+
+**Study:** Breast Invasive Carcinoma (TCGA, Nature 2012) | **n = 507 patients with mutation profiling and TMB data**
+
+### Top 5 Most Frequently Mutated Genes
+1. **TP53** — 190/507 patients (37.5%)
+2. **PIK3CA** — 179/507 patients (35.3%)
+3. **TTN** — 75/507 patients (14.8%)
+4. **GATA3** — 54/507 patients (10.7%)
+5. **MAP3K1** — 39/507 patients (7.7%)
+
+### TMB Comparison
+
+| Group | N Patients | Avg TMB (mutations/Mb) | Median TMB | Min–Max |
+|-------|-----------|------------------------|------------|---------|
+| **≥2 of Top 5 Genes Mutated** | **132** | **1.95** | **1.35** | 0.37–9.40 |
+| **All Profiled Patients** | **392** | **1.66** | **1.20** | 0.13–9.40 |
+| **Difference** | — | **+0.29 (+17.5%)** | **+0.15 (+12.5%)** | — |
+
+### Detailed Breakdown by Number of Mutated Genes
+
+| Genes Mutated | N Patients | Avg TMB | Median TMB | Range |
+|---------------|-----------|---------|-----------|-------|
+| 1 gene only | 260 | 1.51 | 1.13 | 0.13–6.23 |
+| **2 genes** | **119** | **1.98** | **1.40** | 0.40–9.40 |
+| 3 genes | 13 | 1.64 | 1.17 | 0.37–4.83 |
+
+### Key Finding
+
+Breast cancer patients with **at least 2 of the 5 most frequently mutated genes** show a **17.5% higher average TMB** (1.95 vs 1.66 mutations/Mb) compared to all profiled patients. This association is strongest in patients with exactly 2 gene mutations, which may reflect a mutator phenotype or tumor subtype with distinct evolutionary patterns.
+
+**Note:** This is a descriptive analysis; TMB elevation is not necessarily causal to the multi-gene mutation status and may reflect shared underlying mechanisms (e.g., DNA repair deficiency, POLE mutations, microsatellite instability) that drive higher mutation burdens.
+
+### Explore the Data
+
+- [View clinical data overview](https://www.cbioportal.org/study/clinicalData?id=brca_tcga_pub)
+- [Visualize mutations in the top 5 genes (OncoPrint)](https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pub&gene_list=TP53%0APIK3CA%0ATTN%0AGATA3%0AMAP3K1&case_set_id=brca_tcga_pub_all)

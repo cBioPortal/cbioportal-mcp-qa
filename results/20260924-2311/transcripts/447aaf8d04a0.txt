@@ -1,0 +1,590 @@
+Q (sonnet): are there different outcomes for idh1 mutant vs egfr amp in lgg?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ list_studies
+{
+ "search": "lower grade glioma"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH idh1 AS (
+    SELECT DISTINCT patient_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'IDH1' AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+),
+egfr_amp AS (
+    SELECT DISTINCT patient_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'EGFR' AND variant_type = 'cna' AND cna_alteration = 2
+),
+os AS (
+    SELECT patient_unique_id,
+        maxIf(toFloat64OrNull(attribute_value), attribute_name = 'OS_MONTHS') AS os_months,
+        maxIf(attribute_value, attribute_name = 'OS_STATUS') AS os_status
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018' AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+    GROUP BY patient_unique_id
+)
+SELECT
+    multiIf(
+        patient_unique_id IN (SELECT patient_unique_id FROM idh1) AND patient_unique_id IN (SELECT patient_unique_id FROM egfr_amp), 'Both IDH1-mut & EGFR-amp',
+        patient_unique_id IN (SELECT patient_unique_id FROM idh1), 'IDH1-mutant',
+        patient_unique_id IN (SELECT patient_unique_id FROM egfr_amp), 'EGFR-amplified',
+        'Neither'
+    ) AS group_name,
+    count() AS n_patients,
+    countIf(startsWith(os_status, '1')) AS n_events,
+    countIf(startsWith(os_status, '0')) AS n_censored,
+    round(min(os_months),1) AS min_followup_months,
+    round(max(os_months),1) AS max_followup_months
+FROM os
+WHERE os_months IS NOT NULL AND os_status != ''
+GROUP BY group_name
+ORDER BY group_name;
+"
+}
+
+◀ result
+{"rows":[{"group_name":"Both IDH1-mut & EGFR-amp","n_patients":2,"n_events":0,"n_censored":2,"min_followup_months":40.2,"max_followup_months":63.9},{"group_name":"EGFR-amplified","n_patients":37,"n_events":24,"n_censored":13,"min_followup_months":0.6,"max_followup_months":54.8},{"group_name":"IDH1-mutant","n_patients":392,"n_events":72,"n_censored":320,"min_followup_months":0,"max_followup_months":182.3},{"group_name":"Neither","n_patients":82,"n_events":29,"n_censored":53,"min_followup_months":0.1,"max_followup_months":211.2}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH idh1 AS (
+    SELECT DISTINCT patient_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'IDH1' AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+),
+egfr_amp AS (
+    SELECT DISTINCT patient_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'EGFR' AND variant_type = 'cna' AND cna_alteration = 2
+),
+os AS (
+    SELECT patient_unique_id,
+        maxIf(toFloat64OrNull(attribute_value), attribute_name = 'OS_MONTHS') AS os_months,
+        maxIf(attribute_value, attribute_name = 'OS_STATUS') AS os_status
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018' AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+    GROUP BY patient_unique_id
+)
+SELECT
+    multiIf(
+        patient_unique_id IN (SELECT patient_unique_id FROM idh1) AND patient_unique_id NOT IN (SELECT patient_unique_id FROM egfr_amp), 'IDH1-mutant only (EGFR non-amp)',
+        patient_unique_id IN (SELECT patient_unique_id FROM egfr_amp) AND patient_unique_id NOT IN (SELECT patient_unique_id FROM idh1), 'EGFR-amplified only (IDH1-WT)',
+        'Other/excluded'
+    ) AS group_name,
+    count() AS n_patients,
+    countIf(startsWith(os_status, '1')) AS n_events,
+    countIf(startsWith(os_status, '0')) AS n_censored,
+    round(min(os_months),1) AS min_followup_months,
+    round(max(os_months),1) AS max_followup_months
+FROM os
+WHERE os_months IS NOT NULL AND os_status != ''
+GROUP BY group_name
+ORDER BY group_name;
+"
+}
+
+◀ result
+{"rows":[{"group_name":"EGFR-amplified only (IDH1-WT)","n_patients":37,"n_events":24,"n_censored":13,"min_followup_months":0.6,"max_followup_months":54.8},{"group_name":"IDH1-mutant only (EGFR non-amp)","n_patients":392,"n_events":72,"n_censored":320,"min_followup_months":0,"max_followup_months":182.3},{"group_name":"Other/excluded","n_patients":84,"n_events":29,"n_censored":55,"min_followup_months":0.1,"max_followup_months":211.2}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","sampleCount":514,"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["lgg_tcga_pan_can_atlas_2018_gistic","lgg_tcga_pan_can_atlas_2018_log2CNA","lgg_tcga_pan_can_atlas_2018_mutations","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa","lgg_tcga_pan_can_atlas_2018_rppa_Zscores","lgg_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["lgg_tcga_pan_can_atlas_2018_armlevel_cna","lgg_tcga_pan_can_atlas_2018_genetic_ancestry","lgg_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","lgg_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH idh1 AS (
+    SELECT DISTINCT patient_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'IDH1' AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+),
+egfr_amp AS (
+    SELECT DISTINCT patient_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'EGFR' AND variant_type = 'cna' AND cna_alteration = 2
+)
+SELECT 'idh1_total' AS grp, count() FROM idh1
+UNION ALL
+SELECT 'egfr_amp_total', count() FROM egfr_amp;
+"
+}
+
+◀ result
+{"rows":[{"grp":"idh1_total","count()":395},{"grp":"egfr_amp_total","count()":39}]}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "IDH1-mutant only",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "lgg_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "IDH1"
+        }
+       ]
+      ]
+     }
+    ],
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "-2"
+       },
+       {
+        "value": "-1"
+       },
+       {
+        "value": "0"
+       },
+       {
+        "value": "1"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFR-amplified only (IDH1-WT)",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "2"
+       }
+      ]
+     }
+    ],
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "IDH1",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "not_mutated"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/filtered-samples/fetch","data":{"genomicDataFilters":[{"hugoGeneSymbol":"EGFR","profileType":"gistic","values":[{"value":"2"}]}],"mutationDataFilters":[{"hugoGeneSymbol":"IDH1","profileType":"mutations","categorization":"MUTATED","values":[[{"value":"not_mutated"}]]}],"studyIds":["lgg_tcga_pan_can_atlas_2018"]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","content-type":"application/json","date":"Thu, 24 Sep 2026 23:29:14 GMT","elapsed-time":"21","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","connection":"close","transfer-encoding":"chunked"},"status":500,"text":"{\"message\":\"SQL exception. If you are a maintainer of this instance, see logs for details.\"}"}}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "lgg_tcga_pan_can_atlas_2018",
+ "geneSpecificQueries": [
+  {
+   "hugoGeneSymbol": "IDH1",
+   "profileType": "mutations"
+  },
+  {
+   "hugoGeneSymbol": "EGFR",
+   "profileType": "gistic"
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"lgg_tcga_pan_can_atlas_2018","geneSpecificCounts":[{"hugoGeneSymbol":"IDH1","profileType":"mutations","counts":[{"value":"Missense_Mutation","label":"Missense Mutation","count":395}]},{"hugoGeneSymbol":"EGFR","profileType":"gistic","counts":[{"value":"NA","label":"NA","count":3},{"value":"-1","label":"Heterozygously deleted","count":4},{"value":"0","label":"Diploid","count":381},{"value":"2","label":"Amplified","count":39},{"value":"1","label":"Gained","count":87}]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "IDH1-mutant only",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "lgg_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "IDH1"
+        }
+       ]
+      ]
+     }
+    ],
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "-1"
+       },
+       {
+        "value": "0"
+       },
+       {
+        "value": "1"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFR-amplified only (IDH1-WT)",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "2"
+       }
+      ]
+     }
+    ],
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "IDH1",
+      "profileType": "mutations",
+      "categorization": "MUTATION_TYPE",
+      "values": [
+       [
+        {
+         "value": "NOT_MUTATED"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":false,"error":"No samples found for group \"EGFR-amplified only (IDH1-WT)\" — filter may be too restrictive","details":{}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "IDH1-mutant only",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "lgg_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "IDH1"
+        }
+       ]
+      ]
+     }
+    ],
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "-1"
+       },
+       {
+        "value": "0"
+       },
+       {
+        "value": "1"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFR-amplified only (IDH1-WT)",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "2"
+       }
+      ]
+     }
+    ],
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "IDH1",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "unmutated"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/filtered-samples/fetch","data":{"genomicDataFilters":[{"hugoGeneSymbol":"EGFR","profileType":"gistic","values":[{"value":"2"}]}],"mutationDataFilters":[{"hugoGeneSymbol":"IDH1","profileType":"mutations","categorization":"MUTATED","values":[[{"value":"unmutated"}]]}],"studyIds":["lgg_tcga_pan_can_atlas_2018"]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","content-type":"application/json","date":"Thu, 24 Sep 2026 23:29:28 GMT","elapsed-time":"35","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","connection":"close","transfer-encoding":"chunked"},"status":500,"text":"{\"message\":\"SQL exception. If you are a maintainer of this instance, see logs for details.\"}"}}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "IDH1-mutant",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "lgg_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "IDH1"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFR-amplified",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "2"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b25dc2115c492d884dcd","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b25dc2115c492d884dcd","data":{"description":"Group comparison (2 custom groups)","studies":["lgg_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"IDH1-mutant","sampleCount":395},{"name":"EGFR-amplified","sampleCount":39}],"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"IDH1-mutant","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22lgg_tcga_pan_can_atlas_2018_mutations%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22IDH1%22%7D%5D%5D%7D%5D%7D"},{"groupName":"EGFR-amplified","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22gistic%22%2C%22values%22%3A%5B%7B%22value%22%3A%222%22%7D%5D%7D%5D%7D"}],"pageDescription":"Kaplan-Meier survival analysis comparing IDH1-mutant (395) vs EGFR-amplified (39)."}}
+
+═ answer (success)
+## IDH1-mutant vs EGFR-amplified LGG (TCGA, PanCancer Atlas)
+
+Using the [Brain Lower Grade Glioma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018) cohort (514 samples), I pulled the two genomically-defined groups (largely non-overlapping — only 2 patients carry both alterations):
+
+| Group | Patients (with OS data) | Deaths (events) | Censored (alive/last f/u) | Follow-up range (months) |
+|---|---|---|---|---|
+| **IDH1-mutant** (EGFR non-amplified) | 392 | 72 | 320 | 0 – 182.3 |
+| **EGFR-amplified** (IDH1-wildtype) | 37 | 24 | 13 | 0.6 – 54.8 |
+
+A few descriptive observations from these raw counts:
+- The EGFR-amplified group is much smaller (39 patients total pre-OS-filter vs 395 IDH1-mutant) and had a substantially higher proportion of deaths recorded (24/37 ≈ 65%) than the IDH1-mutant group (72/392 ≈ 18%), over a much shorter maximum follow-up (~55 vs ~182 months).
+- These are patient counts, raw and unadjusted — I have **not** run a Kaplan-Meier estimate or log-rank test, so I can't state a median survival or a p-value for the difference. The imbalance in follow-up time also means a naive death-rate comparison could be misleading (EGFR-amp patients were followed for less time, yet still had more events).
+
+**This pattern is consistent with the well-established biology that IDH1-mutant LGG carries a more indolent course, whereas EGFR amplification is characteristic of IDH-wildtype, more aggressive glioma** — but that statement reflects general background knowledge, not something computed from this cBioPortal query, and I have not verified it against a formal statistical test here.
+
+To get the actual Kaplan-Meier curves and log-rank p-value, use the Survival comparison tab:
+
+[IDH1-mutant vs EGFR-amplified — Survival Comparison](https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b25dc2115c492d884dcd)
+
+> Kaplan-Meier survival analysis comparing IDH1-mutant (395 samples) vs EGFR-amplified (39 samples).
+
+You can also explore each group's full clinical/genomic profile in Study View: [IDH1-mutant cohort](https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22lgg_tcga_pan_can_atlas_2018_mutations%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22IDH1%22%7D%5D%5D%7D%5D%7D) · [EGFR-amplified cohort](https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22gistic%22%2C%22values%22%3A%5B%7B%22value%22%3A%222%22%7D%5D%7D%5D%7D)
+
+If you'd like, I can also generate an "aggressiveness" comparison on a different endpoint (progression-free survival, tumor grade distribution) — let me know which specific outcome measure you want compared.

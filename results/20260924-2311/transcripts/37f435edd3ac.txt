@@ -1,0 +1,256 @@
+Q (haiku): What are the most commonly co-occurring mutation pairs in breast cancer samples from the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ list_studies
+{
+ "search": "MSK CHORD breast"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+{"result":[]}
+
+▶ list_studies
+{
+ "search": "CHORD"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "-- Get breast cancer samples from MSK-CHORD
+WITH bc_samples AS (
+    SELECT DISTINCT cd.sample_unique_id
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'msk_chord_2024' 
+      AND cd.attribute_name = 'CANCER_TYPE'
+      AND cd.attribute_value = 'Breast Cancer'
+),
+-- Get distinct genes mutated in each breast cancer sample (one row per sample-gene)
+sample_genes AS (
+    SELECT DISTINCT ged.sample_unique_id, ged.hugo_gene_symbol
+    FROM genomic_event_derived ged
+    WHERE ged.cancer_study_identifier = 'msk_chord_2024' 
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.off_panel = 0
+      AND ged.sample_unique_id IN (SELECT sample_unique_id FROM bc_samples)
+)
+-- Find co-occurring pairs: count samples with both genes mutated
+SELECT 
+    a.hugo_gene_symbol AS gene1,
+    b.hugo_gene_symbol AS gene2,
+    COUNT(DISTINCT a.sample_unique_id) AS samples_with_both
+FROM sample_genes a
+JOIN sample_genes b 
+    ON a.sample_unique_id = b.sample_unique_id 
+    AND a.hugo_gene_symbol < b.hugo_gene_symbol
+GROUP BY gene1, gene2
+ORDER BY samples_with_both DESC
+LIMIT 20",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"gene1":"PIK3CA","gene2":"TP53","samples_with_both":597},{"gene1":"CDH1","gene2":"PIK3CA","samples_with_both":346},{"gene1":"MAP3K1","gene2":"PIK3CA","samples_with_both":256},{"gene1":"GATA3","gene2":"PIK3CA","samples_with_both":230},{"gene1":"KMT2C","gene2":"PIK3CA","samples_with_both":218},{"gene1":"PTEN","gene2":"TP53","samples_with_both":163},{"gene1":"KMT2C","gene2":"TP53","samples_with_both":148},{"gene1":"PIK3CA","gene2":"TBX3","samples_with_both":138},{"gene1":"NF1","gene2":"TP53","samples_with_both":135},{"gene1":"CBFB","gene2":"PIK3CA","samples_with_both":129},{"gene1":"ESR1","gene2":"PIK3CA","samples_with_both":129},{"gene1":"CDH1","gene2":"TP53","samples_with_both":126},{"gene1":"ARID1A","gene2":"PIK3CA","samples_with_both":126},{"gene1":"RB1","gene2":"TP53","samples_with_both":125},{"gene1":"CDH1","gene2":"TBX3","samples_with_both":124},{"gene1":"FOXA1","gene2":"PIK3CA","samples_with_both":121},{"gene1":"GATA3","gene2":"TP53","samples_with_both":111},{"gene1":"NF1","gene2":"PIK3CA","samples_with_both":110},{"gene1":"KMT2D","gene2":"TP53","samples_with_both":107},{"gene1":"MAP3K1","gene2":"TP53","samples_with_both":105}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "-- Count total breast cancer samples in MSK-CHORD
+SELECT COUNT(DISTINCT cd.sample_unique_id) AS total_breast_cancer_samples
+FROM clinical_data_derived cd
+WHERE cd.cancer_study_identifier = 'msk_chord_2024' 
+  AND cd.attribute_name = 'CANCER_TYPE'
+  AND cd.attribute_value = 'Breast Cancer'",
+ "max_rows": 1
+}
+
+◀ result
+{"rows":[{"total_breast_cancer_samples":5368}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","metadata":{"clinicalAttributeIds":["ADRENAL_GLANDS","BONE","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_GROUP","CLINICAL_SUMMARY","CNS_BRAIN","CURRENT_AGE_DEID","DIAGNOSIS_DESCRIPTION","ETHNICITY","FRACTION_GENOME_ALTERED","GENDER","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","GLEASON_SAMPLE_LEVEL","HER2","HISTORY_OF_PDL1","HR","ICD_O_HISTOLOGY_DESCRIPTION","INTRA_ABDOMINAL","LIVER","LUNG","LYMPH_NODES","METASTATIC_SITE","MSI_COMMENT","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","NUM_ICDO_DX","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER","PATHOLOGICAL_GROUP","PDL1_POSITIVE","PLEURA","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","REPRODUCTIVE_ORGANS","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["msk_chord_2024_cna","msk_chord_2024_mutations","msk_chord_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "filterJson": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Breast Cancer"
+     }
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%7D","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+Perfect! Now I have all the information needed to provide a comprehensive answer. Let me compile the results:
+
+## Most Commonly Co-Occurring Mutation Pairs in MSK-CHORD Breast Cancer
+
+I analyzed 5,368 breast cancer samples from the **MSK-CHORD study** to identify the most frequently co-mutated gene pairs. Here are the top 20 co-occurring mutations:
+
+| Gene 1 | Gene 2 | Samples with Both | % of Breast Cancers |
+|--------|--------|------------------|-------------------|
+| PIK3CA | TP53 | 597 | 11.1% |
+| PIK3CA | CDH1 | 346 | 6.4% |
+| PIK3CA | MAP3K1 | 256 | 4.8% |
+| PIK3CA | GATA3 | 230 | 4.3% |
+| PIK3CA | KMT2C | 218 | 4.1% |
+| TP53 | PTEN | 163 | 3.0% |
+| TP53 | KMT2C | 148 | 2.8% |
+| PIK3CA | TBX3 | 138 | 2.6% |
+| TP53 | NF1 | 135 | 2.5% |
+| PIK3CA | CBFB | 129 | 2.4% |
+| PIK3CA | ESR1 | 129 | 2.4% |
+| TP53 | CDH1 | 126 | 2.3% |
+| PIK3CA | ARID1A | 126 | 2.3% |
+| TP53 | RB1 | 125 | 2.3% |
+| CDH1 | TBX3 | 124 | 2.3% |
+| PIK3CA | FOXA1 | 121 | 2.3% |
+| TP53 | GATA3 | 111 | 2.1% |
+| PIK3CA | NF1 | 110 | 2.0% |
+| TP53 | KMT2D | 107 | 2.0% |
+| TP53 | MAP3K1 | 105 | 2.0% |
+
+### Key Findings
+
+**PIK3CA and TP53 dominate:** The single most common co-occurrence is **PIK3CA + TP53** mutations (597 samples, 11.1% of breast cancers). These represent the classic "two-hit" tumor suppressors + PI3K pathway activation frequently observed in breast cancer.
+
+**PIK3CA is a hub gene:** PIK3CA mutations co-occur with nearly every frequently mutated gene in breast cancer, appearing in the top co-mutations with CDH1, MAP3K1, GATA3, KMT2C, and others. This reflects its high baseline frequency in breast cancer.
+
+**Note on interpretation:** These are raw co-occurrence counts; common genes pair more frequently by chance. For statistical significance (mutual exclusivity vs. co-occurrence), see the Group Comparison tool linked below.
+
+---
+
+### Explore the Data
+
+[View MSK-CHORD breast cancer cohort](https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%7D)
+
+This StudyView link shows the breast cancer subcohort (5,368 samples) with interactive distribution charts of clinical and genomic attributes.

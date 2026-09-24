@@ -1,0 +1,224 @@
+Q (haiku): are there cdkn2a het losses in gbm tcga study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "GBM TCGA"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"lgggbm_tcga_pub","name":"Merged Cohort of LGG and GBM (TCGA, Cell 2016)","type_of_cancer_id":"difg","sample_count":1122,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgggbm_tcga_pub"},{"cancer_study_identifier":"gbm_tcga","name":"Glioblastoma Multiforme (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":619,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga"},{"cancer_study_identifier":"gbm_tcga_gdc","name":"Glioblastoma Multiforme (TCGA GDC, 2025)","type_of_cancer_id":"difg","sample_count":611,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_gdc"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":592,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pub2013","name":"Glioblastoma (TCGA, Cell 2013)","type_of_cancer_id":"difg","sample_count":577,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013"},{"cancer_study_identifier":"gbm_tcga_pub","name":"Glioblastoma (TCGA, Nature 2008)","type_of_cancer_id":"difg","sample_count":206,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'gbm_tcga'
+ORDER BY profile_type
+"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"linear_CNA"},{"profile_type":"methylation_hm27"},{"profile_type":"methylation_hm450"},{"profile_type":"mrna"},{"profile_type":"mrna_U133"},{"profile_type":"mrna_U133_Zscores"},{"profile_type":"mrna_U133_all_sample_Zscores"},{"profile_type":"mrna_median_Zscores"},{"profile_type":"mrna_median_all_sample_Zscores"},{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rppa"},{"profile_type":"rppa_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT alteration_value, count() AS samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'gbm_tcga'
+  AND hugo_gene_symbol = 'CDKN2A'
+  AND profile_type = 'gistic'
+  AND alteration_value NOT IN ('', 'NA')
+GROUP BY alteration_value
+ORDER BY alteration_value DESC
+"
+}
+
+◀ result
+{"rows":[{"alteration_value":"2","samples":1},{"alteration_value":"1","samples":19},{"alteration_value":"0","samples":119},{"alteration_value":"-2","samples":331},{"alteration_value":"-1","samples":107}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT count(DISTINCT sample_unique_id) AS profiled_samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'gbm_tcga'
+  AND hugo_gene_symbol = 'CDKN2A'
+  AND profile_type = 'gistic'
+  AND alteration_value NOT IN ('', 'NA')
+"
+}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "gbm_tcga"
+ ]
+}
+
+◀ result
+{"rows":[{"profiled_samples":577}]}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"gbm_tcga","name":"Glioblastoma Multiforme (TCGA, Firehose Legacy)","sampleCount":619,"studyViewUrl":"https://www.cbioportal.org/study?id=gbm_tcga","metadata":{"clinicalAttributeIds":["AGE","CANCER_TYPE","CANCER_TYPE_DETAILED","DAYS_TO_COLLECTION","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DAYS_TO_SPECIMEN_COLLECTION","DFS_MONTHS","DFS_STATUS","DISEASE_CODE","ECOG_SCORE","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","HISTOLOGICAL_DIAGNOSIS","HISTORY_LGG_DX_OF_BRAIN_TISSUE","HISTORY_NEOADJUVANT_TRTYN","HISTORY_OTHER_MALIGNANCY","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","INITIAL_PATHOLOGIC_DX_YEAR","IS_FFPE","KARNOFSKY_PERFORMANCE_SCORE","LONGEST_DIMENSION","METHOD_OF_INITIAL_SAMPLE_PROCUREMENT","METHOD_OF_INITIAL_SAMPLE_PROCUREMENT_OTHER","METHOD_OF_SAMPLE_PROCUREMENT","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","OCT_EMBEDDED","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_METHOD_OF_SAMPLE_PROCUREMENT","OTHER_PATIENT_ID","OTHER_SAMPLE_ID","PATHOLOGY_REPORT_FILE_NAME","PATHOLOGY_REPORT_UUID","PERFORMANCE_STATUS_TIMING","PHARMACEUTICAL_TX_ADJUVANT","PRIMARY_SITE_PATIENT","PROJECT_CODE","PROSPECTIVE_COLLECTION","RACE","RADIATION_TREATMENT_ADJUVANT","RETROSPECTIVE_COLLECTION","SAMPLE_COUNT","SAMPLE_INITIAL_WEIGHT","SAMPLE_TYPE","SAMPLE_TYPE_ID","SEX","SHORTEST_DIMENSION","SITE_OF_TUMOR_TISSUE","SOMATIC_STATUS","SPECIMEN_CURRENT_WEIGHT","SPECIMEN_FREEZING_METHOD","SPECIMEN_SECOND_LONGEST_DIMENSION","TIME_BETWEEN_CLAMPING_AND_FREEZING","TIME_BETWEEN_EXCISION_AND_FREEZING","TISSUE_SOURCE_SITE","TMB_NONSYNONYMOUS","TREATMENT_OUTCOME_FIRST_COURSE","TUMOR_STATUS","VIAL_NUMBER"],"molecularProfileIds":["gbm_tcga_gistic","gbm_tcga_linear_CNA","gbm_tcga_methylation_hm27","gbm_tcga_methylation_hm450","gbm_tcga_mrna","gbm_tcga_mrna_U133","gbm_tcga_mrna_U133_Zscores","gbm_tcga_mrna_U133_all_sample_Zscores","gbm_tcga_mrna_median_Zscores","gbm_tcga_mrna_median_all_sample_Zscores","gbm_tcga_mutations","gbm_tcga_rna_seq_v2_mrna","gbm_tcga_rna_seq_v2_mrna_median_Zscores","gbm_tcga_rna_seq_v2_mrna_median_all_sample_Zscores","gbm_tcga_rppa","gbm_tcga_rppa_Zscores"],"heatmapProfileIds":["gbm_tcga_methylation_hm27","gbm_tcga_methylation_hm450","gbm_tcga_mrna_U133_Zscores","gbm_tcga_mrna_U133_all_sample_Zscores","gbm_tcga_mrna_median_Zscores","gbm_tcga_mrna_median_all_sample_Zscores","gbm_tcga_rna_seq_v2_mrna_median_Zscores","gbm_tcga_rna_seq_v2_mrna_median_all_sample_Zscores","gbm_tcga_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","dna_methylation"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "gbm_tcga"
+ ],
+ "genes": [
+  "CDKN2A"
+ ],
+ "profileFilter": "gistic"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=gbm_tcga&gene_list=CDKN2A&case_set_id=gbm_tcga_all&profileFilter=gistic","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=gbm_tcga&gene_list=CDKN2A&case_set_id=gbm_tcga_all&profileFilter=gistic","data":{"studyIds":["gbm_tcga"],"studies":[{"studyId":"gbm_tcga","name":"Glioblastoma Multiforme (TCGA, Firehose Legacy)","sampleCount":619}],"genes":["CDKN2A"],"caseSetId":"gbm_tcga_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## Yes—CDKN2A heterozygous losses are common in GBM TCGA.
+
+**Heterozygous deletion frequency in GBM (TCGA Firehose Legacy, 577 profiled samples):**
+
+| CNA Level | Samples | Frequency |
+|---|---|---|
+| **HETLOSS (−1)** | **107** | **18.5%** |
+| Diploid (0) | 119 | 20.6% |
+| HOMDEL (−2) | 331 | 57.4% |
+| Gain (1) | 19 | 3.3% |
+| Amplification (2) | 1 | 0.2% |
+
+**Key finding:** CDKN2A is heavily altered in GBM — 76% of samples carry either a heterozygous or homozygous deletion (107 + 331 = 438 / 577). Homozygous deletions dominate (57.4%), but heterozygous losses account for a substantial 18.5% of the profiled cohort.
+
+[View CDKN2A alterations in GBM TCGA](https://www.cbioportal.org/results/oncoprint?cancer_study_list=gbm_tcga&gene_list=CDKN2A&case_set_id=gbm_tcga_all&profileFilter=gistic)

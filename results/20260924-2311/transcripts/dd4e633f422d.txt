@@ -1,0 +1,221 @@
+Q (haiku): show me P135L mutations in $p14^{ARF}$
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://common-pitfalls"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+# Common Query Pitfalls Guide
+
+## Overview
+This guide highlights frequent mistakes when analyzing cBioPortal data and provides solutions to avoid them.
+
+## Critical Pitfalls
+
+### 1. 🚨 CRITICAL MUTATION FREQUENCY ERRORS
+
+#### ❌ WRONG: Using study-wide totals for gene frequencies
+```sql
+-- INCORRECT - This gives wrong frequencies!
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples,
+    (SELECT COUNT(DISTINCT sample_unique_id)
+     FROM genomic_event_derived
+     WHERE cancer_study_identifier = 'your_study_id') as total_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND cancer_study_identifier = 'your_study_id'
+GROUP BY hugo_gene_symbol;
+```
+**Problem**: Different genes have different profiling coverage - you can't use study-wide totals!
+
+#### ❌ WRONG: Not using gene-specific profiling denominators
+```sql
+-- INCORRECT - Missing gene-specific denominators
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+GROUP BY hugo_gene_symbol;
+-- Missing: WHERE ARE THE DENOMINATORS FOR EACH GENE?
+```
+
+#### ❌ WRONG: Skipping individual gene profiling queries
+**Problem**: Failing to run separate profiling queries for EACH gene in results.
+**Each gene has different coverage**: TP53 might be profiled in 25,040 samples, MUC16 in 23,000, etc.
+
+#### ✅ CORRECT: Complete gene-specific workflow
+```sql
+-- STEP 1: Get altered counts per gene
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id,
+    COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
+    COUNT(*) AS totalMutationEvents
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY entrez_gene_id, hugo_gene_symbol
+ORDER BY numberOfAlteredSamplesOnPanel DESC;
+
+-- STEP 2: FOR EACH GENE, run this profiling query:
+SELECT COUNT(DISTINCT stgp.sample_unique_id) AS numberOfProfiledSamples
+FROM sample_to_gene_panel_derived stgp
+JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+  AND g.hugo_gene_symbol = 'TP53'  -- Replace with each gene from Step 1
+  AND stgp.cancer_study_identifier = 'your_study_id';
+
+-- STEP 3: Calculate frequency = numberOfAlteredSamplesOnPanel / numberOfProfiledSamples * 100
+```
+
+#### 🚨 WORKFLOW REQUIREMENTS VIOLATIONS:
+- **Missing denominator columns**: Must show gene-specific profiled samples per row
+- **Wrong table format**: Should be | Gene | # Mutations | # Samples | Profiled Samples | Sample % |
+- **Not replacing gene symbols**: Must replace 'TP53' with actual gene for each query
+- **Using study totals**: Never use genomic_event_derived for total sample counts
+
+### 2. 🚨 OFF-PANEL MUTATION INCLUSION
+
+#### ❌ Wrong: Including off-panel mutations
+```sql
+-- INCORRECT - Includes mutations outside gene panels
+SELEC … (37891 more chars)
+
+▶ search_oncotree
+{
+ "search_term": "ARF"
+}
+
+◀ result
+{"result":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT hugo_gene_symbol FROM genomic_event_derived WHERE hugo_gene_symbol LIKE '%ARF%' LIMIT 10"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"MARF1"},{"hugo_gene_symbol":"ARFGEF2"},{"hugo_gene_symbol":"ARFGEF1"},{"hugo_gene_symbol":"NARF"},{"hugo_gene_symbol":"ARFIP1"},{"hugo_gene_symbol":"ARFGEF3"},{"hugo_gene_symbol":"CARF"},{"hugo_gene_symbol":"ARFGAP2"},{"hugo_gene_symbol":"SCARF2"},{"hugo_gene_symbol":"ARFIP2"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    cancer_study_identifier AS study,
+    hugo_gene_symbol,
+    mutation_variant,
+    mutation_type,
+    COUNT(DISTINCT sample_unique_id) AS sample_count,
+    COUNT(*) AS mutation_events
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'CDKN2A'
+  AND variant_type = 'mutation'
+  AND mutation_status != 'UNCALLED'
+  AND (mutation_variant LIKE '%P135L%' OR mutation_variant LIKE '%135L%')
+GROUP BY cancer_study_identifier, hugo_gene_symbol, mutation_variant, mutation_type
+ORDER BY sample_count DESC
+LIMIT 50
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    mutation_variant,
+    mutation_type,
+    SUM(CASE WHEN variant_type = 'mutation' AND mutation_status != 'UNCALLED' THEN 1 ELSE 0 END) AS mutation_count,
+    COUNT(DISTINCT cancer_study_identifier) AS studies
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'CDKN2A'
+  AND variant_type = 'mutation'
+GROUP BY mutation_variant, mutation_type
+ORDER BY mutation_count DESC
+LIMIT 50
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"mutation_variant":"R80*","mutation_type":"Nonsense_Mutation","mutation_count":1199,"studies":148},{"mutation_variant":"R58*","mutation_type":"Nonsense_Mutation","mutation_count":819,"studies":108},{"mutation_variant":"H83Y","mutation_type":"Missense_Mutation","mutation_count":734,"studies":121},{"mutation_variant":"X51_splice","mutation_type":"Splice_Site","mutation_count":509,"studies":102},{"mutation_variant":"W110*","mutation_type":"Nonsense_Mutation","mutation_count":387,"studies":88},{"mutation_variant":"Y44*","mutation_type":"Nonsense_Mutation","mutation_count":297,"studies":59},{"mutation_variant":"P114L","mutation_type":"Missense_Mutation","mutation_count":215,"studies":55},{"mutation_variant":"L16Pfs*9","mutation_type":"Frame_Shift_Del","mutation_count":208,"studies":33},{"mutation_variant":"X153_splice","mutation_type":"Splice_Site","mutation_count":208,"studies":63},{"mutation_variant":"D84N","mutation_type":"Missense_Mutation","mutation_count":203,"studies":64},{"mutation_variant":"E120*","mutation_type":"Nonsense_Mutation","mutation_count":188,"studies":63},{"mutation_variant":"E88*","mutation_type":"Nonsense_Mutation","mutation_count":151,"studies":47},{"mutation_variant":"E69*","mutation_type":"Nonsense_Mutation","mutation_count":143,"studies":39},{"mutation_variant":"V28_E33del","mutation_type":"In_Frame_Del","mutation_count":140,"studies":32},{"mutation_variant":"D108N","mutation_type":"Missense_Mutation","mutation_count":133,"studies":47},{"mutation_variant":"P48L","mutation_type":"Missense_Mutation","mutation_count":128,"studies":47},{"mutation_variant":"D108Y","mutation_type":"Missense_Mutation","mutation_count":123,"studies":41},{"mutation_variant":"P81L","mutation_type":"Missense_Mutation","mutation_count":122,"studies":45},{"mutation_variant":"E61*","mutation_type":"Nonsense_Mutation","mutation_count":120,"studies":31},{"mutation_variant":"D84Y","mutation_type":"Missense_Mutation","mutation_count":115,"studies":44},{"mutation_variant":"S12*","mutation_type":"Nonsense_Mutation","mutation_count":110,"studies":42},{"mutation_variant":"L78Hfs*41","mutation_type":"Frame_Shift_Del","mutation_count":108,"studies":48},{"mutation_variant":"W15*","mutation_type":"Nonsense_Mutation","mutation_count":96,"studies":33},{"mutation_variant":"Q50*","mutation_type":"Nonsense_Mutation","mutation_count":92,"studies":37},{"mutation_variant":"X50_splice","mutation_type":"Splice_Site","mutation_count":88,"studies":37},{"mutation_variant":"H83D","mutation_type":"Missense_Mutation","mutation_count":84,"studies":34},{"mutation_variant":"A102V","mutation_type":"Missense_Mutation","mutation_count":78,"studies":40},{"mutation_variant":"Y129*","mutation_type":"Nonsense_Mutation","mutation_count":76,"studies":30},{"mutation_variant":"Y44*","mutation_type":"Frame_Shift_Del","mutation_count":73,"studies":19},{"mutation_variant":"L32_L37del","mutation_type":"In_Frame_Del","mutation_count":72,"studies":25},{"mutation_variant":"D74N","mutation_type … (1921 more chars)
+
+═ answer (success)
+**P135L mutations in p14^ARF^ (CDKN2A) are not found in cBioPortal.** 
+
+Based on my search across all cBioPortal studies:
+
+- **P135L specifically:** 0 samples (no matches)
+- **Similar P-to-L variants in CDKN2A:** The closest matches are P114L (215 samples, 55 studies), P81L (122 samples), and P48L (128 samples), but no P135L.
+
+### Interpretation
+
+The lack of P135L in cBioPortal could mean:
+
+1. **It is exceedingly rare** or has not yet been observed in the deposited cancer genomics datasets represented in cBioPortal.
+2. **Positional discrepancy:** The p135 position may refer to p14^ARF^-specific numbering (the shorter isoform), while cBioPortal reports coordinates using the more common p16^INK4a^ reference frame (which is longer). CDKN2A mutations in the database are typically annotated using the full-length coding sequence.
+3. **Nomenclature variation:** If you have a variant in p14^ARF^, it may be stored under a different amino acid position numbering.
+
+### Next Steps
+
+If you have a specific patient sample or study with a P135L variant, I can:
+- Check that specific study directly
+- Help you navigate to cBioPortal's mutation tab to see all available CDKN2A variants
+- Suggest how to report or curate the variant if it's from your own research
+
+Would you like me to help with any of these alternatives?

@@ -1,0 +1,512 @@
+Q (sonnet): Can you explore the difference in mutation frequency between left-sided and right-sided CRC?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ list_studies
+{
+ "search": "colorectal"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"crc_msk_2026","name":"Colorectal Adenocarcinoma (MSK, 2026)","type_of_cancer_id":"read","sample_count":7237,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=crc_msk_2026"},{"cancer_study_identifier":"crc_eo_2020","name":"Colorectal Cancer (MSK, JNCI 2021)","type_of_cancer_id":"bowel","sample_count":1516,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=crc_eo_2020"},{"cancer_study_identifier":"crc_msk_2017","name":"Metastatic Colorectal Cancer (MSK, Cancer Cell 2018)","type_of_cancer_id":"coadread","sample_count":1134,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=crc_msk_2017"},{"cancer_study_identifier":"crc_sysucc_2022","name":"Colorectal Cancer- ChangKang Project (SYSUCC, Nat Commun 2022)","type_of_cancer_id":"coadread","sample_count":1015,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=crc_sysucc_2022"},{"cancer_study_identifier":"coadread_tcga","name":"Colorectal Adenocarcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"coadread","sample_count":640,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=coadread_tcga"},{"cancer_study_identifier":"coadread_dfci_2016","name":"Colorectal Adenocarcinoma (DFCI, Cell Reports 2016)","type_of_cancer_id":"coadread","sample_count":619,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=coadread_dfci_2016"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","name":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"coadread","sample_count":594,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=coadread_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"crc_apc_impact_2020","name":"Colorectal Cancer (MSK, Gastroenterology 2020)","type_of_cancer_id":"coadread","sample_count":471,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=crc_apc_impact_2020"},{"cancer_study_identifier":"coadread_tcga_pub","name":"Colorectal Adenocarcinoma (TCGA, Nature 2012)","type_of_cancer_id":"coadread","sample_count":276,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=coadread_tcga_pub"},{"cancer_study_identifier":"bowel_colitis_msk_2022","name":"Colorectal Adenocarcinoma (MSK, Nat Commun 2022)","type_of_cancer_id":"bowel","sample_count":179,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=bowel_colitis_msk_2022"},{"cancer_study_identifier":"coadread_cass_2020","name":"Colorectal Cancer (CAS Shanghai, Cancer Cell 2020)","type_of_cancer_id":"coadread","sample_count":146,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=coadread_cass_2020"},{"cancer_study_identifier":"coadread_mskcc","name":"Colorectal Adenocarcinoma Triplets (MSK, Geno … (1887 more chars)
+
+▶ get_study_guide
+{
+ "study_id": "coadread_tcga_pan_can_atlas_2018"
+}
+
+◀ result
+# Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)
+
+**Study ID:** `coadread_tcga_pan_can_atlas_2018`
+
+See `_tcga_pancan_template.md` for common TCGA clinical attributes.
+
+## Study-Specific Attributes
+
+### Microsatellite Instability (MSI)
+There is no `MSI_STATUS` attribute. Three attributes carry MSI (594 patients, one sample each):
+
+| Attribute | Definition | MSI-high count |
+|-----------|------------|----------------|
+| `SUBTYPE` | TCGA molecular classification: `COAD_MSI` 60 + `READ_MSI` 3 | **63** |
+| `MSI_SENSOR_SCORE` | MSIsensor score ≥10 (indeterminate 4–10: 10 more) | 78 of 584 scored |
+| `MSI_SCORE_MANTIS` | MANTIS score >0.4 (>0.6 = MSI: 67; 0.4–0.6 indeterminate) | 89 of 557 scored |
+
+**For "MSI-high" questions, use `SUBTYPE` IN (`COAD_MSI`, `READ_MSI`)** (the TCGA molecular classification) and state which definition you used; mention the score-based alternatives if the counts matter. Do not switch to `coadread_tcga_pub` to find MSI; this study has it.
+```sql
+SELECT count(DISTINCT patient_unique_id) AS msi_patients   -- 63
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'SUBTYPE' AND attribute_value IN ('COAD_MSI', 'READ_MSI');
+```
+
+### Molecular Classification (`SUBTYPE`, patients)
+`COAD_CIN` 226, `READ_CIN` 102, `COAD_MSI` 60, `COAD_GS` 49, `READ_GS` 9, `COAD_POLE` 6, `READ_POLE` 4, `READ_MSI` 3, blank 135.
+- **Hypermutated**: no `HYPERMUTATED` attribute. Use `SUBTYPE` MSI + POLE (73 patients), or `TMB_NONSYNONYMOUS` ≥10 (83 samples; all MSI and POLE tumors exceed it).
+- **CMS (consensus molecular subtypes)** are not available in this study.
+
+### Anatomic Location
+There is no `TUMOR_LOCATION` attribute.
+- Colon vs rectum: `TUMOR_TISSUE_SITE` — Colon 436, Rectum 152, blank 6.
+- Subsite (for left vs right): `ICD_O_3_SITE` — right: C18.0 cecum 81, C18.2 ascending 100, C18.3 hepatic flexure 10; transverse C18.4 20; left: C18.5 splenic flexure 5, C18.6 descending 16, C18.7 sigmoid 106, C19.9 rectosigmoid 72, C20.9 rectum 81; C18.9 colon NOS 97 (side unknown).
+
+## Key Genes
+| Gene | Frequency | Clinical Relevance |
+|------|-----------|-------------------|
+| APC | ~80% | Initiating event in most CRC |
+| TP53 | ~55% | Progression marker |
+| KRAS | ~40% | Predicts anti-EGFR resistance |
+| PIK3CA | ~15% | May predict aspirin benefit |
+| BRAF | ~10% | V600E poor prognosis (MSS context) |
+| SMAD4 | ~10% | TGF-β pathway |
+
+## Notes
+- MSI-H tumors respond well to immunotherapy
+- KRAS/NRAS mutations contraindicate anti-EGFR therapy
+- BRAF V600E has different prognosis in MSI-H vs MSS context
+- Left vs right-sided tumors have different biology and outcomes
+
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attr_id, description, patient_attribute
+FROM clinical_attribute_meta
+WHERE cancer_study_id = (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018')
+AND (upper(attr_id) LIKE '%SIDE%' OR upper(attr_id) LIKE '%LOCATION%' OR upper(attr_id) LIKE '%SITE%' OR upper(description) LIKE '%SIDE%' OR upper(description) LIKE '%LOCATION%')
+ORDER BY attr_id"
+}
+
+◀ result
+{"rows":[{"attr_id":"ICD_O_3_SITE","description":"The third edition of the International Classification of Diseases for Oncology, published in 2000, used principally in tumor and cancer registries for coding the site (topography) and the histology (morphology) of neoplasms._The description of an anatomical region or of a body part._Named locations of, or within, the body._A system of numbered categories for representation of data.","patient_attribute":1},{"attr_id":"PATH_M_STAGE","description":"Code to represent the defined absence or presence of distant spread or metastases (M) to locations via vascular channels or lymphatics beyond the regional lymph nodes, using criteria established by the American Joint Committee on Cancer (AJCC).","patient_attribute":1},{"attr_id":"TISSUE_SOURCE_SITE","description":"A Tissue Source Site collects samples (tissue, cell, or blood) and cliincal metadata which are then sent to tha Biospecimen Core Resource.","patient_attribute":0},{"attr_id":"TISSUE_SOURCE_SITE_CODE","description":"Tissue Source Site Code","patient_attribute":0},{"attr_id":"TUMOR_TISSUE_SITE","description":"Text term that describes the anatomic site of the tumor or disease.","patient_attribute":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH side AS (
+  SELECT patient_unique_id,
+    CASE
+      WHEN attribute_value IN ('C18.0','C18.2','C18.3') THEN 'Right'
+      WHEN attribute_value IN ('C18.5','C18.6','C18.7','C19.9','C20.9') THEN 'Left'
+      WHEN attribute_value = 'C18.4' THEN 'Transverse'
+      ELSE 'Unknown'
+    END AS side
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'ICD_O_3_SITE'
+)
+SELECT side, count(DISTINCT patient_unique_id) AS n_patients
+FROM side
+GROUP BY side
+ORDER BY n_patients DESC
+"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"rows":[{"side":"Left","n_patients":280},{"side":"Right","n_patients":191},{"side":"Unknown","n_patients":103},{"side":"Transverse","n_patients":20}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH side AS (
+  SELECT patient_unique_id,
+    CASE
+      WHEN attribute_value IN ('C18.0','C18.2','C18.3') THEN 'Right'
+      WHEN attribute_value IN ('C18.5','C18.6','C18.7','C19.9','C20.9') THEN 'Left'
+      ELSE NULL
+    END AS side
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'ICD_O_3_SITE'
+),
+side_f AS (SELECT * FROM side WHERE side IS NOT NULL),
+patient_sample AS (
+  SELECT DISTINCT sample_unique_id, patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+),
+profiled AS (
+  SELECT DISTINCT ps.patient_unique_id, sf.side
+  FROM sample_to_gene_panel_derived stgp
+  JOIN patient_sample ps ON stgp.sample_unique_id = ps.sample_unique_id
+  JOIN side_f sf ON sf.patient_unique_id = ps.patient_unique_id
+  WHERE stgp.cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+    AND stgp.alteration_type = 'MUTATION_EXTENDED'
+),
+profiled_counts AS (
+  SELECT side, count(DISTINCT patient_unique_id) AS profiled_patients
+  FROM profiled
+  GROUP BY side
+),
+mut AS (
+  SELECT ged.hugo_gene_symbol, ps.patient_unique_id, sf.side
+  FROM genomic_event_derived ged
+  JOIN patient_sample ps ON ged.sample_unique_id = ps.sample_unique_id
+  JOIN side_f sf ON sf.patient_unique_id = ps.patient_unique_id
+  WHERE ged.cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+    AND ged.variant_type = 'mutation'
+    AND ged.mutation_status != 'UNCALLED'
+    AND ged.off_panel = 0
+    AND ged.hugo_gene_symbol IN ('APC','TP53','KRAS','PIK3CA','BRAF','SMAD4')
+),
+mut_counts AS (
+  SELECT hugo_gene_symbol, side, count(DISTINCT patient_unique_id) AS altered_patients
+  FROM mut
+  GROUP BY hugo_gene_symbol, side
+)
+SELECT mc.hugo_gene_symbol, mc.side, mc.altered_patients, pc.profiled_patients,
+       round(mc.altered_patients * 100.0 / pc.profiled_patients, 1) AS pct
+FROM mut_counts mc
+JOIN profiled_counts pc ON mc.side = pc.side
+ORDER BY hugo_gene_symbol, side
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `patient_unique_id` in scope  mut_counts AS mc. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH side AS (
+  SELECT patient_unique_id,
+    CASE
+      WHEN attribute_value IN ('C18.0','C18.2','C18.3') THEN 'Right'
+      WHEN attribute_value IN ('C18.5','C18.6','C18.7','C19.9','C20.9') THEN 'Left'
+      ELSE NULL
+    END AS side
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'ICD_O_3_SITE'
+),
+side_f AS (SELECT * FROM side WHERE side IS NOT NULL),
+patient_sample AS (
+  SELECT DISTINCT sample_unique_id, patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+),
+profiled AS (
+  SELECT DISTINCT ps.patient_unique_id AS patient_unique_id, sf.side AS side
+  FROM sample_to_gene_panel_derived stgp
+  JOIN patient_sample ps ON stgp.sample_unique_id = ps.sample_unique_id
+  JOIN side_f sf ON sf.patient_unique_id = ps.patient_unique_id
+  WHERE stgp.cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+    AND stgp.alteration_type = 'MUTATION_EXTENDED'
+),
+profiled_counts AS (
+  SELECT side, count(DISTINCT patient_unique_id) AS profiled_patients
+  FROM profiled
+  GROUP BY side
+),
+mut AS (
+  SELECT ged.hugo_gene_symbol AS hugo_gene_symbol, ps.patient_unique_id AS patient_unique_id, sf.side AS side
+  FROM genomic_event_derived ged
+  JOIN patient_sample ps ON ged.sample_unique_id = ps.sample_unique_id
+  JOIN side_f sf ON sf.patient_unique_id = ps.patient_unique_id
+  WHERE ged.cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+    AND ged.variant_type = 'mutation'
+    AND ged.mutation_status != 'UNCALLED'
+    AND ged.off_panel = 0
+    AND ged.hugo_gene_symbol IN ('APC','TP53','KRAS','PIK3CA','BRAF','SMAD4')
+),
+mut_counts AS (
+  SELECT hugo_gene_symbol AS hugo_gene_symbol, side AS side, count(DISTINCT patient_unique_id) AS altered_patients
+  FROM mut
+  GROUP BY hugo_gene_symbol, side
+)
+SELECT mc.hugo_gene_symbol AS gene, mc.side AS side, mc.altered_patients AS altered_patients, pc.profiled_patients AS profiled_patients,
+       round(mc.altered_patients * 100.0 / pc.profiled_patients, 1) AS pct
+FROM mut_counts mc
+JOIN profiled_counts pc ON mc.side = pc.side
+ORDER BY gene, side
+"
+}
+
+◀ result
+{"rows":[{"gene":"APC","side":"Left","altered_patients":199,"profiled_patients":254,"pct":78.3},{"gene":"APC","side":"Right","altered_patients":112,"profiled_patients":170,"pct":65.9},{"gene":"BRAF","side":"Left","altered_patients":10,"profiled_patients":254,"pct":3.9},{"gene":"BRAF","side":"Right","altered_patients":40,"profiled_patients":170,"pct":23.5},{"gene":"KRAS","side":"Left","altered_patients":83,"profiled_patients":254,"pct":32.7},{"gene":"KRAS","side":"Right","altered_patients":82,"profiled_patients":170,"pct":48.2},{"gene":"PIK3CA","side":"Left","altered_patients":45,"profiled_patients":254,"pct":17.7},{"gene":"PIK3CA","side":"Right","altered_patients":62,"profiled_patients":170,"pct":36.5},{"gene":"SMAD4","side":"Left","altered_patients":29,"profiled_patients":254,"pct":11.4},{"gene":"SMAD4","side":"Right","altered_patients":25,"profiled_patients":170,"pct":14.7},{"gene":"TP53","side":"Left","altered_patients":174,"profiled_patients":254,"pct":68.5},{"gene":"TP53","side":"Right","altered_patients":88,"profiled_patients":170,"pct":51.8}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "coadread_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"coadread_tcga_pan_can_atlas_2018","name":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":594,"studyViewUrl":"https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["coadread_tcga_pan_can_atlas_2018_gistic","coadread_tcga_pan_can_atlas_2018_log2CNA","coadread_tcga_pan_can_atlas_2018_mutations","coadread_tcga_pan_can_atlas_2018_protein_quantification","coadread_tcga_pan_can_atlas_2018_protein_quantification_zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","coadread_tcga_pan_can_atlas_2018_rppa","coadread_tcga_pan_can_atlas_2018_rppa_Zscores","coadread_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["coadread_tcga_pan_can_atlas_2018_armlevel_cna","coadread_tcga_pan_can_atlas_2018_genetic_ancestry","coadread_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","coadread_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["coadread_tcga_pan_can_atlas_2018_protein_quantification_zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","coadread_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_c … (70 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT hugo_gene_symbol, count(DISTINCT patient_unique_id) as tp53
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018' LIMIT 1
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 215\n Code: 215. DB::Exception: Column 'cbioportal_public_librechat_blue.genomic_event_derived.hugo_gene_symbol' is not under aggregate function and not in GROUP BY keys. In query SELECT hugo_gene_symbol, countDistinct(patient_unique_id) AS tp53 FROM genomic_event_derived WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018' LIMIT 1. (NOT_AN_AGGREGATE) (version 26.4.1.2359 (official build))\n"}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "coadread_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "Right-sided (cecum/ascending/hepatic flexure)",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "ICD_O_3_SITE",
+      "values": [
+       {
+        "value": "C18.0"
+       },
+       {
+        "value": "C18.2"
+       },
+       {
+        "value": "C18.3"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Left-sided (splenic flexure/descending/sigmoid/rectosigmoid/rectum)",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "ICD_O_3_SITE",
+      "values": [
+       {
+        "value": "C18.5"
+       },
+       {
+        "value": "C18.6"
+       },
+       {
+        "value": "C18.7"
+       },
+       {
+        "value": "C19.9"
+       },
+       {
+        "value": "C20.9"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "alterations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/alterations?comparisonId=6ab5b1a0c2115c492d884dc5","url":"https://www.cbioportal.org/comparison/alterations?comparisonId=6ab5b1a0c2115c492d884dc5","data":{"description":"Group comparison (2 custom groups)","studies":["coadread_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"Right-sided (cecum/ascending/hepatic flexure)","sampleCount":191},{"name":"Left-sided (splenic flexure/descending/sigmoid/rectosigmoid/rectum)","sampleCount":280}],"studyViewUrl":"https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"Right-sided (cecum/ascending/hepatic flexure)","url":"https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22ICD_O_3_SITE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22C18.0%22%7D%2C%7B%22value%22%3A%22C18.2%22%7D%2C%7B%22value%22%3A%22C18.3%22%7D%5D%7D%5D%7D"},{"groupName":"Left-sided (splenic flexure/descending/sigmoid/rectosigmoid/rectum)","url":"https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22ICD_O_3_SITE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22C18.5%22%7D%2C%7B%22value%22%3A%22C18.6%22%7D%2C%7B%22value%22%3A%22C18.7%22%7D%2C%7B%22value%22%3A%22C19.9%22%7D%2C%7B%22value%22%3A%22C20.9%22%7D%5D%7D%5D%7D"}],"pageDescription":"Comparison of genomic alteration rates across Right-sided (cecum/ascending/hepatic flexure) (191) vs Left-sided (splenic flexure/descending/sigmoid/rectosigmoid/rectum) (280)."}}
+
+═ answer (success)
+## Left- vs. Right-Sided Colorectal Cancer — Mutation Frequency
+
+**Cohort:** [Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=coadread_tcga_pan_can_atlas_2018) — 594 patients total. Sidedness is not a direct attribute in this study; I derived it from the tumor subsite code (`ICD_O_3_SITE`, per the study's curated mapping):
+
+- **Right-sided (proximal):** cecum, ascending colon, hepatic flexure — **170 mutation-profiled patients**
+- **Left-sided (distal):** splenic flexure, descending colon, sigmoid, rectosigmoid, rectum — **254 mutation-profiled patients**
+- Excluded: transverse colon (20 patients, transitional zone), and 103 patients with only a non-specific "colon NOS" code (side unknown)
+
+Counting unit: **patients**, mutated / mutation-profiled patients on each side (panel-aware denominators).
+
+| Gene | Right-sided | Left-sided | Difference (pp) |
+|---|---|---|---|
+| **BRAF** | 40/170 = **23.5%** | 10/254 = **3.9%** | +19.6 (right higher) |
+| **KRAS** | 82/170 = **48.2%** | 83/254 = **32.7%** | +15.5 (right higher) |
+| **PIK3CA** | 62/170 = **36.5%** | 45/254 = **17.7%** | +18.8 (right higher) |
+| **APC** | 112/170 = **65.9%** | 199/254 = **78.3%** | −12.4 (left higher) |
+| **TP53** | 88/170 = **51.8%** | 174/254 = **68.5%** | −16.7 (left higher) |
+| **SMAD4** | 25/170 = **14.7%** | 29/254 = **11.4%** | +3.3 (right slightly higher) |
+
+**Pattern:** BRAF, KRAS, and PIK3CA mutations are notably more frequent in right-sided tumors, while APC and TP53 are more frequent in left-sided tumors — consistent with the right side's higher prevalence of MSI/serrated-pathway tumors and the left side's higher rate of classic chromosomal-instability (APC→TP53) carcinogenesis in this cohort. This is descriptive; I have not run a statistical test. Each of these is a 2×2 alteration comparison — the appropriate test is **Fisher's exact** (two-tailed), which you can run directly in the Group Comparison tab below (or via `scipy.stats.fisher_exact` / R `fisher.test`), including automatic multiple-testing correction across genes.
+
+**[Open full alteration-frequency comparison (Right vs. Left) in cBioPortal](https://www.cbioportal.org/comparison/alterations?comparisonId=6ab5b1a0c2115c492d884dc5)**
+Comparison of genomic alteration rates across Right-sided (191 samples) vs. Left-sided (280 samples) — includes Fisher's exact p-values/q-values for every altered gene, not just the six above, plus an Enrichment view.
+
+You can also inspect each group's cohort directly in Study View: [Right-sided group](https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22ICD_O_3_SITE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22C18.0%22%7D%2C%7B%22value%22%3A%22C18.2%22%7D%2C%7B%22value%22%3A%22C18.3%22%7D%5D%7D%5D%7D) | [Left-sided group](https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22ICD_O_3_SITE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22C18.5%22%7D%2C%7B%22value%22%3A%22C18.6%22%7D%2C%7B%22value%22%3A%22C18.7%22%7D%2C%7B%22value%22%3A%22C19.9%22%7D%2C%7B%22value%22%3A%22C20.9%22%7D%5D%7D%5D%7D)

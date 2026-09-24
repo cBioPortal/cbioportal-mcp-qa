@@ -1,0 +1,485 @@
+Q (sonnet): Are there differences in chromosome arm 7p copy number between lower grade glioma molecular subtypes?
+
+▶ list_guides
+{}
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ list_studies
+{
+ "search": "lower grade glioma"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"}]}
+
+▶ get_study_guide
+{
+ "study_id": "lgg_tcga_pan_can_atlas_2018"
+}
+
+◀ result
+# Study Guide: Brain Lower Grade Glioma (TCGA, PanCancer Atlas)
+
+**Study ID:** `lgg_tcga_pan_can_atlas_2018`
+**Cancer Type:** difg
+**Description:** Brain Lower Grade Glioma TCGA PanCancer data. The original data is <a href="https://gdc.cancer.gov/about-data/publications/pancanatlas">here</a>. The publications are <a href="https://www.cell.com/pb-assets/consortium/pancanceratlas/pancani3/index.html">here</a>.
+
+## Cohort Statistics
+- **Patients:** 514
+- **Samples:** 515
+
+## Available Data Types
+
+- **PROTEIN_LEVEL**: Protein expression (RPPA)
+- **PROTEIN_LEVEL**: Protein expression z-scores (RPPA)
+- **COPY_NUMBER_ALTERATION**: Putative copy-number alterations from GISTIC
+- **COPY_NUMBER_ALTERATION**: Log2 copy-number values
+- **GENERIC_ASSAY**: Putative arm-level copy-number from GISTIC
+- **MUTATION_EXTENDED**: Mutations
+- **STRUCTURAL_VARIANT**: Structural variants
+- **GENERIC_ASSAY**: Methylation (HM450)
+- **GENERIC_ASSAY**: Methylation (HM27 and HM450 merge)
+- **MRNA_EXPRESSION**: mRNA Expression, RSEM (Batch normalized from Illumina HiSeq_RNASeqV2)
+- **MRNA_EXPRESSION**: mRNA expression z-scores relative to diploid samples (RNA Seq V2 RSEM)
+- **MRNA_EXPRESSION**: mRNA expression z-scores relative to all samples (log RNA Seq V2 RSEM)
+- **GENERIC_ASSAY**: Genetic Ancestry
+
+## Gene Panels
+
+- **WES** (Whole Exome): 514 samples — all genes profiled
+
+## Available Clinical Attributes
+
+| Attribute | Samples with Data |
+|-----------|------------------|
+| MUTATION_COUNT | 514 |
+| TBL_SCORE | 514 |
+| CANCER_TYPE | 514 |
+| TMB_NONSYNONYMOUS | 514 |
+| MSI_SENSOR_SCORE | 514 |
+| TISSUE_SOURCE_SITE | 514 |
+| TISSUE_SOURCE_SITE_CODE | 514 |
+| SAMPLE_TYPE | 514 |
+| MSI_SCORE_MANTIS | 514 |
+| ONCOTREE_CODE | 514 |
+| TISSUE_PROSPECTIVE_COLLECTION_INDICATOR | 514 |
+| SOMATIC_STATUS | 514 |
+| TUMOR_TYPE | 514 |
+| ANEUPLOIDY_SCORE | 514 |
+| CANCER_TYPE_DETAILED | 514 |
+| TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR | 514 |
+| TUMOR_TISSUE_SITE | 514 |
+| FRACTION_GENOME_ALTERED | 514 |
+| GRADE | 514 |
+| ETHNICITY | 1 |
+
+## Top Mutated Genes
+
+| Gene | Altered Samples |
+|------|----------------|
+| IDH1 | 395 |
+| TP53 | 249 |
+| ATRX | 194 |
+| CIC | 108 |
+| TTN | 62 |
+| FUBP1 | 48 |
+| PIK3CA | 42 |
+| NOTCH1 | 38 |
+| MUC16 | 36 |
+| EGFR | 35 |
+
+## Sample Types
+
+- **Primary**: 514 samples
+
+## Query Tips for lgg_tcga_pan_can_atlas_2018
+
+```sql
+-- Get all samples in this study
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018';
+
+-- Get mutations for a specific gene
+SELECT sample_unique_id, hugo_gene_symbol, mutation_variant, mutation_type
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND hugo_gene_symbol = 'TP53'
+    AND variant_type = 'mutation';
+
+-- Get clinical data for specific attributes
+SELECT sample_unique_id, attribute_name, attribute_value
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND a … (66 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT attribute_name FROM clinical_data_derived WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018' AND (attribute_name ILIKE '%SUBTYPE%' OR attribute_name ILIKE '%IDH%' OR attribute_name ILIKE '%CODEL%' OR attribute_name ILIKE '%1P%' OR attribute_name ILIKE '%19Q%')"
+}
+
+◀ result
+{"rows":[{"attribute_name":"SUBTYPE"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "generic_assay_meta_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "generic_assay_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"entity_stable_id","type":"String"},{"name":"entity_type","type":"LowCardinality(String)"},{"name":"properties","type":"Map(String, String)"}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"genetic_entity_id","type":"String"},{"name":"value","type":"String"},{"name":"generic_assay_type","type":"String"},{"name":"profile_stable_id","type":"String"},{"name":"entity_stable_id","type":"String"},{"name":"datatype","type":"String"},{"name":"patient_level","type":"Decimal(10, 0)"},{"name":"profile_type","type":"String"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_value, count() FROM clinical_data_derived WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018' AND attribute_name = 'SUBTYPE' GROUP BY attribute_value ORDER BY count() DESC"
+}
+
+◀ result
+{"rows":[{"attribute_value":"LGG_IDHmut-non-codel","count()":248},{"attribute_value":"LGG_IDHmut-codel","count()":167},{"attribute_value":"LGG_IDHwt","count()":92},{"count()":7}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type, generic_assay_type FROM generic_assay_data_derived WHERE profile_type ILIKE '%arm%' LIMIT 20"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT entity_stable_id, entity_type, properties FROM generic_assay_meta_derived WHERE entity_type = 'ARM_LEVEL_CNA' AND (entity_stable_id ILIKE '%7p%') LIMIT 20"
+}
+
+◀ result
+{"rows":[{"profile_type":"armlevel_cna","generic_assay_type":"ARMLEVEL_CNA"}]}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT entity_type FROM generic_assay_meta_derived LIMIT 20"
+}
+
+◀ result
+{"rows":[{"entity_type":"GENERIC_ASSAY"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT entity_stable_id FROM generic_assay_data_derived WHERE profile_type = 'armlevel_cna' AND entity_stable_id ILIKE '%7p%'"
+}
+
+◀ result
+{"rows":[{"entity_stable_id":"17p_status"},{"entity_stable_id":"7p_status"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT value, count() FROM generic_assay_data_derived WHERE profile_type = 'armlevel_cna' AND entity_stable_id = '7p_status' GROUP BY value ORDER BY count() DESC"
+}
+
+◀ result
+{"rows":[{"value":"Unchanged","count()":36139},{"value":"Gain","count()":14706},{"value":"Loss","count()":9668},{"value":"NA","count()":4827}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT sample_unique_id FROM generic_assay_data_derived WHERE profile_type = 'armlevel_cna' AND entity_stable_id = '7p_status' LIMIT 3"
+}
+
+◀ result
+{"rows":[{"sample_unique_id":"meso_tcga_pan_can_atlas_2018_TCGA-3H-AB3K-01"},{"sample_unique_id":"meso_tcga_pan_can_atlas_2018_TCGA-3H-AB3L-01"},{"sample_unique_id":"meso_tcga_pan_can_atlas_2018_TCGA-3H-AB3M-01"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH subtype AS (
+    SELECT sample_unique_id, attribute_value AS subtype
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+      AND attribute_name = 'SUBTYPE'
+      AND attribute_value != ''
+),
+arm7p AS (
+    SELECT sample_unique_id, value AS status_7p
+    FROM generic_assay_data_derived
+    WHERE profile_type = 'armlevel_cna'
+      AND entity_stable_id = '7p_status'
+      AND sample_unique_id LIKE 'lgg_tcga_pan_can_atlas_2018_%'
+)
+SELECT s.subtype, a.status_7p, count() AS n
+FROM subtype s
+INNER JOIN arm7p a USING (sample_unique_id)
+GROUP BY s.subtype, a.status_7p
+ORDER BY s.subtype, a.status_7p
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT sample_unique_id FROM clinical_data_derived WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018' AND attribute_name = 'SUBTYPE' LIMIT 5"
+}
+
+◀ result
+{"rows":[{}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT sample_unique_id FROM generic_assay_data_derived WHERE profile_type = 'armlevel_cna' AND entity_stable_id = '7p_status' AND sample_unique_id LIKE '%lgg%' LIMIT 5"
+}
+
+◀ result
+{"rows":[{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4938-01"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4941-01"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4942-01"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4943-01"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4944-01"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH subtype AS (
+    SELECT patient_unique_id, attribute_value AS subtype
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+      AND attribute_name = 'SUBTYPE'
+      AND attribute_value != ''
+),
+arm7p AS (
+    SELECT patient_unique_id, sample_unique_id, value AS status_7p
+    FROM generic_assay_data_derived
+    WHERE profile_type = 'armlevel_cna'
+      AND entity_stable_id = '7p_status'
+      AND sample_unique_id LIKE 'lgg_tcga_pan_can_atlas_2018_%'
+)
+SELECT s.subtype, a.status_7p, count() AS n
+FROM subtype s
+INNER JOIN arm7p a USING (patient_unique_id)
+GROUP BY s.subtype, a.status_7p
+ORDER BY s.subtype, a.status_7p
+"
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHmut-codel","status_7p":"Gain","n":8},{"subtype":"LGG_IDHmut-codel","status_7p":"NA","n":3},{"subtype":"LGG_IDHmut-codel","status_7p":"Unchanged","n":156},{"subtype":"LGG_IDHmut-non-codel","status_7p":"Gain","n":29},{"subtype":"LGG_IDHmut-non-codel","status_7p":"NA","n":5},{"subtype":"LGG_IDHmut-non-codel","status_7p":"Unchanged","n":214},{"subtype":"LGG_IDHwt","status_7p":"Gain","n":59},{"subtype":"LGG_IDHwt","status_7p":"NA","n":3},{"subtype":"LGG_IDHwt","status_7p":"Unchanged","n":30}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","sampleCount":514,"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["lgg_tcga_pan_can_atlas_2018_gistic","lgg_tcga_pan_can_atlas_2018_log2CNA","lgg_tcga_pan_can_atlas_2018_mutations","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa","lgg_tcga_pan_can_atlas_2018_rppa_Zscores","lgg_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["lgg_tcga_pan_can_atlas_2018_armlevel_cna","lgg_tcga_pan_can_atlas_2018_genetic_ancestry","lgg_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","lgg_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "lgg_tcga_pan_can_atlas_2018",
+ "attributeIds": [
+  "SUBTYPE"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"lgg_tcga_pan_can_atlas_2018","attributes":[{"attributeId":"SUBTYPE","displayName":"Subtype","description":"Subtype","datatype":"STRING","values":["NA","LGG_IDHwt","LGG_IDHmut-non-codel","LGG_IDHmut-codel"]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "generic_assay_armlevel_cna",
+ "groups": [
+  {
+   "name": "IDHwt",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHwt"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "IDHmut-non-codel",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHmut-non-codel"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "IDHmut-codel",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHmut-codel"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/generic_assay_armlevel_cna?comparisonId=6a43dedf1c2565a03eaeb2d2","url":"https://www.cbioportal.org/comparison/generic_assay_armlevel_cna?comparisonId=6a43dedf1c2565a03eaeb2d2","data":{"description":"Group comparison (3 custom groups)","studies":["lgg_tcga_pan_can_atlas_2018"],"totalGroups":3,"groups":[{"name":"IDHwt","sampleCount":92},{"name":"IDHmut-non-codel","sampleCount":248},{"name":"IDHmut-codel","sampleCount":167}],"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"IDHwt","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHwt%22%7D%5D%7D%5D%7D"},{"groupName":"IDHmut-non-codel","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHmut-non-codel%22%7D%5D%7D%5D%7D"},{"groupName":"IDHmut-codel","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHmut-codel%22%7D%5D%7D%5D%7D"}],"pageDescription":"Chromosome arm-level CNA enrichment — arms ranked by differential gain/loss frequency across groups."}}
+
+═ answer (success)
+## Summary
+
+Using the [Brain Lower Grade Glioma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018) cohort (514 patients), split by the three curated molecular subtypes (*IDH*-wildtype, *IDH*-mutant/non-codel, *IDH*-mutant/1p19q-codel), chromosome 7p arm-level status differs substantially:
+
+| Subtype | 7p Gain | 7p Unchanged | Profiled (n) | % Gain |
+|---|---|---|---|---|
+| IDHwt | 59 | 30 | 89 | 66.3% |
+| IDHmut-non-codel | 29 | 214 | 243 | 11.9% |
+| IDHmut-codel | 8 | 156 | 164 | 4.9% |
+
+No patients in this cohort showed 7p loss; the remainder were "Unchanged" or not callable (NA, excluded from the denominators above). Two-thirds of *IDH*-wildtype tumors carry 7p gain, versus roughly 1 in 10 *IDH*-mutant, non-codeleted tumors and 1 in 20 codeleted oligodendrogliomas — the largest contrast is between IDH-wildtype and either IDH-mutant group.
+
+This is a 3-group categorical comparison, so a **chi-squared test** is the appropriate statistic (I have not computed a p-value — ClickHouse cannot run this test). You can get it via `chisq.test()` in R, `scipy.stats.chi2_contingency()` in Python, or directly in the Group Comparison tool linked below, which reports enrichment statistics automatically for every chromosome arm.
+
+**[Chr 7p (and all other arm-level CNAs) by LGG Subtype — Group Comparison](https://www.cbioportal.org/comparison/generic_assay_armlevel_cna?comparisonId=6a43dedf1c2565a03eaeb2d2)**
+Chromosome arm-level CNA enrichment — arms ranked by differential gain/loss frequency across the three subtype groups (IDHwt: 92 samples, IDHmut-non-codel: 248, IDHmut-codel: 167).
+
+You can also browse the underlying cohort filtered by subtype in [Study View](https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018).

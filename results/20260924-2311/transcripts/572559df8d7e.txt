@@ -1,0 +1,1239 @@
+Q (sonnet): How does overall survival compare between prostate cancer patients where TMPRSS2 is acting as the upstream donor to an ERG fusion event and patients without this fusion?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ list_guides
+{}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://common-pitfalls"
+}
+
+▶ list_studies
+{
+ "search": "prostate"
+}
+
+◀ result
+# Common Query Pitfalls Guide
+
+## Overview
+This guide highlights frequent mistakes when analyzing cBioPortal data and provides solutions to avoid them.
+
+## Critical Pitfalls
+
+### 1. 🚨 CRITICAL MUTATION FREQUENCY ERRORS
+
+#### ❌ WRONG: Using study-wide totals for gene frequencies
+```sql
+-- INCORRECT - This gives wrong frequencies!
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples,
+    (SELECT COUNT(DISTINCT sample_unique_id)
+     FROM genomic_event_derived
+     WHERE cancer_study_identifier = 'your_study_id') as total_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND cancer_study_identifier = 'your_study_id'
+GROUP BY hugo_gene_symbol;
+```
+**Problem**: Different genes have different profiling coverage - you can't use study-wide totals!
+
+#### ❌ WRONG: Not using gene-specific profiling denominators
+```sql
+-- INCORRECT - Missing gene-specific denominators
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+GROUP BY hugo_gene_symbol;
+-- Missing: WHERE ARE THE DENOMINATORS FOR EACH GENE?
+```
+
+#### ❌ WRONG: Skipping individual gene profiling queries
+**Problem**: Failing to run separate profiling queries for EACH gene in results.
+**Each gene has different coverage**: TP53 might be profiled in 25,040 samples, MUC16 in 23,000, etc.
+
+#### ✅ CORRECT: Complete gene-specific workflow
+```sql
+-- STEP 1: Get altered counts per gene
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id,
+    COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
+    COUNT(*) AS totalMutationEvents
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY entrez_gene_id, hugo_gene_symbol
+ORDER BY numberOfAlteredSamplesOnPanel DESC;
+
+-- STEP 2: FOR EACH GENE, run this profiling query:
+SELECT COUNT(DISTINCT stgp.sample_unique_id) AS numberOfProfiledSamples
+FROM sample_to_gene_panel_derived stgp
+JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+  AND g.hugo_gene_symbol = 'TP53'  -- Replace with each gene from Step 1
+  AND stgp.cancer_study_identifier = 'your_study_id';
+
+-- STEP 3: Calculate frequency = numberOfAlteredSamplesOnPanel / numberOfProfiledSamples * 100
+```
+
+#### 🚨 WORKFLOW REQUIREMENTS VIOLATIONS:
+- **Missing denominator columns**: Must show gene-specific profiled samples per row
+- **Wrong table format**: Should be | Gene | # Mutations | # Samples | Profiled Samples | Sample % |
+- **Not replacing gene symbols**: Must replace 'TP53' with actual gene for each query
+- **Using study totals**: Never use genomic_event_derived for total sample counts
+
+### 2. 🚨 OFF-PANEL MUTATION INCLUSION
+
+#### ❌ Wrong: Including off-panel mutations
+```sql
+-- INCORRECT - Includes mutations outside gene panels
+SELEC … (37891 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"prostate_msk_2024","name":"Prostate Cancer (MSK, Clin Cancer Res 2024)","type_of_cancer_id":"prostate","sample_count":2260,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prostate_msk_2024"},{"cancer_study_identifier":"prad_msk_stopsack_2021","name":"Race Differences in Prostate Cancer (MSK, 2021)","type_of_cancer_id":"prad","sample_count":2069,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_msk_stopsack_2021"},{"cancer_study_identifier":"prad_cdk12_mskcc_2020","name":"Prostate Adenocarcinoma (MSK, Eur Urol 2020)","type_of_cancer_id":"prad","sample_count":1465,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_cdk12_mskcc_2020"},{"cancer_study_identifier":"prad_pik3r1_msk_2021","name":"Prostate Adenocarcinoma (MSK, Clin Cancer Res. 2022)","type_of_cancer_id":"prad","sample_count":1417,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_pik3r1_msk_2021"},{"cancer_study_identifier":"prad_p1000","name":"Prostate Adenocarcinoma (MSK/DFCI, Nature Genetics 2018)","type_of_cancer_id":"prad","sample_count":1013,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_p1000"},{"cancer_study_identifier":"prad_mskcc_2017","name":"Prostate Cancer (MSK, JCO Precis Oncol 2017)","type_of_cancer_id":"prad","sample_count":504,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_mskcc_2017"},{"cancer_study_identifier":"prad_tcga","name":"Prostate Adenocarcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"prad","sample_count":501,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_tcga"},{"cancer_study_identifier":"prad_tcga_gdc","name":"Prostate Adenocarcinoma (TCGA GDC, 2025)","type_of_cancer_id":"prad","sample_count":501,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_tcga_gdc"},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018","name":"Prostate Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"prad","sample_count":494,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"prad_cpcg_2017","name":"Prostate Adenocarcinoma (CPC-GENE, Nature 2017)","type_of_cancer_id":"prad","sample_count":477,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_cpcg_2017"},{"cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","type_of_cancer_id":"prad","sample_count":444,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_su2c_2019"},{"cancer_study_identifier":"prad_mcspc_mskcc_2020","name":"Metastatic castration-sensitive prostate cancer (MSK, Clin Cancer R … (1820 more chars)
+
+▶ get_study_guide
+{
+ "study_id": "prad_tcga_pan_can_atlas_2018"
+}
+
+◀ result
+# Study Guide: Prostate Adenocarcinoma (TCGA, PanCancer Atlas)
+
+**Study ID:** `prad_tcga_pan_can_atlas_2018`
+**Cancer Type:** prad
+**Description:** Prostate Adenocarcinoma TCGA PanCancer data. The original data is <a href="https://gdc.cancer.gov/about-data/publications/pancanatlas">here</a>. The publications are <a href="https://www.cell.com/pb-assets/consortium/pancanceratlas/pancani3/index.html">here</a>.
+
+## Cohort Statistics
+- **Patients:** 494
+- **Samples:** 495
+
+## Available Data Types
+
+- **PROTEIN_LEVEL**: Protein expression (RPPA)
+- **PROTEIN_LEVEL**: Protein expression z-scores (RPPA)
+- **COPY_NUMBER_ALTERATION**: Putative copy-number alterations from GISTIC
+- **COPY_NUMBER_ALTERATION**: Log2 copy-number values
+- **GENERIC_ASSAY**: Putative arm-level copy-number from GISTIC
+- **MUTATION_EXTENDED**: Mutations
+- **STRUCTURAL_VARIANT**: Structural variants
+- **GENERIC_ASSAY**: Methylation (HM450)
+- **GENERIC_ASSAY**: Methylation (HM27 and HM450 merge)
+- **MRNA_EXPRESSION**: mRNA Expression, RSEM (Batch normalized from Illumina HiSeq_RNASeqV2)
+- **MRNA_EXPRESSION**: mRNA expression z-scores relative to diploid samples (RNA Seq V2 RSEM)
+- **MRNA_EXPRESSION**: mRNA expression z-scores relative to all samples (log RNA Seq V2 RSEM)
+- **MRNA_EXPRESSION**: mRNA expression z-scores relative to normal samples (log RNA Seq V2 RSEM)
+- **GENERIC_ASSAY**: Genetic Ancestry
+
+## Gene Panels
+
+- **WES** (Whole Exome): 494 samples — all genes profiled
+
+## Available Clinical Attributes
+
+| Attribute | Samples with Data |
+|-----------|------------------|
+| MUTATION_COUNT | 494 |
+| TBL_SCORE | 494 |
+| CANCER_TYPE | 494 |
+| TMB_NONSYNONYMOUS | 494 |
+| MSI_SENSOR_SCORE | 494 |
+| TISSUE_SOURCE_SITE | 494 |
+| TISSUE_SOURCE_SITE_CODE | 494 |
+| SAMPLE_TYPE | 494 |
+| MSI_SCORE_MANTIS | 494 |
+| ONCOTREE_CODE | 494 |
+| TISSUE_PROSPECTIVE_COLLECTION_INDICATOR | 494 |
+| SOMATIC_STATUS | 494 |
+| TUMOR_TYPE | 494 |
+| ANEUPLOIDY_SCORE | 494 |
+| CANCER_TYPE_DETAILED | 494 |
+| TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR | 494 |
+| TUMOR_TISSUE_SITE | 494 |
+| FRACTION_GENOME_ALTERED | 494 |
+| GRADE | 494 |
+| ETHNICITY | 1 |
+
+## Top Mutated Genes
+
+| Gene | Altered Samples |
+|------|----------------|
+| TP53 | 57 |
+| SPOP | 55 |
+| TTN | 54 |
+| MUC16 | 31 |
+| FOXA1 | 28 |
+| KMT2D | 28 |
+| KMT2C | 25 |
+| SPTA1 | 23 |
+| SYNE1 | 23 |
+| LRP1B | 22 |
+
+## Sample Types
+
+- **Primary**: 494 samples
+
+## Query Tips for prad_tcga_pan_can_atlas_2018
+
+```sql
+-- Get all samples in this study
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018';
+
+-- Get mutations for a specific gene
+SELECT sample_unique_id, hugo_gene_symbol, mutation_variant, mutation_type
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+    AND hugo_gene_symbol = 'TP53'
+    AND variant_type = 'mutation';
+
+-- Get clinical data for specific attributes
+SELECT sample_unique_id, attribute_name, attribute_value
+F … (164 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "structural_variant"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int64"},{"name":"genetic_profile_id","type":"Int64"},{"name":"sample_id","type":"Int64"},{"name":"site1_entrez_gene_id","type":"Nullable(Int64)"},{"name":"site1_ensembl_transcript_id","type":"Nullable(String)"},{"name":"site1_chromosome","type":"Nullable(String)"},{"name":"site1_region","type":"Nullable(String)"},{"name":"site1_region_number","type":"Nullable(Int64)"},{"name":"site1_contig","type":"Nullable(String)"},{"name":"site1_position","type":"Nullable(Int64)"},{"name":"site1_description","type":"Nullable(String)"},{"name":"site2_entrez_gene_id","type":"Nullable(Int64)"},{"name":"site2_ensembl_transcript_id","type":"Nullable(String)"},{"name":"site2_chromosome","type":"Nullable(String)"},{"name":"site2_region","type":"Nullable(String)"},{"name":"site2_region_number","type":"Nullable(Int64)"},{"name":"site2_contig","type":"Nullable(String)"},{"name":"site2_position","type":"Nullable(Int64)"},{"name":"site2_description","type":"Nullable(String)"},{"name":"site2_effect_on_frame","type":"Nullable(String)"},{"name":"ncbi_build","type":"Nullable(String)"},{"name":"dna_support","type":"Nullable(String)"},{"name":"rna_support","type":"Nullable(String)"},{"name":"normal_read_count","type":"Nullable(Int64)"},{"name":"tumor_read_count","type":"Nullable(Int64)"},{"name":"normal_variant_count","type":"Nullable(Int64)"},{"name":"tumor_variant_count","type":"Nullable(Int64)"},{"name":"normal_paired_end_read_count","type":"Nullable(Int64)"},{"name":"tumor_paired_end_read_count","type":"Nullable(Int64)"},{"name":"normal_split_read_count","type":"Nullable(Int64)"},{"name":"tumor_split_read_count","type":"Nullable(Int64)"},{"name":"annotation","type":"Nullable(String)"},{"name":"breakpoint_type","type":"Nullable(String)"},{"name":"connection_type","type":"Nullable(String)"},{"name":"event_info","type":"Nullable(String)"},{"name":"class","type":"Nullable(String)"},{"name":"length","type":"Nullable(Int64)"},{"name":"comments","type":"Nullable(String)"},{"name":"sv_status","type":"String"},{"name":"annotation_json","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT sv.internal_id, sv.sample_id,
+       g1.hugo_gene_symbol AS site1_gene, g2.hugo_gene_symbol AS site2_gene,
+       sv.event_info, sv.sv_status, s.stable_id AS sample_stable_id
+FROM structural_variant sv
+JOIN sample s ON sv.sample_id = s.internal_id
+JOIN patient p ON s.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+LEFT JOIN gene g1 ON sv.site1_entrez_gene_id = g1.entrez_gene_id
+LEFT JOIN gene g2 ON sv.site2_entrez_gene_id = g2.entrez_gene_id
+WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+  AND (g1.hugo_gene_symbol = 'TMPRSS2' OR g2.hugo_gene_symbol = 'TMPRSS2'
+       OR g1.hugo_gene_symbol = 'ERG' OR g2.hugo_gene_symbol = 'ERG')
+LIMIT 50
+"
+}
+
+◀ result
+{"rows":[{"sv.internal_id":313068,"sample_id":739001,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-2A-A8VL-01"},{"sv.internal_id":313072,"sample_id":739003,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-2A-A8VT-01"},{"sv.internal_id":313079,"sample_id":739004,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-2A-A8VV-01"},{"sv.internal_id":313102,"sample_id":739010,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-2A-AAYU-01"},{"sv.internal_id":313108,"sample_id":739011,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-4L-AA1F-01"},{"sv.internal_id":313120,"sample_id":739014,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5739-01"},{"sv.internal_id":313122,"sample_id":739014,"site1_gene":"ERG","site2_gene":"PLEKHH1","event_info":"ERG-PLEKHH1 fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5739-01"},{"sv.internal_id":313126,"sample_id":739015,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5740-01"},{"sv.internal_id":313136,"sample_id":739016,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5741-01"},{"sv.internal_id":313139,"sample_id":739017,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5743-01"},{"sv.internal_id":313140,"sample_id":739018,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5744-01"},{"sv.internal_id":313150,"sample_id":739018,"site1_gene":"ERG","site2_gene":"CDHR2","event_info":"ERG-CDHR2 fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5744-01"},{"sv.internal_id":313158,"sample_id":739020,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5746-01"},{"sv.internal_id":313180,"sample_id":739024,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5752-01"},{"sv.internal_id":313183,"sample_id":739026,"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5754-01"},{"sv.internal_id":313193,"sample_id":739028,"site1_gene":"TMPRSS2","site2_gene":"MORC3","event_info":"TMPRSS2-MORC3 fusion","sv_status":"SOMATIC","sample_stable_id":"TCGA-CH-5762-01"},{"sv.internal_id":313195,"sample_id":739029,"site1_gene":"TMPRSS2","site2_gene":"ETV4","event_info":"TMPRSS2-ET … (6020 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH fusion_patients AS (
+    SELECT DISTINCT p.stable_id AS patient_stable_id
+    FROM structural_variant sv
+    JOIN sample s ON sv.sample_id = s.internal_id
+    JOIN patient p ON s.patient_id = p.internal_id
+    JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+    LEFT JOIN gene g1 ON sv.site1_entrez_gene_id = g1.entrez_gene_id
+    LEFT JOIN gene g2 ON sv.site2_entrez_gene_id = g2.entrez_gene_id
+    WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+      AND g1.hugo_gene_symbol = 'TMPRSS2' AND g2.hugo_gene_symbol = 'ERG'
+      AND sv.sv_status = 'SOMATIC'
+),
+all_sv_profiled_patients AS (
+    -- patients profiled for structural variants (denominator context)
+    SELECT DISTINCT p.stable_id AS patient_stable_id
+    FROM sample_profile sp
+    JOIN genetic_profile gp ON sp.genetic_profile_id = gp.genetic_profile_id
+    JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+    JOIN sample s ON sp.sample_id = s.internal_id
+    JOIN patient p ON s.patient_id = p.internal_id
+    WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+      AND gp.generic_assay_type = ''
+      AND gp.genetic_alteration_type = 'STRUCTURAL_VARIANT'
+)
+SELECT
+  (SELECT count() FROM fusion_patients) AS n_fusion_patients,
+  (SELECT count() FROM all_sv_profiled_patients) AS n_sv_profiled_patients
+"
+}
+
+◀ result
+{"rows":[{"n_fusion_patients":189,"n_sv_profiled_patients":0}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_profile"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "sample_profile"
+}
+
+◀ result
+{"columns":[{"name":"genetic_profile_id","type":"Int64"},{"name":"stable_id","type":"String"},{"name":"cancer_study_id","type":"Int64"},{"name":"genetic_alteration_type","type":"String"},{"name":"generic_assay_type","type":"Nullable(String)"},{"name":"datatype","type":"String"},{"name":"name","type":"String"},{"name":"description","type":"Nullable(String)"},{"name":"show_profile_in_analysis_tab","type":"Int32"},{"name":"pivot_threshold","type":"Nullable(Float64)"},{"name":"sort_order","type":"Nullable(String)"},{"name":"patient_level","type":"Nullable(Int32)"}]}
+
+◀ result
+{"columns":[{"name":"sample_id","type":"Int64"},{"name":"genetic_profile_id","type":"Int64"},{"name":"panel_id","type":"Nullable(Int64)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sv_profiled_patients AS (
+    SELECT DISTINCT p.stable_id AS patient_stable_id
+    FROM sample_profile sp
+    JOIN genetic_profile gp ON sp.genetic_profile_id = gp.genetic_profile_id
+    JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+    JOIN sample s ON sp.sample_id = s.internal_id
+    JOIN patient p ON s.patient_id = p.internal_id
+    WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+      AND gp.genetic_alteration_type = 'STRUCTURAL_VARIANT'
+)
+SELECT count() FROM sv_profiled_patients
+"
+}
+
+◀ result
+{"rows":[{"count()":494}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH fusion_patients AS (
+    SELECT DISTINCT p.stable_id AS patient_stable_id
+    FROM structural_variant sv
+    JOIN sample s ON sv.sample_id = s.internal_id
+    JOIN patient p ON s.patient_id = p.internal_id
+    JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+    LEFT JOIN gene g1 ON sv.site1_entrez_gene_id = g1.entrez_gene_id
+    LEFT JOIN gene g2 ON sv.site2_entrez_gene_id = g2.entrez_gene_id
+    WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+      AND g1.hugo_gene_symbol = 'TMPRSS2' AND g2.hugo_gene_symbol = 'ERG'
+      AND sv.sv_status = 'SOMATIC'
+)
+SELECT
+  multiIf(patient_unique_id IN (SELECT concat('prad_tcga_pan_can_atlas_2018_', patient_stable_id) FROM fusion_patients),
+    'TMPRSS2->ERG fusion', 'No TMPRSS2->ERG fusion') AS grp,
+  count(DISTINCT patient_unique_id) AS n_patients,
+  countIf(attribute_name='OS_STATUS' AND attribute_value = '1:DECEASED') AS n_events,
+  countIf(attribute_name='OS_STATUS' AND attribute_value = '0:LIVING') AS n_censored,
+  min(CASE WHEN attribute_name='OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS min_os_months,
+  max(CASE WHEN attribute_name='OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS max_os_months
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+  AND attribute_name IN ('OS_STATUS','OS_MONTHS')
+GROUP BY grp
+"
+}
+
+◀ result
+{"rows":[{"grp":"No TMPRSS2->ERG fusion","n_patients":305,"n_events":6,"n_censored":299,"min_os_months":0.756156097,"max_os_months":122.1685242},{"grp":"TMPRSS2->ERG fusion","n_patients":189,"n_events":4,"n_censored":185,"min_os_months":1.019166913,"max_os_months":165.1707927}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "prad_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"prad_tcga_pan_can_atlas_2018","name":"Prostate Adenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":494,"studyViewUrl":"https://www.cbioportal.org/study?id=prad_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["prad_tcga_pan_can_atlas_2018_gistic","prad_tcga_pan_can_atlas_2018_log2CNA","prad_tcga_pan_can_atlas_2018_mutations","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","prad_tcga_pan_can_atlas_2018_rppa","prad_tcga_pan_can_atlas_2018_rppa_Zscores","prad_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["prad_tcga_pan_can_atlas_2018_armlevel_cna","prad_tcga_pan_can_atlas_2018_genetic_ancestry","prad_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","prad_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","prad_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "prad_tcga_pan_can_atlas_2018",
+ "geneSpecificQueries": [
+  {
+   "hugoGeneSymbol": "TMPRSS2",
+   "profileType": "structural_variants"
+  },
+  {
+   "hugoGeneSymbol": "ERG",
+   "profileType": "structural_variants"
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"prad_tcga_pan_can_atlas_2018","geneSpecificCounts":[{"hugoGeneSymbol":"TMPRSS2","profileType":"structural_variants","bins":[]},{"hugoGeneSymbol":"ERG","profileType":"structural_variants","bins":[]}]}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT s.stable_id AS sample_stable_id
+FROM structural_variant sv
+JOIN sample s ON sv.sample_id = s.internal_id
+JOIN patient p ON s.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+LEFT JOIN gene g1 ON sv.site1_entrez_gene_id = g1.entrez_gene_id
+LEFT JOIN gene g2 ON sv.site2_entrez_gene_id = g2.entrez_gene_id
+WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+  AND g1.hugo_gene_symbol = 'TMPRSS2' AND g2.hugo_gene_symbol = 'ERG'
+  AND sv.sv_status = 'SOMATIC'
+ORDER BY sample_stable_id
+",
+ "max_rows": 300
+}
+
+◀ result
+{"rows":[{"sample_stable_id":"TCGA-2A-A8VL-01"},{"sample_stable_id":"TCGA-2A-A8VT-01"},{"sample_stable_id":"TCGA-2A-A8VV-01"},{"sample_stable_id":"TCGA-2A-AAYU-01"},{"sample_stable_id":"TCGA-4L-AA1F-01"},{"sample_stable_id":"TCGA-CH-5739-01"},{"sample_stable_id":"TCGA-CH-5740-01"},{"sample_stable_id":"TCGA-CH-5741-01"},{"sample_stable_id":"TCGA-CH-5743-01"},{"sample_stable_id":"TCGA-CH-5744-01"},{"sample_stable_id":"TCGA-CH-5746-01"},{"sample_stable_id":"TCGA-CH-5752-01"},{"sample_stable_id":"TCGA-CH-5754-01"},{"sample_stable_id":"TCGA-CH-5764-01"},{"sample_stable_id":"TCGA-CH-5765-01"},{"sample_stable_id":"TCGA-CH-5768-01"},{"sample_stable_id":"TCGA-CH-5769-01"},{"sample_stable_id":"TCGA-CH-5789-01"},{"sample_stable_id":"TCGA-CH-5790-01"},{"sample_stable_id":"TCGA-CH-5791-01"},{"sample_stable_id":"TCGA-CH-5794-01"},{"sample_stable_id":"TCGA-EJ-5495-01"},{"sample_stable_id":"TCGA-EJ-5496-01"},{"sample_stable_id":"TCGA-EJ-5497-01"},{"sample_stable_id":"TCGA-EJ-5498-01"},{"sample_stable_id":"TCGA-EJ-5499-01"},{"sample_stable_id":"TCGA-EJ-5502-01"},{"sample_stable_id":"TCGA-EJ-5503-01"},{"sample_stable_id":"TCGA-EJ-5506-01"},{"sample_stable_id":"TCGA-EJ-5507-01"},{"sample_stable_id":"TCGA-EJ-5508-01"},{"sample_stable_id":"TCGA-EJ-5512-01"},{"sample_stable_id":"TCGA-EJ-5516-01"},{"sample_stable_id":"TCGA-EJ-5521-01"},{"sample_stable_id":"TCGA-EJ-5522-01"},{"sample_stable_id":"TCGA-EJ-5524-01"},{"sample_stable_id":"TCGA-EJ-5525-01"},{"sample_stable_id":"TCGA-EJ-5526-01"},{"sample_stable_id":"TCGA-EJ-5527-01"},{"sample_stable_id":"TCGA-EJ-5530-01"},{"sample_stable_id":"TCGA-EJ-5542-01"},{"sample_stable_id":"TCGA-EJ-7315-01"},{"sample_stable_id":"TCGA-EJ-7321-01"},{"sample_stable_id":"TCGA-EJ-7325-01"},{"sample_stable_id":"TCGA-EJ-7327-01"},{"sample_stable_id":"TCGA-EJ-7328-01"},{"sample_stable_id":"TCGA-EJ-7783-01"},{"sample_stable_id":"TCGA-EJ-7784-01"},{"sample_stable_id":"TCGA-EJ-7785-01"},{"sample_stable_id":"TCGA-EJ-7793-01"},{"sample_stable_id":"TCGA-EJ-7797-01"},{"sample_stable_id":"TCGA-EJ-8469-01"},{"sample_stable_id":"TCGA-EJ-8472-01"},{"sample_stable_id":"TCGA-EJ-A46D-01"},{"sample_stable_id":"TCGA-EJ-A46F-01"},{"sample_stable_id":"TCGA-EJ-A46I-01"},{"sample_stable_id":"TCGA-EJ-A65D-01"},{"sample_stable_id":"TCGA-EJ-A65F-01"},{"sample_stable_id":"TCGA-EJ-A7NF-01"},{"sample_stable_id":"TCGA-EJ-A7NK-01"},{"sample_stable_id":"TCGA-EJ-A8FO-01"},{"sample_stable_id":"TCGA-FC-7708-01"},{"sample_stable_id":"TCGA-G9-6329-01"},{"sample_stable_id":"TCGA-G9-6332-01"},{"sample_stable_id":"TCGA-G9-6336-01"},{"sample_stable_id":"TCGA-G9-6342-01"},{"sample_stable_id":"TCGA-G9-6351-01"},{"sample_stable_id":"TCGA-G9-6353-01"},{"sample_stable_id":"TCGA-G9-6354-01"},{"sample_stable_id":"TCGA-G9-6356-01"},{"sample_stable_id":"TCGA-G9-6361-01"},{"sample_stable_id":"TCGA-G9-6362-01"},{"sample_stable_id":"TCGA-G9-6363-01"},{"sample_stable_id":"TCGA-G9-6364-01"},{"sample_stable_id":"TCGA-G9-6365-01"},{"sample_stable_id":"TCGA-G9-6373-01"},{"sample_stable_id":"TCGA-G … (4381 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "prad_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "TMPRSS2>ERG fusion",
+   "studyViewFilter": {
+    "sampleIdentifiers": [
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-2A-A8VL-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-2A-A8VT-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-2A-A8VV-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-2A-AAYU-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-4L-AA1F-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5739-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5740-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5741-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5743-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5744-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5746-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5752-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5754-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5764-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5765-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5768-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5769-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5789-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5790-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5791-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-CH-5794-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5495-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5496-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5497-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5498-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5499-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5502-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5503-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5506-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5507-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5508-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5512-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5516-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5521-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5522-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5524-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5525-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5526-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5527-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5530-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-5542-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7315-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7321-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7325-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7327-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7328-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7783-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7784-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7785-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7793-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-7797-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-8469-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-8472-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-A46D-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-A46F-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-A46I-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-A65D-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-A65F-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-A7NF-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-A7NK-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-EJ-A8FO-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-FC-7708-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6329-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6332-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6336-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6342-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6351-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6353-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6354-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6356-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6361-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6362-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6363-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6364-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6365-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6373-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6377-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6384-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-6385-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-7509-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-7525-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-G9-A9S7-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-H9-A6BY-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7077-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7081-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7209-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7211-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7212-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7213-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7230-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7231-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7232-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7744-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7745-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7747-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7818-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-7819-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-8213-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-8257-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-8259-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-8260-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-8262-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-A48F-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-A632-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-A6HY-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-A76X-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-A8D0-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HC-A8D1-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-HI-7171-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-8198-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A67K-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A67L-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A67N-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A67R-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A67S-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A67T-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A6G1-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A6M7-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A83I-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A83J-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-A83K-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J4-AATV-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J9-A52B-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J9-A8CK-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-J9-A8CM-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KC-A4BN-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KC-A4BR-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KC-A4BV-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KC-A7F6-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A59Y-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A6DY-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A6E1-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A6E2-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A6E4-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A6E6-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A7AU-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A7B1-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A7B2-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A7B4-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A8I4-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A8I8-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A8IA-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A8IC-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A8IH-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A8II-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-KK-A8IM-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-M7-A71Z-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-MG-AAMC-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-QU-A6IN-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-QU-A6IP-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-TP-A8TT-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-V1-A8MK-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-V1-A8WS-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-V1-A9O9-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-V1-A9OY-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-V1-A9ZG-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VN-A88K-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VN-A88L-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VN-A88M-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VN-A88Q-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VP-A872-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VP-A875-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VP-A876-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VP-A879-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VP-A87C-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VP-A87D-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-VP-A87K-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-X4-A8KQ-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-XJ-A83F-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-XJ-A9DI-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-XJ-A9DK-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-XQ-A8TB-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A8HJ-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A8HK-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A8HL-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A8SA-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A8SF-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A8SL-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A8SP-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A9WL-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-YL-A9WX-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-ZG-A8QZ-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-ZG-A9L1-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-ZG-A9L2-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-ZG-A9L4-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-ZG-A9L9-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-ZG-A9LZ-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-ZG-A9MC-01"
+     },
+     {
+      "studyId": "prad_tcga_pan_can_atlas_2018",
+      "sampleId": "TCGA-ZG-A9N3-01"
+     }
+    ]
+   }
+  },
+  {
+   "name": "No TMPRSS2>ERG fusion",
+   "isUnselected": true
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b2d4e497aad53593c23f","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b2d4e497aad53593c23f","data":{"description":"Group comparison (2 custom groups)","studies":["prad_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"TMPRSS2>ERG fusion","sampleCount":189},{"name":"No TMPRSS2>ERG fusion","sampleCount":305}],"studyViewUrl":"https://www.cbioportal.org/study?id=prad_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"TMPRSS2>ERG fusion","url":"https://www.cbioportal.org/study?id=prad_tcga_pan_can_atlas_2018#filterJson=%7B%22sampleIdentifiers%22%3A%5B%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-2A-A8VL-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-2A-A8VT-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-2A-A8VV-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-2A-AAYU-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-4L-AA1F-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5739-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5740-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5741-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5743-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5744-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5746-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5752-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5754-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5764-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5765-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5768-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5769-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5789-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5790-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5791-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-CH-5794-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-EJ-5495-01%22%7D%2C%7B%22studyId%22%3A%22prad_tcga_pan_can_atlas_2018%22%2C%22sampleId%22%3A%22TCGA-EJ-5496-01%22%7D%2C%7B%22st … (16718 more chars)
+
+═ answer (success)
+The group comparison confirms the exact same sample counts derived from the database (189 vs. 305), validating the fusion-directionality filtering.
+
+## Cohort: Prostate Adenocarcinoma (TCGA, PanCancer Atlas)
+
+**"TMPRSS2 upstream donor to ERG"** refers to structural variants where TMPRSS2 is site1 (5′ partner) and ERG is site2 (3′ partner) — i.e., the canonical `TMPRSS2-ERG` fusion transcript orientation. Filtering the study's somatic structural variant calls this way (as opposed to any TMPRSS2 or ERG rearrangement regardless of order) gives:
+
+| Group | Patients | Deceased (events) | Living (censored) | Follow-up range (months) |
+|---|---|---|---|---|
+| **TMPRSS2→ERG fusion** | 189 | 4 | 185 | 1.0 – 165.2 |
+| **No TMPRSS2→ERG fusion** | 305 | 6 | 299 | 0.8 – 122.2 |
+
+This is a genomics-only breakdown, not a survival estimate: with only 4 and 6 deaths across the two groups, event counts are far too sparse for a reliable Kaplan-Meier median in either arm — the KM median overall survival is very likely **not reached** for both groups. A valid comparison requires Kaplan-Meier estimation with a log-rank test (which handles censoring properly); I can't compute that here, and a raw mean/median of the survival months would be misleading given how few events occurred.
+
+I've pre-built the exact two groups above (matched by directional site1=TMPRSS2/site2=ERG structural variant calls) in cBioPortal's Group Comparison tool, so you can run the Kaplan-Meier curve and log-rank test directly:
+
+[TMPRSS2→ERG fusion vs. No fusion — Survival Comparison](https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b2d4e497aad53593c23f)
+
+[Prostate Adenocarcinoma (TCGA, PanCancer Atlas) — Study Overview](https://www.cbioportal.org/study?id=prad_tcga_pan_can_atlas_2018)
+
+A caveat worth noting: TCGA `prad_tcga_pan_can_atlas_2018` is a primary-tumor cohort with generally excellent short-term prognosis, which is why event rates are low in both arms — the comparison may be underpowered here. If you're interested in a cohort with more death events (e.g., a metastatic castration-resistant prostate cancer study such as `prad_su2c_2019`), I can rerun this same directional-fusion analysis there.

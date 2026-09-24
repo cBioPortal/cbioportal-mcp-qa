@@ -1,0 +1,331 @@
+Q (sonnet): What is the average tumor mutational burden of breast cancer patients who have at least two of the five most frequently mutated genes and how does this compare to the average TMB of all patients?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ list_studies
+{
+ "search": "Breast Invasive Carcinoma TCGA PanCancer"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"brca","sample_count":1084,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT hugo_gene_symbol, total_mutation_events AS mutations, altered_samples, profiled_samples, frequency_pct
+FROM top_mutated_genes_in_study(study = 'brca_tcga_pan_can_atlas_2018', top_n = 5)"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"PIK3CA","mutations":387,"altered_samples":347,"profiled_samples":1066,"frequency_pct":32.6},{"hugo_gene_symbol":"TP53","mutations":353,"altered_samples":347,"profiled_samples":1066,"frequency_pct":32.6},{"hugo_gene_symbol":"TTN","mutations":311,"altered_samples":187,"profiled_samples":1066,"frequency_pct":17.5},{"hugo_gene_symbol":"CDH1","mutations":132,"altered_samples":130,"profiled_samples":1066,"frequency_pct":12.2},{"hugo_gene_symbol":"GATA3","mutations":130,"altered_samples":127,"profiled_samples":1066,"frequency_pct":11.9}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH top5 AS (
+    SELECT ['PIK3CA','TP53','TTN','CDH1','GATA3'] AS genes
+),
+sample_gene_counts AS (
+    SELECT sample_unique_id, uniqExact(hugo_gene_symbol) AS n_top5_mutated
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+      AND hugo_gene_symbol IN (SELECT arrayJoin(genes) FROM top5)
+    GROUP BY sample_unique_id
+),
+tmb AS (
+    SELECT sample_unique_id, toFloat64OrNull(attribute_value) AS tmb_val
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND attribute_name = 'TMB_NONSYNONYMOUS'
+)
+SELECT
+    if(sgc.sample_unique_id != '', 'AtLeast2Top5', 'AllOthers') AS group_name,
+    count() AS n_samples,
+    round(avg(t.tmb_val), 3) AS mean_tmb,
+    round(quantile(0.5)(t.tmb_val), 3) AS median_tmb
+FROM tmb t
+LEFT JOIN (SELECT sample_unique_id FROM sample_gene_counts WHERE n_top5_mutated >= 2) sgc
+    ON t.sample_unique_id = sgc.sample_unique_id
+WHERE t.tmb_val IS NOT NULL
+GROUP BY group_name
+"
+}
+
+◀ result
+{"rows":[{"group_name":"AllOthers","n_samples":770,"mean_tmb":1.658,"median_tmb":1.167},{"group_name":"AtLeast2Top5","n_samples":296,"mean_tmb":5.534,"median_tmb":2.033}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT count() AS n_samples,
+       round(avg(toFloat64OrNull(attribute_value)), 3) AS mean_tmb,
+       round(quantile(0.5)(toFloat64OrNull(attribute_value)), 3) AS median_tmb
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'TMB_NONSYNONYMOUS'
+  AND toFloat64OrNull(attribute_value) IS NOT NULL
+"
+}
+
+◀ result
+{"rows":[{"n_samples":1066,"mean_tmb":2.734,"median_tmb":1.3}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["brca_tcga_pan_can_atlas_2018_gistic","brca_tcga_pan_can_atlas_2018_log2CNA","brca_tcga_pan_can_atlas_2018_mutations","brca_tcga_pan_can_atlas_2018_protein_quantification","brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa","brca_tcga_pan_can_atlas_2018_rppa_Zscores","brca_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["brca_tcga_pan_can_atlas_2018_armlevel_cna","brca_tcga_pan_can_atlas_2018_genetic_ancestry","brca_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","brca_tcga_pan_can_atlas_2018_methylation_hm450","brca_tcga_pan_can_atlas_2018_phosphoprotein_quantification"],"heatmapProfileIds":["brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_anc … (83 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "≥2 of top-5 mutated genes (PIK3CA/TP53/TTN/CDH1/GATA3)",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "brca_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "TP53"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "TTN"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "CDH1"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "GATA3"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Rest of cohort",
+   "isUnselected": true
+  }
+ ],
+ "tab": "clinical"
+}
+
+◀ result
+{"success":false,"error":"No samples found for group \"≥2 of top-5 mutated genes (PIK3CA/TP53/TTN/CDH1/GATA3)\" — filter may be too restrictive","details":{}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018","url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018","data":{"studyIds":["brca_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084}],"tab":"summary","hasFilters":false,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "PIK3CA: MUT",
+  "TP53: MUT",
+  "TTN: MUT",
+  "CDH1: MUT",
+  "GATA3: MUT"
+ ],
+ "tab": "oncoprint",
+ "oncoprintClinicalTracks": [
+  "TMB_NONSYNONYMOUS"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=PIK3CA%3A+MUT%0ATP53%3A+MUT%0ATTN%3A+MUT%0ACDH1%3A+MUT%0AGATA3%3A+MUT&case_set_id=brca_tcga_pan_can_atlas_2018_all&clinicallist=TMB_NONSYNONYMOUS","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=PIK3CA%3A+MUT%0ATP53%3A+MUT%0ATTN%3A+MUT%0ACDH1%3A+MUT%0AGATA3%3A+MUT&case_set_id=brca_tcga_pan_can_atlas_2018_all&clinicallist=TMB_NONSYNONYMOUS","data":{"studyIds":["brca_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084}],"genes":["PIK3CA","TP53","TTN","CDH1","GATA3"],"caseSetId":"brca_tcga_pan_can_atlas_2018_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## Results
+
+**Cohort:** [Breast Invasive Carcinoma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018) — 1,066 samples with both mutation and TMB data (whole-exome sequenced, sample-level counting unit).
+
+**Top 5 most frequently mutated genes** (of 1,066 profiled samples): PIK3CA (32.6%), TP53 (32.6%), TTN (17.5%), CDH1 (12.2%), GATA3 (11.9%).
+
+| Group | n samples | Mean TMB (mut/Mb) | Median TMB |
+|---|---|---|---|
+| ≥2 of the top‑5 genes mutated | 296 | **5.53** | 2.03 |
+| Fewer than 2 of the top‑5 mutated (rest of cohort) | 770 | 1.66 | 1.17 |
+| **All samples (cohort average)** | 1,066 | **2.73** | 1.30 |
+
+Patients with ≥2 of the five most frequently mutated genes have a mean TMB roughly **2× the overall cohort average** (5.53 vs. 2.73 mutations/Mb) and about **3.3× the average of samples with fewer than 2 of these genes mutated** (5.53 vs. 1.66). This pattern is expected: a higher mutation burden mechanically increases the chance that any given gene, including these frequently mutated ones, will be hit. Both the mean and median differences point the same direction, though means are pulled upward by hypermutated outliers.
+
+No formal statistical test (e.g., t-test or Mann-Whitney) has been run on this difference — these are descriptive summary statistics only. If you want a rigorous comparison with a significance test, that can be evaluated via cBioPortal's Group Comparison tools.
+
+### Explore further
+- [OncoPrint of the 5 top-mutated genes with TMB annotation track](https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=PIK3CA%3A+MUT%0ATP53%3A+MUT%0ATTN%3A+MUT%0ACDH1%3A+MUT%0AGATA3%3A+MUT&case_set_id=brca_tcga_pan_can_atlas_2018_all&clinicallist=TMB_NONSYNONYMOUS) — visualize per-sample mutation status alongside TMB.
+- [Study overview / cohort browser](https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018) — explore clinical and genomic distributions interactively.
+
+Note: I could not auto-generate a direct two-group comparison link for "≥2 of 5 genes" vs. the rest, since that combinatorial condition (count of mutated genes across a gene set) isn't expressible as a simple study-view filter. The OncoPrint above lets you inspect this pattern visually, and you can build a custom group in the portal's Group Comparison tool from the OncoPrint selection if a formal statistical test is desired.

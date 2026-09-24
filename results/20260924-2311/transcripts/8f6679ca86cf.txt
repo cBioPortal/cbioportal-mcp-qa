@@ -1,0 +1,359 @@
+Q (haiku): How many patients have a shallow deletion for SMARCA4 in the POG study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+▶ list_studies
+{
+ "search": "POG"
+}
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7083 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"pog570_bcgsc_2020","name":"Pan-cancer Analysis of Advanced and Metastatic Tumors (BCGSC, Nature Cancer 2020)","type_of_cancer_id":"mixed","sample_count":570,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pog570_bcgsc_2020"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ get_study_guide
+{
+ "study_id": "pog570_bcgsc_2020"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+◀ result
+# Study Guide: Pan-cancer Analysis of Advanced and Metastatic Tumors (BCGSC, Nature Cancer 2020)
+
+**Study ID:** `pog570_bcgsc_2020`
+**Cancer Type:** mixed
+**Description:** Whole-genome and transcriptome sequencing of 570 advanced and metastatic cancers and their matched normals.
+
+## Cohort Statistics
+- **Patients:** 570
+- **Samples:** 571
+
+## Available Data Types
+
+- **COPY_NUMBER_ALTERATION**: Putative copy-number alterations from GISTIC
+- **MUTATION_EXTENDED**: Mutations
+- **STRUCTURAL_VARIANT**: Structural Variants
+- **MRNA_EXPRESSION**: mRNA expression (RNA Seq RPKM)
+- **MRNA_EXPRESSION**: mRNA expression z-scores relative to all samples (log RNA Seq RPKM)
+- **GENERIC_ASSAY**: Immune Cell Expression Signatures (Absolute Scores)
+
+## Gene Panels
+
+- **WES** (Whole Exome): 570 samples — all genes profiled
+
+## Available Clinical Attributes
+
+| Attribute | Samples with Data |
+|-----------|------------------|
+| TUMOR_CONTENT | 570 |
+| CANCER_TYPE_DETAILED | 570 |
+| ANALYSIS_COHORT | 570 |
+| PRIMARY_SITE | 570 |
+| MUTATION_COUNT | 570 |
+| SOMATIC_STATUS | 570 |
+| BIOPSY_COHORT | 570 |
+| HRD_SCORE | 570 |
+| BIOPSY_SITE | 570 |
+| CANCER_TYPE | 570 |
+| SAMPLE_TYPE | 570 |
+| TMB_NONSYNONYMOUS | 570 |
+| MSI_SCORE | 570 |
+| ONCOTREE_CODE | 570 |
+| AGE | 1 |
+| T_CELLS_CD4_NAIVE | 1 |
+| ICI_DURABLE_CLINICAL_BENEFIT | 1 |
+| OS_MONTHS | 1 |
+| ICI_BEST_RESPONSE | 1 |
+| GENDER | 1 |
+
+## Top Mutated Genes
+
+| Gene | Altered Samples |
+|------|----------------|
+| TP53 | 209 |
+| TTN | 126 |
+| MUC16 | 98 |
+| KRAS | 88 |
+| AHNAK2 | 82 |
+| PIK3CA | 73 |
+| APC | 72 |
+| MUC4 | 51 |
+| SYNE1 | 49 |
+| RYR2 | 48 |
+
+## Sample Types
+
+- **Metastatic**: 438 samples
+- **Local Recurrence**: 122 samples
+- **Unknown**: 10 samples
+
+## Query Tips for pog570_bcgsc_2020
+
+```sql
+-- Get all samples in this study
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'pog570_bcgsc_2020';
+
+-- Get mutations for a specific gene
+SELECT sample_unique_id, hugo_gene_symbol, mutation_variant, mutation_type
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'pog570_bcgsc_2020'
+    AND hugo_gene_symbol = 'TP53'
+    AND variant_type = 'mutation';
+
+-- Get clinical data for specific attributes
+SELECT sample_unique_id, attribute_name, attribute_value
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'pog570_bcgsc_2020'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'OS_MONTHS');
+```
+
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'pog570_bcgsc_2020'
+ORDER BY profile_type
+"
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"rna_seq_mrna"},{"profile_type":"rna_seq_mrna_median_all_sample_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT COUNT(DISTINCT patient_unique_id) as num_patients,
+       COUNT(DISTINCT sample_unique_id) as num_samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'pog570_bcgsc_2020'
+  AND profile_type = 'gistic'
+  AND hugo_gene_symbol = 'SMARCA4'
+  AND alteration_value = '-1'
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `patient_unique_id` in scope SELECT COUNTDistinct(patient_unique_id) AS num_patients, COUNTDistinct(sample_unique_id) AS num_samples FROM genetic_alteration_derived WHERE (cancer_study_identifier = 'pog570_bcgsc_2020') AND (profile_type = 'gistic') AND (hugo_gene_symbol = 'SMARCA4') AND (alteration_value = '-1'). Maybe you meant: ['sample_unique_id']. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT COUNT(DISTINCT cd.patient_unique_id) as num_patients,
+       COUNT(DISTINCT gad.sample_unique_id) as num_samples
+FROM genetic_alteration_derived gad
+INNER JOIN clinical_data_derived cd ON gad.sample_unique_id = cd.sample_unique_id
+WHERE gad.cancer_study_identifier = 'pog570_bcgsc_2020'
+  AND gad.profile_type = 'gistic'
+  AND gad.hugo_gene_symbol = 'SMARCA4'
+  AND gad.alteration_value = '-1'
+"
+}
+
+◀ result
+{"rows":[{"num_patients":111,"num_samples":111}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "pog570_bcgsc_2020"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"pog570_bcgsc_2020","name":"Pan-cancer Analysis of Advanced and Metastatic Tumors (BCGSC, Nature Cancer 2020)","sampleCount":570,"studyViewUrl":"https://www.cbioportal.org/study?id=pog570_bcgsc_2020","metadata":{"clinicalAttributeIds":["AGE","ANALYSIS_COHORT","BIOPSY_COHORT","BIOPSY_SITE","CANCER_TYPE","CANCER_TYPE_DETAILED","GENDER","HRD_SCORE","ICI","ICI_BEST_RESPONSE","ICI_DURABLE_CLINICAL_BENEFIT","ICI_MUTATION_CATEGORY","MSI_SCORE","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PRIMARY_SITE","SAMPLE_COUNT","SAMPLE_TYPE","SOMATIC_STATUS","TMB_NONSYNONYMOUS","TREATED_WITH_ICI","TREATMENT_CATEGORY","TUMOR_CONTENT","T_CELLS_CD4_MEMORY_ACTIVATED","T_CELLS_CD4_MEMORY_RESTING","T_CELLS_CD4_NAIVE","T_CELLS_CD8","T_CELLS_FOLLICULAR_HELPER","T_CELLS_GAMMA_DELTA","T_CELLS_REGULATORY_TREGS"],"molecularProfileIds":["pog570_bcgsc_2020_gistic","pog570_bcgsc_2020_mutations","pog570_bcgsc_2020_rna_seq_mrna","pog570_bcgsc_2020_rna_seq_mrna_median_all_sample_Zscores","pog570_bcgsc_2020_structural_variants"],"genericAssayProfiles":["pog570_bcgsc_2020_immune_cell_signature"],"heatmapProfileIds":["pog570_bcgsc_2020_rna_seq_mrna_median_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","generic_assay_immune_cell_signature"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "pog570_bcgsc_2020"
+ ],
+ "genes": [
+  "SMARCA4"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=pog570_bcgsc_2020&gene_list=SMARCA4&case_set_id=pog570_bcgsc_2020_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=pog570_bcgsc_2020&gene_list=SMARCA4&case_set_id=pog570_bcgsc_2020_all","data":{"studyIds":["pog570_bcgsc_2020"],"studies":[{"studyId":"pog570_bcgsc_2020","name":"Pan-cancer Analysis of Advanced and Metastatic Tumors (BCGSC, Nature Cancer 2020)","sampleCount":570}],"genes":["SMARCA4"],"caseSetId":"pog570_bcgsc_2020_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## Answer
+
+**111 patients** have a shallow deletion (−1) for SMARCA4 in the POG study (pog570_bcgsc_2020). These deletions are present across 111 samples.
+
+### Breakdown
+- **Patients with SMARCA4 shallow deletion:** 111 / 570 (19.5%)
+- **Total patients in POG cohort:** 570
+
+[View SMARCA4 alterations in POG on OncoPrint](https://www.cbioportal.org/results/oncoprint?cancer_study_list=pog570_bcgsc_2020&gene_list=SMARCA4&case_set_id=pog570_bcgsc_2020_all) — the visualization shows all SMARCA4 alterations (mutations, shallow deletions, and other copy-number changes) across the 570 samples.

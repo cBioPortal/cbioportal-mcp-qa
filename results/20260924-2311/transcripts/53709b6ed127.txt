@@ -1,0 +1,499 @@
+Q (sonnet): In the TCGA Glioblastoma multiforme study compare the median patient age at diagnosis between patients with IDH1 R132H mutation and patients with wild-type IDH1.
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://common-pitfalls"
+}
+
+▶ list_studies
+{
+ "search": "glioblastoma TCGA"
+}
+
+◀ result
+# Common Query Pitfalls Guide
+
+## Overview
+This guide highlights frequent mistakes when analyzing cBioPortal data and provides solutions to avoid them.
+
+## Critical Pitfalls
+
+### 1. 🚨 CRITICAL MUTATION FREQUENCY ERRORS
+
+#### ❌ WRONG: Using study-wide totals for gene frequencies
+```sql
+-- INCORRECT - This gives wrong frequencies!
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples,
+    (SELECT COUNT(DISTINCT sample_unique_id)
+     FROM genomic_event_derived
+     WHERE cancer_study_identifier = 'your_study_id') as total_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND cancer_study_identifier = 'your_study_id'
+GROUP BY hugo_gene_symbol;
+```
+**Problem**: Different genes have different profiling coverage - you can't use study-wide totals!
+
+#### ❌ WRONG: Not using gene-specific profiling denominators
+```sql
+-- INCORRECT - Missing gene-specific denominators
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+GROUP BY hugo_gene_symbol;
+-- Missing: WHERE ARE THE DENOMINATORS FOR EACH GENE?
+```
+
+#### ❌ WRONG: Skipping individual gene profiling queries
+**Problem**: Failing to run separate profiling queries for EACH gene in results.
+**Each gene has different coverage**: TP53 might be profiled in 25,040 samples, MUC16 in 23,000, etc.
+
+#### ✅ CORRECT: Complete gene-specific workflow
+```sql
+-- STEP 1: Get altered counts per gene
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id,
+    COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
+    COUNT(*) AS totalMutationEvents
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY entrez_gene_id, hugo_gene_symbol
+ORDER BY numberOfAlteredSamplesOnPanel DESC;
+
+-- STEP 2: FOR EACH GENE, run this profiling query:
+SELECT COUNT(DISTINCT stgp.sample_unique_id) AS numberOfProfiledSamples
+FROM sample_to_gene_panel_derived stgp
+JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+  AND g.hugo_gene_symbol = 'TP53'  -- Replace with each gene from Step 1
+  AND stgp.cancer_study_identifier = 'your_study_id';
+
+-- STEP 3: Calculate frequency = numberOfAlteredSamplesOnPanel / numberOfProfiledSamples * 100
+```
+
+#### 🚨 WORKFLOW REQUIREMENTS VIOLATIONS:
+- **Missing denominator columns**: Must show gene-specific profiled samples per row
+- **Wrong table format**: Should be | Gene | # Mutations | # Samples | Profiled Samples | Sample % |
+- **Not replacing gene symbols**: Must replace 'TP53' with actual gene for each query
+- **Using study totals**: Never use genomic_event_derived for total sample counts
+
+### 2. 🚨 OFF-PANEL MUTATION INCLUSION
+
+#### ❌ Wrong: Including off-panel mutations
+```sql
+-- INCORRECT - Includes mutations outside gene panels
+SELEC … (37891 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"gbm_tcga","name":"Glioblastoma Multiforme (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":619,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga"},{"cancer_study_identifier":"gbm_tcga_gdc","name":"Glioblastoma Multiforme (TCGA GDC, 2025)","type_of_cancer_id":"difg","sample_count":611,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_gdc"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":592,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pub2013","name":"Glioblastoma (TCGA, Cell 2013)","type_of_cancer_id":"difg","sample_count":577,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013"},{"cancer_study_identifier":"gbm_tcga_pub","name":"Glioblastoma (TCGA, Nature 2008)","type_of_cancer_id":"difg","sample_count":206,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub"}]}
+
+▶ get_study_guide
+{
+ "study_id": "gbm_tcga_pan_can_atlas_2018"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT
+    arrayMin(ages) AS min_age, arrayMax(ages) AS max_age,
+    countEqual(ages, min_age) AS at_min, countEqual(ages, max_age) AS at_max, length(ages) AS patients
+FROM (
+    SELECT groupArray(toFloat64OrNull(attribute_value)) AS ages
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018' AND attribute_name = 'AGE'
+      AND toFloat64OrNull(attribute_value) IS NOT NULL
+)"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT mutation_variant, count(DISTINCT sample_unique_id) AS n
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'IDH1' AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY mutation_variant
+ORDER BY n DESC"
+}
+
+◀ result
+# Glioblastoma Multiforme (TCGA, PanCancer Atlas)
+
+**Study ID:** `gbm_tcga_pan_can_atlas_2018`
+
+See `_tcga_pancan_template.md` for common TCGA clinical attributes.
+
+## Study-Specific Attributes
+
+### Molecular Classification
+| Attribute | Description | Values (patients) |
+|-----------|-------------|--------|
+| `SUBTYPE` | TCGA glioma IDH classification | `GBM_IDHwt` 114, `GBM_IDHmut-non-codel` 7, `GBM` 5, blank 459 |
+
+`SUBTYPE` is blank for most patients and does not hold the transcriptional subtypes (Classical/Mesenchymal/Proneural/Neural).
+
+### Not available in this study
+- **IDH status**: no `IDH_STATUS` attribute. Use IDH1/IDH2 mutations from mutation data (covers all sequenced samples), or `SUBTYPE` for the 121 classified patients.
+- **MGMT promoter methylation status**: not available (the methylation profiles are CpG-probe level, with no MGMT status call).
+- **Karnofsky performance status and extent of resection**: not available.
+
+## Key Genes & Pathways
+- **TP53**: Frequently mutated
+- **PTEN**: Common deletions
+- **EGFR**: Amplified in ~40%, often with EGFRvIII variant
+- **IDH1**: R132H mutation defines IDH-mutant subtype (better prognosis)
+- **RB pathway**: CDKN2A deletion, CDK4 amplification, RB1 mutation (often mutually exclusive)
+
+## Notes
+- IDH-mutant GBMs have significantly better prognosis
+- MGMT methylation predicts temozolomide response
+- EGFR amplification and EGFRvIII are GBM-specific
+- Molecular subtypes have distinct transcriptional programs
+
+
+◀ result
+{"rows":[{"min_age":10,"max_age":89,"at_min":1,"at_max":1,"patients":297}]}
+
+◀ result
+{"rows":[{"mutation_variant":"R132H","n":22},{"mutation_variant":"R132G","n":2},{"mutation_variant":"R132C","n":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH profiled AS (
+    SELECT DISTINCT c.patient_unique_id
+    FROM sample_to_gene_panel_derived s
+    JOIN (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived
+          WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018') c USING sample_unique_id
+    WHERE s.cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018' AND s.alteration_type = 'MUTATION_EXTENDED'
+),
+r132h AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'IDH1' AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+      AND mutation_variant = 'R132H'
+),
+any_idh1_mut AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'IDH1' AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+),
+ages AS (
+    SELECT patient_unique_id, toFloat64OrNull(attribute_value) AS age
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018' AND attribute_name = 'AGE'
+      AND toFloat64OrNull(attribute_value) IS NOT NULL
+)
+SELECT
+    grp,
+    count() AS n_patients,
+    round(avg(age),1) AS mean_age,
+    round(quantile(0.5)(age),1) AS median_age,
+    min(age) AS min_age,
+    max(age) AS max_age
+FROM (
+    SELECT a.patient_unique_id, a.age,
+        multiIf(a.patient_unique_id IN (SELECT patient_unique_id FROM r132h), 'IDH1 R132H',
+                a.patient_unique_id IN (SELECT patient_unique_id FROM any_idh1_mut), 'IDH1 other mutation (excluded)',
+                'IDH1 wild-type') AS grp
+    FROM ages a
+    WHERE a.patient_unique_id IN (SELECT patient_unique_id FROM profiled)
+)
+GROUP BY grp
+ORDER BY grp"
+}
+
+◀ result
+{"rows":[{"grp":"IDH1 R132H","n_patients":17,"mean_age":38.9,"median_age":40,"min_age":21,"max_age":60},{"grp":"IDH1 wild-type","n_patients":248,"mean_age":61.6,"median_age":61.5,"min_age":21,"max_age":89}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "gbm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","sampleCount":592,"studyViewUrl":"https://www.cbioportal.org/study?id=gbm_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["gbm_tcga_pan_can_atlas_2018_gistic","gbm_tcga_pan_can_atlas_2018_log2CNA","gbm_tcga_pan_can_atlas_2018_mutations","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","gbm_tcga_pan_can_atlas_2018_rppa","gbm_tcga_pan_can_atlas_2018_rppa_Zscores","gbm_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["gbm_tcga_pan_can_atlas_2018_armlevel_cna","gbm_tcga_pan_can_atlas_2018_genetic_ancestry","gbm_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","gbm_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","gbm_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "gbm_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "clinical",
+ "groups": [
+  {
+   "name": "IDH1 R132H",
+   "studyViewFilter": {
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "IDH1",
+      "profileType": "mutations",
+      "categorization": "MUTATION_TYPE",
+      "values": [
+       [
+        {
+         "value": "R132H"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "IDH1 wild-type",
+   "studyViewFilter": {
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "IDH1",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "NOT_MUTATED"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":false,"error":"No samples found for group \"IDH1 R132H\" — filter may be too restrictive","details":{}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "gbm_tcga_pan_can_atlas_2018",
+ "geneSpecificQueries": [
+  {
+   "hugoGeneSymbol": "IDH1",
+   "profileType": "mutations"
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"gbm_tcga_pan_can_atlas_2018","geneSpecificCounts":[{"hugoGeneSymbol":"IDH1","profileType":"mutations","counts":[{"value":"Missense_Mutation","label":"Missense Mutation","count":25}]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "gbm_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "clinical",
+ "groups": [
+  {
+   "name": "IDH1 Mutant",
+   "studyViewFilter": {
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "IDH1",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "MUTATED"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "IDH1 Wild-type",
+   "studyViewFilter": {
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "IDH1",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "NOT_MUTATED"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5b029e497aad53593c227","url":"https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5b029e497aad53593c227","data":{"description":"Group comparison (2 custom groups)","studies":["gbm_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"IDH1 Mutant","sampleCount":25},{"name":"IDH1 Wild-type","sampleCount":372}],"studyViewUrl":"https://www.cbioportal.org/study?id=gbm_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"IDH1 Mutant","url":"https://www.cbioportal.org/study?id=gbm_tcga_pan_can_atlas_2018#filterJson=%7B%22mutationDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22IDH1%22%2C%22profileType%22%3A%22mutations%22%2C%22categorization%22%3A%22MUTATED%22%2C%22values%22%3A%5B%5B%7B%22value%22%3A%22MUTATED%22%7D%5D%5D%7D%5D%7D"},{"groupName":"IDH1 Wild-type","url":"https://www.cbioportal.org/study?id=gbm_tcga_pan_can_atlas_2018#filterJson=%7B%22mutationDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22IDH1%22%2C%22profileType%22%3A%22mutations%22%2C%22categorization%22%3A%22MUTATED%22%2C%22values%22%3A%5B%5B%7B%22value%22%3A%22NOT_MUTATED%22%7D%5D%5D%7D%5D%7D"}],"pageDescription":"Clinical attribute distributions compared across IDH1 Mutant (25) vs IDH1 Wild-type (372)."}}
+
+═ answer (success)
+## Results — TCGA GBM (PanCancer Atlas), Age at Diagnosis by IDH1 Status
+
+Since cBioPortal's mutation-type filter only distinguishes broad classes (e.g., Missense_Mutation) and not specific protein changes, I queried the underlying variant data directly to isolate **R132H** specifically vs. patients with no IDH1 mutation of any kind (patients, restricted to those with sequencing coverage and recorded age):
+
+| Group | Patients | Mean age | **Median age** | Age range |
+|---|---|---|---|---|
+| IDH1 R132H | 17 | 38.9 | **40.0** | 21–60 |
+| IDH1 wild-type | 248 | 61.6 | **61.5** | 21–89 |
+
+(Of 22 total R132H-mutant patients, 17 had age recorded; all IDH1-profiled wild-type patients with age data are included as the comparator. Age data showed no floor/cap artifacts — only a single patient at each boundary of a 10–89 range.)
+
+**IDH1 R132H-mutant GBM patients were diagnosed roughly 21 years younger** than IDH1 wild-type patients (median 40 vs. 61.5 years) — consistent with the well-established association between IDH1 mutation and younger-onset, secondary glioblastoma. This is a descriptive comparison (medians of an unbiased continuous variable, not survival data), so no formal statistical test (e.g., Mann-Whitney) has been run here; use the Clinical tab below to run that comparison and see the full age distribution/box plots.
+
+Note: the portal's built-in mutation filter (used for the live comparison groups below) can only select "IDH1 Mutated" broadly (25 samples, of which 22/25 = 88% are R132H) vs. "Not Mutated" (372 samples) — it cannot restrict to R132H alone. The 17-vs-248 figures above are the R132H-specific numbers computed directly from the variant-level data.
+
+[**View IDH1 Mutant vs Wild-type — Clinical Comparison**](https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5b029e497aad53593c227)
+Clinical attribute distributions (including Age) compared across IDH1 Mutant (25 patients) vs IDH1 Wild-type (372 patients) in the TCGA GBM PanCancer Atlas study.
+
+[**Browse the GBM PanCancer Atlas cohort**](https://www.cbioportal.org/study?id=gbm_tcga_pan_can_atlas_2018)

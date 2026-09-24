@@ -1,0 +1,222 @@
+Q (haiku): What is the median age at diagnosis for osteosarcoma patients in the TARGET study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ list_studies
+{
+ "search": "TARGET osteosarcoma"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"os_target_gdc","name":"Osteosarcoma (TARGET GDC, 2025)","type_of_cancer_id":"os","sample_count":159,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=os_target_gdc"}]}
+
+▶ get_study_guide
+{
+ "study_id": "os_target_gdc"
+}
+
+◀ result
+# Osteosarcoma (TARGET GDC, 2025)
+
+**Study ID:** `os_target_gdc`
+
+## Overview
+Pediatric osteosarcoma study from the TARGET (Therapeutically Applicable Research to Generate Effective Treatments) initiative. Whole exome sequencing data.
+
+## Gene Panel
+- **WES** (Whole Exome Sequencing): all coding genes profiled
+- **143 of the 160 samples are profiled for mutations.** Use 143 as the mutation-frequency denominator (`sample_to_gene_panel_derived`, `alteration_type = 'MUTATION_EXTENDED'`), not the study's sample count — e.g. TP53 is mutated in 32/143 = 22.4%.
+
+## Patients vs Samples
+383 patients have clinical data, but only 153 of them have a sample (159 samples). Patient-level questions (age, sex, survival) use all patients with a value; genomic questions use the 143 mutation-profiled samples.
+
+## Clinical Attributes - Semantic Guide
+
+### Patient Demographics
+| Attribute | Description | Notes |
+|-----------|-------------|-------|
+| `AGE` | Age at diagnosis, **floored at 18** | Every patient younger than 18 is recorded as 18 (241 of 293). **Don't use it for age statistics** — use `DAYS_TO_BIRTH` |
+| `DAYS_TO_BIRTH` | Days from birth to diagnosis, negative | Age at diagnosis in years = `-DAYS_TO_BIRTH / 365.25`. 293 patients have a value; 90 are empty |
+| `SEX` | Patient sex | Male 172, Female 133, 78 empty |
+| `RACE`, `ETHNICITY` | Race, ethnicity | |
+
+### Disease Characteristics
+| Attribute | Description | Notes |
+|-----------|-------------|-------|
+| `CANCER_TYPE_DETAILED` | Cancer type | Osteosarcoma for every sample |
+| `PRIMARY_SITE_PATIENT` | Primary site | "Appendicular Skeleton" for every patient with a value — no finer location (femur, tibia) |
+
+No histological subtype, tumor necrosis / chemotherapy response, or event-free survival attributes exist in this study.
+
+### Clinical Outcomes
+| Attribute | Description | Notes |
+|-----------|-------------|-------|
+| `OS_MONTHS` | Overall survival in months | Time from diagnosis |
+| `OS_STATUS` | Overall survival status | 0:LIVING 171, 1:DECEASED 105, 107 empty |
+
+## Age at Diagnosis
+
+Compute age from `DAYS_TO_BIRTH`, not `AGE`. A median from `AGE` comes out as 18 because every child is recorded as 18; the real median is about 15 years.
+
+```sql
+SELECT
+    count() AS patients,
+    round(median(-toFloat64OrNull(attribute_value) / 365.25), 1) AS median_age_years,
+    round(min(-toFloat64OrNull(attribute_value) / 365.25), 1) AS min_age_years,
+    round(max(-toFloat64OrNull(attribute_value) / 365.25), 1) AS max_age_years
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'os_target_gdc'
+  AND attribute_name = 'DAYS_TO_BIRTH'
+  AND toFloat64OrNull(attribute_value) IS NOT NULL;
+-- 293 patients, median 15.2, range 3.6-87.1
+```
+
+When reporting, say the age comes from `DAYS_TO_BIRTH` and that `AGE` is floored at 18.
+
+## Notes & Caveats
+- This is a pediatric cancer cohort; age distribution is younger than adult studies
+- WES coverage means no gene panel filtering needed for frequency calculations
+- Part  … (66 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    count(DISTINCT patient_unique_id) AS patient_count,
+    quantile(0.5)(age) AS median_age
+FROM (
+    SELECT 
+        patient_unique_id,
+        toFloat64OrNull(attribute_value) AS age
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'os_target_gdc'
+      AND attribute_name = 'AGE'
+      AND toFloat64OrNull(attribute_value) IS NOT NULL
+)
+"
+}
+
+◀ result
+{"rows":[{"patient_count":293,"median_age":18}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+    count() AS patients,
+    round(quantile(0.5)(-toFloat64OrNull(attribute_value) / 365.25), 1) AS median_age_years,
+    round(min(-toFloat64OrNull(attribute_value) / 365.25), 1) AS min_age_years,
+    round(max(-toFloat64OrNull(attribute_value) / 365.25), 1) AS max_age_years
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'os_target_gdc'
+  AND attribute_name = 'DAYS_TO_BIRTH'
+  AND toFloat64OrNull(attribute_value) IS NOT NULL
+"
+}
+
+◀ result
+{"rows":[{"patients":293,"median_age_years":15.2,"min_age_years":3.6,"max_age_years":87.1}]}
+
+═ answer (success)
+## Answer
+
+**Median age at diagnosis for osteosarcoma patients in the TARGET study: 15.2 years**
+
+### Details
+
+- **Study:** [Osteosarcoma (TARGET GDC, 2025)](https://www.cbioportal.org/study/summary?id=os_target_gdc)
+- **Patients with age data:** 293 out of 383 patients
+- **Age range:** 3.6 to 87.1 years
+
+### Important Note
+
+The age at diagnosis was computed from the `DAYS_TO_BIRTH` clinical attribute (age in years = −DAYS_TO_BIRTH / 365.25), not the raw `AGE` field. This is necessary because the study floors the `AGE` attribute at 18 for de-identification — all patients younger than 18 are recorded as exactly 18 years old. The `DAYS_TO_BIRTH` approach provides the true age distribution. This is consistent with the study guide for the TARGET osteosarcoma cohort, which contains mostly pediatric patients.

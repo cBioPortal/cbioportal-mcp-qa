@@ -1,0 +1,223 @@
+Q (sonnet): In TCGA lower grade glioma, show me samples with EGFR gains.
+
+▶ list_studies
+{
+ "search": "lower grade glioma TCGA PanCancer"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"}]}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT sample_unique_id, alteration_value
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'EGFR'
+  AND profile_type = 'gistic'
+  AND alteration_value = '1'
+ORDER BY sample_unique_id
+",
+ "max_rows": 600
+}
+
+◀ result
+{"rows":[{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4942-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-5395-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-5396-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-5397-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-6186-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-6665-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-6670-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DB-5270-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DB-5277-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DB-A4X9-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DB-A4XE-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DB-A64O-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DH-A669-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DH-A66G-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DH-A7UT-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DH-A7UV-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-6392-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-6395-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-6400-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-6402-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-6404-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-6407-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-6410-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-7006-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-7011-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-7012-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-7014-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-7015-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-8161-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-8163-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-8165-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-8166-01","alteration_value":"1"},{"sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-A5TR-01","alteration_value":"1"},{"sample_unique_id":" … (4840 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT alteration_value, count() AS samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'EGFR'
+  AND profile_type = 'gistic'
+  AND alteration_value NOT IN ('', 'NA')
+GROUP BY alteration_value
+ORDER BY alteration_value
+"
+}
+
+◀ result
+{"rows":[{"alteration_value":"-1","samples":4},{"alteration_value":"0","samples":381},{"alteration_value":"1","samples":87},{"alteration_value":"2","samples":39}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","sampleCount":514,"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["lgg_tcga_pan_can_atlas_2018_gistic","lgg_tcga_pan_can_atlas_2018_log2CNA","lgg_tcga_pan_can_atlas_2018_mutations","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa","lgg_tcga_pan_can_atlas_2018_rppa_Zscores","lgg_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["lgg_tcga_pan_can_atlas_2018_armlevel_cna","lgg_tcga_pan_can_atlas_2018_genetic_ancestry","lgg_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","lgg_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "filterJson": {
+  "genomicDataFilters": [
+   {
+    "hugoGeneSymbol": "EGFR",
+    "profileType": "gistic",
+    "values": [
+     {
+      "value": "1"
+     }
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22gistic%22%2C%22values%22%3A%5B%7B%22value%22%3A%221%22%7D%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22gistic%22%2C%22values%22%3A%5B%7B%22value%22%3A%221%22%7D%5D%7D%5D%7D","data":{"studyIds":["lgg_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","sampleCount":514}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+In **TCGA Lower Grade Glioma (PanCancer Atlas)** (`lgg_tcga_pan_can_atlas_2018`, 514 samples), copy-number gain of EGFR is defined here as a low-level GISTIC "Gain" call (value = 1), distinct from full-level amplification (value = 2).
+
+**87 of 511 profiled samples (17.0%) show an EGFR gain.** For context, the full discrete CNA distribution:
+
+| GISTIC category | Samples |
+|---|---|
+| Shallow deletion (−1) | 4 |
+| Diploid (0) | 381 |
+| **Gain (1)** | **87** |
+| Amplification (2) | 39 |
+
+[View EGFR-gain samples in StudyView](https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22gistic%22%2C%22values%22%3A%5B%7B%22value%22%3A%221%22%7D%5D%7D%5D%7D)
+
+Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu.
+
+Note: if you intended "gain" to mean any copy-number increase (gain + amplification combined), let me know and I can refilter to include both GISTIC values 1 and 2.

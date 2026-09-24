@@ -1,0 +1,435 @@
+Q (haiku): Is there a correlation between ERBB2 gene amplification and ERBB2 protein expression levels in breast cancer samples from the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "MSK-CHORD breast"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+◀ result
+{"result":[]}
+
+▶ list_studies
+{
+ "search": "MSK CHORD"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+  AND hugo_gene_symbol = 'ERBB2'
+ORDER BY profile_type;
+"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+◀ result
+{"rows":[{"profile_type":"cna"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+  AND profile_type LIKE '%protein%'
+ORDER BY profile_type;
+"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+ORDER BY profile_type;
+"
+}
+
+◀ result
+{"rows":[]}
+
+◀ result
+{"rows":[{"profile_type":"cna"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check for HER2-related clinical attributes in breast cancer samples
+SELECT DISTINCT attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+  AND attribute_name LIKE '%HER%'
+ORDER BY attribute_name;
+"
+}
+
+◀ result
+{"rows":[{"attribute_name":"HER2"},{"attribute_name":"OTHER"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get breast cancer samples with ERBB2 CNA data
+SELECT COUNT(DISTINCT sample_unique_id) as breast_samples_with_erbb2_cna
+FROM genetic_alteration_derived gad
+JOIN clinical_data_derived clin ON gad.sample_unique_id = clin.sample_unique_id
+WHERE gad.cancer_study_identifier = 'msk_chord_2024'
+  AND clin.cancer_study_identifier = 'msk_chord_2024'
+  AND gad.hugo_gene_symbol = 'ERBB2'
+  AND gad.profile_type = 'cna'
+  AND clin.attribute_name = 'CANCER_TYPE'
+  AND clin.attribute_value = 'Breast Cancer';
+"
+}
+
+◀ result
+{"rows":[{"breast_samples_with_erbb2_cna":5368}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check HER2 attribute values in breast cancer samples
+SELECT attribute_value, COUNT(DISTINCT sample_unique_id) as count
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+  AND attribute_name = 'HER2'
+GROUP BY attribute_value
+ORDER BY count DESC;
+"
+}
+
+◀ result
+{"rows":[{"count":1},{"attribute_value":"Yes","count":1},{"attribute_value":"No","count":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check ERBB2 CNA values in breast cancer
+SELECT toFloat64OrNull(alteration_value) as erbb2_cna, COUNT(DISTINCT sample_unique_id) as count
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+  AND hugo_gene_symbol = 'ERBB2'
+  AND profile_type = 'cna'
+  AND alteration_value NOT IN ('', 'NA')
+GROUP BY toFloat64OrNull(alteration_value)
+ORDER BY erbb2_cna;
+"
+}
+
+◀ result
+{"rows":[{"erbb2_cna":-2,"count":4},{"erbb2_cna":0,"count":24070},{"erbb2_cna":2,"count":960}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Examine HER2 attribute data more closely, filtering breast cancer only
+SELECT attribute_value, COUNT(DISTINCT sample_unique_id) as count
+FROM clinical_data_derived clin
+WHERE clin.cancer_study_identifier = 'msk_chord_2024'
+  AND clin.attribute_name = 'HER2'
+  AND clin.sample_unique_id IN (
+      SELECT DISTINCT clin2.sample_unique_id
+      FROM clinical_data_derived clin2
+      WHERE clin2.cancer_study_identifier = 'msk_chord_2024'
+        AND clin2.attribute_name = 'CANCER_TYPE'
+        AND clin2.attribute_value = 'Breast Cancer'
+  )
+GROUP BY attribute_value
+ORDER BY count DESC;
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Count breast cancer samples with both ERBB2 CNA and HER2 clinical data
+SELECT COUNT(DISTINCT gad.sample_unique_id) as samples_with_both
+FROM genetic_alteration_derived gad
+JOIN clinical_data_derived clin_her2 ON gad.sample_unique_id = clin_her2.sample_unique_id
+  AND clin_her2.cancer_study_identifier = 'msk_chord_2024'
+  AND clin_her2.attribute_name = 'HER2'
+  AND clin_her2.attribute_value NOT IN ('', 'NA')
+WHERE gad.cancer_study_identifier = 'msk_chord_2024'
+  AND gad.hugo_gene_symbol = 'ERBB2'
+  AND gad.profile_type = 'cna'
+  AND gad.alteration_value NOT IN ('', 'NA');
+"
+}
+
+◀ result
+{"rows":[{"samples_with_both":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check all molecular profile types in the study
+SELECT profile_type, COUNT(DISTINCT sample_unique_id) as samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+GROUP BY profile_type
+ORDER BY samples DESC;
+"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check molecular profile metadata for the study
+SELECT molecular_profile_id, profile_type, description
+FROM molecular_profile
+WHERE cancer_study_identifier = 'msk_chord_2024'
+ORDER BY profile_type;
+"
+}
+
+◀ result
+{"rows":[{"profile_type":"cna","samples":25034}]}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 60\n Code: 60. DB::Exception: Unknown table expression identifier 'molecular_profile' in scope SELECT molecular_profile_id, profile_type, description FROM molecular_profile WHERE cancer_study_identifier = 'msk_chord_2024' ORDER BY profile_type ASC. (UNKNOWN_TABLE) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check what molecular profiles exist for MSK-CHORD
+SELECT genetic_profile_id, stable_id, profile_type, name
+FROM genetic_profile
+WHERE cancer_study_id IN (
+  SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'msk_chord_2024'
+)
+ORDER BY profile_type;
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `profile_type` in scope SELECT genetic_profile_id, stable_id, profile_type, name FROM genetic_profile WHERE cancer_study_id IN (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'msk_chord_2024') ORDER BY profile_type ASC. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_profile"
+}
+
+◀ result
+{"columns":[{"name":"genetic_profile_id","type":"Int64"},{"name":"stable_id","type":"String"},{"name":"cancer_study_id","type":"Int64"},{"name":"genetic_alteration_type","type":"String"},{"name":"generic_assay_type","type":"Nullable(String)"},{"name":"datatype","type":"String"},{"name":"name","type":"String"},{"name":"description","type":"Nullable(String)"},{"name":"show_profile_in_analysis_tab","type":"Int32"},{"name":"pivot_threshold","type":"Nullable(Float64)"},{"name":"sort_order","type":"Nullable(String)"},{"name":"patient_level","type":"Nullable(Int32)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check genetic profiles for MSK-CHORD
+SELECT genetic_alteration_type, datatype, COUNT(*) as count
+FROM genetic_profile
+WHERE cancer_study_id IN (
+  SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'msk_chord_2024'
+)
+GROUP BY genetic_alteration_type, datatype
+ORDER BY genetic_alteration_type, datatype;
+"
+}
+
+◀ result
+{"rows":[{"genetic_alteration_type":"COPY_NUMBER_ALTERATION","datatype":"DISCRETE","count":1},{"genetic_alteration_type":"MUTATION_EXTENDED","datatype":"MAF","count":1},{"genetic_alteration_type":"STRUCTURAL_VARIANT","datatype":"SV","count":1}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","metadata":{"clinicalAttributeIds":["ADRENAL_GLANDS","BONE","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_GROUP","CLINICAL_SUMMARY","CNS_BRAIN","CURRENT_AGE_DEID","DIAGNOSIS_DESCRIPTION","ETHNICITY","FRACTION_GENOME_ALTERED","GENDER","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","GLEASON_SAMPLE_LEVEL","HER2","HISTORY_OF_PDL1","HR","ICD_O_HISTOLOGY_DESCRIPTION","INTRA_ABDOMINAL","LIVER","LUNG","LYMPH_NODES","METASTATIC_SITE","MSI_COMMENT","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","NUM_ICDO_DX","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER","PATHOLOGICAL_GROUP","PDL1_POSITIVE","PLEURA","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","REPRODUCTIVE_ORGANS","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["msk_chord_2024_cna","msk_chord_2024_mutations","msk_chord_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "filterJson": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Breast Cancer"
+     }
+    ]
+   }
+  ],
+  "geneFilters": [
+   {
+    "molecularProfileIds": [
+     "msk_chord_2024_cna"
+    ],
+    "geneQueries": [
+     [
+      {
+       "hugoGeneSymbol": "ERBB2",
+       "alterations": [
+        "AMP"
+       ]
+      }
+     ]
+    ]
+   }
+  ]
+ },
+ "tab": "summary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%2C%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22alterations%22%3A%5B%22AMP%22%5D%2C%22hugoGeneSymbol%22%3A%22ERBB2%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_chord_2024_cna%22%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%2C%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22alterations%22%3A%5B%22AMP%22%5D%2C%22hugoGeneSymbol%22%3A%22ERBB2%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_chord_2024_cna%22%5D%7D%5D%7D","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+2. **Alternative Studies:** If you need protein expression data (IHC, RPPA, or mass spectrometry), consider other breast cancer cohorts in cBioPortal that contain both copy number and protein data:
+   - **TCGA-BRCA (PanCancer Atlas)** — Contains RPPA protein quantification
+   - **METABRIC** — Contains extensive clinical annotations but limited protein data
+   - **MSK-ImmuneOnc** — May have additional immunological markers
+
+### Recommendation:
+For this analysis, you would need to either:
+1. Access MSK's internal HER2 IHC/FISH clinical reports (if available in your institutional EMR)
+2. Use a different public study that has both genomic and proteomic data
+3. Perform the correlation in a combined discovery study using these complementary datasets
+
+[View ERBB2-amplified breast cancer samples in MSK-CHORD](https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%2C%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22alterations%22%3A%5B%22AMP%22%5D%2C%22hugoGeneSymbol%22%3A%22ERBB2%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_chord_2024_cna%22%5D%7D%5D%7D)
