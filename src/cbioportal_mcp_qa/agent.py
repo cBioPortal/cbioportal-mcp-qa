@@ -21,6 +21,7 @@ class AgentReply:
     completion_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    trace: dict | None = None
 
 
 class AgentClient:

@@ -10,6 +10,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from .agent import AgentClient
+from .claude_code import ClaudeCodeClient
 from .dataset import Question
 from .grade import Judge, StudyValidator, cbio_links
 from .render import render_links
@@ -29,7 +30,14 @@ class Run:
 
     @classmethod
     def create(
-        cls, target: str, models: list[str], repeats: int, judge_model: str, questions_file: str
+        cls,
+        target: str,
+        models: list[str],
+        repeats: int,
+        judge_model: str,
+        questions_file: str,
+        runner: str = "agents-api",
+        extra: dict | None = None,
     ) -> "Run":
         run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M")
         path = RESULTS_DIR / run_id / "run.json"
@@ -37,11 +45,13 @@ class Run:
         data = {
             "run_id": run_id,
             "target": target,
+            "runner": runner,
             "models": models,
             "repeats": repeats,
             "judge_model": judge_model,
             "questions_file": questions_file,
             "created_at": datetime.now(UTC).isoformat(),
+            **(extra or {}),
             "records": {},
         }
         run = cls(path, data)
@@ -74,7 +84,7 @@ class Run:
 async def collect_answers(
     run: Run,
     questions: list[Question],
-    client: AgentClient,
+    client: "AgentClient | ClaudeCodeClient",
     concurrency: int,
 ) -> None:
     todo = [
@@ -90,12 +100,10 @@ async def collect_answers(
     async def one(q: Question, model: str, repeat: int) -> None:
         async with sem:
             reply = await client.ask(q.question, model)
-        run.records[record_key(q.id, model, repeat)] = {
-            "question": asdict(q),
-            "model": model,
-            "repeat": repeat,
-            "reply": asdict(reply),
-        }
+        rec = {"question": asdict(q), "model": model, "repeat": repeat, "reply": asdict(reply)}
+        if trace := rec["reply"].pop("trace"):
+            rec["trace"] = trace
+        run.records[record_key(q.id, model, repeat)] = rec
         run.save()
         bar.update(1)
         if reply.error:

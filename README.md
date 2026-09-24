@@ -79,6 +79,47 @@ Output goes to `results/<run-id>/`: `run.json` (every answer, trace and grade), 
 Keep `--concurrency` low (default 2, at most ~3): the beta pod is small and shared with real users. A full run
 (146 questions × Haiku + Sonnet) takes about 1.5 hours and ~35M LibreChat credits (~$35 at list prices).
 
+## Cheap runs with Claude Code (`--runner claude-code`)
+
+For iterating on prompts, guides and views, `--runner claude-code` answers each question with headless
+Claude Code (`claude -p`) instead of the deployed agent:
+
+- **System prompt:** the deployed agent's instructions, read from the cBioAgent MongoDB via `kubectl` at the
+  start of the run (`--target beta` → the beta agent). Only its hash is stored in `run.json`.
+- **Tools:** only the two MCP servers (`cbioportal-database`, `cbioportal-navigator`); Claude Code's built-in
+  tools are disabled and extended thinking is off, matching the deployment.
+- **Models:** the same Haiku 4.5 / Sonnet 5.
+- **Cost:** runs on the Claude subscription of the Claude home it's started with, so point
+  `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock.
+
+`kubectl port-forward` occasionally drops a connection; the answer then shows a tool error such as
+`ECONNRESET` that the deployed agent wouldn't have hit. Each answer's transcript (tool calls with their SQL
+and results, then the answer) is saved under `results/<run>/transcripts/` and linked from the report, in
+place of the Langfuse trace link. Costs in claude-code reports are list-price equivalents; nothing is billed
+per token.
+
+Scores are close to, not identical with, the deployed agent (different harness: no LibreChat recursion limit
+or eager tool execution). Compare claude-code runs with each other; confirm on beta with the Agents API
+runner before changing prod. Reports and the results index label the runner.
+
+The MCP servers are reached through port-forwards to the prod services (the same image, guides and active
+database the agent uses):
+
+```bash
+kubectl port-forward svc/cbioagent-clickhouse-mcp 18080:80 &   # DATABASE_MCP_URL=http://localhost:18080/db/mcp
+kubectl port-forward svc/cbioportal-navigator 18081:80 &       # NAVIGATOR_MCP_URL=http://localhost:18081/mcp
+uv run cbioportal-mcp-qa run --runner claude-code --questions 1-20
+uv run cbioportal-mcp-qa ask "what is the median age in os target gdc" --runner claude-code
+```
+
+To test an unmerged cbioportal-mcp branch, run its image locally instead and point `DATABASE_MCP_URL` at it:
+`docker run --rm -p 18080:8000 --env-file <clickhouse.env> -e CLICKHOUSE_MCP_SERVER_TRANSPORT=http
+-e CLICKHOUSE_MCP_BIND_HOST=0.0.0.0 -e CLICKHOUSE_MCP_BIND_PORT=8000 <image>` (URL `http://localhost:18080/mcp`).
+
+Every run also records versions (both runners): cBioPortal portal / DB schema / gene table versions, the
+cbioportal-mcp and navigator server versions and image digests, and the ClickHouse database the MCP server
+is using and when it was built.
+
 ## Adding questions
 
 Append to `input/questions.yaml` with the next unused `id` (ids are stable; never renumber or reuse):

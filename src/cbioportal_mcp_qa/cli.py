@@ -5,6 +5,8 @@ from pathlib import Path
 import click
 
 from .agent import AgentClient
+from .agent_prompt import fetch_agent_prompt, prompt_fingerprint
+from .claude_code import ClaudeCodeClient
 from .config import MODELS, TARGETS, load_settings
 from .dataset import DEFAULT_QUESTIONS, load_questions, parse_selection
 from .grade import Judge
@@ -18,6 +20,7 @@ from .run import (
     wait_for_ingestion,
 )
 from .traces import Langfuse
+from .versions import collect as collect_versions
 
 MODEL_CHOICES = [k for k in MODELS if k in TARGETS["beta"].specs]
 
@@ -37,6 +40,37 @@ def _langfuse(settings) -> Langfuse:
     return langfuse
 
 
+RUNNERS = ["agents-api", "claude-code"]
+runner_option = click.option(
+    "--runner",
+    type=click.Choice(RUNNERS),
+    default="agents-api",
+    show_default=True,
+    help="agents-api: the deployed agent through LibreChat. claude-code: headless Claude Code with the "
+    "deployed agent's prompt and the same MCP servers (runs on the Claude subscription).",
+)
+
+
+def _agent_prompt(settings, target: str) -> str:
+    try:
+        return fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
+    except Exception as exc:
+        raise click.ClickException(f"could not read the {target} agent's prompt via kubectl: {exc}") from exc
+
+
+def _client(
+    settings, target: str, runner: str, prompt: str | None = None, transcript_dir: Path | None = None
+):
+    if runner == "claude-code":
+        return ClaudeCodeClient(
+            prompt or _agent_prompt(settings, target),
+            settings.database_mcp_url,
+            settings.navigator_mcp_url,
+            transcript_dir=transcript_dir,
+        )
+    return AgentClient(TARGETS[target], settings.api_key)
+
+
 def _judge(settings) -> Judge:
     return Judge(settings.judge_model, settings.aws_region, settings.aws_profile)
 
@@ -50,12 +84,13 @@ def cli() -> None:
 @click.argument("question")
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
 @click.option("--model", type=click.Choice(MODEL_CHOICES), default="haiku", show_default=True)
-def ask(question: str, target: str, model: str) -> None:
+@runner_option
+def ask(question: str, target: str, model: str, runner: str) -> None:
     """Ask the deployed agent a single question."""
     settings = load_settings()
 
     async def go():
-        client = AgentClient(TARGETS[target], settings.api_key)
+        client = _client(settings, target, runner)
         try:
             return await client.ask(question, model)
         finally:
@@ -94,8 +129,9 @@ def ask(question: str, target: str, model: str) -> None:
     show_default=True,
     help="Open navigation answers' links in Chromium.",
 )
+@runner_option
 def run(
-    target, models_arg, selection, questions_file, repeats, concurrency, resume, no_grade, render
+    target, models_arg, selection, questions_file, repeats, concurrency, resume, no_grade, render, runner
 ) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
@@ -105,23 +141,42 @@ def run(
     if resume:
         bench = Run.load(resume)
         target = bench.data["target"]
+        runner = bench.data.get("runner", "agents-api")
+    prompt = _agent_prompt(settings, target) if runner == "claude-code" else None
+    if resume:
+        recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
+        if prompt and recorded and prompt_fingerprint(prompt)["sha256"] != recorded:
+            click.echo("Warning: the agent's prompt changed since this run started", err=True)
     else:
-        bench = Run.create(target, _models(models_arg), repeats, settings.judge_model, str(questions_file))
+        try:
+            fingerprint = prompt_fingerprint(
+                prompt or fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
+            )
+        except Exception as exc:  # noqa: BLE001 - the Agents API runner doesn't need the prompt itself
+            fingerprint = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+        extra = {
+            "agent_prompt": {"agent_id": TARGETS[target].agent_id, **fingerprint},
+            "versions": collect_versions(settings, runner, target),
+        }
+        bench = Run.create(
+            target, _models(models_arg), repeats, settings.judge_model, str(questions_file), runner, extra
+        )
     click.echo(
-        f"Run {bench.data['run_id']}: {len(questions)} questions × {bench.data['models']} × "
-        f"{bench.data['repeats']} on {TARGETS[target].url}"
+        f"Run {bench.data['run_id']} ({runner}): {len(questions)} questions × {bench.data['models']} × "
+        f"{bench.data['repeats']} against {TARGETS[target].agent_id} ({target})"
     )
 
     async def go():
-        client = AgentClient(TARGETS[target], settings.api_key)
+        client = _client(settings, target, runner, prompt, bench.dir / "transcripts")
         try:
             await collect_answers(bench, questions, client, concurrency)
         finally:
             await client.aclose()
 
     asyncio.run(go())
-    wait_for_ingestion()
-    click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")
+    if runner == "agents-api":
+        wait_for_ingestion()
+        click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")
     if render:
         click.echo(f"Rendered {render_navigation_links(bench, settings.chromium_path)} navigation links")
     if not no_grade:

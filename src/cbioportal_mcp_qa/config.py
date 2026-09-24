@@ -28,6 +28,7 @@ class Model:
     label: str
     bedrock_id: str
     price: Price
+    claude_code_id: str | None = None
 
 
 MODELS = {
@@ -36,8 +37,11 @@ MODELS = {
         "Haiku 4.5",
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         Price(1.0, 5.0, 1.25, 0.10),
+        "claude-haiku-4-5-20251001",
     ),
-    "sonnet": Model("sonnet", "Sonnet 5", "us.anthropic.claude-sonnet-5", Price(2.0, 10.0, 2.5, 0.20)),
+    "sonnet": Model(
+        "sonnet", "Sonnet 5", "us.anthropic.claude-sonnet-5", Price(2.0, 10.0, 2.5, 0.20), "claude-sonnet-5"
+    ),
     "sonnet-4.6": Model(
         "sonnet-4.6",
         "Sonnet 4.6",
@@ -84,6 +88,9 @@ class Settings:
     aws_region: str
     aws_profile: str | None
     chromium_path: str | None
+    database_mcp_url: str
+    navigator_mcp_url: str
+    kube_context: str | None
 
 
 def load_settings() -> Settings:
@@ -97,4 +104,7 @@ def load_settings() -> Settings:
         aws_region=os.environ.get("AWS_REGION", "us-east-1"),
         aws_profile=os.environ.get("AWS_PROFILE") or None,
         chromium_path=os.environ.get("CHROMIUM_PATH") or None,
+        database_mcp_url=os.environ.get("DATABASE_MCP_URL", "http://localhost:18080/db/mcp"),
+        navigator_mcp_url=os.environ.get("NAVIGATOR_MCP_URL", "http://localhost:18081/mcp"),
+        kube_context=os.environ.get("KUBE_CONTEXT") or None,
     )
