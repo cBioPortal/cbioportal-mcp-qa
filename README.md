@@ -90,7 +90,7 @@ Claude Code (`claude -p`) instead of the deployed agent:
   tools are disabled and extended thinking is off, matching the deployment.
 - **Models:** the same Haiku 4.5 / Sonnet 5.
 - **Cost:** runs on the Claude subscription of the Claude home it's started with, so point
-  `CLAUDE_CONFIG_DIR` at the work profile (e.g. `~/.claude-cbioportal-team`). Only the judge bills Bedrock.
+  `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock.
 
 Scores are close to, not identical with, the deployed agent (different harness: no LibreChat recursion limit
 or eager tool execution). Compare claude-code runs with each other; confirm on beta with the Agents API
