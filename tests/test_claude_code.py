@@ -10,6 +10,7 @@ from cbioportal_mcp_qa.claude_code import (
     claude_args,
     connector_tool_prefix,
     format_transcript,
+    loaded_servers,
     parse_stream,
     short_tool_name,
     tool_setup,
@@ -232,3 +233,51 @@ def test_format_transcript_shows_calls_results_and_answer():
     assert "SELECT 1\nFROM x" in text
     assert "◀ result\na\nb" in text
     assert text.rstrip().endswith("═ answer (success)\ndone")
+
+
+def test_loaded_servers_reads_the_init_event():
+    lines = _events(
+        {
+            "type": "system",
+            "subtype": "init",
+            "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide", "mcp__cbioportal-navigator__x"],
+        },
+        {"type": "result", "subtype": "success", "result": "ok"},
+    )
+    assert loaded_servers(lines) == {"claude_ai_cBioPortal_MCP", "cbioportal-navigator"}
+    assert loaded_servers(_events({"type": "result"})) is None
+
+
+def test_answers_without_the_connector_are_retried(monkeypatch):
+    monkeypatch.setattr(
+        "cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: {"claude_ai_cBioPortal_MCP"}
+    )
+    client = ClaudeCodeClient(
+        "PROMPT", "unused", "https://nav/mcp", database_connector="claude.ai cBioPortal MCP"
+    )
+    with_connector = _events(
+        {"type": "system", "subtype": "init", "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide"]},
+        *[json.loads(line) for line in STREAM[1:]],
+    )
+    without = _events(
+        {"type": "system", "subtype": "init", "tools": []}, *[json.loads(line) for line in STREAM[1:]]
+    )
+    outputs = iter([without, without, with_connector])
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return ("\n".join(next(outputs)).encode(), b"")
+
+    async def fake_exec(*args, **kwargs):
+        return Proc()
+
+    import asyncio
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    try:
+        reply = asyncio.run(client.ask("q?", "haiku"))
+    finally:
+        asyncio.run(client.aclose())
+    assert reply.error is None and reply.answer == "Median age: 15.2 years"

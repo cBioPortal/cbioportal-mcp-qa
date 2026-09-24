@@ -21,13 +21,17 @@ from .agent import AgentReply
 from .config import MODELS
 from .traces import ToolCall, TraceStats
 
+PROBE_ATTEMPTS = 4
+CONNECTOR_ATTEMPTS = 4
 HEADERS = {"x-user-id": "cbioportal-mcp-qa", "x-user-email": "cbioportal-mcp-qa@localhost"}
 
 
 @dataclass
 class ToolSetup:
-    """Which MCP servers Claude Code gets: servers from an --mcp-config file, plus optionally one claude.ai
-    connector (for the database MCP, whose public endpoint needs the connector's OAuth login)."""
+    """The MCP servers Claude Code gets. `servers` are plain URLs written to an --mcp-config file: the navigator
+    always (its public endpoint needs no login), and the database too when it's reached by URL (port-forward).
+    `connector` is a claude.ai connector used for the database instead: its public endpoint needs the OAuth
+    login that only the connector holds. The other claude.ai connectors go in `disallowed`."""
 
     servers: dict[str, str]
     connector: str | None = None
@@ -66,6 +70,16 @@ def tool_setup(
     return setup
 
 
+def loaded_servers(lines: list[str]) -> set[str] | None:
+    """MCP servers whose tools the session actually had, from the stream-json init event (None if absent)."""
+    for line in lines:
+        if line.startswith("{") and '"init"' in line:
+            event = json.loads(line)
+            if event.get("subtype") == "init":
+                return {t.split("__")[1] for t in event.get("tools", []) if t.startswith("mcp__")}
+    return None
+
+
 def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
     """The MCP servers a Claude Code session loads, read from the stream-json init event of a trivial call."""
     config = os.path.join(workdir, "probe-mcp.json")
@@ -83,14 +97,19 @@ def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
         "stream-json",
     ]
     cmd += ["--verbose", "--no-session-persistence", "--model", MODELS["haiku"].claude_code_id]
-    out = subprocess.run(
-        cmd, cwd=workdir, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180
-    )
-    for line in out.stdout.splitlines():
-        event = json.loads(line) if line.startswith("{") else {}
-        if event.get("subtype") == "init":
-            return {t.split("__")[1] for t in event.get("tools", []) if t.startswith("mcp__")}
-    raise RuntimeError(f"could not start claude to probe MCP servers: {out.stderr[-500:]}")
+    # claude.ai connectors load only some of the time in headless mode, so retry until one shows up.
+    seen: set[str] = set()
+    for _ in range(PROBE_ATTEMPTS):
+        out = subprocess.run(
+            cmd, cwd=workdir, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180
+        )
+        servers = loaded_servers(out.stdout.splitlines())
+        if servers is None:
+            raise RuntimeError(f"could not start claude to probe MCP servers: {out.stderr[-500:]}")
+        seen |= servers
+        if any(name.startswith("claude_ai_") for name in servers):
+            break
+    return seen
 
 
 def claude_args(
@@ -242,13 +261,21 @@ class ClaudeCodeClient:
 
     async def ask(self, question: str, model: str) -> AgentReply:
         started = time.time()
-        for attempt in range(self.retries + 1):
+        retries = connector_misses = 0
+        while True:
             reply = await self._run(question, model, started)
             if reply.error is None:
                 return reply
-            if attempt < self.retries:
+            if "did not load in this session" in reply.error:
+                # The attempt never had the database tools; retry it without using up a regular retry.
+                connector_misses += 1
+                if connector_misses < CONNECTOR_ATTEMPTS:
+                    continue
+            elif retries < self.retries:
+                retries += 1
                 await asyncio.sleep(10)
-        return reply
+                continue
+            return reply
 
     async def _run(self, question: str, model: str, started: float) -> AgentReply:
         t0 = time.monotonic()
@@ -271,6 +298,12 @@ class ClaudeCodeClient:
             )
         lines = stdout.decode().splitlines()
         reply = parse_stream(lines, started, time.monotonic() - t0)
+        if self.setup.connector and connector_tool_prefix(self.setup.connector) not in (
+            loaded_servers(lines) or set()
+        ):
+            reply.status = None
+            reply.error = f"claude.ai connector {self.setup.connector!r} did not load in this session"
+            return reply
         if self.transcript_dir is not None and reply.trace is not None:
             self.transcript_dir.mkdir(parents=True, exist_ok=True)
             name = hashlib.sha1(f"{model}:{question}:{started}".encode()).hexdigest()[:12] + ".txt"
