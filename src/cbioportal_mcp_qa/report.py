@@ -299,6 +299,7 @@ def _headline(summary: dict) -> dict:
     return {
         "run_id": summary["run"]["run_id"],
         "target": summary["run"]["target"],
+        "runner": summary["run"].get("runner", "agents-api"),
         "created_at": summary["run"]["created_at"],
         "n_questions": summary["n_questions"],
         "n_gradeable": summary["n_gradeable"],
