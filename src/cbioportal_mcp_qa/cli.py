@@ -9,7 +9,14 @@ from .config import MODELS, TARGETS, load_settings
 from .dataset import DEFAULT_QUESTIONS, load_questions, parse_selection
 from .grade import Judge
 from .report import write_index, write_report
-from .run import Run, attach_traces, collect_answers, grade_answers, wait_for_ingestion
+from .run import (
+    Run,
+    attach_traces,
+    collect_answers,
+    grade_answers,
+    render_navigation_links,
+    wait_for_ingestion,
+)
 from .traces import Langfuse
 
 MODEL_CHOICES = [k for k in MODELS if k in TARGETS["beta"].specs]
@@ -81,7 +88,15 @@ def ask(question: str, target: str, model: str) -> None:
 @click.option("--concurrency", type=int, default=2, show_default=True, help="Parallel requests to the agent.")
 @click.option("--resume", default=None, help="Run id to continue (re-asks only missing/failed answers).")
 @click.option("--no-grade", is_flag=True, help="Only collect answers and traces.")
-def run(target, models_arg, selection, questions_file, repeats, concurrency, resume, no_grade) -> None:
+@click.option(
+    "--render/--no-render",
+    default=True,
+    show_default=True,
+    help="Open navigation answers' links in Chromium.",
+)
+def run(
+    target, models_arg, selection, questions_file, repeats, concurrency, resume, no_grade, render
+) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
     questions = parse_selection(selection, load_questions(questions_file))
@@ -107,8 +122,20 @@ def run(target, models_arg, selection, questions_file, repeats, concurrency, res
     asyncio.run(go())
     wait_for_ingestion()
     click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")
+    if render:
+        click.echo(f"Rendered {render_navigation_links(bench, settings.chromium_path)} navigation links")
     if not no_grade:
         grade_answers(bench, _judge(settings))
+    click.echo(f"Report: {write_report(bench)}")
+
+
+@cli.command("render")
+@click.argument("run_id")
+@click.option("--concurrency", type=int, default=3, show_default=True)
+def render_cmd(run_id: str, concurrency: int) -> None:
+    """Open the cBioPortal links in navigation answers and record what each page shows (then regrade them)."""
+    bench = Run.load(run_id)
+    click.echo(f"Rendered {render_navigation_links(bench, load_settings().chromium_path, concurrency)} links")
     click.echo(f"Report: {write_report(bench)}")
 
 

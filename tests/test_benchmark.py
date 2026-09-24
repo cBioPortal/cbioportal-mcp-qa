@@ -5,7 +5,7 @@ import pytest
 from cbioportal_mcp_qa import report as report_mod
 from cbioportal_mcp_qa import run as run_mod
 from cbioportal_mcp_qa.dataset import Question, load_questions, parse_selection
-from cbioportal_mcp_qa.grade import StudyValidator, cbio_links, invalid_studies, number_match
+from cbioportal_mcp_qa.grade import StudyValidator, cbio_links, describe_link, invalid_studies, number_match
 from cbioportal_mcp_qa.report import record_cost, summarize, write_report
 from cbioportal_mcp_qa.run import Run
 from cbioportal_mcp_qa.traces import _tool_calls
@@ -217,3 +217,17 @@ def test_write_report_renders_report_and_index(fake_run):
     assert headline["models"]["haiku"]["pass_rate"] == 50.0
     assert headline["models"]["sonnet"]["by_track"]["navigation"] == 0.0
     assert headline["models"]["haiku"]["by_category"]["Cohort & clinical counts"] == 50.0
+
+
+def test_describe_link_decodes_study_view_filter_json():
+    url = (
+        "https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018#filterJson="
+        "%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22IDH1%22%7D%5D%2C"
+        "%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22"
+        "lgg_tcga_pan_can_atlas_2018_mutations%22%5D%7D%5D%7D"
+    )
+    text = describe_link(url)
+    assert "page: /study/summary" in text
+    assert "id: lgg_tcga_pan_can_atlas_2018" in text
+    assert '"hugoGeneSymbol": "IDH1"' in text and '"hugoGeneSymbol": "TP53"' in text
+    assert cbio_links(f"See {url} for details.") == [url]

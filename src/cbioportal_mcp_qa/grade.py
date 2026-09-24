@@ -38,12 +38,20 @@ Also report `declined`: true when the answer refuses or says the data isn't avai
 
 Keep the rationale to 1-3 sentences.
 
+When the answer contains cBioPortal links, judge them from the decoded form below, using these conventions:
+- study view `filterJson` → `geneFilters[].geneQueries` is a list of lists: the OUTER list is AND, each INNER list is OR. `[[IDH1],[TP53]]` means IDH1 AND TP53; `[[IDH1, TP53]]` means IDH1 OR TP53.
+- Values listed for one clinical attribute (`clinicalDataFilters[].values`) are OR; different filters in the same filterJson are AND.
+- For navigation answers the links were also opened in a browser: "what the page shows when opened" is the page's visible text (study name, filter pills such as "IDH1 and TP53", query summary, sample counts, error messages). Trust it over your reading of the URL.
+- If opening a page failed or timed out, that is a problem with the grader's browser, not evidence the link is wrong: judge that link from its decoded URL.
+- `id` / `cancer_study_list` / `studyId` carry the study ids (comma-separated for several studies); `gene_list` the genes; the path picks the page (`/study/summary`, `/results/oncoprint`, `/results/plots`, `/comparison`, `/patient`).
+
 <question>{question}</question>
 <study>{study}</study>
 <reference_answer>{expected_answer}</reference_answer>
 <expected_links>{expected_links}</expected_links>
 <notes>{notes}</notes>
-<answer>{answer}</answer>"""
+<answer>{answer}</answer>
+<decoded_answer_links>{decoded_links}</decoded_answer_links>"""
 
 NUMBER_RE = re.compile(r"-?\d[\d,]*\.?\d*")
 BARE_NUMBER_RE = re.compile(r"^~?\s*-?\d[\d,]*\.?\d*\s*%?$")
@@ -87,6 +95,30 @@ def number_match(expected: str, answer: str, rel_tol: float = 0.01, abs_tol: flo
     return any(abs(v - target) <= tol for v in values)
 
 
+def describe_link(url: str) -> str:
+    """A cBioPortal URL as page, query parameters and pretty-printed filterJson, for the judge."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query) | parse_qs(parsed.fragment)
+    lines = [f"page: {parsed.path or '/'}"]
+    for key, values in params.items():
+        value = values[0]
+        if key == "filterJson":
+            try:
+                value = json.dumps(json.loads(value), indent=1)
+            except ValueError:
+                pass
+        lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+def rendered_text(render: dict | None) -> str:
+    if not render:
+        return ""
+    if not render["ok"]:
+        return f"\nopening the page failed: {render['error']}"
+    return f"\nwhat the page shows when opened:\n{render['text']}"
+
+
 def cbio_links(text: str) -> list[str]:
     return [u for u in extract_urls(text) if "cbioportal.org" in urlparse(u).netloc]
 
@@ -101,19 +133,31 @@ def study_ids(url: str) -> set[str]:
 
 
 class StudyValidator:
-    """Checks study ids in links exist on the public portal (cached per run)."""
+    """Checks study ids in links against the public portal's study list, fetched once per run.
 
-    def __init__(self):
-        self.http = httpx.Client(base_url="https://www.cbioportal.org/api", timeout=30)
-        self.cache: dict[str, bool] = {}
+    If the list can't be fetched (e.g. the API is down), every id is treated as valid rather than flagged.
+    """
+
+    def __init__(
+        self, url: str = "https://www.cbioportal.org/api/studies?projection=SUMMARY&pageSize=100000"
+    ):
+        self.url = url
+        self._known: set[str] | None = None
+        self._loaded = False
+
+    def _load(self) -> None:
+        self._loaded = True
+        try:
+            resp = httpx.get(self.url, timeout=60)
+            resp.raise_for_status()
+            self._known = {s["studyId"] for s in resp.json()} or None
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            self._known = None
 
     def exists(self, study_id: str) -> bool:
-        if study_id not in self.cache:
-            try:
-                self.cache[study_id] = self.http.get(f"/studies/{study_id}").status_code == 200
-            except httpx.HTTPError:
-                self.cache[study_id] = True
-        return self.cache[study_id]
+        if not self._loaded:
+            self._load()
+        return self._known is None or study_id in self._known
 
 
 def invalid_studies(links: list[str], studies: StudyValidator) -> list[str]:
@@ -125,7 +169,9 @@ class Judge:
         self.model = model
         self.client = AnthropicBedrock(aws_region=aws_region, aws_profile=aws_profile)
 
-    def grade(self, q: Question, answer: str, studies: StudyValidator) -> Grade:
+    def grade(
+        self, q: Question, answer: str, studies: StudyValidator, renders: dict[str, dict] | None = None
+    ) -> Grade:
         links = cbio_links(answer)
         base = dict(
             number_match=number_match(q.expected_answer, answer) if q.expected_answer else None,
@@ -145,10 +191,15 @@ class Judge:
             expected_links="\n".join(q.expected_links) or "(none)",
             notes=q.notes or "(none)",
             answer=answer,
+            decoded_links="\n\n".join(
+                f"{url}\n{describe_link(url)}{rendered_text((renders or {}).get(url))}" for url in links
+            )
+            or "(none)",
         )
         response = self.client.messages.create(
             model=self.model,
             max_tokens=1024,
+            extra_body={"temperature": 0},
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
         )

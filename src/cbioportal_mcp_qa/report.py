@@ -169,6 +169,7 @@ def summarize(run: Run) -> dict:
     stats = {m: ModelStats(m, MODELS[m].label) for m in models}
     questions: dict[int, dict] = {}
     judge_tokens = Counter()
+    renders = run.data.get("renders", {})
 
     for rec in run.records.values():
         s = stats[rec["model"]]
@@ -225,6 +226,7 @@ def summarize(run: Run) -> dict:
                 "tokens": (reply.get("prompt_tokens") or 0) + (reply.get("completion_tokens") or 0),
                 "grade": grade,
                 "number_disagreement": disagreement,
+                "renders": [renders[u] for u in (grade.get("links") or []) if u in renders],
                 "trace": trace,
                 "tool_errors": [c for c in (trace or {}).get("tool_calls", []) if not c["ok"]],
             }
