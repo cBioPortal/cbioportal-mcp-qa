@@ -8,6 +8,7 @@ from pathlib import Path
 
 from jinja2 import Environment, PackageLoader, select_autoescape
 
+from .checks import internal_leaks
 from .config import MODELS, PRICES_BY_BEDROCK_ID, TARGETS
 from .dataset import CATEGORIES, TRACKS
 from .run import RESULTS_DIR, Run
@@ -97,6 +98,7 @@ class ModelStats:
     number_disagreements: int = 0
     link_answers: int = 0
     invalid_study_links: int = 0
+    internal_leak_answers: int = 0
 
     @property
     def graded(self) -> int:
@@ -212,6 +214,9 @@ def summarize(run: Run) -> dict:
             s.link_answers += bool(grade.get("links"))
             s.invalid_study_links += bool(grade.get("invalid_studies"))
 
+        leaks = internal_leaks(reply.get("answer") or "") if reply.get("status") == 200 else []
+        s.internal_leak_answers += bool(leaks)
+
         row = questions.setdefault(q["id"], {"question": q, "cells": defaultdict(list)})
         row["cells"][rec["model"]].append(
             {
@@ -226,6 +231,7 @@ def summarize(run: Run) -> dict:
                 "tokens": (reply.get("prompt_tokens") or 0) + (reply.get("completion_tokens") or 0),
                 "grade": grade,
                 "number_disagreement": disagreement,
+                "internal_leaks": leaks,
                 "renders": [renders[u] for u in (grade.get("links") or []) if u in renders],
                 "trace": trace,
                 "tool_errors": [c for c in (trace or {}).get("tool_calls", []) if not c["ok"]],
