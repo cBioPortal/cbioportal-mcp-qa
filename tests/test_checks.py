@@ -26,3 +26,10 @@ def test_plain_answers_and_links_are_fine():
     )
     assert internal_leaks(answer) == []
     assert internal_leaks("") == []
+
+
+def test_technical_questions_are_exempt_from_the_internals_check():
+    from cbioportal_mcp_qa.dataset import Question
+
+    assert Question.from_dict({"id": 1, "question": "write python code", "technical": True}).technical
+    assert not Question.from_dict({"id": 2, "question": "how many samples?"}).technical

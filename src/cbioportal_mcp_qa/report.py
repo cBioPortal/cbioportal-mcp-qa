@@ -214,7 +214,11 @@ def summarize(run: Run) -> dict:
             s.link_answers += bool(grade.get("links"))
             s.invalid_study_links += bool(grade.get("invalid_studies"))
 
-        leaks = internal_leaks(reply.get("answer") or "") if reply.get("status") == 200 else []
+        leaks = (
+            internal_leaks(reply.get("answer") or "")
+            if reply.get("status") == 200 and not q.get("technical")
+            else []
+        )
         s.internal_leak_answers += bool(leaks)
 
         row = questions.setdefault(q["id"], {"question": q, "cells": defaultdict(list)})
