@@ -10,29 +10,133 @@ import asyncio
 import hashlib
 import json
 import os
+import re
+import subprocess
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .agent import AgentReply
 from .config import MODELS
 from .traces import ToolCall, TraceStats
 
-SERVER_NAMES = ("cbioportal-database", "cbioportal-navigator")
+PROBE_ATTEMPTS = 4
+CONNECTOR_ATTEMPTS = 4
+HEADERS = {"x-user-id": "cbioportal-mcp-qa", "x-user-email": "cbioportal-mcp-qa@localhost"}
 
 
-def mcp_config(database_url: str, navigator_url: str) -> dict:
-    headers = {"x-user-id": "cbioportal-mcp-qa", "x-user-email": "cbioportal-mcp-qa@localhost"}
-    return {
-        "mcpServers": {
-            "cbioportal-database": {"type": "http", "url": database_url, "headers": headers},
-            "cbioportal-navigator": {"type": "http", "url": navigator_url, "headers": headers},
+@dataclass
+class ToolSetup:
+    """The MCP servers Claude Code gets. `servers` are plain URLs written to an --mcp-config file: the navigator
+    always (its public endpoint needs no login), and the database too when it's reached by URL (port-forward).
+    `connector` is a claude.ai connector used for the database instead: its public endpoint needs the OAuth
+    login that only the connector holds. The other claude.ai connectors go in `disallowed`."""
+
+    servers: dict[str, str]
+    connector: str | None = None
+    disallowed: list[str] = field(default_factory=list)
+
+    def mcp_config(self) -> dict:
+        return {
+            "mcpServers": {n: {"type": "http", "url": u, "headers": HEADERS} for n, u in self.servers.items()}
         }
-    }
+
+    @property
+    def allowed(self) -> list[str]:
+        prefixes = [f"mcp__{name}" for name in self.servers]
+        return prefixes + ([f"mcp__{connector_tool_prefix(self.connector)}"] if self.connector else [])
 
 
-def claude_args(question: str, model: str, system_prompt: str, mcp_config_path: str) -> list[str]:
-    return [
+def find_connector(url: str, env: dict | None = None) -> str | None:
+    """The claude.ai connector (by whatever name it has in this Claude home) that points at `url`."""
+    out = subprocess.run(
+        ["claude", "mcp", "list"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    ).stdout
+    for line in out.splitlines():
+        name, sep, rest = line.partition(": ")
+        if (
+            sep
+            and name.startswith("claude.ai ")
+            and rest.split(" - ")[0].strip().rstrip("/") == url.rstrip("/")
+        ):
+            return name
+    return None
+
+
+def connector_tool_prefix(connector: str) -> str:
+    """'claude.ai cBioPortal MCP' → 'claude_ai_cBioPortal_MCP', the server segment of its tool names."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", connector)
+
+
+def tool_setup(
+    database_url: str, navigator_url: str, connector: str | None, workdir: str, env: dict
+) -> ToolSetup:
+    if not connector:
+        return ToolSetup({"cbioportal-database": database_url, "cbioportal-navigator": navigator_url})
+    setup = ToolSetup({"cbioportal-navigator": navigator_url}, connector)
+    wanted = connector_tool_prefix(connector)
+    loaded = probe_mcp_servers(setup, workdir, env)
+    if wanted not in loaded:
+        raise RuntimeError(
+            f"claude.ai connector {connector!r} is not connected for this Claude home: {sorted(loaded)}"
+        )
+    # Every other claude.ai connector would otherwise be visible to the model.
+    setup.disallowed = [f"mcp__{s}" for s in sorted(loaded) if s.startswith("claude_ai_") and s != wanted]
+    return setup
+
+
+def loaded_servers(lines: list[str]) -> set[str] | None:
+    """MCP servers whose tools the session actually had, from the stream-json init event (None if absent)."""
+    for line in lines:
+        if line.startswith("{") and '"init"' in line:
+            event = json.loads(line)
+            if event.get("subtype") == "init":
+                return {t.split("__")[1] for t in event.get("tools", []) if t.startswith("mcp__")}
+    return None
+
+
+def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
+    """The MCP servers a Claude Code session loads, read from the stream-json init event of a trivial call."""
+    config = os.path.join(workdir, "probe-mcp.json")
+    with open(config, "w") as f:
+        json.dump(setup.mcp_config(), f)
+    cmd = [
+        "claude",
+        "-p",
+        "Reply OK.",
+        "--tools",
+        "",
+        "--mcp-config",
+        config,
+        "--output-format",
+        "stream-json",
+    ]
+    cmd += ["--verbose", "--no-session-persistence", "--model", MODELS["haiku"].claude_code_id]
+    # claude.ai connectors load only some of the time in headless mode, so retry until one shows up.
+    seen: set[str] = set()
+    for _ in range(PROBE_ATTEMPTS):
+        out = subprocess.run(
+            cmd, cwd=workdir, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180
+        )
+        servers = loaded_servers(out.stdout.splitlines())
+        if servers is None:
+            raise RuntimeError(f"could not start claude to probe MCP servers: {out.stderr[-500:]}")
+        seen |= servers
+        if any(name.startswith("claude_ai_") for name in servers):
+            break
+    return seen
+
+
+def claude_args(
+    question: str, model: str, system_prompt: str, setup: ToolSetup, mcp_config_path: str
+) -> list[str]:
+    args = [
         "claude",
         "-p",
         question,
@@ -42,22 +146,24 @@ def claude_args(question: str, model: str, system_prompt: str, mcp_config_path: 
         system_prompt,
         "--tools",
         "",
-        "--strict-mcp-config",
         "--mcp-config",
         mcp_config_path,
         "--allowedTools",
-        *(f"mcp__{name}" for name in SERVER_NAMES),
+        *setup.allowed,
         "--output-format",
         "stream-json",
         "--verbose",
         "--no-session-persistence",
     ]
+    if setup.connector is None:
+        args.insert(args.index("--mcp-config"), "--strict-mcp-config")
+    if setup.disallowed:
+        args += ["--disallowedTools", *setup.disallowed]
+    return args
 
 
 def short_tool_name(name: str) -> str:
-    for server in SERVER_NAMES:
-        name = name.removeprefix(f"mcp__{server}__")
-    return name
+    return name.split("__", 2)[-1] if name.startswith("mcp__") else name
 
 
 RESULT_CHARS = 3000
@@ -154,6 +260,7 @@ class ClaudeCodeClient:
         system_prompt: str,
         database_url: str,
         navigator_url: str,
+        database_connector: str | None = None,
         timeout_s: float = 900.0,
         retries: int = 1,
         transcript_dir: Path | None = None,
@@ -163,30 +270,39 @@ class ClaudeCodeClient:
         self.timeout_s = timeout_s
         self.retries = retries
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
-        self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
-        with open(self.mcp_config_path, "w") as f:
-            json.dump(mcp_config(database_url, navigator_url), f)
         # Thinking off to match the deployed agent (thinking=false); CLAUDE_CONFIG_DIR passes through.
         self.env = {**os.environ, "MAX_THINKING_TOKENS": "0"}
+        self.setup = tool_setup(database_url, navigator_url, database_connector, self._workdir.name, self.env)
+        self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
+        with open(self.mcp_config_path, "w") as f:
+            json.dump(self.setup.mcp_config(), f)
 
     async def aclose(self) -> None:
         self._workdir.cleanup()
 
     async def ask(self, question: str, model: str) -> AgentReply:
         started = time.time()
-        for attempt in range(self.retries + 1):
+        retries = connector_misses = 0
+        while True:
             reply = await self._run(question, model, started)
             if reply.error is None:
                 return reply
-            if attempt < self.retries:
+            if "did not load in this session" in reply.error:
+                # The attempt never had the database tools; retry it without using up a regular retry.
+                connector_misses += 1
+                if connector_misses < CONNECTOR_ATTEMPTS:
+                    continue
+            elif retries < self.retries:
+                retries += 1
                 await asyncio.sleep(10)
-        return reply
+                continue
+            return reply
 
     async def _run(self, question: str, model: str, started: float) -> AgentReply:
         t0 = time.monotonic()
         # An empty working directory keeps project CLAUDE.md files out of the context.
         proc = await asyncio.create_subprocess_exec(
-            *claude_args(question, model, self.system_prompt, self.mcp_config_path),
+            *claude_args(question, model, self.system_prompt, self.setup, self.mcp_config_path),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -203,6 +319,12 @@ class ClaudeCodeClient:
             )
         lines = stdout.decode().splitlines()
         reply = parse_stream(lines, started, time.monotonic() - t0)
+        if self.setup.connector and connector_tool_prefix(self.setup.connector) not in (
+            loaded_servers(lines) or set()
+        ):
+            reply.status = None
+            reply.error = f"claude.ai connector {self.setup.connector!r} did not load in this session"
+            return reply
         if self.transcript_dir is not None and reply.trace is not None:
             self.transcript_dir.mkdir(parents=True, exist_ok=True)
             name = hashlib.sha1(f"{model}:{question}:{started}".encode()).hexdigest()[:12] + ".txt"

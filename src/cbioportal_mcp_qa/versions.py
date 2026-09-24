@@ -36,19 +36,6 @@ def mcp_server(url: str) -> dict:
     return {"name": info.get("name"), "version": info.get("version")}
 
 
-def clickhouse_database(database_mcp_url: str) -> dict:
-    """The database the MCP server actually queries, and when its tables were built (the daily clone)."""
-    query = (
-        "SELECT currentDatabase() AS database, toString(max(metadata_modification_time)) AS built "
-        "FROM system.tables WHERE database = currentDatabase()"
-    )
-    with MCPSession(database_mcp_url) as mcp:
-        mcp.initialize()
-        text = mcp.call_tool("clickhouse_run_select_query", {"query": query})
-    rows = json.loads(text).get("rows") or [{}]
-    return rows[0]
-
-
 def image_digests(context: str | None) -> dict:
     """Running image of each MCP deployment in the cluster (cbioportal/mcp images carry no git labels)."""
     cmd = ["kubectl", *(["--context", context] if context else []), "get", "pods", "-o", "json"]
@@ -86,10 +73,10 @@ def collect(settings, runner: str, target: str) -> dict:
     versions = {
         "cbioportal_api": _probe(cbioportal_api),
         "image_digests": _probe(lambda: image_digests(settings.kube_context)),
-        "cbioportal_mcp": _probe(lambda: mcp_server(settings.database_mcp_url)),
         "cbioportal_navigator": _probe(lambda: mcp_server(settings.navigator_mcp_url)),
-        "clickhouse": _probe(lambda: clickhouse_database(settings.database_mcp_url)),
     }
+    if settings.database_mcp_url:
+        versions["cbioportal_mcp"] = _probe(lambda: mcp_server(settings.database_mcp_url))
     if runner == "claude-code":
         versions["claude_code"] = _probe(claude_code)
     else:
