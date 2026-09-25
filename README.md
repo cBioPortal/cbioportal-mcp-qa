@@ -91,6 +91,8 @@ Claude Code (`claude -p`) instead of the deployed agent:
 - **Models:** the same Haiku 4.5 / Sonnet 5.
 - **Cost:** runs on the Claude subscription of the Claude home it's started with, so point
   `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock.
+  If the subscription's usage limit is hit (or the connector's login expires), the run stops asking, skips
+  grading, and prints the `--resume` command to continue once the limit resets.
 
 With a port-forward, dropped connections show up as tool errors such as `ECONNRESET` that the deployed agent
 wouldn't have hit — prefer the connector. The prompt the run tested is saved as `results/<run>/agent-prompt.md`

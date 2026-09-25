@@ -190,6 +190,9 @@ def connector_needs_signin(lines: list[str], connector: str) -> bool:
     return False
 
 
+USAGE_LIMIT = re.compile(r"hit your \w+ limit|usage limit reached", re.IGNORECASE)
+
+
 def format_transcript(lines: list[str]) -> str:
     """A readable transcript: every tool call with its arguments and (truncated) result, then the answer."""
     out: list[str] = []
@@ -289,6 +292,7 @@ class ClaudeCodeClient:
         self.system_prompt = system_prompt
         self.transcript_dir = transcript_dir
         self.signin_expired = False
+        self.usage_limit: str | None = None
         self.timeout_s = timeout_s
         self.retries = retries
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
@@ -311,10 +315,12 @@ class ClaudeCodeClient:
         while True:
             if self.signin_expired:
                 return AgentReply("", None, None, self.signin_message(), 0.0, started)
+            if self.usage_limit:
+                return AgentReply("", None, None, self.usage_limit, 0.0, started)
             reply = await self._run(question, model, started)
             if reply.error is None:
                 return reply
-            if self.signin_expired:
+            if self.signin_expired or self.usage_limit:
                 return reply
             if "did not load in this session" in reply.error:
                 # The attempt never had the database tools; retry it without using up a regular retry.
@@ -348,6 +354,9 @@ class ClaudeCodeClient:
             )
         lines = stdout.decode().splitlines()
         reply = parse_stream(lines, started, time.monotonic() - t0)
+        if reply.error and USAGE_LIMIT.search(reply.error):
+            self.usage_limit = reply.error
+            return reply
         if self.setup.connector and connector_needs_signin(lines, self.setup.connector):
             self.signin_expired = True
             reply.status = None

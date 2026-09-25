@@ -350,3 +350,39 @@ def test_client_stops_asking_after_an_expired_login(monkeypatch):
     assert first.status is None and "sign in again" in first.error
     assert second.status is None and "sign in again" in second.error
     assert len(calls) == 1 and client.signin_expired
+
+
+def test_client_stops_asking_after_the_usage_limit(monkeypatch):
+    monkeypatch.setattr("cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: set())
+    client = ClaudeCodeClient("PROMPT", "http://db/mcp", "https://nav/mcp")
+    calls = []
+    limited = _events(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": "You've hit your session limit · resets 3:40am (UTC)",
+        }
+    )
+
+    class Proc:
+        returncode = 1
+
+        async def communicate(self):
+            return ("\n".join(limited).encode(), b"")
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        return Proc()
+
+    import asyncio
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    try:
+        first = asyncio.run(client.ask("q1", "haiku"))
+        second = asyncio.run(client.ask("q2", "haiku"))
+    finally:
+        asyncio.run(client.aclose())
+    assert first.status is None and "session limit" in first.error
+    assert second.status is None and "session limit" in second.error
+    assert len(calls) == 1 and "resets 3:40am" in client.usage_limit
