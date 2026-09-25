@@ -231,3 +231,58 @@ def test_describe_link_decodes_study_view_filter_json():
     assert "id: lgg_tcga_pan_can_atlas_2018" in text
     assert '"hugoGeneSymbol": "IDH1"' in text and '"hugoGeneSymbol": "TP53"' in text
     assert cbio_links(f"See {url} for details.") == [url]
+
+
+def test_index_shows_runner_and_flags_changed_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(report_mod, "RESULTS_DIR", tmp_path)
+    versions = {
+        "cbioportal_api": {
+            "portal_version": "v7.1.2",
+            "db_schema_version": "3.0.0",
+            "gene_table_version": "hgnc_v7",
+        },
+        "image_digests": {
+            "cbioportal_mcp": "sha256:a06ebc2283e0",
+            "cbioportal_navigator": "sha256:4135b03b8257",
+        },
+        "cbioportal_navigator": {"version": "1.0.0"},
+        "claude_code": "2.1.282 (Claude Code)",
+    }
+    runs = {
+        "20260101-0000": {"runner": "agents-api"},
+        "20260102-0000": {"runner": "claude-code", "agent_prompt": {"sha256": "aaa"}, "versions": versions},
+        "20260103-0000": {"runner": "claude-code", "agent_prompt": {"sha256": "bbb"}, "versions": versions},
+    }
+    for run_id, extra in runs.items():
+        (tmp_path / run_id).mkdir()
+        summary = {
+            "run_id": run_id,
+            "target": "beta",
+            "n_questions": 1,
+            "n_gradeable": 1,
+            "models": {
+                "haiku": {
+                    "label": "Haiku 4.5",
+                    "pass_rate": 50.0,
+                    "errors": 0,
+                    "by_track": {},
+                    "cost_per_pass": None,
+                    "median_latency": None,
+                }
+            },
+        }
+        (tmp_path / run_id / "summary.json").write_text(json.dumps(summary | {"runner": extra["runner"]}))
+        (tmp_path / run_id / "run.json").write_text(json.dumps(extra))
+    assert report_mod.run_setup(runs["20260102-0000"]) == {
+        "runner": "Claude Code 2.1.282",
+        "prompt": "aaa",
+        "cbioportal_mcp": "a06ebc2",
+        "navigator": "1.0.0 4135b03",
+        "cbioportal": "v7.1.2 / DB 3.0.0 / hgnc_v7",
+    }
+    assert report_mod.run_setup(runs["20260101-0000"])["runner"] == "LibreChat"
+    html = report_mod.write_index().read_text()
+    newest, middle, oldest = (html.index(r) for r in sorted(runs, reverse=True))
+    assert 'class="changed"><span class="muted">prompt' in html[newest:middle]
+    assert 'class="changed"><strong>Claude Code' in html[middle:oldest]
+    assert 'class="changed"><strong>Claude Code' not in html[newest:middle]
