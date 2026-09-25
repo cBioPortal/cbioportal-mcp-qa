@@ -310,6 +310,7 @@ def _headline(summary: dict) -> dict:
         "run_id": summary["run"]["run_id"],
         "target": summary["run"]["target"],
         "runner": summary["run"].get("runner", "agents-api"),
+        **{k: summary["run"].get(k) for k in RUN_SETUP_KEYS},
         "created_at": summary["run"]["created_at"],
         "n_questions": summary["n_questions"],
         "n_gradeable": summary["n_gradeable"],
@@ -334,8 +335,63 @@ def _headline(summary: dict) -> dict:
     }
 
 
+RUN_SETUP_KEYS = ("agent_prompt", "versions", "database_mcp")
+
+
+def run_setup(run: dict) -> dict:
+    """What a run ran on, as short labels: runner, prompt and server versions (None when not recorded)."""
+    v = run.get("versions") or {}
+    api = v.get("cbioportal_api") or {}
+    digests = v.get("image_digests") or {}
+    digests = {} if digests.get("error") else digests
+    nav = v.get("cbioportal_navigator") or {}
+    mcp = v.get("cbioportal_mcp") or {}
+    prompt = run.get("agent_prompt") or {}
+    if run.get("runner") == "claude-code":
+        cc = v.get("claude_code")
+        runner = "Claude Code " + cc.split()[0] if isinstance(cc, str) else "Claude Code"
+    else:
+        lc = v.get("librechat")
+        runner = "LibreChat " + lc.split(":")[-1] if isinstance(lc, str) else "LibreChat"
+
+    def server(version: str | None, digest: str | None) -> str | None:
+        parts = [x for x in (version, digest and digest.removeprefix("sha256:")[:7]) if x]
+        return " ".join(parts) or None
+
+    return {
+        "runner": runner,
+        "prompt": prompt.get("sha256"),
+        "cbioportal_mcp": server(mcp.get("version"), digests.get("cbioportal_mcp")),
+        "navigator": server(nav.get("version"), digests.get("cbioportal_navigator")),
+        "cbioportal": " / ".join(
+            x
+            for x in (
+                api.get("portal_version"),
+                api.get("db_schema_version") and f"DB {api['db_schema_version']}",
+                api.get("gene_table_version"),
+            )
+            if x
+        )
+        or None,
+    }
+
+
 def write_index() -> Path:
-    runs = [json.loads(p.read_text()) for p in sorted(RESULTS_DIR.glob("*/summary.json"), reverse=True)]
+    runs = []
+    for path in sorted(RESULTS_DIR.glob("*/summary.json"), reverse=True):
+        summary = json.loads(path.read_text())
+        if not all(k in summary for k in RUN_SETUP_KEYS) and (path.parent / "run.json").exists():
+            recorded = json.loads((path.parent / "run.json").read_text())
+            summary |= {k: recorded.get(k) for k in RUN_SETUP_KEYS}
+        summary["setup"] = run_setup(summary)
+        runs.append(summary)
+    # A setup value is flagged when it differs from the next older run that recorded it.
+    for i, run in enumerate(runs):
+        run["changed"] = set()
+        for key, value in run["setup"].items():
+            older = next((r["setup"][key] for r in runs[i + 1 :] if r["setup"][key] is not None), None)
+            if value is not None and older is not None and value != older:
+                run["changed"].add(key)
     out = RESULTS_DIR / "index.html"
     out.write_text(_env().get_template("index.html.j2").render(runs=runs, track_labels=TRACK_LABELS))
     return out
