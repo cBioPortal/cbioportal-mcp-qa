@@ -1,0 +1,154 @@
+Q (haiku): <conversation_so_far>
+<user>
+What is the % of KRAS G12D across different tumor types? Use the MSK-IMPACT dataset.
+</user>
+
+<assistant>
+In MSK-IMPACT (msk_impact_50k_2026), KRAS G12D by cancer type (samples profiled for KRAS):
+- Pancreatic Cancer: 964 / 2,851 (33.8%)
+- Colorectal Cancer: 674 / 5,277 (12.8%)
+- Cancer of Unknown Primary: 100 / 1,581 (6.3%)
+- Endometrial Cancer: 135 / 2,445 (5.5%)
+- Non-Small Cell Lung Cancer: 285 / 7,867 (3.6%)
+</assistant>
+</conversation_so_far>
+
+Continue this conversation: reply to the user's new message.
+
+<user>
+How about G12C?
+</user>
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT *
+FROM gene_mutation_variants_in_study(
+    study = 'msk_impact_50k_2026',
+    gene = 'KRAS'
+)
+WHERE mutation_variant = 'G12C'
+ORDER BY frequency_pct DESC;
+"
+}
+
+◀ result
+{"rows":[{"mutation_variant":"G12C","mutation_type":"Missense_Mutation","altered_samples":1288,"profiled_samples":54331,"frequency_pct":2.4,"total_mutation_events":1288}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cancer_types AS (
+    SELECT DISTINCT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'msk_impact_50k_2026'
+      AND cd.attribute_name = 'CANCER_TYPE'
+),
+g12c_altered AS (
+    SELECT ct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cancer_types ct USING (sample_unique_id)
+    WHERE ged.cancer_study_identifier = 'msk_impact_50k_2026'
+      AND ged.hugo_gene_symbol = 'KRAS'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.mutation_variant = 'G12C'
+      AND ged.off_panel = 0
+    GROUP BY ct.cancer_type
+),
+kras_profiled AS (
+    SELECT ct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM (
+        SELECT sample_unique_id, cancer_study_identifier
+        FROM mutation_panel_gene_coverage
+        WHERE hugo_gene_symbol = 'KRAS'
+        UNION ALL
+        SELECT sample_unique_id, cancer_study_identifier
+        FROM mutation_wes_coverage
+    ) p
+    JOIN cancer_types ct USING (sample_unique_id)
+    WHERE p.cancer_study_identifier = 'msk_impact_50k_2026'
+    GROUP BY ct.cancer_type
+)
+SELECT 
+    p.cancer_type,
+    COALESCE(g.altered_samples, 0) AS altered_samples,
+    p.profiled_samples,
+    ROUND(COALESCE(g.altered_samples, 0) * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM kras_profiled p
+LEFT JOIN g12c_altered g USING (cancer_type)
+WHERE p.profiled_samples >= 50
+ORDER BY frequency_pct DESC;
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_type":"Non-Small Cell Lung Cancer","altered_samples":922,"profiled_samples":7867,"frequency_pct":11.7},{"cancer_type":"Appendiceal Cancer","altered_samples":12,"profiled_samples":274,"frequency_pct":4.4},{"cancer_type":"Small Bowel Cancer","altered_samples":7,"profiled_samples":161,"frequency_pct":4.3},{"cancer_type":"Colorectal Cancer","altered_samples":158,"profiled_samples":5277,"frequency_pct":3},{"cancer_type":"Cancer of Unknown Primary","altered_samples":48,"profiled_samples":1581,"frequency_pct":3},{"cancer_type":"Ampullary Cancer","altered_samples":4,"profiled_samples":134,"frequency_pct":3},{"cancer_type":"Vaginal Cancer","altered_samples":1,"profiled_samples":57,"frequency_pct":1.8},{"cancer_type":"Small Cell Lung Cancer","altered_samples":8,"profiled_samples":466,"frequency_pct":1.7},{"cancer_type":"Anal Cancer","altered_samples":2,"profiled_samples":143,"frequency_pct":1.4},{"cancer_type":"Endometrial Cancer","altered_samples":30,"profiled_samples":2445,"frequency_pct":1.2},{"cancer_type":"Pancreatic Cancer","altered_samples":33,"profiled_samples":2851,"frequency_pct":1.2},{"cancer_type":"Hepatobiliary Cancer","altered_samples":10,"profiled_samples":1431,"frequency_pct":0.7},{"cancer_type":"Germ Cell Tumor","altered_samples":4,"profiled_samples":725,"frequency_pct":0.6},{"cancer_type":"Ovarian Cancer","altered_samples":13,"profiled_samples":2140,"frequency_pct":0.6},{"cancer_type":"Esophagogastric Cancer","altered_samples":8,"profiled_samples":1834,"frequency_pct":0.4},{"cancer_type":"Cervical Cancer","altered_samples":1,"profiled_samples":351,"frequency_pct":0.3},{"cancer_type":"Bladder Cancer","altered_samples":7,"profiled_samples":2526,"frequency_pct":0.3},{"cancer_type":"Thyroid Cancer","altered_samples":3,"profiled_samples":867,"frequency_pct":0.3},{"cancer_type":"Melanoma","altered_samples":3,"profiled_samples":1831,"frequency_pct":0.2},{"cancer_type":"Mesothelioma","altered_samples":1,"profiled_samples":408,"frequency_pct":0.2},{"cancer_type":"Peripheral Nervous System","altered_samples":1,"profiled_samples":411,"frequency_pct":0.2},{"cancer_type":"Head and Neck Cancer","altered_samples":1,"profiled_samples":657,"frequency_pct":0.2},{"cancer_type":"Soft Tissue Sarcoma","altered_samples":3,"profiled_samples":2307,"frequency_pct":0.1},{"cancer_type":"Glioma","altered_samples":2,"profiled_samples":2322,"frequency_pct":0.1},{"cancer_type":"Breast Cancer","altered_samples":4,"profiled_samples":6807,"frequency_pct":0.1},{"altered_samples":0,"profiled_samples":50,"frequency_pct":0},{"cancer_type":"Bone Cancer","altered_samples":0,"profiled_samples":590,"frequency_pct":0},{"cancer_type":"Wilms Tumor","altered_samples":0,"profiled_samples":68,"frequency_pct":0},{"cancer_type":"Miscellaneous Brain Tumor","altered_samples":0,"profiled_samples":58,"frequency_pct":0},{"cancer_type":"Embryonal Tumor","altered_samples":0,"profiled_samples":80,"frequency_pct":0},{"cancer_type":"Sex Cord Stromal Tumor","altered_samples":0,"pro … (1330 more chars)
+
+═ answer (success)
+In MSK-IMPACT (msk_impact_50k_2026), **KRAS G12C** by cancer type (samples profiled for KRAS):
+
+- **Non-Small Cell Lung Cancer**: 922 / 7,867 (11.7%)
+- **Appendiceal Cancer**: 12 / 274 (4.4%)
+- **Small Bowel Cancer**: 7 / 161 (4.3%)
+- **Colorectal Cancer**: 158 / 5,277 (3.0%)
+- **Cancer of Unknown Primary**: 48 / 1,581 (3.0%)
+- **Ampullary Cancer**: 4 / 134 (3.0%)
+- **Vaginal Cancer**: 1 / 57 (1.8%)
+- **Small Cell Lung Cancer**: 8 / 466 (1.7%)
+- **Anal Cancer**: 2 / 143 (1.4%)
+- **Endometrial Cancer**: 30 / 2,445 (1.2%)
+- **Pancreatic Cancer**: 33 / 2,851 (1.2%)
+
+G12C is predominantly a lung cancer variant, appearing in 11.7% of NSCLC samples versus much lower frequencies in other cancer types.

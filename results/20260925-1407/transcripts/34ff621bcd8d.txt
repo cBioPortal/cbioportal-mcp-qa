@@ -1,0 +1,431 @@
+Q (haiku): <conversation_so_far>
+<user>
+How does ESR1 mRNA expression differ between PAM50 subtypes in TCGA breast cancer?
+</user>
+
+<assistant>
+In Breast Invasive Carcinoma (TCGA, PanCancer Atlas), ESR1 mRNA is highest in Luminal A and Luminal B tumors, intermediate in Normal-like and HER2-enriched, and lowest in Basal-like tumors. You can see the distribution here:
+[ESR1 expression by subtype](https://www.cbioportal.org/results/plots?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=ESR1)
+</assistant>
+</conversation_so_far>
+
+Continue this conversation: reply to the user's new message.
+
+<user>
+Can you do this with METABRIC instead?
+</user>
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+▶ list_studies
+{
+ "search": "METABRIC",
+ "limit": 5
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","type_of_cancer_id":"brca","sample_count":2509,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_metabric"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type
+LIMIT 20;
+"
+}
+
+◀ result
+{"rows":[{"profile_type":"cna"},{"profile_type":"methylation_promoters_rrbs"},{"profile_type":"mrna"},{"profile_type":"mrna_median_all_sample_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    c.attribute_value AS pam50_subtype,
+    count() AS sample_count,
+    avg(toFloat64OrNull(g.alteration_value)) AS mean_esr1_expression,
+    median(toFloat64OrNull(g.alteration_value)) AS median_esr1_expression,
+    min(toFloat64OrNull(g.alteration_value)) AS min_esr1_expression,
+    max(toFloat64OrNull(g.alteration_value)) AS max_esr1_expression
+FROM genetic_alteration_derived g
+INNER JOIN clinical_data_derived c 
+    ON g.sample_unique_id = c.sample_unique_id
+    AND g.cancer_study_identifier = c.cancer_study_identifier
+WHERE g.cancer_study_identifier = 'brca_metabric'
+  AND g.hugo_gene_symbol = 'ESR1'
+  AND g.profile_type = 'mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+  AND c.attribute_id = 'PAM50'
+  AND c.attribute_value NOT IN ('', 'NA')
+GROUP BY pam50_subtype
+ORDER BY median_esr1_expression DESC;
+",
+ "max_rows": 10
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'c.attribute_id' cannot be resolved from table with name c. In scope SELECT c.attribute_value AS pam50_subtype, count() AS sample_count, avg(toFloat64OrNull(g.alteration_value)) AS mean_esr1_expression, median(toFloat64OrNull(g.alteration_value)) AS median_esr1_expression, min(toFloat64OrNull(g.alteration_value)) AS min_esr1_expression, max(toFloat64OrNull(g.alteration_value)) AS max_esr1_expression FROM genetic_alteration_derived AS g INNER JOIN clinical_data_derived AS c ON (g.sample_unique_id = c.sample_unique_id) AND (g.cancer_study_identifier = c.cancer_study_identifier) WHERE (g.cancer_study_identifier = 'brca_metabric') AND (g.hugo_gene_symbol = 'ESR1') AND (g.profile_type = 'mrna') AND (g.alteration_value NOT IN ('', 'NA')) AND (toFloat64OrNull(g.alteration_value) IS NOT NULL) AND (c.attribute_id = 'PAM50') AND (c.attribute_value NOT IN ('', 'NA')) GROUP BY pam50_subtype ORDER BY median_esr1_expression DESC. Maybe you meant: ['c.attribute_name']. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    c.attribute_value AS pam50_subtype,
+    count() AS sample_count,
+    avg(toFloat64OrNull(g.alteration_value)) AS mean_esr1_expression,
+    median(toFloat64OrNull(g.alteration_value)) AS median_esr1_expression,
+    min(toFloat64OrNull(g.alteration_value)) AS min_esr1_expression,
+    max(toFloat64OrNull(g.alteration_value)) AS max_esr1_expression
+FROM genetic_alteration_derived g
+INNER JOIN clinical_data_derived c 
+    ON g.sample_unique_id = c.sample_unique_id
+    AND g.cancer_study_identifier = c.cancer_study_identifier
+WHERE g.cancer_study_identifier = 'brca_metabric'
+  AND g.hugo_gene_symbol = 'ESR1'
+  AND g.profile_type = 'mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+  AND c.attribute_name = 'PAM50'
+  AND c.attribute_value NOT IN ('', 'NA')
+GROUP BY pam50_subtype
+ORDER BY median_esr1_expression DESC;
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY attribute_name
+LIMIT 30;
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"attribute_name":"AGE_AT_DIAGNOSIS"},{"attribute_name":"BREAST_SURGERY"},{"attribute_name":"CANCER_TYPE"},{"attribute_name":"CANCER_TYPE_DETAILED"},{"attribute_name":"CELLULARITY"},{"attribute_name":"CHEMOTHERAPY"},{"attribute_name":"CLAUDIN_SUBTYPE"},{"attribute_name":"COHORT"},{"attribute_name":"ER_IHC"},{"attribute_name":"ER_STATUS"},{"attribute_name":"GRADE"},{"attribute_name":"HER2_SNP6"},{"attribute_name":"HER2_STATUS"},{"attribute_name":"HISTOLOGICAL_SUBTYPE"},{"attribute_name":"HORMONE_THERAPY"},{"attribute_name":"INFERRED_MENOPAUSAL_STATE"},{"attribute_name":"INTCLUST"},{"attribute_name":"LATERALITY"},{"attribute_name":"LYMPH_NODES_EXAMINED_POSITIVE"},{"attribute_name":"MUTATION_COUNT"},{"attribute_name":"NPI"},{"attribute_name":"ONCOTREE_CODE"},{"attribute_name":"OS_MONTHS"},{"attribute_name":"OS_STATUS"},{"attribute_name":"PR_STATUS"},{"attribute_name":"RADIO_THERAPY"},{"attribute_name":"RFS_MONTHS"},{"attribute_name":"RFS_STATUS"},{"attribute_name":"SAMPLE_COUNT"},{"attribute_name":"SAMPLE_TYPE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT attribute_value
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+  AND attribute_name = 'CLAUDIN_SUBTYPE'
+  AND attribute_value NOT IN ('', 'NA')
+ORDER BY attribute_value;
+",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"attribute_value":"Basal"},{"attribute_value":"Her2"},{"attribute_value":"LumA"},{"attribute_value":"LumB"},{"attribute_value":"NC"},{"attribute_value":"Normal"},{"attribute_value":"claudin-low"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    c.attribute_value AS claudin_subtype,
+    count() AS sample_count,
+    round(avg(toFloat64OrNull(g.alteration_value)), 2) AS mean_esr1_expression,
+    round(median(toFloat64OrNull(g.alteration_value)), 2) AS median_esr1_expression
+FROM genetic_alteration_derived g
+INNER JOIN clinical_data_derived c 
+    ON g.sample_unique_id = c.sample_unique_id
+    AND g.cancer_study_identifier = c.cancer_study_identifier
+WHERE g.cancer_study_identifier = 'brca_metabric'
+  AND g.hugo_gene_symbol = 'ESR1'
+  AND g.profile_type = 'mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+  AND c.attribute_name = 'CLAUDIN_SUBTYPE'
+  AND c.attribute_value NOT IN ('', 'NA')
+GROUP BY claudin_subtype
+ORDER BY median_esr1_expression DESC;
+",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT count(DISTINCT g.sample_unique_id) AS samples_with_esr1_mrna,
+       count(DISTINCT c.sample_unique_id) AS samples_with_claudin,
+       count(DISTINCT (CASE WHEN c.sample_unique_id IS NOT NULL THEN g.sample_unique_id END)) AS samples_with_both
+FROM genetic_alteration_derived g
+LEFT JOIN clinical_data_derived c 
+    ON g.sample_unique_id = c.sample_unique_id
+    AND g.cancer_study_identifier = c.cancer_study_identifier
+    AND c.attribute_name = 'CLAUDIN_SUBTYPE'
+WHERE g.cancer_study_identifier = 'brca_metabric'
+  AND g.hugo_gene_symbol = 'ESR1'
+  AND g.profile_type = 'mrna'
+  AND g.alteration_value NOT IN ('', 'NA');
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"samples_with_esr1_mrna":1980,"samples_with_claudin":1,"samples_with_both":1980}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT c.type, count(DISTINCT c.sample_unique_id) AS sample_count
+FROM clinical_data_derived c
+WHERE c.cancer_study_identifier = 'brca_metabric'
+  AND c.attribute_name = 'CLAUDIN_SUBTYPE'
+  AND c.attribute_value NOT IN ('', 'NA')
+GROUP BY c.type;
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"type":"patient","sample_count":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    c.attribute_value AS claudin_subtype,
+    count() AS sample_count,
+    round(avg(toFloat64OrNull(g.alteration_value)), 2) AS mean_esr1_expression,
+    round(median(toFloat64OrNull(g.alteration_value)), 2) AS median_esr1_expression
+FROM genetic_alteration_derived g
+INNER JOIN clinical_data_derived c 
+    ON g.cancer_study_identifier = c.cancer_study_identifier
+    AND substr(g.sample_unique_id, 1, position('_' IN g.sample_unique_id) - 1 || '_' || substring(g.sample_unique_id, position('_' IN g.sample_unique_id) + 1)) = c.patient_unique_id
+WHERE g.cancer_study_identifier = 'brca_metabric'
+  AND g.hugo_gene_symbol = 'ESR1'
+  AND g.profile_type = 'mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+  AND c.attribute_name = 'CLAUDIN_SUBTYPE'
+  AND c.attribute_value NOT IN ('', 'NA')
+GROUP BY claudin_subtype
+ORDER BY median_esr1_expression DESC;
+",
+ "max_rows": 20
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 43\n Code: 43. DB::Exception: Illegal type String of second argument of function substring, expected (U)Int*: In scope SELECT c.attribute_value AS claudin_subtype, count() AS sample_count, round(avg(toFloat64OrNull(g.alteration_value)), 2) AS mean_esr1_expression, round(median(toFloat64OrNull(g.alteration_value)), 2) AS median_esr1_expression FROM genetic_alteration_derived AS g INNER JOIN clinical_data_derived AS c ON (g.cancer_study_identifier = c.cancer_study_identifier) AND (substr(g.sample_unique_id, 1, concat(position(g.sample_unique_id, '_') - 1, '_', substring(g.sample_unique_id, position(g.sample_unique_id, '_') + 1))) = c.patient_unique_id) WHERE (g.cancer_study_identifier = 'brca_metabric') AND (g.hugo_gene_symbol = 'ESR1') AND (g.profile_type = 'mrna') AND (g.alteration_value NOT IN ('', 'NA')) AND (toFloat64OrNull(g.alteration_value) IS NOT NULL) AND (c.attribute_name = 'CLAUDIN_SUBTYPE') AND (c.attribute_value NOT IN ('', 'NA')) GROUP BY claudin_subtype ORDER BY median_esr1_expression DESC. (ILLEGAL_TYPE_OF_ARGUMENT) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    c.attribute_value AS claudin_subtype,
+    count() AS sample_count,
+    round(avg(toFloat64OrNull(g.alteration_value)), 2) AS mean_esr1_expression,
+    round(median(toFloat64OrNull(g.alteration_value)), 2) AS median_esr1_expression
+FROM genetic_alteration_derived g
+INNER JOIN clinical_data_derived c 
+    ON g.cancer_study_identifier = c.cancer_study_identifier
+    AND c.patient_unique_id IN (
+        SELECT patient_unique_id
+        FROM clinical_data_derived
+        WHERE cancer_study_identifier = g.cancer_study_identifier
+          AND sample_unique_id = g.sample_unique_id
+    )
+WHERE g.cancer_study_identifier = 'brca_metabric'
+  AND g.hugo_gene_symbol = 'ESR1'
+  AND g.profile_type = 'mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+  AND c.attribute_name = 'CLAUDIN_SUBTYPE'
+  AND c.attribute_value NOT IN ('', 'NA')
+GROUP BY claudin_subtype
+ORDER BY median_esr1_expression DESC;
+",
+ "max_rows": 20
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 1\n Code: 1. DB::Exception: Resolved identifier 'g.cancer_study_identifier' in parent scope to expression 'g.cancer_study_identifier' with correlated columns 'cancer_study_identifier' (Enable 'allow_experimental_correlated_subqueries' setting to allow correlated subqueries execution). In scope (SELECT patient_unique_id FROM clinical_data_derived WHERE (cancer_study_identifier = g.cancer_study_identifier) AND (sample_unique_id = g.sample_unique_id)). (UNSUPPORTED_METHOD) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sample_to_patient AS (
+    SELECT DISTINCT sample_unique_id, patient_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+),
+esr1_mrna AS (
+    SELECT g.sample_unique_id, toFloat64OrNull(g.alteration_value) AS esr1_value
+    FROM genetic_alteration_derived g
+    WHERE g.cancer_study_identifier = 'brca_metabric'
+      AND g.hugo_gene_symbol = 'ESR1'
+      AND g.profile_type = 'mrna'
+      AND g.alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+),
+claudin_subtype AS (
+    SELECT patient_unique_id, attribute_value
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND attribute_name = 'CLAUDIN_SUBTYPE'
+      AND attribute_value NOT IN ('', 'NA')
+)
+SELECT 
+    c.attribute_value AS claudin_subtype,
+    count() AS sample_count,
+    round(avg(e.esr1_value), 2) AS mean_esr1_expression,
+    round(median(e.esr1_value), 2) AS median_esr1_expression
+FROM esr1_mrna e
+INNER JOIN sample_to_patient s ON e.sample_unique_id = s.sample_unique_id
+INNER JOIN claudin_subtype c ON s.patient_unique_id = c.patient_unique_id
+GROUP BY c.attribute_value
+ORDER BY median_esr1_expression DESC;
+",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"claudin_subtype":"LumB","sample_count":475,"mean_esr1_expression":11,"median_esr1_expression":11.15},{"claudin_subtype":"LumA","sample_count":700,"mean_esr1_expression":10.81,"median_esr1_expression":10.93},{"claudin_subtype":"NC","sample_count":6,"mean_esr1_expression":10.93,"median_esr1_expression":10.83},{"claudin_subtype":"Normal","sample_count":148,"mean_esr1_expression":9.47,"median_esr1_expression":9.76},{"claudin_subtype":"Her2","sample_count":224,"mean_esr1_expression":7.8,"median_esr1_expression":7.1},{"claudin_subtype":"claudin-low","sample_count":218,"mean_esr1_expression":7.41,"median_esr1_expression":6.62},{"claudin_subtype":"Basal","sample_count":209,"mean_esr1_expression":6.42,"median_esr1_expression":5.99}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_metabric"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_metabric","metadata":{"clinicalAttributeIds":["AGE_AT_DIAGNOSIS","BREAST_SURGERY","CANCER_TYPE","CANCER_TYPE_DETAILED","CELLULARITY","CHEMOTHERAPY","CLAUDIN_SUBTYPE","COHORT","ER_IHC","ER_STATUS","GRADE","HER2_SNP6","HER2_STATUS","HISTOLOGICAL_SUBTYPE","HORMONE_THERAPY","INFERRED_MENOPAUSAL_STATE","INTCLUST","LATERALITY","LYMPH_NODES_EXAMINED_POSITIVE","MUTATION_COUNT","NPI","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PR_STATUS","RADIO_THERAPY","RFS_MONTHS","RFS_STATUS","SAMPLE_COUNT","SAMPLE_TYPE","SEX","THREEGENE","TMB_NONSYNONYMOUS","TUMOR_SIZE","TUMOR_STAGE","VITAL_STATUS"],"molecularProfileIds":["brca_metabric_cna","brca_metabric_methylation_promoters_rrbs","brca_metabric_mrna","brca_metabric_mrna_median_all_sample_Zscores","brca_metabric_mutations"],"heatmapProfileIds":["brca_metabric_methylation_promoters_rrbs","brca_metabric_mrna_median_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","dna_methylation"]}}]}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "brca_metabric"
+ ],
+ "filterAttributeId": "CLAUDIN_SUBTYPE",
+ "tab": "plots",
+ "plotsVertSelection": {
+  "selectedGeneOption": "ESR1",
+  "dataType": "mrna"
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/plots?id=brca_metabric&filterAttributeId=CLAUDIN_SUBTYPE&plots_vert_selection=%7B%22selectedGeneOption%22%3A%222099%22%2C%22dataType%22%3A%22mrna%22%7D","url":"https://www.cbioportal.org/study/plots?id=brca_metabric&filterAttributeId=CLAUDIN_SUBTYPE&plots_vert_selection=%7B%22selectedGeneOption%22%3A%222099%22%2C%22dataType%22%3A%22mrna%22%7D","data":{"studyIds":["brca_metabric"],"studies":[{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509}],"tab":"plots","hasFilters":true,"hasPlotsConfig":true,"pageDescription":"Scatter/box plots comparing any two data elements."}}
+
+═ answer (success)
+## ESR1 mRNA Expression by Claudin Subtype in METABRIC
+
+METABRIC breast cancer uses **Claudin subtyping**, not PAM50. Here's the ESR1 expression distribution across subtypes (1,980 samples with mRNA data):
+
+| Subtype | Samples | Median ESR1 | Mean ESR1 |
+|---------|---------|------------|----------|
+| **Luminal B** | 475 | 11.15 | 11.00 |
+| **Luminal A** | 700 | 10.93 | 10.81 |
+| Normal-like | 148 | 9.76 | 9.47 |
+| HER2-enriched | 224 | 7.10 | 7.80 |
+| Claudin-low | 218 | 6.62 | 7.41 |
+| **Basal** | 209 | 5.99 | 6.42 |
+
+**Key finding:** ESR1 is highest in Luminal A/B tumors (median 10.9–11.2, consistent with hormone receptor expression), intermediate in HER2-enriched and normal-like, and lowest in Basal-like (median 6.0).
+
+[View plots with ESR1 expression by Claudin subtype](https://www.cbioportal.org/study/plots?id=brca_metabric&filterAttributeId=CLAUDIN_SUBTYPE&plots_vert_selection=%7B%22selectedGeneOption%22%3A%222099%22%2C%22dataType%22%3A%22mrna%22%7D)

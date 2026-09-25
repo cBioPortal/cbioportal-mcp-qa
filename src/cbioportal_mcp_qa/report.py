@@ -10,7 +10,7 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 
 from .checks import internal_leaks
 from .config import MODELS, PRICES_BY_BEDROCK_ID, TARGETS
-from .dataset import CATEGORIES, TRACKS
+from .dataset import CATEGORIES, TRACKS, load_questions
 from .run import RESULTS_DIR, Run
 from .traces import SCHEMA_ERROR
 
@@ -335,7 +335,45 @@ def _headline(summary: dict) -> dict:
     }
 
 
-RUN_SETUP_KEYS = ("agent_prompt", "versions", "database_mcp")
+RUN_SETUP_KEYS = ("agent_prompt", "versions", "database_mcp", "questions_file")
+
+# Each questions file is its own test set: its runs get a separate table on the index, in this order.
+QUESTION_SETS = {
+    "input/questions.yaml": {
+        "title": "Main benchmark",
+        "short": "Single questions covering data lookups, analysis, navigation links and out-of-scope requests.",
+        "purpose": "The headline score. Each question stands alone: a count, frequency or list from the "
+        "data, an analysis (comparison, survival, co-occurrence), a request for a cBioPortal link, or "
+        "something the agent should decline or redirect. Use it to compare prompts, models and runners.",
+    },
+    "input/questions-multiturn.yaml": {
+        "title": "Multi-turn follow-ups",
+        "short": "Follow-up messages in a scripted conversation, modeled on real traffic. Smaller set; scores "
+        "are not comparable with the main benchmark.",
+        "purpose": "About 40% of real messages are follow-ups that need the earlier conversation. Each "
+        "question is the user's next message after scripted turns: swapping a gene, study or cohort, "
+        "breaking results down, accepting an offered option, answering a clarifying question, pushing back "
+        "on a correct number, asking for significance or citations, and follow-ups in other languages.",
+    },
+}
+SOURCE_URL = "https://github.com/cBioPortal/cbioportal-mcp-qa/blob/main/"
+
+
+def question_set_info(questions_file: str) -> dict:
+    """Title, purpose and question/track counts for a questions file (counts are None if it can't be read)."""
+    info = {"file": questions_file, "title": questions_file, "short": "", "purpose": ""} | QUESTION_SETS.get(
+        questions_file, {}
+    )
+    try:
+        questions = load_questions(RESULTS_DIR.parent / questions_file)
+    except (OSError, ValueError):
+        questions = None
+    info["n_questions"] = len(questions) if questions is not None else None
+    tracks = Counter(q.track for q in questions or ())
+    info["tracks"] = [(TRACK_LABELS[t], tracks[t]) for t in TRACKS if tracks[t]]
+    info["url"] = SOURCE_URL + questions_file
+    info["anchor"] = "runs-" + Path(questions_file).stem
+    return info
 
 
 def run_setup(run: dict) -> dict:
@@ -385,13 +423,28 @@ def write_index() -> Path:
             summary |= {k: recorded.get(k) for k in RUN_SETUP_KEYS}
         summary["setup"] = run_setup(summary)
         runs.append(summary)
-    # A setup value is flagged when it differs from the next older run that recorded it.
-    for i, run in enumerate(runs):
-        run["changed"] = set()
-        for key, value in run["setup"].items():
-            older = next((r["setup"][key] for r in runs[i + 1 :] if r["setup"][key] is not None), None)
-            if value is not None and older is not None and value != older:
-                run["changed"].add(key)
+    sets: dict[str, list[dict]] = {}
+    for run in runs:
+        sets.setdefault(run.get("questions_file") or "input/questions.yaml", []).append(run)
+    # A setup value is flagged when it differs from the next older run of the same set that recorded it.
+    for set_runs in sets.values():
+        for i, run in enumerate(set_runs):
+            run["changed"] = set()
+            for key, value in run["setup"].items():
+                older = next(
+                    (r["setup"][key] for r in set_runs[i + 1 :] if r["setup"][key] is not None), None
+                )
+                if value is not None and older is not None and value != older:
+                    run["changed"].add(key)
+    order = list(QUESTION_SETS)
+    question_sets = [
+        question_set_info(f) | {"runs": sets.get(f, [])}
+        for f in sorted(
+            set(QUESTION_SETS) | set(sets), key=lambda f: (order.index(f) if f in order else len(order), f)
+        )
+    ]
     out = RESULTS_DIR / "index.html"
-    out.write_text(_env().get_template("index.html.j2").render(runs=runs, track_labels=TRACK_LABELS))
+    out.write_text(
+        _env().get_template("index.html.j2").render(question_sets=question_sets, track_labels=TRACK_LABELS)
+    )
     return out
