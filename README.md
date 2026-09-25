@@ -179,6 +179,15 @@ Append to `input/questions.yaml` with the next unused `id` (ids are stable; neve
   source: https://github.com/cBioPortal/cbioportal-mcp/issues/24
 ```
 
+Where things go:
+
+- **`expected_answer`**: what a correct answer says — the facts, numbers or conclusion. A single bare number
+  (e.g. `548`) is also checked automatically against the answer.
+- **`notes`**: how to grade — `A correct answer must: …` / `Must not: …`. Facts the judge needs but the answer
+  doesn't have to state (e.g. survival statistics the agent can't compute) go here too, labelled as context.
+- **`expected_links`**: links that open the right view. Don't pin session-based group comparison links
+  (`comparisonId=…`); they differ on every run.
+
 Questions from user-feedback issues set `source` to the issue URL and usually carry a rubric in `notes`.
 Add `technical: true` when the question asks for code, the schema, or how the agent works: answers are then
 expected to be technical and are exempt from the "exposes internals" check.
