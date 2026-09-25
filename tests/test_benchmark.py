@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -286,3 +287,61 @@ def test_index_shows_runner_and_flags_changed_setup(tmp_path, monkeypatch):
     assert 'class="changed"><span class="muted">prompt' in html[newest:middle]
     assert 'class="changed"><strong>Claude Code' in html[middle:oldest]
     assert 'class="changed"><strong>Claude Code' not in html[newest:middle]
+
+
+def test_multiturn_history_loads_and_is_validated(tmp_path):
+    turns = [{"role": "user", "content": "EGFR in LUAD?"}, {"role": "assistant", "content": "12.4%"}]
+    good = {"id": 1, "category": "Alteration frequency", "question": "And KRAS?", "history": turns}
+    path = tmp_path / "q.yaml"
+    path.write_text(json.dumps([good]))
+    assert load_questions(path)[0].history == tuple(turns)
+    for bad in (turns[:1], turns[::-1]):
+        path.write_text(json.dumps([good | {"history": bad}]))
+        with pytest.raises(ValueError, match="history"):
+            load_questions(path)
+    assert load_questions(Path("input/questions-multiturn.yaml"))
+
+
+def test_agents_api_sends_history_as_messages():
+    import asyncio
+
+    from cbioportal_mcp_qa.agent import AgentClient, AgentReply
+    from cbioportal_mcp_qa.config import TARGETS
+
+    client = AgentClient(TARGETS["beta"], "key")
+    sent = {}
+
+    async def fake_post(body, started):
+        sent.update(body)
+        return AgentReply("ok", "r1", 200, None, 1.0, started)
+
+    client._post = fake_post
+    history = ({"role": "user", "content": "a"}, {"role": "assistant", "content": "b"})
+    assert asyncio.run(client.ask("c", "haiku", history)).answer == "ok"
+    assert sent["messages"] == [*history, {"role": "user", "content": "c"}]
+    asyncio.run(client.aclose())
+
+
+def test_judge_sees_the_conversation():
+    from cbioportal_mcp_qa.grade import Judge
+
+    q = Question(
+        id=1,
+        category="Alteration frequency",
+        study="luad",
+        question="And KRAS?",
+        notes="A correct answer must: give KRAS",
+        history=({"role": "user", "content": "EGFR in LUAD?"}, {"role": "assistant", "content": "12.4%"}),
+    )
+    prompts = []
+
+    class Messages:
+        def create(self, **kwargs):
+            prompts.append(kwargs["messages"][0]["content"])
+            raise RuntimeError("stop")
+
+    judge = Judge.__new__(Judge)
+    judge.model, judge.client = "m", type("C", (), {"messages": Messages()})()
+    with pytest.raises(RuntimeError):
+        judge.grade(q, "29.7%", StudyValidator.__new__(StudyValidator))
+    assert "<conversation_so_far>" in prompts[0] and "EGFR in LUAD?" in prompts[0]

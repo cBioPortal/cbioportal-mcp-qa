@@ -99,7 +99,7 @@ async def collect_answers(
 
     async def one(q: Question, model: str, repeat: int) -> None:
         async with sem:
-            reply = await client.ask(q.question, model)
+            reply = await client.ask(q.question, model, q.history)
         rec = {"question": asdict(q), "model": model, "repeat": repeat, "reply": asdict(reply)}
         if trace := rec["reply"].pop("trace"):
             rec["trace"] = trace

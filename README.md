@@ -182,6 +182,33 @@ Questions from user-feedback issues set `source` to the issue URL and usually ca
 Add `technical: true` when the question asks for code, the schema, or how the agent works: answers are then
 expected to be technical and are exempt from the "exposes internals" check.
 
+### Multi-turn follow-ups
+
+`input/questions-multiturn.yaml` is a separate set of follow-up questions modeled on real conversations in
+Langfuse (paraphrased; `trace_id` names the conversation it's based on). Its pass rates are kept apart from
+the main 146 questions so those stay comparable across runs:
+
+```bash
+uv run cbioportal-mcp-qa run --questions-file input/questions-multiturn.yaml
+```
+
+A question with `history` is the user's next message in that conversation; the earlier turns alternate
+`user` / `assistant` and end with an assistant turn:
+
+```yaml
+- id: 1003
+  question: And in lung squamous?
+  history:
+  - role: user
+    content: What are the most common KRAS mutations in TCGA lung adenocarcinoma?
+  - role: assistant
+    content: In Lung Adenocarcinoma (TCGA, PanCancer Atlas), 168 of 566 profiled samples (29.7%) ...
+```
+
+The Agents API runner sends the history as prior messages. `claude -p` takes a single message, so the
+claude-code runner quotes the history ahead of the new message. The judge sees the whole conversation.
+Assistant turns are written by hand, not generated, and must be correct: the follow-up is graded, not them.
+
 ## Development
 
 ```bash
