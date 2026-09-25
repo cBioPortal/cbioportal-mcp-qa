@@ -429,16 +429,17 @@ def write_index() -> Path:
     sets: dict[str, list[dict]] = {}
     for run in runs:
         sets.setdefault(run.get("questions_file") or "input/questions.yaml", []).append(run)
-    # A setup value is flagged when it differs from the next older run of the same set that recorded it.
+    # A setup value is flagged, with its previous value, when it differs from the next older run of the same set
+    # that recorded it.
     for set_runs in sets.values():
         for i, run in enumerate(set_runs):
-            run["changed"] = set()
+            run["changed"] = {}
             for key, value in run["setup"].items():
                 older = next(
                     (r["setup"][key] for r in set_runs[i + 1 :] if r["setup"][key] is not None), None
                 )
                 if value is not None and older is not None and value != older:
-                    run["changed"].add(key)
+                    run["changed"][key] = older
     order = list(QUESTION_SETS)
     question_sets = [
         question_set_info(f) | {"runs": sets.get(f, [])}
