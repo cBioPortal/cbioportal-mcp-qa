@@ -8,6 +8,7 @@ from cbioportal_mcp_qa.claude_code import (
     ClaudeCodeClient,
     ToolSetup,
     claude_args,
+    connector_needs_signin,
     connector_tool_prefix,
     find_connector,
     format_transcript,
@@ -150,7 +151,7 @@ def test_missing_connector_is_an_error(monkeypatch):
     try:
         tool_setup("unused", "https://nav/mcp", "claude.ai cBioPortal MCP", "/tmp", {})
     except RuntimeError as exc:
-        assert "not connected" in str(exc)
+        assert "sign in" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
 
@@ -298,3 +299,54 @@ def test_find_connector_matches_by_url_not_name(monkeypatch):
     monkeypatch.setattr("cbioportal_mcp_qa.claude_code.subprocess.run", lambda *a, **k: Out())
     assert find_connector("https://mcp.cbioportal.org/db/mcp") == "claude.ai My cBio DB"
     assert find_connector("https://example.org/mcp") is None
+
+
+def test_expired_connector_login_is_detected():
+    connector = "claude.ai cBioPortal MCP"
+    from_init = _events(
+        {"type": "system", "subtype": "init", "mcp_servers": [{"name": connector, "status": "needs-auth"}]}
+    )
+    from_tool = _events(
+        _tool_result(
+            "t1", True, f'MCP server "{connector}" needs you to sign in again. Run /mcp to authenticate.'
+        )
+    )
+    assert connector_needs_signin(from_init, connector)
+    assert connector_needs_signin(from_tool, connector)
+    assert not connector_needs_signin(STREAM, connector)
+
+
+def test_client_stops_asking_after_an_expired_login(monkeypatch):
+    connector = "claude.ai cBioPortal MCP"
+    monkeypatch.setattr(
+        "cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: {"claude_ai_cBioPortal_MCP"}
+    )
+    client = ClaudeCodeClient("PROMPT", "unused", "https://nav/mcp", database_connector=connector)
+    calls = []
+    expired = _events(
+        {"type": "system", "subtype": "init", "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide"]},
+        _tool_result("t1", True, f'MCP server "{connector}" needs you to sign in again.'),
+        {"type": "result", "subtype": "success", "result": "partial"},
+    )
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return ("\n".join(expired).encode(), b"")
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        return Proc()
+
+    import asyncio
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    try:
+        first = asyncio.run(client.ask("q1", "haiku"))
+        second = asyncio.run(client.ask("q2", "haiku"))
+    finally:
+        asyncio.run(client.aclose())
+    assert first.status is None and "sign in again" in first.error
+    assert second.status is None and "sign in again" in second.error
+    assert len(calls) == 1 and client.signin_expired

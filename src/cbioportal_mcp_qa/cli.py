@@ -76,13 +76,16 @@ def _client(
     settings, target: str, runner: str, prompt: str | None = None, transcript_dir: Path | None = None
 ):
     if runner == "claude-code":
-        return ClaudeCodeClient(
-            prompt or _agent_prompt(settings, target)["instructions"],
-            settings.database_mcp_url,
-            settings.navigator_mcp_url,
-            database_connector=_database_connector(settings),
-            transcript_dir=transcript_dir,
-        )
+        try:
+            return ClaudeCodeClient(
+                prompt or _agent_prompt(settings, target)["instructions"],
+                settings.database_mcp_url,
+                settings.navigator_mcp_url,
+                database_connector=_database_connector(settings),
+                transcript_dir=transcript_dir,
+            )
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
     return AgentClient(TARGETS[target], settings.api_key)
 
 
@@ -195,14 +198,21 @@ def run(
         f"{bench.data['repeats']} against {TARGETS[target].agent_id} ({target})"
     )
 
+    client = _client(settings, target, runner, prompt, bench.dir / "transcripts")
+
     async def go():
-        client = _client(settings, target, runner, prompt, bench.dir / "transcripts")
         try:
             await collect_answers(bench, questions, client, concurrency)
         finally:
             await client.aclose()
 
     asyncio.run(go())
+    if getattr(client, "signin_expired", False):
+        raise click.ClickException(
+            f"{client.signin_message()}: authenticate it (claude.ai → Settings → Connectors, or `/mcp` in "
+            f"`claude` with the same CLAUDE_CONFIG_DIR), then continue with "
+            f"`cbioportal-mcp-qa run --resume {bench.data['run_id']}`. Stopped before grading."
+        )
     if runner == "agents-api":
         wait_for_ingestion()
         click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")
