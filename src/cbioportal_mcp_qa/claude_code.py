@@ -173,6 +173,17 @@ def short_tool_name(name: str) -> str:
 RESULT_CHARS = 3000
 
 
+def conversation_prompt(question: str, history: tuple[dict, ...]) -> str:
+    """`claude -p` takes one message, so earlier turns are quoted ahead of the user's new message."""
+    if not history:
+        return question
+    turns = "\n\n".join(f"<{t['role']}>\n{t['content']}\n</{t['role']}>" for t in history)
+    return (
+        f"<conversation_so_far>\n{turns}\n</conversation_so_far>\n\n"
+        f"Continue this conversation: reply to the user's new message.\n\n<user>\n{question}\n</user>"
+    )
+
+
 def connector_needs_signin(lines: list[str], connector: str) -> bool:
     """Whether the claude.ai connector's login has expired: its init status or a tool error says so."""
     for line in lines:
@@ -309,7 +320,8 @@ class ClaudeCodeClient:
     def signin_message(self) -> str:
         return f"claude.ai connector {self.setup.connector!r} needs you to sign in again"
 
-    async def ask(self, question: str, model: str) -> AgentReply:
+    async def ask(self, question: str, model: str, history: tuple[dict, ...] = ()) -> AgentReply:
+        question = conversation_prompt(question, history)
         started = time.time()
         retries = connector_misses = 0
         while True:

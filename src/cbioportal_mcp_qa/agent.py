@@ -41,11 +41,11 @@ class AgentClient:
     async def aclose(self) -> None:
         await self.http.aclose()
 
-    async def ask(self, question: str, model: str) -> AgentReply:
+    async def ask(self, question: str, model: str, history: tuple[dict, ...] = ()) -> AgentReply:
         body = {
             "model": self.target.agent_id,
             "spec": self.target.specs[model],
-            "messages": [{"role": "user", "content": question}],
+            "messages": [*history, {"role": "user", "content": question}],
             "stream": False,
         }
         started = time.time()

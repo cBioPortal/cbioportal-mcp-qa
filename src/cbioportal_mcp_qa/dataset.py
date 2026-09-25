@@ -7,6 +7,7 @@ import yaml
 URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
 
 DEFAULT_QUESTIONS = Path("input/questions.yaml")
+ROLES = ("user", "assistant")
 TRACKS = ("data", "navigation", "analysis", "out_of_scope")
 CATEGORIES = (
     "Study discovery",
@@ -35,6 +36,9 @@ class Question:
     checked: str | None = None
     source: str = "curated"
     technical: bool = False  # asks for code, schema or how the agent works: technical detail is expected
+    # Earlier turns of the conversation, oldest first: ({"role": "user"|"assistant", "content": ...}, ...).
+    # The question is the user's next message.
+    history: tuple[dict, ...] = ()
 
     @property
     def has_reference(self) -> bool:
@@ -54,6 +58,9 @@ class Question:
             checked=str(d["checked"]) if d.get("checked") else None,
             source=d.get("source") or "curated",
             technical=bool(d.get("technical")),
+            history=tuple(
+                {"role": t["role"], "content": t["content"].strip()} for t in d.get("history") or ()
+            ),
         )
 
 
@@ -70,6 +77,14 @@ def load_questions(path: Path = DEFAULT_QUESTIONS) -> list[Question]:
     bad_tracks = sorted(q.id for q in questions if q.track not in TRACKS)
     if bad_tracks:
         raise ValueError(f"Unknown track for question ids {bad_tracks}; use one of {TRACKS}")
+    bad_history = sorted(
+        q.id
+        for q in questions
+        if len(q.history) % 2
+        or [t["role"] for t in q.history] != [ROLES[i % 2] for i in range(len(q.history))]
+    )
+    if bad_history:
+        raise ValueError(f"history must alternate user/assistant turns, ending with assistant: {bad_history}")
     bad_categories = sorted(q.id for q in questions if q.category not in CATEGORIES)
     if bad_categories:
         raise ValueError(f"Unknown category for question ids {bad_categories}; use one of {CATEGORIES}")

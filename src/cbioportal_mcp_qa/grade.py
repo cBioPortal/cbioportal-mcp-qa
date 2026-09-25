@@ -45,7 +45,7 @@ When the answer contains cBioPortal links, judge them from the decoded form belo
 - If opening a page failed or timed out, that is a problem with the grader's browser, not evidence the link is wrong: judge that link from its decoded URL.
 - `id` / `cancer_study_list` / `studyId` carry the study ids (comma-separated for several studies); `gene_list` the genes; the path picks the page (`/study/summary`, `/results/oncoprint`, `/results/plots`, `/comparison`, `/patient`).
 
-<question>{question}</question>
+{conversation}<question>{question}</question>
 <study>{study}</study>
 <reference_answer>{expected_answer}</reference_answer>
 <expected_links>{expected_links}</expected_links>
@@ -185,6 +185,13 @@ class Judge:
         prompt = JUDGE_PROMPT.format(
             track=q.track.replace("_", " "),
             criterion=TRACK_CRITERIA[q.track],
+            conversation=(
+                "The QUESTION is a follow-up; judge the ANSWER as the reply to it in this conversation:\n<conversation_so_far>\n"
+                + "\n".join(f"<{t['role']}>{t['content']}</{t['role']}>" for t in q.history)
+                + "\n</conversation_so_far>\n"
+                if q.history
+                else ""
+            ),
             question=q.question,
             study=q.study,
             expected_answer=q.expected_answer or "(none)",

@@ -386,3 +386,14 @@ def test_client_stops_asking_after_the_usage_limit(monkeypatch):
     assert first.status is None and "session limit" in first.error
     assert second.status is None and "session limit" in second.error
     assert len(calls) == 1 and "resets 3:40am" in client.usage_limit
+
+
+def test_history_is_quoted_ahead_of_the_new_message():
+    from cbioportal_mcp_qa.claude_code import conversation_prompt
+
+    assert conversation_prompt("q", ()) == "q"
+    prompt = conversation_prompt(
+        "And KRAS?", ({"role": "user", "content": "EGFR?"}, {"role": "assistant", "content": "12%"})
+    )
+    assert prompt.index("EGFR?") < prompt.index("12%") < prompt.index("And KRAS?")
+    assert "<assistant>\n12%\n</assistant>" in prompt
