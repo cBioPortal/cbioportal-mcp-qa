@@ -213,6 +213,12 @@ def run(
             f"`claude` with the same CLAUDE_CONFIG_DIR), then continue with "
             f"`cbioportal-mcp-qa run --resume {bench.data['run_id']}`. Stopped before grading."
         )
+    if getattr(client, "usage_limit", None):
+        raise click.ClickException(
+            f"Claude subscription limit: {client.usage_limit}. Once it resets, continue with "
+            f"`cbioportal-mcp-qa run --resume {bench.data['run_id']}` (same CLAUDE_CONFIG_DIR). "
+            f"Stopped before grading."
+        )
     if runner == "agents-api":
         wait_for_ingestion()
         click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")
