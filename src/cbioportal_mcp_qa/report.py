@@ -10,7 +10,7 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 
 from .checks import internal_leaks
 from .config import MODELS, PRICES_BY_BEDROCK_ID, TARGETS
-from .dataset import CATEGORIES, TRACKS
+from .dataset import CATEGORIES, TRACKS, load_questions
 from .run import RESULTS_DIR, Run
 from .traces import SCHEMA_ERROR
 
@@ -339,16 +339,41 @@ RUN_SETUP_KEYS = ("agent_prompt", "versions", "database_mcp", "questions_file")
 
 # Each questions file is its own test set: its runs get a separate table on the index, in this order.
 QUESTION_SETS = {
-    "input/questions.yaml": (
-        "Main benchmark",
-        "Single questions covering data lookups, analysis, navigation links and out-of-scope requests.",
-    ),
-    "input/questions-multiturn.yaml": (
-        "Multi-turn follow-ups",
-        "Follow-up messages in a scripted conversation, modeled on real traffic. Smaller set; scores are not "
-        "comparable with the main benchmark.",
-    ),
+    "input/questions.yaml": {
+        "title": "Main benchmark",
+        "short": "Single questions covering data lookups, analysis, navigation links and out-of-scope requests.",
+        "purpose": "The headline score. Each question stands alone: a count, frequency or list from the "
+        "data, an analysis (comparison, survival, co-occurrence), a request for a cBioPortal link, or "
+        "something the agent should decline or redirect. Use it to compare prompts, models and runners.",
+    },
+    "input/questions-multiturn.yaml": {
+        "title": "Multi-turn follow-ups",
+        "short": "Follow-up messages in a scripted conversation, modeled on real traffic. Smaller set; scores "
+        "are not comparable with the main benchmark.",
+        "purpose": "About 40% of real messages are follow-ups that need the earlier conversation. Each "
+        "question is the user's next message after scripted turns: swapping a gene, study or cohort, "
+        "breaking results down, accepting an offered option, answering a clarifying question, pushing back "
+        "on a correct number, asking for significance or citations, and follow-ups in other languages.",
+    },
 }
+SOURCE_URL = "https://github.com/cBioPortal/cbioportal-mcp-qa/blob/main/"
+
+
+def question_set_info(questions_file: str) -> dict:
+    """Title, purpose and question/track counts for a questions file (counts are None if it can't be read)."""
+    info = {"file": questions_file, "title": questions_file, "short": "", "purpose": ""} | QUESTION_SETS.get(
+        questions_file, {}
+    )
+    try:
+        questions = load_questions(RESULTS_DIR.parent / questions_file)
+    except (OSError, ValueError):
+        questions = None
+    info["n_questions"] = len(questions) if questions is not None else None
+    tracks = Counter(q.track for q in questions or ())
+    info["tracks"] = [(TRACK_LABELS[t], tracks[t]) for t in TRACKS if tracks[t]]
+    info["url"] = SOURCE_URL + questions_file
+    info["anchor"] = "runs-" + Path(questions_file).stem
+    return info
 
 
 def run_setup(run: dict) -> dict:
@@ -413,13 +438,10 @@ def write_index() -> Path:
                     run["changed"].add(key)
     order = list(QUESTION_SETS)
     question_sets = [
-        {
-            "file": f,
-            "title": QUESTION_SETS.get(f, (f, ""))[0],
-            "description": QUESTION_SETS.get(f, (f, ""))[1],
-            "runs": sets[f],
-        }
-        for f in sorted(sets, key=lambda f: (order.index(f) if f in order else len(order), f))
+        question_set_info(f) | {"runs": sets.get(f, [])}
+        for f in sorted(
+            set(QUESTION_SETS) | set(sets), key=lambda f: (order.index(f) if f in order else len(order), f)
+        )
     ]
     out = RESULTS_DIR / "index.html"
     out.write_text(

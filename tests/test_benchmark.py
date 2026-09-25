@@ -370,7 +370,11 @@ def test_index_has_one_table_per_question_set(tmp_path, monkeypatch):
             json.dumps({"questions_file": questions_file, "agent_prompt": {"sha256": prompt}})
         )
     html = report_mod.write_index().read_text()
-    main, multiturn = html.index("<h2>Main benchmark"), html.index("<h2>Multi-turn follow-ups")
+    main = html.index('<h2 id="runs-questions">Main benchmark')
+    multiturn = html.index('<h2 id="runs-questions-multiturn">Multi-turn follow-ups')
+    sets_table = html[: html.index("</table>")]
+    assert "Main benchmark" in sets_table and "Multi-turn follow-ups" in sets_table
+    assert 'href="#runs-questions-multiturn">1<' in sets_table
     assert main < multiturn
     assert "20260103-0000" in html[main:multiturn] and "20260101-0000" in html[main:multiturn]
     assert "20260102-0000" in html[multiturn:]
