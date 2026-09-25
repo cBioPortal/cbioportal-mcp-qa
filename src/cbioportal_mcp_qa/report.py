@@ -335,7 +335,20 @@ def _headline(summary: dict) -> dict:
     }
 
 
-RUN_SETUP_KEYS = ("agent_prompt", "versions", "database_mcp")
+RUN_SETUP_KEYS = ("agent_prompt", "versions", "database_mcp", "questions_file")
+
+# Each questions file is its own test set: its runs get a separate table on the index, in this order.
+QUESTION_SETS = {
+    "input/questions.yaml": (
+        "Main benchmark",
+        "Single questions covering data lookups, analysis, navigation links and out-of-scope requests.",
+    ),
+    "input/questions-multiturn.yaml": (
+        "Multi-turn follow-ups",
+        "Follow-up messages in a scripted conversation, modeled on real traffic. Smaller set; scores are not "
+        "comparable with the main benchmark.",
+    ),
+}
 
 
 def run_setup(run: dict) -> dict:
@@ -385,13 +398,31 @@ def write_index() -> Path:
             summary |= {k: recorded.get(k) for k in RUN_SETUP_KEYS}
         summary["setup"] = run_setup(summary)
         runs.append(summary)
-    # A setup value is flagged when it differs from the next older run that recorded it.
-    for i, run in enumerate(runs):
-        run["changed"] = set()
-        for key, value in run["setup"].items():
-            older = next((r["setup"][key] for r in runs[i + 1 :] if r["setup"][key] is not None), None)
-            if value is not None and older is not None and value != older:
-                run["changed"].add(key)
+    sets: dict[str, list[dict]] = {}
+    for run in runs:
+        sets.setdefault(run.get("questions_file") or "input/questions.yaml", []).append(run)
+    # A setup value is flagged when it differs from the next older run of the same set that recorded it.
+    for set_runs in sets.values():
+        for i, run in enumerate(set_runs):
+            run["changed"] = set()
+            for key, value in run["setup"].items():
+                older = next(
+                    (r["setup"][key] for r in set_runs[i + 1 :] if r["setup"][key] is not None), None
+                )
+                if value is not None and older is not None and value != older:
+                    run["changed"].add(key)
+    order = list(QUESTION_SETS)
+    question_sets = [
+        {
+            "file": f,
+            "title": QUESTION_SETS.get(f, (f, ""))[0],
+            "description": QUESTION_SETS.get(f, (f, ""))[1],
+            "runs": sets[f],
+        }
+        for f in sorted(sets, key=lambda f: (order.index(f) if f in order else len(order), f))
+    ]
     out = RESULTS_DIR / "index.html"
-    out.write_text(_env().get_template("index.html.j2").render(runs=runs, track_labels=TRACK_LABELS))
+    out.write_text(
+        _env().get_template("index.html.j2").render(question_sets=question_sets, track_labels=TRACK_LABELS)
+    )
     return out

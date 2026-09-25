@@ -345,3 +345,34 @@ def test_judge_sees_the_conversation():
     with pytest.raises(RuntimeError):
         judge.grade(q, "29.7%", StudyValidator.__new__(StudyValidator))
     assert "<conversation_so_far>" in prompts[0] and "EGFR in LUAD?" in prompts[0]
+
+
+def test_index_has_one_table_per_question_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(report_mod, "RESULTS_DIR", tmp_path)
+    model = {"label": "Haiku 4.5", "pass_rate": 50.0, "errors": 0, "by_track": {}, "cost_per_pass": None}
+    runs = {
+        "20260101-0000": ("input/questions.yaml", "aaa"),
+        "20260102-0000": ("input/questions-multiturn.yaml", "bbb"),
+        "20260103-0000": ("input/questions.yaml", "aaa"),
+    }
+    for run_id, (questions_file, prompt) in runs.items():
+        (tmp_path / run_id).mkdir()
+        summary = {
+            "run_id": run_id,
+            "target": "beta",
+            "runner": "claude-code",
+            "n_questions": 1,
+            "n_gradeable": 1,
+            "models": {"haiku": model | {"median_latency": None}},
+        }
+        (tmp_path / run_id / "summary.json").write_text(json.dumps(summary))
+        (tmp_path / run_id / "run.json").write_text(
+            json.dumps({"questions_file": questions_file, "agent_prompt": {"sha256": prompt}})
+        )
+    html = report_mod.write_index().read_text()
+    main, multiturn = html.index("<h2>Main benchmark"), html.index("<h2>Multi-turn follow-ups")
+    assert main < multiturn
+    assert "20260103-0000" in html[main:multiturn] and "20260101-0000" in html[main:multiturn]
+    assert "20260102-0000" in html[multiturn:]
+    # The multi-turn run's different prompt doesn't count as a change for the main set.
+    assert 'class="changed"' not in html[main:multiturn]
