@@ -3,7 +3,7 @@
 import json
 import statistics
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from jinja2 import Environment, PackageLoader, select_autoescape
@@ -371,8 +371,11 @@ def question_set_info(questions_file: str) -> dict:
     info["n_questions"] = len(questions) if questions is not None else None
     tracks = Counter(q.track for q in questions or ())
     info["tracks"] = [(TRACK_LABELS[t], tracks[t]) for t in TRACKS if tracks[t]]
+    categories = Counter(q.category for q in questions or ())
+    info["categories"] = [(c, categories[c]) for c in CATEGORIES if categories[c]]
+    info["questions"] = [asdict(q) | {"has_reference": q.has_reference} for q in questions or ()]
     info["url"] = SOURCE_URL + questions_file
-    info["anchor"] = "runs-" + Path(questions_file).stem
+    info["anchor"] = Path(questions_file).stem
     return info
 
 
@@ -443,8 +446,12 @@ def write_index() -> Path:
             set(QUESTION_SETS) | set(sets), key=lambda f: (order.index(f) if f in order else len(order), f)
         )
     ]
+    env = _env()
+    (RESULTS_DIR / "test-sets.html").write_text(
+        env.get_template("test_sets.html.j2").render(question_sets=question_sets, track_labels=TRACK_LABELS)
+    )
     out = RESULTS_DIR / "index.html"
     out.write_text(
-        _env().get_template("index.html.j2").render(question_sets=question_sets, track_labels=TRACK_LABELS)
+        env.get_template("index.html.j2").render(question_sets=question_sets, track_labels=TRACK_LABELS)
     )
     return out
