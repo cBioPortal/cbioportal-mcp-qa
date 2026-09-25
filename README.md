@@ -6,6 +6,7 @@ Because it calls the real deployment, a run measures what users get: the same sy
 (cbioportal-database, cbioportal-navigator), prompt caching and model.
 
 **[Results](https://cbioportal.github.io/cbioportal-mcp-qa/results/)** — one HTML report per run, published with GitHub Pages.
+**[Test sets](https://cbioportal.github.io/cbioportal-mcp-qa/results/test-sets.html)** — what each questions file covers, with every question, its reference and rubric.
 
 ## What a run records
 

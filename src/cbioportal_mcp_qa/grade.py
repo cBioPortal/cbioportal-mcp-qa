@@ -41,7 +41,7 @@ Keep the rationale to 1-3 sentences.
 When the answer contains cBioPortal links, judge them from the decoded form below, using these conventions:
 - study view `filterJson` → `geneFilters[].geneQueries` is a list of lists: the OUTER list is AND, each INNER list is OR. `[[IDH1],[TP53]]` means IDH1 AND TP53; `[[IDH1, TP53]]` means IDH1 OR TP53.
 - Values listed for one clinical attribute (`clinicalDataFilters[].values`) are OR; different filters in the same filterJson are AND.
-- For navigation answers the links were also opened in a browser: "what the page shows when opened" is the page's visible text (study name, filter pills such as "IDH1 and TP53", query summary, sample counts, error messages). Trust it over your reading of the URL.
+- For navigation answers, and for group comparison links in any answer, the links were also opened in a browser: "what the page shows when opened" is the page's visible text (study name, filter pills such as "IDH1 and TP53", query summary, sample counts, error messages). Trust it over your reading of the URL.
 - If opening a page failed or timed out, that is a problem with the grader's browser, not evidence the link is wrong: judge that link from its decoded URL.
 - `id` / `cancer_study_list` / `studyId` carry the study ids (comma-separated for several studies); `gene_list` the genes; the path picks the page (`/study/summary`, `/results/oncoprint`, `/results/plots`, `/comparison`, `/patient`).
 

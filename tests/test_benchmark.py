@@ -372,11 +372,26 @@ def test_index_has_one_table_per_question_set(tmp_path, monkeypatch):
     html = report_mod.write_index().read_text()
     main = html.index('<h2 id="runs-questions">Main benchmark')
     multiturn = html.index('<h2 id="runs-questions-multiturn">Multi-turn follow-ups')
-    sets_table = html[: html.index("</table>")]
+    assert 'href="test-sets.html#questions-multiturn"' in html
+    sets_page = (tmp_path / "test-sets.html").read_text()
+    sets_table = sets_page[: sets_page.index("</table>")]
     assert "Main benchmark" in sets_table and "Multi-turn follow-ups" in sets_table
-    assert 'href="#runs-questions-multiturn">1<' in sets_table
+    assert 'href="index.html#runs-questions-multiturn">1<' in sets_table
     assert main < multiturn
     assert "20260103-0000" in html[main:multiturn] and "20260101-0000" in html[main:multiturn]
     assert "20260102-0000" in html[multiturn:]
     # The multi-turn run's different prompt doesn't count as a change for the main set.
     assert 'class="changed"' not in html[main:multiturn]
+
+
+def test_test_sets_page_lists_the_questions():
+    info = report_mod.question_set_info("input/questions-multiturn.yaml")
+    assert info["title"] == "Multi-turn follow-ups" and info["n_questions"] == len(info["questions"]) > 0
+    assert sum(n for _, n in info["tracks"]) == sum(n for _, n in info["categories"]) == info["n_questions"]
+    html = (
+        report_mod._env()
+        .get_template("test_sets.html.j2")
+        .render(question_sets=[info | {"runs": []}], track_labels=report_mod.TRACK_LABELS)
+    )
+    assert html.count('<details class="q"') == info["n_questions"]
+    assert "Conversation so far" in html

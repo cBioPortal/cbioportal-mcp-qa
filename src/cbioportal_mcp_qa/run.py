@@ -147,14 +147,16 @@ def grade_answers(run: Run, judge: Judge) -> None:
 
 
 def render_navigation_links(run: Run, executable: str | None, concurrency: int = 3) -> int:
-    """Open the cBioPortal links in navigation answers and record what each page shows. Returns the number rendered."""
+    """Open the cBioPortal links in navigation answers, and group comparison links in any answer (their session ids
+    can't be decoded), and record what each page shows. Returns the number rendered."""
     renders = run.data.setdefault("renders", {})
     urls = sorted(
         {
             url
             for rec in run.records.values()
-            if rec["question"].get("track") == "navigation" and rec["reply"].get("status") == 200
+            if rec["reply"].get("status") == 200
             for url in cbio_links(rec["reply"]["answer"])
+            if rec["question"].get("track") == "navigation" or "/comparison" in url
         }
         - renders.keys()
     )
