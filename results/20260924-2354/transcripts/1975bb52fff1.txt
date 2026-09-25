@@ -1,0 +1,487 @@
+Q (haiku): show me EGFR expression across cancer types
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ list_guides
+{}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- EGFR expression across cancer types in pan-cancer TCGA
+WITH egfr_data AS (
+    SELECT
+        cs.type_of_cancer_id,
+        cs.name as cancer_type,
+        cdd.sample_unique_id,
+        cdd.cancer_study_identifier,
+        gad.hugo_gene_symbol,
+        gad.profile_type,
+        toFloat64OrNull(gad.alteration_value) as expression_value
+    FROM genetic_alteration_derived gad
+    JOIN cancer_study cs ON gad.cancer_study_identifier = cs.cancer_study_identifier
+    JOIN cancer_study_query_preferences csp ON cs.cancer_study_id = csp.cancer_study_id
+    JOIN clinical_data_derived cdd ON gad.sample_unique_id = cdd.sample_unique_id 
+        AND gad.cancer_study_identifier = cdd.cancer_study_identifier
+    WHERE csp.preference_name = 'pan_cancer_tcga'
+      AND gad.hugo_gene_symbol = 'EGFR'
+      AND gad.profile_type LIKE '%mrna%'
+      AND gad.alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+)
+SELECT
+    cancer_type,
+    count(*) as n_samples,
+    round(avg(expression_value), 2) as mean_expression,
+    round(quantile(0.5)(expression_value), 2) as median_expression,
+    round(min(expression_value), 2) as min_expression,
+    round(max(expression_value), 2) as max_expression,
+    round(stddev(expression_value), 2) as stddev_expression,
+    profile_type
+FROM egfr_data
+GROUP BY cancer_type, profile_type
+ORDER BY cancer_type, profile_type
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'csp.cancer_study_id' cannot be resolved from table with name csp. In scope  egfr_data. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "cancer_study_query_preferences"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"preference_name","type":"LowCardinality(String)","comment":"Named purpose. See SELECT DISTINCT preference_name FROM cancer_study_query_preferences for what this deployment loaded."},{"name":"cancer_study_identifier","type":"String","comment":"cancer_study.cancer_study_identifier — join key"},{"name":"notes","type":"String","comment":"Why this study is recommended for this preference"}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- EGFR expression across cancer types in pan-cancer TCGA
+WITH studies AS (
+    SELECT DISTINCT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+egfr_data AS (
+    SELECT
+        gad.cancer_study_identifier,
+        gad.sample_unique_id,
+        gad.hugo_gene_symbol,
+        gad.profile_type,
+        toFloat64OrNull(gad.alteration_value) as expression_value
+    FROM genetic_alteration_derived gad
+    WHERE gad.hugo_gene_symbol = 'EGFR'
+      AND gad.profile_type LIKE '%mrna%'
+      AND gad.alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+      AND gad.cancer_study_identifier IN (SELECT cancer_study_identifier FROM studies)
+)
+SELECT
+    egfr_data.cancer_study_identifier,
+    cs.name as cancer_type,
+    count(*) as n_samples,
+    round(avg(expression_value), 2) as mean_expression,
+    round(quantile(0.5)(expression_value), 2) as median_expression,
+    round(min(expression_value), 2) as min_expression,
+    round(max(expression_value), 2) as max_expression,
+    round(stddev(expression_value), 2) as stddev_expression,
+    egfr_data.profile_type
+FROM egfr_data
+JOIN cancer_study cs ON egfr_data.cancer_study_identifier = cs.cancer_study_identifier
+GROUP BY egfr_data.cancer_study_identifier, cs.name, egfr_data.profile_type
+ORDER BY n_samples DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 46\n Code: 46. DB::Exception: Function with name `stddev` does not exist. In scope WITH studies AS (SELECT DISTINCT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga'), egfr_data AS (SELECT gad.cancer_study_identifier, gad.sample_unique_id, gad.hugo_gene_symbol, gad.profile_type, toFloat64OrNull(gad.alteration_value) AS expression_value FROM genetic_alteration_derived AS gad WHERE (gad.hugo_gene_symbol = 'EGFR') AND (gad.profile_type LIKE '%mrna%') AND (gad.alteration_value NOT IN ('', 'NA')) AND (toFloat64OrNull(gad.alteration_value) IS NOT NULL) AND (gad.cancer_study_identifier IN (SELECT cancer_study_identifier FROM studies))) SELECT egfr_data.cancer_study_identifier, cs.name AS cancer_type, count(*) AS n_samples, round(avg(expression_value), 2) AS mean_expression, round(quantile(0.5)(expression_value), 2) AS median_expression, round(min(expression_value), 2) AS min_expression, round(max(expression_value), 2) AS max_expression, round(stddev(expression_value), 2) AS stddev_expression, egfr_data.profile_type FROM egfr_data INNER JOIN cancer_study AS cs ON egfr_data.cancer_study_identifier = cs.cancer_study_identifier GROUP BY egfr_data.cancer_study_identifier, cs.name, egfr_data.profile_type ORDER BY n_samples DESC. (UNKNOWN_FUNCTION) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- EGFR expression across cancer types in pan-cancer TCGA
+WITH studies AS (
+    SELECT DISTINCT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+egfr_data AS (
+    SELECT
+        gad.cancer_study_identifier,
+        gad.sample_unique_id,
+        gad.hugo_gene_symbol,
+        gad.profile_type,
+        toFloat64OrNull(gad.alteration_value) as expression_value
+    FROM genetic_alteration_derived gad
+    WHERE gad.hugo_gene_symbol = 'EGFR'
+      AND gad.profile_type LIKE '%mrna%'
+      AND gad.alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+      AND gad.cancer_study_identifier IN (SELECT cancer_study_identifier FROM studies)
+)
+SELECT
+    egfr_data.cancer_study_identifier,
+    cs.name as cancer_type,
+    count(*) as n_samples,
+    round(avg(expression_value), 2) as mean_expression,
+    round(quantile(0.5)(expression_value), 2) as median_expression,
+    round(min(expression_value), 2) as min_expression,
+    round(max(expression_value), 2) as max_expression,
+    round(sqrt(variance(expression_value)), 2) as stdev_expression,
+    egfr_data.profile_type
+FROM egfr_data
+JOIN cancer_study cs ON egfr_data.cancer_study_identifier = cs.cancer_study_identifier
+GROUP BY egfr_data.cancer_study_identifier, cs.name, egfr_data.profile_type
+ORDER BY n_samples DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 46\n Code: 46. DB::Exception: Function with name `variance` does not exist. In scope WITH studies AS (SELECT DISTINCT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga'), egfr_data AS (SELECT gad.cancer_study_identifier, gad.sample_unique_id, gad.hugo_gene_symbol, gad.profile_type, toFloat64OrNull(gad.alteration_value) AS expression_value FROM genetic_alteration_derived AS gad WHERE (gad.hugo_gene_symbol = 'EGFR') AND (gad.profile_type LIKE '%mrna%') AND (gad.alteration_value NOT IN ('', 'NA')) AND (toFloat64OrNull(gad.alteration_value) IS NOT NULL) AND (gad.cancer_study_identifier IN (SELECT cancer_study_identifier FROM studies))) SELECT egfr_data.cancer_study_identifier, cs.name AS cancer_type, count(*) AS n_samples, round(avg(expression_value), 2) AS mean_expression, round(quantile(0.5)(expression_value), 2) AS median_expression, round(min(expression_value), 2) AS min_expression, round(max(expression_value), 2) AS max_expression, round(sqrt(variance(expression_value)), 2) AS stdev_expression, egfr_data.profile_type FROM egfr_data INNER JOIN cancer_study AS cs ON egfr_data.cancer_study_identifier = cs.cancer_study_identifier GROUP BY egfr_data.cancer_study_identifier, cs.name, egfr_data.profile_type ORDER BY n_samples DESC. (UNKNOWN_FUNCTION) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- EGFR expression across cancer types in pan-cancer TCGA
+WITH studies AS (
+    SELECT DISTINCT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+egfr_data AS (
+    SELECT
+        gad.cancer_study_identifier,
+        gad.sample_unique_id,
+        gad.hugo_gene_symbol,
+        gad.profile_type,
+        toFloat64OrNull(gad.alteration_value) as expression_value
+    FROM genetic_alteration_derived gad
+    WHERE gad.hugo_gene_symbol = 'EGFR'
+      AND gad.profile_type LIKE '%mrna%'
+      AND gad.alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+      AND gad.cancer_study_identifier IN (SELECT cancer_study_identifier FROM studies)
+)
+SELECT
+    egfr_data.cancer_study_identifier,
+    cs.name as cancer_type,
+    count(*) as n_samples,
+    round(avg(expression_value), 2) as mean_expression,
+    round(quantile(0.5)(expression_value), 2) as median_expression,
+    round(min(expression_value), 2) as min_expression,
+    round(max(expression_value), 2) as max_expression,
+    egfr_data.profile_type
+FROM egfr_data
+JOIN cancer_study cs ON egfr_data.cancer_study_identifier = cs.cancer_study_identifier
+GROUP BY egfr_data.cancer_study_identifier, cs.name, egfr_data.profile_type
+ORDER BY n_samples DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","cancer_type":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","n_samples":1082,"mean_expression":0,"median_expression":0.02,"min_expression":-3.45,"max_expression":4.63,"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","cancer_type":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","n_samples":1082,"mean_expression":611.31,"median_expression":166.3,"min_expression":0.31,"max_expression":106097,"profile_type":"rna_seq_v2_mrna"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","cancer_type":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","n_samples":1082,"mean_expression":-4.26,"median_expression":-4.2,"min_expression":-13.16,"max_expression":7.7,"profile_type":"rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","cancer_type":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","n_samples":1082,"mean_expression":0.59,"median_expression":-0.28,"min_expression":-0.61,"max_expression":207.46,"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","cancer_type":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":592,"mean_expression":-1.59,"median_expression":-1.62,"min_expression":-7.2,"max_expression":5.55,"profile_type":"rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","cancer_type":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":592,"mean_expression":0,"median_expression":-0.02,"min_expression":-4.09,"max_expression":5.21,"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","cancer_type":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":592,"mean_expression":0.58,"median_expression":0.16,"min_expression":-1.86,"max_expression":37.69,"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","cancer_type":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":592,"mean_expression":624.37,"median_expression":529.37,"min_expression":59.17,"max_expression":8679.43,"profile_type":"rna_seq_v2_mrna"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018","cancer_type":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","n_samples":527,"mean_expression":0.14,"median_expression":-0.23,"min_expression":-1.22,"max_expression":47.42,"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018","cancer_type":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","n_samples":527,"mean_expression":377.4,"median_expression":273.71,"min_expression":0,"max_expression":13481.75,"profile_type":"rna_seq_v2_mrna"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018","cancer_type":"Uterine Corpus End … (25844 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- EGFR expression summary across TCGA PanCancer Atlas cancer types (raw expression)
+WITH studies AS (
+    SELECT DISTINCT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+egfr_raw AS (
+    SELECT
+        gad.cancer_study_identifier,
+        cs.name as cancer_type,
+        gad.sample_unique_id,
+        toFloat64OrNull(gad.alteration_value) as expression_value
+    FROM genetic_alteration_derived gad
+    JOIN cancer_study cs ON gad.cancer_study_identifier = cs.cancer_study_identifier
+    WHERE gad.hugo_gene_symbol = 'EGFR'
+      AND gad.profile_type = 'rna_seq_v2_mrna'
+      AND gad.alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+      AND gad.cancer_study_identifier IN (SELECT cancer_study_identifier FROM studies)
+)
+SELECT
+    cancer_type,
+    count(*) as n_samples,
+    round(avg(expression_value), 1) as mean_expression,
+    round(quantile(0.5)(expression_value), 1) as median_expression,
+    round(min(expression_value), 1) as min_expression,
+    round(max(expression_value), 1) as max_expression
+FROM egfr_raw
+GROUP BY cancer_type
+ORDER BY median_expression DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_type":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","n_samples":160,"mean_expression":12016.9,"median_expression":3910.3,"min_expression":143,"max_expression":147457},{"cancer_type":"Head and Neck Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","n_samples":515,"mean_expression":4788.7,"median_expression":2899.5,"min_expression":26.7,"max_expression":82763.5},{"cancer_type":"Kidney Renal Clear Cell Carcinoma (TCGA, PanCancer Atlas)","n_samples":510,"mean_expression":3192.7,"median_expression":2478.2,"min_expression":46.3,"max_expression":43778.8},{"cancer_type":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","n_samples":514,"mean_expression":5174.6,"median_expression":2412.9,"min_expression":50,"max_expression":120100},{"cancer_type":"Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","n_samples":484,"mean_expression":3602.4,"median_expression":2084.6,"min_expression":22.7,"max_expression":80121.9},{"cancer_type":"Esophageal Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":181,"mean_expression":4460.9,"median_expression":1677.6,"min_expression":107.2,"max_expression":144426.6},{"cancer_type":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":510,"mean_expression":1630.8,"median_expression":994.6,"min_expression":12.5,"max_expression":24089.1},{"cancer_type":"Mesothelioma (TCGA, PanCancer Atlas)","n_samples":87,"mean_expression":1125,"median_expression":858.5,"min_expression":45.9,"max_expression":3927.4},{"cancer_type":"Cervical Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","n_samples":294,"mean_expression":1562.2,"median_expression":837,"min_expression":2,"max_expression":53811},{"cancer_type":"Liver Hepatocellular Carcinoma (TCGA, PanCancer Atlas)","n_samples":366,"mean_expression":1139.7,"median_expression":811.6,"min_expression":0.6,"max_expression":9054.2},{"cancer_type":"Kidney Chromophobe (TCGA, PanCancer Atlas)","n_samples":65,"mean_expression":1107.5,"median_expression":803,"min_expression":29.2,"max_expression":6487.4},{"cancer_type":"Thyroid Carcinoma (TCGA, PanCancer Atlas)","n_samples":498,"mean_expression":962.8,"median_expression":778,"min_expression":33.3,"max_expression":4275.6},{"cancer_type":"Prostate Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":493,"mean_expression":856.1,"median_expression":721,"min_expression":87.7,"max_expression":3362.6},{"cancer_type":"Cholangiocarcinoma (TCGA, PanCancer Atlas)","n_samples":36,"mean_expression":860.6,"median_expression":707.2,"min_expression":26.2,"max_expression":3899.6},{"cancer_type":"Stomach Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":412,"mean_expression":1350.1,"median_expression":679.6,"min_expression":13.8,"max_expression":38713.8},{"cancer_type":"Kidney Renal Papillary Cell Carcinoma (TCGA, PanCancer Atlas)","n_samples":283,"mean_expression":915.7,"median_expression":660.7,"min_expression":40.1,"max_expression":4803.3},{"cancer_type":"Pancreatic Adenocarcinoma (TCGA, PanCancer Atlas)","n_samples":177,"mean_expression":747.2, … (2720 more chars)
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 4 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":4,"studiesWithMetadata":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["brca_tcga_pan_can_atlas_2018_gistic","brca_tcga_pan_can_atlas_2018_log2CNA","brca_tcga_pan_can_atlas_2018_mutations","brca_tcga_pan_can_atlas_2018_protein_quantification","brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa","brca_tcga_pan_can_atlas_2018_rppa_Zscores","brca_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["brca_tcga_pan_can_atlas_2018_armlevel_cna","brca_tcga_pan_can_atlas_2018_genetic_ancestry","brca_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","brca_tcga_pan_can_atlas_2018_methylation_hm450","brca_tcga_pan_can_atlas_2018_phosphoprotein_quantification"],"heatmapProfileIds":["brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableCompari … (7985 more chars)
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "gbm_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "EGFR"
+ ],
+ "tab": "plots",
+ "plotsVertSelection": {
+  "selectedGeneOption": "EGFR",
+  "dataType": "mrna_median_Zscores"
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/plots?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=gbm_tcga_pan_can_atlas_2018_all&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22mrna_median_Zscores%22%7D","url":"https://www.cbioportal.org/results/plots?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=gbm_tcga_pan_can_atlas_2018_all&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22mrna_median_Zscores%22%7D","data":{"studyIds":["gbm_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","sampleCount":592}],"genes":["EGFR"],"caseSetId":"gbm_tcga_pan_can_atlas_2018_all","pageDescription":"Scatter/box plots comparing any two data elements."}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "hnsc_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "EGFR"
+ ],
+ "tab": "oncoprint",
+ "oncoprintHeatmapTracks": [
+  {
+   "molecularProfileId": "hnsc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores",
+   "entities": [
+    "EGFR"
+   ]
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=hnsc_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=hnsc_tcga_pan_can_atlas_2018_all&heatmap_track_groups=hnsc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores%2CEGFR","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=hnsc_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=hnsc_tcga_pan_can_atlas_2018_all&heatmap_track_groups=hnsc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores%2CEGFR","data":{"studyIds":["hnsc_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"hnsc_tcga_pan_can_atlas_2018","name":"Head and Neck Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","sampleCount":523}],"genes":["EGFR"],"caseSetId":"hnsc_tcga_pan_can_atlas_2018_all","oncoprintHeatmapTracks":[{"molecularProfileId":"hnsc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","entities":["EGFR"]}],"pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+Perfect! Here's a summary of EGFR expression across cancer types:
+
+## EGFR mRNA Expression Across Cancer Types (TCGA PanCancer Atlas)
+
+**Key Findings:**
+
+| Cancer Type | Median Expression | Mean Expression | n Samples | Range |
+|---|---|---|---|---|
+| **Glioblastoma Multiforme** | **3,910** | 12,017 | 160 | 143–147,457 |
+| **Head and Neck SCC** | **2,900** | 4,789 | 515 | 27–82,764 |
+| **Kidney Renal Clear Cell** | **2,478** | 3,193 | 510 | 46–43,779 |
+| **Brain Lower Grade Glioma** | **2,413** | 5,175 | 514 | 50–120,100 |
+| **Lung Squamous Cell** | **2,085** | 3,602 | 484 | 23–80,122 |
+| **Esophageal Adenocarcinoma** | **1,678** | 4,461 | 181 | 107–144,427 |
+| **Lung Adenocarcinoma** | **995** | 1,631 | 510 | 13–24,089 |
+| Breast | 166 | 611 | 1,082 | 0–106,097 |
+| **Acute Myeloid Leukemia** | **−0** | 1.4 | 173 | −0–23 |
+
+**Data source:** RNA-Seq v2 mRNA expression (raw counts). Expression values are highly variable, reflecting both biological differences and outlier samples in individual cancers.
+
+---
+
+### Explore Interactively
+
+**Highest EGFR expression (Glioblastoma):**
+[View EGFR expression plots in GBM](https://www.cbioportal.org/results/plots?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=gbm_tcga_pan_can_atlas_2018_all&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22mrna_median_Zscores%22%7D)
+
+**Second highest (Head and Neck SCC):**
+[View EGFR OncoPrint in HNSC](https://www.cbioportal.org/results/oncoprint?cancer_study_list=hnsc_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=hnsc_tcga_pan_can_atlas_2018_all&heatmap_track_groups=hnsc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores%2CEGFR)
+
+Brain tumors (GBM, LGG) and squamous cell carcinomas (HNSC, lung) show markedly elevated EGFR expression, while blood malignancies (AML) show minimal expression. Breast cancer and kidney cancers occupy the intermediate range.

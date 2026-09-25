@@ -1,0 +1,132 @@
+Q (haiku): What is the median survival time in the Pediatric Neuroblastoma study from TARGET?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ list_studies
+{
+ "search": "TARGET pediatric neuroblastoma",
+ "verbose": true
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"nbl_target_2018_pub","name":"Pediatric Neuroblastoma (TARGET, 2018)","description":"Whole genome or whole exome sequencing on 1089 NBL samples. Comprehensive profiling of 1089 NBL samples. <p>TARGET data is intended exclusively for biomedical research using pediatric data (i.e., the research objectives cannot be accomplished using data from adults) that focus on the development of more effective treatments, diagnostic tests, or prognostic markers for childhood cancers. Moreover, TARGET data can be used for research relevant to the biology, causes, treatment and late complications of treatment of pediatric cancers, but is not intended for the sole purposes of methods and/or tool development (please see <a href=\"https://ocg.cancer.gov/programs/target/using-target-data\">Using TARGET Data</a> section of the OCG website). If you are interested in using TARGET data for publication or other research purposes, you must follow the <a href=\"https://ocg.cancer.gov/programs/target/target-publication-guidelines\">TARGET Publication Guidelines</a>.</p>","type_of_cancer_id":"nbl","sample_count":1089,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nbl_target_2018_pub"},{"cancer_study_identifier":"nbl_msk_2023","name":"Pediatric Neuroblastoma (MSK, Nat Genet 2023)","description":"Targeted sequencing of 223 pediatric neuroblastoma tumor/normal pairs via MSK-IMPACT.","type_of_cancer_id":"nbl","sample_count":223,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nbl_msk_2023"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+  attribute_name,
+  COUNT(DISTINCT patient_unique_id) AS patient_count,
+  COUNT(DISTINCT CASE WHEN attribute_value != '' THEN patient_unique_id END) AS non_empty_count,
+  COUNT(DISTINCT CASE WHEN attribute_name = 'OS_STATUS' AND attribute_value = '1:DECEASED' THEN patient_unique_id END) AS events,
+  COUNT(DISTINCT CASE WHEN attribute_name = 'OS_STATUS' AND attribute_value = '0:LIVING' THEN patient_unique_id END) AS censored
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'nbl_target_2018_pub'
+  AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+GROUP BY attribute_name
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"attribute_name":"OS_STATUS","patient_count":1076,"non_empty_count":1072,"events":397,"censored":675},{"attribute_name":"OS_MONTHS","patient_count":1076,"non_empty_count":1072,"events":0,"censored":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+  attribute_name,
+  COUNT(DISTINCT patient_unique_id) AS n_patients,
+  MIN(toFloat64OrNull(attribute_value)) AS min_months,
+  MAX(toFloat64OrNull(attribute_value)) AS max_months,
+  ROUND(AVG(toFloat64OrNull(attribute_value)), 2) AS mean_months
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'nbl_target_2018_pub'
+  AND attribute_name = 'OS_MONTHS'
+  AND attribute_value != ''
+GROUP BY attribute_name
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"attribute_name":"OS_MONTHS","n_patients":1072,"min_months":1,"max_months":183,"mean_months":57.66}]}
+
+═ answer (success)
+---
+
+## Median Overall Survival — TARGET Pediatric Neuroblastoma
+
+**Cannot be reported directly from the database.** Median OS requires **Kaplan-Meier estimation** because survival data is censored — patients still alive at last follow-up (OS_STATUS = 0:LIVING) have not yet experienced the event, and a naive quantile over OS_MONTHS ignores this critical information.
+
+### Cohort Summary
+
+| Metric | Value |
+|--------|-------|
+| Total patients with survival data | 1,072 |
+| Events (OS_STATUS = 1:DECEASED) | 397 |
+| Censored (OS_STATUS = 0:LIVING) | 675 |
+| Follow-up range | 1–183 months |
+| Mean follow-up | 57.66 months |
+
+**37% (397/1,072) of patients experienced the death event; 63% (675/1,072) were censored** — meaning the KM median may not be reached for this cohort, or could be substantially different from the mean.
+
+### To Compute Median OS
+
+Use one of these tools:
+
+1. **cBioPortal Group Comparison** (recommended): Navigate to the study and use the **Survival tab** to generate a Kaplan-Meier curve, which displays the median OS directly.
+2. **R:** 
+   ```r
+   library(survival)
+   # Assuming data frame 'data' with OS_MONTHS and OS_STATUS columns
+   survfit(Surv(OS_MONTHS, OS_STATUS == "1:DECEASED") ~ 1, data = data)
+   ```
+3. **Python:**
+   ```python
+   from lifelines import KaplanMeierFitter
+   kmf = KaplanMeierFitter()
+   kmf.fit(T=data['OS_MONTHS'], E=data['OS_STATUS']=="1:DECEASED")
+   kmf.median_survival_time_
+   ```
+
+---
+
+Would you like me to generate a cBioPortal link to view the Kaplan-Meier curve for this study, or compare survival across specific subgroups (e.g., by MYCN status, stage, or other clinical attributes)?

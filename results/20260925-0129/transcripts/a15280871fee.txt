@@ -1,0 +1,258 @@
+Q (haiku): What percentage of genomic events in the MSK-CHORD Study occur in genes that are off-panel (not covered by the sequencing panel used)?
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7083 more chars)
+
+▶ list_studies
+{
+ "search": "MSK-CHORD"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation_panel_gene_coverage"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "cna_panel_gene_coverage"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"gene_panel_id","type":"LowCardinality(String)"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "sv_panel_gene_coverage"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"gene_panel_id","type":"LowCardinality(String)"}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"gene_panel_id","type":"LowCardinality(String)"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "sample_to_gene_panel_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"alteration_type","type":"LowCardinality(String)"},{"name":"gene_panel_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_id","type":"LowCardinality(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    off_panel,
+    COUNT(*) as event_count,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) as percentage
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+GROUP BY off_panel
+ORDER BY off_panel
+"
+}
+
+◀ result
+{"rows":[{"off_panel":false,"event_count":276413,"percentage":98.97},{"off_panel":true,"event_count":2877,"percentage":1.03}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    variant_type,
+    off_panel,
+    COUNT(*) as event_count,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (PARTITION BY variant_type), 2) as percentage_within_type
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+GROUP BY variant_type, off_panel
+ORDER BY variant_type, off_panel
+"
+}
+
+◀ result
+{"rows":[{"variant_type":"cna","off_panel":false,"event_count":60787,"percentage_within_type":100},{"variant_type":"mutation","off_panel":false,"event_count":208082,"percentage_within_type":99.93},{"variant_type":"mutation","off_panel":true,"event_count":150,"percentage_within_type":0.07},{"variant_type":"structural_variant","off_panel":false,"event_count":7544,"percentage_within_type":73.45},{"variant_type":"structural_variant","off_panel":true,"event_count":2727,"percentage_within_type":26.55}]}
+
+═ answer (success)
+Perfect! Here's the answer to your question:
+
+## Off-Panel Genomic Events in MSK-CHORD
+
+**Overall: 1.03% of genomic events (2,877 of 279,290) occur in genes that are off-panel.**
+
+### Breakdown by Variant Type:
+
+| Variant Type | On-Panel | Off-Panel | Off-Panel % |
+|---|---|---|---|
+| **Mutations** | 208,082 | 150 | **0.07%** |
+| **Copy Number Alterations (CNA)** | 60,787 | 0 | **0%** |
+| **Structural Variants (SVs)** | 7,544 | 2,727 | **26.55%** |
+
+### Key Findings:
+
+1. **Structural variants drive off-panel events**: Over 95% of off-panel events (2,727 of 2,877) are structural variants. This makes sense because SV detection often captures genes at fusion breakpoints that may fall outside the core targeted sequencing panel.
+
+2. **Mutations are predominantly on-panel**: Only 150 mutations (0.07%) are off-panel, demonstrating that the MSK-IMPACT panels provide excellent coverage of genes with recurrent mutations.
+
+3. **CNAs are entirely on-panel**: All 60,787 copy-number alterations are within panel coverage, likely because CNA calling focuses on genes with targeted probes.
+
+The study guide notes that MSK-CHORD uses multiple IMPACT panel versions (341, 410, 468, and 505 genes), and samples may have different gene coverage depending on which panel version was used for sequencing.

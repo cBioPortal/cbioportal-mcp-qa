@@ -1,0 +1,543 @@
+Q (sonnet): What are the key genomic differences between lung adenocarcinomas and squamous cell carcinomas identified in the Pan-Lung Cancer TCGA study?
+
+▶ list_studies
+{
+ "search": "Pan-Lung Cancer"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"nsclc_tcga_broad_2016","name":"Pan-Lung Cancer (TCGA, Nat Genet 2016)","type_of_cancer_id":"nsclc","sample_count":1144,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nsclc_tcga_broad_2016"},{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"luad","sample_count":566,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","name":"Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"lusc","sample_count":487,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ get_study_guide
+{
+ "study_id": "nsclc_tcga_broad_2016"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+# Study Guide: Pan-Lung Cancer (TCGA, Nat Genet 2016)
+
+**Study ID:** `nsclc_tcga_broad_2016`
+**Cancer Type:** nsclc
+**Description:** Whole-exome sequencing of 660 lung ADC and 484 lung SqCC tumor/normal pairs.
+
+## Cohort Statistics
+- **Patients:** 1,144
+- **Samples:** 1,145
+
+## Available Data Types
+
+- **COPY_NUMBER_ALTERATION**: Putative copy-number alterations
+- **MUTATION_EXTENDED**: Somatic mutations
+- **STRUCTURAL_VARIANT**: Structural variants
+
+## Gene Panels
+
+- **WES** (Whole Exome): 1,144 samples — all genes profiled
+
+## Available Clinical Attributes
+
+| Attribute | Samples with Data |
+|-----------|------------------|
+| CANCER_TYPE_DETAILED | 1,144 |
+| MUTATION_COUNT | 1,144 |
+| SOMATIC_STATUS | 1,144 |
+| FRACTION_GENOME_ALTERED | 1,144 |
+| TMB_NONSYNONYMOUS | 1,144 |
+| ONCOTREE_CODE | 1,144 |
+| T_STAGE | 1,144 |
+| CANCER_TYPE | 1,144 |
+| OS_MONTHS | 1 |
+| DAYS_TO_DEATH | 1 |
+| SMOKING_HISTORY | 1 |
+| DAYS_TO_LAST_FOLLOWUP | 1 |
+| SEX | 1 |
+| HISTORY_OTHER_MALIGNANCY | 1 |
+| STAGE | 1 |
+| SMOKING_PACK_YEARS | 1 |
+| HISTORY_NEOADJUVANT_TRTYN | 1 |
+| SAMPLE_COUNT | 1 |
+| AGE | 1 |
+| AGE_AT_SURGERY | 1 |
+
+## Top Mutated Genes
+
+| Gene | Altered Samples |
+|------|----------------|
+| TP53 | 775 |
+| TTN | 682 |
+| CSMD3 | 477 |
+| MUC16 | 463 |
+| RYR2 | 448 |
+| LRP1B | 402 |
+| USH2A | 390 |
+| ZFHX4 | 356 |
+| SPTA1 | 284 |
+| XIRP2 | 268 |
+
+## Query Tips for nsclc_tcga_broad_2016
+
+```sql
+-- Get all samples in this study
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016';
+
+-- Get mutations for a specific gene
+SELECT sample_unique_id, hugo_gene_symbol, mutation_variant, mutation_type
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+    AND hugo_gene_symbol = 'TP53'
+    AND variant_type = 'mutation';
+
+-- Get clinical data for specific attributes
+SELECT sample_unique_id, attribute_name, attribute_value
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'OS_MONTHS');
+```
+
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sample_hist AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND attribute_name = 'CANCER_TYPE_DETAILED'
+),
+sg AS (
+    SELECT DISTINCT ged.sample_unique_id, ged.hugo_gene_symbol, sh.cancer_type
+    FROM genomic_event_derived ged
+    JOIN sample_hist sh USING (sample_unique_id)
+    WHERE ged.cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.off_panel = 0
+),
+totals AS (
+    SELECT cancer_type, COUNT(DISTINCT sample_unique_id) AS n
+    FROM sample_hist
+    GROUP BY cancer_type
+)
+SELECT sg.cancer_type, sg.hugo_gene_symbol, COUNT(DISTINCT sg.sample_unique_id) AS altered, t.n AS total,
+       ROUND(COUNT(DISTINCT sg.sample_unique_id) * 100.0 / t.n, 1) AS pct
+FROM sg
+JOIN totals t ON t.cancer_type = sg.cancer_type
+GROUP BY sg.cancer_type, sg.hugo_gene_symbol, t.n
+HAVING altered >= 50
+ORDER BY sg.cancer_type, altered DESC
+LIMIT 60
+"
+}
+
+◀ result
+{"rows":[{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"TP53","altered":357,"total":660,"pct":54.1},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"TTN","altered":325,"total":660,"pct":49.2},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"MUC16","altered":271,"total":660,"pct":41.1},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CSMD3","altered":262,"total":660,"pct":39.7},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"RYR2","altered":250,"total":660,"pct":37.9},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"LRP1B","altered":231,"total":660,"pct":35},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"USH2A","altered":224,"total":660,"pct":33.9},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"KRAS","altered":214,"total":660,"pct":32.4},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"ZFHX4","altered":205,"total":660,"pct":31.1},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"SPTA1","altered":178,"total":660,"pct":27},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"XIRP2","altered":173,"total":660,"pct":26.2},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"FLG","altered":161,"total":660,"pct":24.4},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"FAT3","altered":147,"total":660,"pct":22.3},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CSMD1","altered":145,"total":660,"pct":22},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"MUC17","altered":136,"total":660,"pct":20.6},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"PCLO","altered":131,"total":660,"pct":19.8},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"PCDH15","altered":131,"total":660,"pct":19.8},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"NAV3","altered":130,"total":660,"pct":19.7},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"COL11A1","altered":130,"total":660,"pct":19.7},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"APOB","altered":130,"total":660,"pct":19.7},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"ZNF536","altered":127,"total":660,"pct":19.2},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"PAPPA2","altered":125,"total":660,"pct":18.9},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"ANK2","altered":122,"total":660,"pct":18.5},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"RYR3","altered":120,"total":660,"pct":18.2},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"SI","altered":119,"total":660,"pct":18},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"DNAH9","altered":118,"total":660,"pct":17.9},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"RP1L1","altered":118,"total":660,"pct":17.9},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"OBSCN","altered":116,"total":660,"pct":17.6},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"TNR","altered":115,"total":660,"pct":17.4},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol … (3095 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT attribute_value AS cancer_type, COUNT(DISTINCT sample_unique_id) AS n
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+  AND attribute_name = 'CANCER_TYPE_DETAILED'
+GROUP BY attribute_value
+"
+}
+
+◀ result
+{"rows":[{"cancer_type":"Lung Adenocarcinoma","n":660},{"cancer_type":"Lung Squamous Cell Carcinoma","n":484}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sample_hist AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND attribute_name = 'CANCER_TYPE_DETAILED'
+),
+tmb AS (
+    SELECT sample_unique_id, toFloat64OrNull(attribute_value) AS v
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND attribute_name = 'TMB_NONSYNONYMOUS'
+)
+SELECT sh.cancer_type, count(), round(avg(tmb.v),2) AS mean_tmb, round(quantile(0.5)(tmb.v),2) AS median_tmb
+FROM sample_hist sh JOIN tmb USING (sample_unique_id)
+GROUP BY sh.cancer_type
+"
+}
+
+◀ result
+{"rows":[{"cancer_type":"Lung Adenocarcinoma","count()":660,"mean_tmb":9.01,"median_tmb":6.27},{"cancer_type":"Lung Squamous Cell Carcinoma","count()":484,"mean_tmb":8.53,"median_tmb":7.07}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sample_hist AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND attribute_name = 'CANCER_TYPE_DETAILED'
+),
+cna AS (
+    SELECT DISTINCT ged.sample_unique_id, ged.hugo_gene_symbol, ged.cna_alteration, sh.cancer_type
+    FROM genomic_event_derived ged
+    JOIN sample_hist sh USING (sample_unique_id)
+    WHERE ged.cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND ged.variant_type = 'cna'
+      AND ged.cna_alteration IN (2, -2)
+),
+totals AS (
+    SELECT cancer_type, COUNT(DISTINCT sample_unique_id) AS n
+    FROM sample_hist
+    GROUP BY cancer_type
+)
+SELECT cna.cancer_type, cna.hugo_gene_symbol, cna.cna_alteration, COUNT(DISTINCT cna.sample_unique_id) AS altered, t.n, ROUND(COUNT(DISTINCT cna.sample_unique_id)*100.0/t.n,1) AS pct
+FROM cna JOIN totals t ON t.cancer_type = cna.cancer_type
+GROUP BY cna.cancer_type, cna.hugo_gene_symbol, cna.cna_alteration, t.n
+HAVING altered >= 60
+ORDER BY cna.cancer_type, altered DESC
+LIMIT 40
+"
+}
+
+◀ result
+{"rows":[{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CDKN2A","cna_alteration":-2,"altered":112,"n":660,"pct":17},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CDKN2B","cna_alteration":-2,"altered":108,"n":660,"pct":16.4},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CDKN2A-AS1","cna_alteration":-2,"altered":105,"n":660,"pct":15.9},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CDKN2B-AS1","cna_alteration":-2,"altered":104,"n":660,"pct":15.8},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"TRIP13","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CEP72","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"SDHA","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"EXOC3","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"SLC9A3","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"ZDHHC11","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"BRD9","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"EXOC3-AS1","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"PDCD6","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CCDC127","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"TPPP","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"AHRR","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"LRRC14B","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"SLC9A3-OT1","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"PLEKHG4B","cna_alteration":2,"altered":99,"n":660,"pct":15},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"LINC02982","cna_alteration":2,"altered":98,"n":660,"pct":14.8},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"NKD2","cna_alteration":2,"altered":98,"n":660,"pct":14.8},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"TERT","cna_alteration":2,"altered":98,"n":660,"pct":14.8},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"SLC12A7","cna_alteration":2,"altered":97,"n":660,"pct":14.7},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"SLC6A18","cna_alteration":2,"altered":97,"n":660,"pct":14.7},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"SLC6A19","cna_alteration":2,"altered":97,"n":660,"pct":14.7},{"cancer_type":"Lung Adenocarcinoma","hugo_gene_symbol":"CLPTM1L","cna_alterati … (1668 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sample_hist AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND attribute_name = 'CANCER_TYPE_DETAILED'
+),
+sg AS (
+    SELECT DISTINCT ged.sample_unique_id, ged.hugo_gene_symbol, sh.cancer_type
+    FROM genomic_event_derived ged
+    JOIN sample_hist sh USING (sample_unique_id)
+    WHERE ged.cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.off_panel = 0
+      AND ged.hugo_gene_symbol IN ('TP53','KRAS','EGFR','STK11','KEAP1','NFE2L2','PIK3CA','SOX2','PTEN','RB1','NOTCH1','FAT1','HRAS','BRAF','MET','ERBB2','SMARCA4','ARID1A','U2AF1','SETD2','CDKN2A')
+),
+totals AS (
+    SELECT cancer_type, COUNT(DISTINCT sample_unique_id) AS n
+    FROM sample_hist
+    GROUP BY cancer_type
+)
+SELECT sg.hugo_gene_symbol, sg.cancer_type, COUNT(DISTINCT sg.sample_unique_id) AS altered, t.n AS total,
+       ROUND(COUNT(DISTINCT sg.sample_unique_id) * 100.0 / t.n, 1) AS pct
+FROM sg
+JOIN totals t ON t.cancer_type = sg.cancer_type
+GROUP BY sg.hugo_gene_symbol, sg.cancer_type, t.n
+ORDER BY sg.hugo_gene_symbol, sg.cancer_type
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"ARID1A","cancer_type":"Lung Adenocarcinoma","altered":48,"total":660,"pct":7.3},{"hugo_gene_symbol":"ARID1A","cancer_type":"Lung Squamous Cell Carcinoma","altered":32,"total":484,"pct":6.6},{"hugo_gene_symbol":"BRAF","cancer_type":"Lung Adenocarcinoma","altered":54,"total":660,"pct":8.2},{"hugo_gene_symbol":"BRAF","cancer_type":"Lung Squamous Cell Carcinoma","altered":16,"total":484,"pct":3.3},{"hugo_gene_symbol":"CDKN2A","cancer_type":"Lung Adenocarcinoma","altered":27,"total":660,"pct":4.1},{"hugo_gene_symbol":"CDKN2A","cancer_type":"Lung Squamous Cell Carcinoma","altered":75,"total":484,"pct":15.5},{"hugo_gene_symbol":"EGFR","cancer_type":"Lung Adenocarcinoma","altered":104,"total":660,"pct":15.8},{"hugo_gene_symbol":"EGFR","cancer_type":"Lung Squamous Cell Carcinoma","altered":13,"total":484,"pct":2.7},{"hugo_gene_symbol":"ERBB2","cancer_type":"Lung Adenocarcinoma","altered":17,"total":660,"pct":2.6},{"hugo_gene_symbol":"ERBB2","cancer_type":"Lung Squamous Cell Carcinoma","altered":9,"total":484,"pct":1.9},{"hugo_gene_symbol":"FAT1","cancer_type":"Lung Adenocarcinoma","altered":73,"total":660,"pct":11.1},{"hugo_gene_symbol":"FAT1","cancer_type":"Lung Squamous Cell Carcinoma","altered":69,"total":484,"pct":14.3},{"hugo_gene_symbol":"HRAS","cancer_type":"Lung Adenocarcinoma","altered":3,"total":660,"pct":0.5},{"hugo_gene_symbol":"HRAS","cancer_type":"Lung Squamous Cell Carcinoma","altered":8,"total":484,"pct":1.7},{"hugo_gene_symbol":"KEAP1","cancer_type":"Lung Adenocarcinoma","altered":110,"total":660,"pct":16.7},{"hugo_gene_symbol":"KEAP1","cancer_type":"Lung Squamous Cell Carcinoma","altered":52,"total":484,"pct":10.7},{"hugo_gene_symbol":"KRAS","cancer_type":"Lung Adenocarcinoma","altered":214,"total":660,"pct":32.4},{"hugo_gene_symbol":"KRAS","cancer_type":"Lung Squamous Cell Carcinoma","altered":8,"total":484,"pct":1.7},{"hugo_gene_symbol":"MET","cancer_type":"Lung Adenocarcinoma","altered":28,"total":660,"pct":4.2},{"hugo_gene_symbol":"MET","cancer_type":"Lung Squamous Cell Carcinoma","altered":6,"total":484,"pct":1.2},{"hugo_gene_symbol":"NFE2L2","cancer_type":"Lung Adenocarcinoma","altered":14,"total":660,"pct":2.1},{"hugo_gene_symbol":"NFE2L2","cancer_type":"Lung Squamous Cell Carcinoma","altered":70,"total":484,"pct":14.5},{"hugo_gene_symbol":"NOTCH1","cancer_type":"Lung Adenocarcinoma","altered":31,"total":660,"pct":4.7},{"hugo_gene_symbol":"NOTCH1","cancer_type":"Lung Squamous Cell Carcinoma","altered":40,"total":484,"pct":8.3},{"hugo_gene_symbol":"PIK3CA","cancer_type":"Lung Adenocarcinoma","altered":39,"total":660,"pct":5.9},{"hugo_gene_symbol":"PIK3CA","cancer_type":"Lung Squamous Cell Carcinoma","altered":55,"total":484,"pct":11.4},{"hugo_gene_symbol":"PTEN","cancer_type":"Lung Adenocarcinoma","altered":11,"total":660,"pct":1.7},{"hugo_gene_symbol":"PTEN","cancer_type":"Lung Squamous Cell Carcinoma","altered":56,"total":484,"pct":11.6},{"hugo_gene_symbol":"RB1","cancer_type":"Lung Adenocarcinoma"," … (1291 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sample_hist AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND attribute_name = 'CANCER_TYPE_DETAILED'
+),
+cna AS (
+    SELECT DISTINCT ged.sample_unique_id, ged.hugo_gene_symbol, ged.cna_alteration, sh.cancer_type
+    FROM genomic_event_derived ged
+    JOIN sample_hist sh USING (sample_unique_id)
+    WHERE ged.cancer_study_identifier = 'nsclc_tcga_broad_2016'
+      AND ged.variant_type = 'cna'
+      AND ged.cna_alteration IN (2, -2)
+      AND ged.hugo_gene_symbol IN ('CDKN2A','SOX2','PIK3CA','MYC','EGFR','MDM2','TERT','NKX2-1','FGFR1','TP63')
+),
+totals AS (
+    SELECT cancer_type, COUNT(DISTINCT sample_unique_id) AS n
+    FROM sample_hist
+    GROUP BY cancer_type
+)
+SELECT cna.hugo_gene_symbol, cna.cancer_type, cna.cna_alteration, COUNT(DISTINCT cna.sample_unique_id) AS altered, t.n, ROUND(COUNT(DISTINCT cna.sample_unique_id)*100.0/t.n,1) AS pct
+FROM cna JOIN totals t ON t.cancer_type = cna.cancer_type
+GROUP BY cna.hugo_gene_symbol, cna.cancer_type, cna.cna_alteration, t.n
+ORDER BY cna.hugo_gene_symbol, cna.cancer_type
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"CDKN2A","cancer_type":"Lung Adenocarcinoma","cna_alteration":2,"altered":1,"n":660,"pct":0.2},{"hugo_gene_symbol":"CDKN2A","cancer_type":"Lung Adenocarcinoma","cna_alteration":-2,"altered":112,"n":660,"pct":17},{"hugo_gene_symbol":"CDKN2A","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":2,"altered":2,"n":484,"pct":0.4},{"hugo_gene_symbol":"CDKN2A","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":-2,"altered":129,"n":484,"pct":26.7},{"hugo_gene_symbol":"EGFR","cancer_type":"Lung Adenocarcinoma","cna_alteration":2,"altered":36,"n":660,"pct":5.5},{"hugo_gene_symbol":"EGFR","cancer_type":"Lung Adenocarcinoma","cna_alteration":-2,"altered":3,"n":660,"pct":0.5},{"hugo_gene_symbol":"EGFR","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":2,"altered":33,"n":484,"pct":6.8},{"hugo_gene_symbol":"EGFR","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":-2,"altered":2,"n":484,"pct":0.4},{"hugo_gene_symbol":"FGFR1","cancer_type":"Lung Adenocarcinoma","cna_alteration":2,"altered":19,"n":660,"pct":2.9},{"hugo_gene_symbol":"FGFR1","cancer_type":"Lung Adenocarcinoma","cna_alteration":-2,"altered":10,"n":660,"pct":1.5},{"hugo_gene_symbol":"FGFR1","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":2,"altered":83,"n":484,"pct":17.1},{"hugo_gene_symbol":"FGFR1","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":-2,"altered":2,"n":484,"pct":0.4},{"hugo_gene_symbol":"MDM2","cancer_type":"Lung Adenocarcinoma","cna_alteration":-2,"altered":1,"n":660,"pct":0.2},{"hugo_gene_symbol":"MDM2","cancer_type":"Lung Adenocarcinoma","cna_alteration":2,"altered":36,"n":660,"pct":5.5},{"hugo_gene_symbol":"MDM2","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":2,"altered":10,"n":484,"pct":2.1},{"hugo_gene_symbol":"MYC","cancer_type":"Lung Adenocarcinoma","cna_alteration":2,"altered":62,"n":660,"pct":9.4},{"hugo_gene_symbol":"MYC","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":2,"altered":38,"n":484,"pct":7.9},{"hugo_gene_symbol":"NKX2-1","cancer_type":"Lung Adenocarcinoma","cna_alteration":2,"altered":79,"n":660,"pct":12},{"hugo_gene_symbol":"NKX2-1","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":2,"altered":13,"n":484,"pct":2.7},{"hugo_gene_symbol":"NKX2-1","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":-2,"altered":3,"n":484,"pct":0.6},{"hugo_gene_symbol":"PIK3CA","cancer_type":"Lung Adenocarcinoma","cna_alteration":-2,"altered":3,"n":660,"pct":0.5},{"hugo_gene_symbol":"PIK3CA","cancer_type":"Lung Adenocarcinoma","cna_alteration":2,"altered":14,"n":660,"pct":2.1},{"hugo_gene_symbol":"PIK3CA","cancer_type":"Lung Squamous Cell Carcinoma","cna_alteration":2,"altered":194,"n":484,"pct":40.1},{"hugo_gene_symbol":"SOX2","cancer_type":"Lung Adenocarcinoma","cna_alteration":-2,"altered":3,"n":660,"pct":0.5},{"hugo_gene_symbol":"SOX2","cancer_type":"Lung Adenocarcinoma","cna_alteration":2,"altered":15,"n":660,"pct":2.3},{"hugo_gene_sym … (701 more chars)
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "nsclc_tcga_broad_2016"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"nsclc_tcga_broad_2016","name":"Pan-Lung Cancer (TCGA, Nat Genet 2016)","sampleCount":1144,"studyViewUrl":"https://www.cbioportal.org/study?id=nsclc_tcga_broad_2016","metadata":{"clinicalAttributeIds":["AGE","AGE_AT_SURGERY","CANCER_TYPE","CANCER_TYPE_DETAILED","DAYS_TO_DEATH","DAYS_TO_LAST_FOLLOWUP","FRACTION_GENOME_ALTERED","HISTORY_NEOADJUVANT_TRTYN","HISTORY_OTHER_MALIGNANCY","MUTATION_COUNT","M_STAGE","N_STAGE","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","SAMPLE_COUNT","SEX","SMOKING_HISTORY","SMOKING_PACK_YEARS","SOMATIC_STATUS","STAGE","TMB_NONSYNONYMOUS","T_STAGE"],"molecularProfileIds":["nsclc_tcga_broad_2016_cna","nsclc_tcga_broad_2016_mutations","nsclc_tcga_broad_2016_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "nsclc_tcga_broad_2016"
+ ],
+ "groups": [
+  {
+   "name": "Lung Adenocarcinoma",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "CANCER_TYPE_DETAILED",
+      "values": [
+       {
+        "value": "Lung Adenocarcinoma"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Lung Squamous Cell Carcinoma",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "CANCER_TYPE_DETAILED",
+      "values": [
+       {
+        "value": "Lung Squamous Cell Carcinoma"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "alterations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/alterations?comparisonId=6ab4329ee497aad53593be0b","url":"https://www.cbioportal.org/comparison/alterations?comparisonId=6ab4329ee497aad53593be0b","data":{"description":"Group comparison (2 custom groups)","studies":["nsclc_tcga_broad_2016"],"totalGroups":2,"groups":[{"name":"Lung Adenocarcinoma","sampleCount":660},{"name":"Lung Squamous Cell Carcinoma","sampleCount":484}],"studyViewUrl":"https://www.cbioportal.org/study?id=nsclc_tcga_broad_2016","groupUrls":[{"groupName":"Lung Adenocarcinoma","url":"https://www.cbioportal.org/study?id=nsclc_tcga_broad_2016#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE_DETAILED%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Lung%20Adenocarcinoma%22%7D%5D%7D%5D%7D"},{"groupName":"Lung Squamous Cell Carcinoma","url":"https://www.cbioportal.org/study?id=nsclc_tcga_broad_2016#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE_DETAILED%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Lung%20Squamous%20Cell%20Carcinoma%22%7D%5D%7D%5D%7D"}],"pageDescription":"Comparison of genomic alteration rates across Lung Adenocarcinoma (660) vs Lung Squamous Cell Carcinoma (484)."}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "nsclc_tcga_broad_2016"
+ ],
+ "genes": [
+  "TP53",
+  "KRAS",
+  "EGFR",
+  "STK11",
+  "KEAP1",
+  "NFE2L2",
+  "PIK3CA",
+  "SOX2",
+  "PTEN",
+  "CDKN2A",
+  "TP63",
+  "FGFR1"
+ ],
+ "tab": "oncoprint",
+ "oncoprintClinicalTracks": [
+  "CANCER_TYPE_DETAILED"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=nsclc_tcga_broad_2016&gene_list=TP53%0AKRAS%0AEGFR%0ASTK11%0AKEAP1%0ANFE2L2%0APIK3CA%0ASOX2%0APTEN%0ACDKN2A%0ATP63%0AFGFR1&case_set_id=nsclc_tcga_broad_2016_all&clinicallist=CANCER_TYPE_DETAILED","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=nsclc_tcga_broad_2016&gene_list=TP53%0AKRAS%0AEGFR%0ASTK11%0AKEAP1%0ANFE2L2%0APIK3CA%0ASOX2%0APTEN%0ACDKN2A%0ATP63%0AFGFR1&case_set_id=nsclc_tcga_broad_2016_all&clinicallist=CANCER_TYPE_DETAILED","data":{"studyIds":["nsclc_tcga_broad_2016"],"studies":[{"studyId":"nsclc_tcga_broad_2016","name":"Pan-Lung Cancer (TCGA, Nat Genet 2016)","sampleCount":1144}],"genes":["TP53","KRAS","EGFR","STK11","KEAP1","NFE2L2","PIK3CA","SOX2","PTEN","CDKN2A","TP63","FGFR1"],"caseSetId":"nsclc_tcga_broad_2016_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## Genomic Differences: LUAD vs LUSC in the Pan-Lung Cancer TCGA Study
+
+**Cohort:** [Pan-Lung Cancer (TCGA, Nat Genet 2016)](https://www.cbioportal.org/study/summary?id=nsclc_tcga_broad_2016) — whole-exome sequencing of 1,144 patients: 660 Lung Adenocarcinoma (LUAD) samples and 484 Lung Squamous Cell Carcinoma (LUSC) samples. All figures below are mutated (or copy-number-altered) samples / profiled samples (all 1,144 samples are WES, so every gene has a full denominator in its histology).
+
+### Mutation frequency differences (largest, most consistent contrasts)
+
+| Gene | LUAD | LUSC | Direction |
+|---|---|---|---|
+| **KRAS** | 214/660 (32.4%) | 8/484 (1.7%) | Strongly LUAD-enriched |
+| **EGFR** | 104/660 (15.8%) | 13/484 (2.7%) | LUAD-enriched |
+| **STK11** | 104/660 (15.8%) | 7/484 (1.4%) | LUAD-enriched |
+| **KEAP1** | 110/660 (16.7%) | 52/484 (10.7%) | LUAD-enriched |
+| **SMARCA4** | 61/660 (9.2%) | 18/484 (3.7%) | LUAD-enriched |
+| **BRAF** | 54/660 (8.2%) | 16/484 (3.3%) | LUAD-enriched |
+| **TP53** | 357/660 (54.1%) | 418/484 (86.4%) | Strongly LUSC-enriched |
+| **PTEN** | 11/660 (1.7%) | 56/484 (11.6%) | LUSC-enriched |
+| **NFE2L2** | 14/660 (2.1%) | 70/484 (14.5%) | LUSC-enriched |
+| **PIK3CA** | 39/660 (5.9%) | 55/484 (11.4%) | LUSC-enriched (mutation) |
+| **NOTCH1** | 31/660 (4.7%) | 40/484 (8.3%) | LUSC-enriched |
+
+### Copy-number differences
+
+| Gene | Alteration | LUAD | LUSC | Direction |
+|---|---|---|---|---|
+| **SOX2** | Amplification | 15/660 (2.3%) | 205/484 (42.4%) | LUSC hallmark |
+| **PIK3CA** | Amplification | 14/660 (2.1%) | 194/484 (40.1%) | LUSC hallmark |
+| **TP63** | Amplification | 13/660 (2.0%) | 163/484 (33.7%) | LUSC hallmark |
+| **FGFR1** | Amplification | 19/660 (2.9%) | 83/484 (17.1%) | LUSC-enriched |
+| **CDKN2A** | Homozygous deletion | 112/660 (17.0%) | 129/484 (26.7%) | LUSC-enriched |
+| **NKX2-1 (TTF-1)** | Amplification | 79/660 (12.0%) | 13/484 (2.7%) | LUAD-enriched (lineage TF) |
+| **EGFR** | Amplification | 36/660 (5.5%) | 33/484 (6.8%) | Similar |
+
+### Tumor mutational burden
+Comparable overall — LUAD mean 9.01, median 6.27 mutations/Mb; LUSC mean 8.53, median 7.07 mutations/Mb (both n=660/484 profiled). LUSC has a somewhat right-shifted/less skewed distribution.
+
+### Summary interpretation
+- **LUAD** is defined by activating oncogene mutations in the classic driver pathway — KRAS, EGFR, BRAF — often mutually exclusive, plus higher rates of STK11/KEAP1 co-mutation and NKX2-1 amplification (a lineage-survival oncogene consistent with glandular differentiation).
+- **LUSC** is defined by near-universal TP53 inactivation (86% vs 54%), the 3q26 amplicon (SOX2, PIK3CA, TP63 co-amplified — the single sharpest structural distinguisher between the two histologies), FGFR1 amplification, and higher rates of PTEN loss and NFE2L2/KEAP1-pathway (oxidative stress response) alterations, though via different members than LUAD (NFE2L2 mutation in LUSC vs KEAP1 mutation in LUAD).
+
+These frequencies reflect descriptive counts from the database, not statistical significance testing — for formal enrichment statistics (Fisher's exact / odds ratios) between the two histologies, use the Comparison "Alterations" tab linked below.
+
+**Links:**
+- [Group Comparison: LUAD vs LUSC — genomic alteration rates](https://www.cbioportal.org/comparison/alterations?comparisonId=6ab4329ee497aad53593be0b) — statistical enrichment comparison across all genes, with survival/clinical tabs also available for this cohort.
+- [OncoPrint: key LUAD/LUSC driver genes across the full cohort](https://www.cbioportal.org/results/oncoprint?cancer_study_list=nsclc_tcga_broad_2016&gene_list=TP53%0AKRAS%0AEGFR%0ASTK11%0AKEAP1%0ANFE2L2%0APIK3CA%0ASOX2%0APTEN%0ACDKN2A%0ATP63%0AFGFR1&case_set_id=nsclc_tcga_broad_2016_all&clinicallist=CANCER_TYPE_DETAILED) — visualizes mutation/CNA patterns per sample with histology annotation track.
+- [Study overview](https://www.cbioportal.org/study/summary?id=nsclc_tcga_broad_2016)

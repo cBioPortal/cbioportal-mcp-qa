@@ -1,0 +1,212 @@
+Q (haiku): Show me cases where PALB2 or ATM have germline mutations
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT
+    cancer_study_identifier,
+    patient_unique_id,
+    sample_unique_id,
+    hugo_gene_symbol,
+    mutation_variant,
+    mutation_type,
+    mutation_status
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+  AND hugo_gene_symbol IN ('PALB2', 'ATM')
+  AND mutation_status = 'Germline'
+ORDER BY cancer_study_identifier, hugo_gene_symbol, patient_unique_id
+LIMIT 500",
+ "max_rows": 500
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-A2-A0T7","sample_unique_id":"brca_tcga_pub_TCGA-A2-A0T7-01","hugo_gene_symbol":"ATM","mutation_variant":"R3047*","mutation_type":"Nonsense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-A8-A08L","sample_unique_id":"brca_tcga_pub_TCGA-A8-A08L-01","hugo_gene_symbol":"ATM","mutation_variant":"G2023R","mutation_type":"Missense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-AN-A041","sample_unique_id":"brca_tcga_pub_TCGA-AN-A041-01","hugo_gene_symbol":"ATM","mutation_variant":"D1815Tfs*13","mutation_type":"Frame_Shift_Del","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-AN-A049","sample_unique_id":"brca_tcga_pub_TCGA-AN-A049-01","hugo_gene_symbol":"ATM","mutation_variant":"Q95*","mutation_type":"Nonsense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-AN-A0XL","sample_unique_id":"brca_tcga_pub_TCGA-AN-A0XL-01","hugo_gene_symbol":"ATM","mutation_variant":"X166_splice","mutation_type":"Splice_Site","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-B6-A0RV","sample_unique_id":"brca_tcga_pub_TCGA-B6-A0RV-01","hugo_gene_symbol":"ATM","mutation_variant":"X2032_splice","mutation_type":"Splice_Site","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-B6-A0WY","sample_unique_id":"brca_tcga_pub_TCGA-B6-A0WY-01","hugo_gene_symbol":"ATM","mutation_variant":"R2547_S2549del","mutation_type":"In_Frame_Del","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-BH-A0DD","sample_unique_id":"brca_tcga_pub_TCGA-BH-A0DD-01","hugo_gene_symbol":"ATM","mutation_variant":"R2912G","mutation_type":"Missense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-C8-A12X","sample_unique_id":"brca_tcga_pub_TCGA-C8-A12X-01","hugo_gene_symbol":"ATM","mutation_variant":"N1650S","mutation_type":"Missense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-D8-A13Z","sample_unique_id":"brca_tcga_pub_TCGA-D8-A13Z-01","hugo_gene_symbol":"ATM","mutation_variant":"X2544_splice","mutation_type":"Splice_Site","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-E2-A154","sample_unique_id":"brca_tcga_pub_TCGA-E2-A154-01","hugo_gene_symbol":"ATM","mutation_variant":"G2023R","mutation_type":"Missense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"kirc_tcga_pub","patient_unique_id":"kirc_tcga_pub_TCGA-B0-5097","sample_unique … (3314 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT
+    hugo_gene_symbol,
+    cancer_study_identifier,
+    COUNT(DISTINCT patient_unique_id) AS germline_patients,
+    COUNT(DISTINCT sample_unique_id) AS germline_samples,
+    groupArray(DISTINCT mutation_type) AS mutation_types
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+  AND hugo_gene_symbol IN ('PALB2', 'ATM')
+  AND mutation_status = 'Germline'
+GROUP BY hugo_gene_symbol, cancer_study_identifier
+ORDER BY hugo_gene_symbol, cancer_study_identifier",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"ATM","cancer_study_identifier":"brca_tcga_pub","germline_patients":11,"germline_samples":11,"mutation_types":["Nonsense_Mutation","Missense_Mutation","Frame_Shift_Del","Splice_Site","In_Frame_Del"]},{"hugo_gene_symbol":"ATM","cancer_study_identifier":"kirc_tcga_pub","germline_patients":3,"germline_samples":3,"mutation_types":["Frame_Shift_Del","Splice_Site"]},{"hugo_gene_symbol":"ATM","cancer_study_identifier":"lung_nci_2022","germline_patients":2,"germline_samples":2,"mutation_types":["Nonsense_Mutation","Splice_Site"]},{"hugo_gene_symbol":"ATM","cancer_study_identifier":"prad_su2c_2019","germline_patients":7,"germline_samples":8,"mutation_types":["Splice_Site","Frame_Shift_Del","Nonsense_Mutation"]}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT
+    cancer_study_identifier,
+    patient_unique_id,
+    sample_unique_id,
+    hugo_gene_symbol,
+    mutation_variant,
+    mutation_type,
+    mutation_status
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+  AND hugo_gene_symbol IN ('PALB2', 'ATM')
+  AND mutation_status = 'Germline'
+ORDER BY hugo_gene_symbol, cancer_study_identifier, patient_unique_id",
+ "max_rows": 500
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-A2-A0T7","sample_unique_id":"brca_tcga_pub_TCGA-A2-A0T7-01","hugo_gene_symbol":"ATM","mutation_variant":"R3047*","mutation_type":"Nonsense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-A8-A08L","sample_unique_id":"brca_tcga_pub_TCGA-A8-A08L-01","hugo_gene_symbol":"ATM","mutation_variant":"G2023R","mutation_type":"Missense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-AN-A041","sample_unique_id":"brca_tcga_pub_TCGA-AN-A041-01","hugo_gene_symbol":"ATM","mutation_variant":"D1815Tfs*13","mutation_type":"Frame_Shift_Del","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-AN-A049","sample_unique_id":"brca_tcga_pub_TCGA-AN-A049-01","hugo_gene_symbol":"ATM","mutation_variant":"Q95*","mutation_type":"Nonsense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-AN-A0XL","sample_unique_id":"brca_tcga_pub_TCGA-AN-A0XL-01","hugo_gene_symbol":"ATM","mutation_variant":"X166_splice","mutation_type":"Splice_Site","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-B6-A0RV","sample_unique_id":"brca_tcga_pub_TCGA-B6-A0RV-01","hugo_gene_symbol":"ATM","mutation_variant":"X2032_splice","mutation_type":"Splice_Site","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-B6-A0WY","sample_unique_id":"brca_tcga_pub_TCGA-B6-A0WY-01","hugo_gene_symbol":"ATM","mutation_variant":"R2547_S2549del","mutation_type":"In_Frame_Del","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-BH-A0DD","sample_unique_id":"brca_tcga_pub_TCGA-BH-A0DD-01","hugo_gene_symbol":"ATM","mutation_variant":"R2912G","mutation_type":"Missense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-C8-A12X","sample_unique_id":"brca_tcga_pub_TCGA-C8-A12X-01","hugo_gene_symbol":"ATM","mutation_variant":"N1650S","mutation_type":"Missense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-D8-A13Z","sample_unique_id":"brca_tcga_pub_TCGA-D8-A13Z-01","hugo_gene_symbol":"ATM","mutation_variant":"X2544_splice","mutation_type":"Splice_Site","mutation_status":"Germline"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-E2-A154","sample_unique_id":"brca_tcga_pub_TCGA-E2-A154-01","hugo_gene_symbol":"ATM","mutation_variant":"G2023R","mutation_type":"Missense_Mutation","mutation_status":"Germline"},{"cancer_study_identifier":"kirc_tcga_pub","patient_unique_id":"kirc_tcga_pub_TCGA-B0-5097","sample_unique … (3314 more chars)
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_tcga_pub",
+  "kirc_tcga_pub",
+  "lung_nci_2022",
+  "prad_su2c_2019"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 4 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":4,"studiesWithMetadata":[{"studyId":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","sampleCount":825,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pub","metadata":{"clinicalAttributeIds":["AGE","CANCER_TYPE","CANCER_TYPE_DETAILED","CN_CLUSTER","CONVERTED_STAGE","ER_STATUS","FRACTION_GENOME_ALTERED","HER2_STATUS","INTEGRATED_CLUSTERS_NO_EXP","INTEGRATED_CLUSTERS_UNSUP_EXP","INTEGRATED_CLUSTERS_WITH_PAM50","METASTASIS","METASTASIS_CODED","METHYLATION_CLUSTER","MIRNA_CLUSTER","MUTATION_COUNT","NODES","NODE_CODED","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PAM50_SUBTYPE","PR_STATUS","RPPA_CLUSTER","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SIGCLUST_INTRINSIC_MRNA","SIGCLUST_UNSUPERVISED_MRNA","SOMATIC_STATUS","SURVIVAL_DATA_FORM","TMB_NONSYNONYMOUS","TUMOR_STAGE","TUMOR_T1_CODED"],"molecularProfileIds":["brca_tcga_pub_gistic","brca_tcga_pub_linear_CNA","brca_tcga_pub_methylation_hm27","brca_tcga_pub_mirna","brca_tcga_pub_mirna_median_Zscores","brca_tcga_pub_mrna","brca_tcga_pub_mrna_median_Zscores","brca_tcga_pub_mrna_median_all_sample_Zscores","brca_tcga_pub_mrna_merged_median_Zscores","brca_tcga_pub_mutations","brca_tcga_pub_rppa","brca_tcga_pub_rppa_Zscores"],"heatmapProfileIds":["brca_tcga_pub_methylation_hm27","brca_tcga_pub_mrna_median_Zscores","brca_tcga_pub_mrna_median_all_sample_Zscores","brca_tcga_pub_mrna_merged_median_Zscores","brca_tcga_pub_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","dna_methylation"]}},{"studyId":"kirc_tcga_pub","name":"Kidney Renal Clear Cell Carcinoma (TCGA, Nature 2013)","sampleCount":446,"studyViewUrl":"https://www.cbioportal.org/study?id=kirc_tcga_pub","metadata":{"clinicalAttributeIds":["CANCER_TYPE","CANCER_TYPE_DETAILED","FRACTION_GENOME_ALTERED","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","SAMPLE_COUNT","SAMPLE_TYPE","SOMATIC_STATUS","TMB_NONSYNONYMOUS"],"molecularProfileIds":["kirc_tcga_pub_gistic","kirc_tcga_pub_linear_CNA","kirc_tcga_pub_methylation_hm27","kirc_tcga_pub_mirna","kirc_tcga_pub_mirna_median_Zscores","kirc_tcga_pub_mrna","kirc_tcga_pub_mrna_median_Zscores","kirc_tcga_pub_mrna_median_all_sample_Zscores","kirc_tcga_pub_mrna_merged_median_Zscores","kirc_tcga_pub_mutations","kirc_tcga_pub_rna_seq_v2_mrna","kirc_tcga_pub_rna_seq_v2_mrna_median_Zscores","kirc_tcga_pub_rna_seq_v2_mrna_median_all_sample_Zscores","kirc_tcga_pub_rppa","kirc_tcga_pub_rppa_Zscores","kirc_tcga_pub_structural_variants"],"heatmapProfileIds":["kirc_tcga_pub_methylation_hm27","kirc_tcga_pub_mirna_median_Zscores","kirc_tcga_pub_mrna_median_Zscores","kirc_tcga_pub_mrna_median_all_sample_Zscores","kirc_tcga_pub_mrna_merged_median_Zscores","kirc_tcga_pub_rn … (2618 more chars)
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_tcga_pub",
+  "kirc_tcga_pub",
+  "lung_nci_2022",
+  "prad_su2c_2019"
+ ],
+ "genes": [
+  "ATM",
+  "PALB2"
+ ],
+ "tab": "mutations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/mutations?cancer_study_list=brca_tcga_pub%2Ckirc_tcga_pub%2Clung_nci_2022%2Cprad_su2c_2019&gene_list=ATM%0APALB2&case_set_id=all","url":"https://www.cbioportal.org/results/mutations?cancer_study_list=brca_tcga_pub%2Ckirc_tcga_pub%2Clung_nci_2022%2Cprad_su2c_2019&gene_list=ATM%0APALB2&case_set_id=all","data":{"studyIds":["brca_tcga_pub","kirc_tcga_pub","lung_nci_2022","prad_su2c_2019"],"studies":[{"studyId":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","sampleCount":825},{"studyId":"kirc_tcga_pub","name":"Kidney Renal Clear Cell Carcinoma (TCGA, Nature 2013)","sampleCount":446},{"studyId":"lung_nci_2022","name":"Lung Cancer in Never Smokers (NCI, Nature Genetics 2021)","sampleCount":232},{"studyId":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sampleCount":444}],"genes":["ATM","PALB2"],"caseSetId":"all","pageDescription":"Detailed mutation table with lollipop plot showing mutation positions, types, and frequencies for queried genes."}}
+
+═ answer (success)
+## Results: Cases with Germline PALB2 or ATM Mutations
+
+I found **23 patient cases** with germline mutations in **ATM**. No germline PALB2 mutations were detected in the current database.
+
+### Summary by Gene and Study
+
+| Gene | Study | Germline Patients | Mutation Types |
+|------|-------|------------------|-----------------|
+| **ATM** | Breast Cancer (TCGA) | 11 | Nonsense, Missense, Frameshift, Splice Site, In-Frame Deletion |
+| **ATM** | Kidney Cancer (TCGA) | 3 | Frameshift, Splice Site |
+| **ATM** | Lung Cancer Never Smokers (NCI) | 2 | Nonsense, Splice Site |
+| **ATM** | Prostate Cancer Metastatic (SU2C) | 7 | Splice Site, Frameshift, Nonsense |
+
+### Detailed Case List (ATM Germline Mutations)
+
+**BRCA (11 cases):**
+- TCGA-A2-A0T7: R3047* (Nonsense)
+- TCGA-A8-A08L: G2023R (Missense)
+- TCGA-AN-A041: D1815Tfs*13 (Frameshift)
+- TCGA-AN-A049: Q95* (Nonsense)
+- TCGA-AN-A0XL: X166_splice (Splice Site)
+- TCGA-B6-A0RV: X2032_splice (Splice Site)
+- TCGA-B6-A0WY: R2547_S2549del (In-Frame Deletion)
+- TCGA-BH-A0DD: R2912G (Missense)
+- TCGA-C8-A12X: N1650S (Missense)
+- TCGA-D8-A13Z: X2544_splice (Splice Site)
+- TCGA-E2-A154: G2023R (Missense)
+
+**KIRC (3 cases):**
+- TCGA-B0-5097: S496Ifs*16 (Frameshift)
+- TCGA-BP-4988: X974_splice (Splice Site)
+- TCGA-BP-5009: Q2066Rfs*16 (Frameshift)
+
+**Lung Cancer (2 cases):**
+- NSLC-0079: W1221* (Nonsense)
+- NSLC-0101: X974_splice (Splice Site)
+
+**Prostate Cancer (7 cases):**
+- 1115082: K2589Nfs*17 (Frameshift, 2 samples)
+- 5115194: X2544_splice (Splice Site)
+- 96115206: L1255* (Frameshift)
+- 97115005: Q1852* (Nonsense)
+- 97115131: V1268* (Frameshift)
+- 97115167: W2638* (Nonsense)
+- 97115333: E1971Rfs*19 (Frameshift)
+
+---
+
+### [View ATM & PALB2 Mutations in cBioPortal](https://www.cbioportal.org/results/mutations?cancer_study_list=brca_tcga_pub%2Ckirc_tcga_pub%2Clung_nci_2022%2Cprad_su2c_2019&gene_list=ATM%0APALB2&case_set_id=all)
+
+This link opens the Mutations tab showing all identified cases across the four studies, with an OncoPrint visualization of mutation positions and types.

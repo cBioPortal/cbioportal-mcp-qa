@@ -1,0 +1,402 @@
+Q (sonnet): In the TCGA Breast Cancer study if a patient has both a PIK3CA mutation and a PTEN deletion what is their probability of having a luminal A subtype? Is this probability different from a patient with only a PIK3CA mutation?
+
+▶ list_guides
+{}
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT attribute_name FROM clinical_data_derived WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018' AND upper(attribute_name) LIKE '%SUBTYPE%'"
+}
+
+◀ result
+{"rows":[{"attribute_name":"SUBTYPE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT attribute_value FROM clinical_data_derived WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018' AND attribute_name = 'SUBTYPE'"
+}
+
+◀ result
+{"rows":[{"attribute_value":"BRCA_LumA"},{"attribute_value":"BRCA_Her2"},{"attribute_value":"BRCA_LumB"},{"attribute_value":"BRCA_Normal"},{"attribute_value":"BRCA_Basal"},{}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH profiled AS (
+    SELECT DISTINCT c.patient_unique_id
+    FROM sample_to_gene_panel_derived s
+    JOIN (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived
+          WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018') c USING (sample_unique_id)
+    WHERE s.cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND s.alteration_type = 'MUTATION_EXTENDED'
+),
+pik3ca_mut AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PIK3CA' AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+pten_del AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PTEN' AND variant_type = 'cna' AND cna_alteration = -2
+),
+subtype AS (
+    SELECT patient_unique_id, attribute_value AS subtype
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018' AND attribute_name = 'SUBTYPE'
+),
+groups AS (
+    SELECT p.patient_unique_id,
+        (p.patient_unique_id IN (SELECT patient_unique_id FROM pik3ca_mut)) AS has_pik3ca,
+        (p.patient_unique_id IN (SELECT patient_unique_id FROM pten_del)) AS has_pten_del
+    FROM profiled p
+)
+SELECT
+    CASE WHEN has_pik3ca AND has_pten_del THEN 'PIK3CA_mut + PTEN_del'
+         WHEN has_pik3ca AND NOT has_pten_del THEN 'PIK3CA_mut only'
+    END AS group_name,
+    s.subtype,
+    count() AS n_patients
+FROM groups g
+JOIN subtype s USING (patient_unique_id)
+WHERE has_pik3ca = 1
+  AND s.subtype != ''
+GROUP BY group_name, s.subtype
+ORDER BY group_name, n_patients DESC
+"
+}
+
+◀ result
+{"rows":[{"group_name":"PIK3CA_mut + PTEN_del","subtype":"BRCA_LumA","n_patients":3},{"group_name":"PIK3CA_mut + PTEN_del","subtype":"BRCA_LumB","n_patients":2},{"group_name":"PIK3CA_mut + PTEN_del","subtype":"BRCA_Basal","n_patients":1},{"group_name":"PIK3CA_mut only","subtype":"BRCA_LumA","n_patients":234},{"group_name":"PIK3CA_mut only","subtype":"BRCA_LumB","n_patients":57},{"group_name":"PIK3CA_mut only","subtype":"BRCA_Her2","n_patients":26},{"group_name":"PIK3CA_mut only","subtype":"BRCA_Basal","n_patients":11},{"group_name":"PIK3CA_mut only","subtype":"BRCA_Normal","n_patients":8}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH profiled AS (
+    SELECT DISTINCT c.patient_unique_id
+    FROM sample_to_gene_panel_derived s
+    JOIN (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived
+          WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018') c USING (sample_unique_id)
+    WHERE s.cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND s.alteration_type = 'MUTATION_EXTENDED'
+),
+pik3ca_mut AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PIK3CA' AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+pten_del AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PTEN' AND variant_type = 'cna' AND cna_alteration = -2
+),
+subtype AS (
+    SELECT patient_unique_id, attribute_value AS subtype
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018' AND attribute_name = 'SUBTYPE'
+),
+groups AS (
+    SELECT p.patient_unique_id,
+        (p.patient_unique_id IN (SELECT patient_unique_id FROM pik3ca_mut)) AS has_pik3ca,
+        (p.patient_unique_id IN (SELECT patient_unique_id FROM pten_del)) AS has_pten_del
+    FROM profiled p
+)
+SELECT
+    CASE WHEN has_pik3ca AND has_pten_del THEN 'PIK3CA_mut + PTEN_del'
+         WHEN has_pik3ca AND NOT has_pten_del THEN 'PIK3CA_mut only'
+    END AS group_name,
+    countIf(s.subtype = 'BRCA_LumA') AS n_luma,
+    count() AS n_total_with_subtype
+FROM groups g
+JOIN subtype s USING (patient_unique_id)
+WHERE has_pik3ca = 1 AND s.subtype != ''
+GROUP BY group_name
+"
+}
+
+◀ result
+{"rows":[{"group_name":"PIK3CA_mut only","n_luma":234,"n_total_with_subtype":336},{"group_name":"PIK3CA_mut + PTEN_del","n_luma":3,"n_total_with_subtype":6}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["brca_tcga_pan_can_atlas_2018_gistic","brca_tcga_pan_can_atlas_2018_log2CNA","brca_tcga_pan_can_atlas_2018_mutations","brca_tcga_pan_can_atlas_2018_protein_quantification","brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa","brca_tcga_pan_can_atlas_2018_rppa_Zscores","brca_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["brca_tcga_pan_can_atlas_2018_armlevel_cna","brca_tcga_pan_can_atlas_2018_genetic_ancestry","brca_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","brca_tcga_pan_can_atlas_2018_methylation_hm450","brca_tcga_pan_can_atlas_2018_phosphoprotein_quantification"],"heatmapProfileIds":["brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_anc … (83 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "PIK3CA-mut + PTEN-del",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "brca_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        }
+       ]
+      ]
+     },
+     {
+      "molecularProfileIds": [
+       "brca_tcga_pan_can_atlas_2018_gistic"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PTEN",
+         "alterations": [
+          "HOMDEL"
+         ]
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "PIK3CA-mut only (no PTEN del)",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "brca_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        }
+       ]
+      ]
+     }
+    ],
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "PTEN",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "-1"
+       },
+       {
+        "value": "0"
+       },
+       {
+        "value": "1"
+       },
+       {
+        "value": "2"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "clinical"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5c10fc2115c492d884df9","url":"https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5c10fc2115c492d884df9","data":{"description":"Group comparison (2 custom groups)","studies":["brca_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"PIK3CA-mut + PTEN-del","sampleCount":6},{"name":"PIK3CA-mut only (no PTEN del)","sampleCount":339}],"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"PIK3CA-mut + PTEN-del","url":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22brca_tcga_pan_can_atlas_2018_mutations%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%5D%5D%7D%2C%7B%22molecularProfileIds%22%3A%5B%22brca_tcga_pan_can_atlas_2018_gistic%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PTEN%22%2C%22alterations%22%3A%5B%22HOMDEL%22%5D%7D%5D%5D%7D%5D%7D"},{"groupName":"PIK3CA-mut only (no PTEN del)","url":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22brca_tcga_pan_can_atlas_2018_mutations%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%5D%5D%7D%5D%2C%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22PTEN%22%2C%22profileType%22%3A%22gistic%22%2C%22values%22%3A%5B%7B%22value%22%3A%22-1%22%7D%2C%7B%22value%22%3A%220%22%7D%2C%7B%22value%22%3A%221%22%7D%2C%7B%22value%22%3A%222%22%7D%5D%7D%5D%7D"}],"pageDescription":"Clinical attribute distributions compared across PIK3CA-mut + PTEN-del (6) vs PIK3CA-mut only (no PTEN del) (339)."}}
+
+═ answer (success)
+Group sizes (6 vs. 339) closely match my manual counts (6 vs. 336 with subtype data available).
+
+### [View Group Comparison — Clinical (PAM50 Subtype)](https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5c10fc2115c492d884df9)
+
+Clinical attribute distributions compared across PIK3CA-mut + PTEN-del (6) vs PIK3CA-mut only (no PTEN del) (339). Open the **Clinical** tab and select `SUBTYPE` to see the Luminal A proportion with cBioPortal's built-in chi-squared test and exact p-value — something ClickHouse itself cannot compute.
+
+**Caveat:** the co-mutant group is extremely small (n=6), so any statistical comparison will be underpowered — treat the 50% vs. 69.6% difference as descriptive, not confirmed significant, until you check the p-value on that page.

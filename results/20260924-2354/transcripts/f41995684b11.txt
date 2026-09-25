@@ -1,0 +1,477 @@
+Q (sonnet): "What are the survival differences between EGFR-mutated, EGFR-amplified, and EGFR wild-type lung adenocarcinoma patients?"
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7083 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT cancer_study_identifier, name, sample_count, mutation_sample_count, cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'
+ORDER BY sample_count DESC
+LIMIT 10
+"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"luad_mskcc_2023_met_organotropism","name":"Lung Adenocarcinoma Met Organotropism (MSK, Cancer Cell 2023)","sample_count":2653,"mutation_sample_count":2653,"cna_sample_count":2422},{"cancer_study_identifier":"lung_msk_2017","name":"Non-Small Cell Cancer (MSK, Cancer Discov 2017)","sample_count":915,"mutation_sample_count":915,"cna_sample_count":915},{"cancer_study_identifier":"luad_mskcc_2020","name":"Lung Adenocarcinoma (MSK, J Thorac Oncol 2020)","sample_count":604,"mutation_sample_count":604,"cna_sample_count":604},{"cancer_study_identifier":"luad_tcga","name":"Lung Adenocarcinoma (TCGA, Firehose Legacy)","sample_count":586,"mutation_sample_count":230,"cna_sample_count":516},{"cancer_study_identifier":"luad_tcga_gdc","name":"Lung Adenocarcinoma (TCGA GDC, 2025)","sample_count":571,"mutation_sample_count":559,"cna_sample_count":508},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","sample_count":566,"mutation_sample_count":566,"cna_sample_count":511},{"cancer_study_identifier":"luad_msk_npjpo_2021","name":"Lung Adenocarcinoma (MSK, NPJ Precision Oncology 2021)","sample_count":426,"mutation_sample_count":426,"cna_sample_count":426},{"cancer_study_identifier":"luad_oncosg_2020","name":"Lung Adenocarcinoma (OncoSG, Nat Genet 2020)","sample_count":305,"mutation_sample_count":302,"cna_sample_count":302},{"cancer_study_identifier":"luad_cptac_gdc","name":"Lung Adenocarcinoma (CPTAC GDC, 2025)","sample_count":241,"mutation_sample_count":236,"cna_sample_count":232},{"cancer_study_identifier":"lung_nci_2022","name":"Lung Cancer in Never Smokers (NCI, Nature Genetics 2021)","sample_count":232,"mutation_sample_count":232,"cna_sample_count":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH egfr_status AS (
+    SELECT
+        sample_unique_id,
+        MAX(CASE WHEN hugo_gene_symbol = 'EGFR' AND variant_type = 'mutation' AND mutation_status != 'GERMLINE' THEN 1 ELSE 0 END) AS has_mut,
+        MAX(CASE WHEN hugo_gene_symbol = 'EGFR' AND variant_type = 'cna' AND alteration_value = 'AMP' THEN 1 ELSE 0 END) AS has_amp
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+      AND off_panel = FALSE
+    GROUP BY sample_unique_id
+),
+groups AS (
+    SELECT
+        sample_unique_id,
+        CASE
+            WHEN has_mut = 1 THEN 'EGFR-mutated'
+            WHEN has_amp = 1 THEN 'EGFR-amplified'
+            ELSE 'EGFR-wildtype'
+        END AS egfr_group
+    FROM egfr_status
+)
+SELECT egfr_group, COUNT(*) AS n_samples
+FROM groups
+GROUP BY egfr_group
+ORDER BY n_samples DESC
+"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 241\n Code: 241. DB::Exception: (total) memory limit exceeded: would use 31.14 GiB (attempt to allocate chunk of 0.00 B), current RSS: 31.14 GiB, maximum: 28.80 GiB. (MEMORY_LIMIT_EXCEEDED)\n"}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 241\n Code: 241. DB::Exception: (total) memory limit exceeded: would use 29.23 GiB (attempt to allocate chunk of 0.00 B), current RSS: 29.23 GiB, maximum: 28.80 GiB. (MEMORY_LIMIT_EXCEEDED)\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+    sample_unique_id,
+    MAX(CASE WHEN variant_type = 'mutation' AND mutation_status != 'UNCALLED' THEN 1 ELSE 0 END) AS has_mut,
+    MAX(CASE WHEN variant_type = 'cna' AND cna_alteration = 2 THEN 1 ELSE 0 END) AS has_amp
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'EGFR'
+  AND off_panel = 0
+GROUP BY sample_unique_id
+",
+ "max_rows": 1000
+}
+
+◀ result
+{"rows":[{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-50-5944-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-62-A46U-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-62-8402-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-38-4627-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-67-3772-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-95-7947-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-50-5066-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-97-8172-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-55-8096-01","has_mut":1,"has_amp":1},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-50-6591-01","has_mut":1,"has_amp":1},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-86-8280-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-MP-A4SW-01","has_mut":1,"has_amp":1},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-75-6214-01","has_mut":0,"has_amp":1},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-97-8171-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-78-7220-01","has_mut":0,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-91-6847-01","has_mut":0,"has_amp":1},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-75-7025-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-55-6968-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-38-4628-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-55-8620-01","has_mut":0,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-49-4490-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-97-A4M6-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-55-1594-01","has_mut":0,"has_amp":1},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-17-Z026-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-17-Z047-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-86-8075-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-44-5645-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-17-Z032-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-75-6212-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-55-A57B-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-78-7158-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_2018_TCGA-97-8177-01","has_mut":1,"has_amp":0},{"sample_unique_id":"luad_tcga_pan_can_atlas_20 … (4738 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT variant_type, mutation_status, off_panel, count(*) as n
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'EGFR'
+GROUP BY variant_type, mutation_status, off_panel
+ORDER BY variant_type, n DESC
+"
+}
+
+◀ result
+{"rows":[{"variant_type":"cna","mutation_status":"NA","off_panel":false,"n":29},{"variant_type":"mutation","mutation_status":".","off_panel":false,"n":86}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+    CASE
+        WHEN has_mut = 1 THEN 'EGFR-mutated'
+        WHEN has_amp = 1 THEN 'EGFR-amplified'
+        ELSE 'EGFR-wildtype'
+    END AS egfr_group,
+    COUNT(*) AS n_samples
+FROM (
+    SELECT
+        sample_unique_id,
+        MAX(CASE WHEN variant_type = 'mutation' THEN 1 ELSE 0 END) AS has_mut,
+        MAX(CASE WHEN variant_type = 'cna' AND cna_alteration = 2 THEN 1 ELSE 0 END) AS has_amp
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'EGFR'
+    GROUP BY sample_unique_id
+) t
+GROUP BY egfr_group
+"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT COUNT(DISTINCT sample_unique_id) AS profiled_samples
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+"
+}
+
+◀ result
+{"rows":[{"egfr_group":"EGFR-wildtype","n_samples":3},{"egfr_group":"EGFR-mutated","n_samples":70},{"egfr_group":"EGFR-amplified","n_samples":11}]}
+
+◀ result
+{"rows":[{"profiled_samples":566}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH all_samples AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+),
+egfr_events AS (
+    SELECT
+        sample_unique_id,
+        MAX(CASE WHEN variant_type = 'mutation' THEN 1 ELSE 0 END) AS has_mut,
+        MAX(CASE WHEN variant_type = 'cna' AND cna_alteration = 2 THEN 1 ELSE 0 END) AS has_amp
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'EGFR'
+    GROUP BY sample_unique_id
+)
+SELECT
+    CASE
+        WHEN e.has_mut = 1 THEN 'EGFR-mutated'
+        WHEN e.has_amp = 1 THEN 'EGFR-amplified'
+        ELSE 'EGFR-wildtype'
+    END AS egfr_group,
+    COUNT(*) AS n_samples
+FROM all_samples a
+LEFT JOIN egfr_events e ON a.sample_unique_id = e.sample_unique_id
+GROUP BY egfr_group
+ORDER BY n_samples DESC
+"
+}
+
+◀ result
+{"rows":[{"egfr_group":"EGFR-wildtype","n_samples":485},{"egfr_group":"EGFR-mutated","n_samples":70},{"egfr_group":"EGFR-amplified","n_samples":11}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH all_samples AS (
+    SELECT DISTINCT sample_unique_id, patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+),
+egfr_events AS (
+    SELECT
+        sample_unique_id,
+        MAX(CASE WHEN variant_type = 'mutation' THEN 1 ELSE 0 END) AS has_mut,
+        MAX(CASE WHEN variant_type = 'cna' AND cna_alteration = 2 THEN 1 ELSE 0 END) AS has_amp
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'EGFR'
+    GROUP BY sample_unique_id
+),
+groups AS (
+    SELECT
+        a.sample_unique_id,
+        a.patient_unique_id,
+        CASE
+            WHEN e.has_mut = 1 THEN 'EGFR-mutated'
+            WHEN e.has_amp = 1 THEN 'EGFR-amplified'
+            ELSE 'EGFR-wildtype'
+        END AS egfr_group
+    FROM all_samples a
+    LEFT JOIN egfr_events e ON a.sample_unique_id = e.sample_unique_id
+),
+os AS (
+    SELECT patient_unique_id,
+        MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN attribute_value END) AS os_months,
+        MAX(CASE WHEN attribute_name = 'OS_STATUS' THEN attribute_value END) AS os_status
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+      AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+    GROUP BY patient_unique_id
+)
+SELECT
+    g.egfr_group,
+    COUNT(DISTINCT g.patient_unique_id) AS n_patients,
+    COUNT(DISTINCT CASE WHEN o.os_status = '1:DECEASED' THEN g.patient_unique_id END) AS n_events,
+    COUNT(DISTINCT CASE WHEN o.os_status = '0:LIVING' THEN g.patient_unique_id END) AS n_censored,
+    COUNT(DISTINCT CASE WHEN o.os_months IS NULL THEN g.patient_unique_id END) AS n_missing_os,
+    MIN(toFloat64OrNull(o.os_months)) AS min_followup_months,
+    MAX(toFloat64OrNull(o.os_months)) AS max_followup_months
+FROM groups g
+LEFT JOIN os o ON g.patient_unique_id = o.patient_unique_id
+GROUP BY g.egfr_group
+ORDER BY n_patients DESC
+"
+}
+
+◀ result
+{"rows":[{"egfr_group":"EGFR-wildtype","n_patients":485,"n_events":152,"n_censored":285,"n_missing_os":0,"min_followup_months":0,"max_followup_months":238.2877996},{"egfr_group":"EGFR-mutated","n_patients":70,"n_events":28,"n_censored":38,"n_missing_os":0,"min_followup_months":0,"max_followup_months":108.6563435},{"egfr_group":"EGFR-amplified","n_patients":11,"n_events":6,"n_censored":5,"n_missing_os":0,"min_followup_months":2.991748036,"max_followup_months":123.5822073}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":566,"studyViewUrl":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["luad_tcga_pan_can_atlas_2018_gistic","luad_tcga_pan_can_atlas_2018_log2CNA","luad_tcga_pan_can_atlas_2018_mutations","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","luad_tcga_pan_can_atlas_2018_rppa","luad_tcga_pan_can_atlas_2018_rppa_Zscores","luad_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["luad_tcga_pan_can_atlas_2018_armlevel_cna","luad_tcga_pan_can_atlas_2018_genetic_ancestry","luad_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","luad_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","luad_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT hugo_gene_symbol, genetic_profile_stable_id, variant_type
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'EGFR'
+GROUP BY hugo_gene_symbol, genetic_profile_stable_id, variant_type
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"EGFR","genetic_profile_stable_id":"luad_tcga_pan_can_atlas_2018_mutations","variant_type":"mutation"},{"hugo_gene_symbol":"EGFR","genetic_profile_stable_id":"luad_tcga_pan_can_atlas_2018_gistic","variant_type":"cna"}]}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "EGFR-mutated",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "luad_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "EGFR"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFR-amplified (not mutated)",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "luad_tcga_pan_can_atlas_2018_gistic"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "EGFR",
+         "alterations": [
+          "AMP"
+         ]
+        }
+       ]
+      ]
+     }
+    ],
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "NOT_MUTATED"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFR wild-type",
+   "isUnselected": true
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ab5ba13e497aad53593c252","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ab5ba13e497aad53593c252","data":{"description":"Group comparison (3 custom groups)","studies":["luad_tcga_pan_can_atlas_2018"],"totalGroups":3,"groups":[{"name":"EGFR-mutated","sampleCount":70},{"name":"EGFR-amplified (not mutated)","sampleCount":11},{"name":"EGFR wild-type","sampleCount":485}],"studyViewUrl":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"EGFR-mutated","url":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22luad_tcga_pan_can_atlas_2018_mutations%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%7D%5D%5D%7D%5D%7D"},{"groupName":"EGFR-amplified (not mutated)","url":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22luad_tcga_pan_can_atlas_2018_gistic%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22alterations%22%3A%5B%22AMP%22%5D%7D%5D%5D%7D%5D%2C%22mutationDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22mutations%22%2C%22categorization%22%3A%22MUTATED%22%2C%22values%22%3A%5B%5B%7B%22value%22%3A%22NOT_MUTATED%22%7D%5D%5D%7D%5D%7D"}],"pageDescription":"Kaplan-Meier survival analysis comparing EGFR-mutated (70) vs EGFR-amplified (not mutated) (11) vs EGFR wild-type (485)."}}
+
+═ answer (success)
+Group sizes match my SQL exactly (70 / 11 / 485), confirming the group definitions are correct.
+
+## Cohort: TCGA Lung Adenocarcinoma (PanCancer Atlas) — `luad_tcga_pan_can_atlas_2018`, 566 profiled samples
+
+I cannot compute Kaplan-Meier estimates, median survival, or log-rank p-values in ClickHouse — survival is censored time-to-event data, and naive medians/means over `OS_MONTHS` ignore that. Here are the raw group definitions and follow-up summaries; the actual KM curves and log-rank test are in the linked cBioPortal Survival tab.
+
+**Group definitions** (mutually exclusive, mutated takes priority over amplified):
+
+| Group | N patients | N events (deceased) | N censored (living) | Follow-up range (months) |
+|---|---|---|---|---|
+| EGFR-mutated | 70 | 28 | 38 (4 missing status)* | 0 – 108.7 |
+| EGFR-amplified (not mutated) | 11 | 6 | 5 | 3.0 – 123.6 |
+| EGFR wild-type (neither) | 485 | 152 | 285 (48 missing status)* | 0 – 238.3 |
+
+*Note: event + censored counts don't sum exactly to N patients in mutated/wildtype groups — a small number of patients have missing `OS_STATUS`; total N_missing_os (missing `OS_MONTHS`) was 0 for all groups.
+
+Since more than half of each group is censored, KM medians are likely **not reached** in at least the EGFR-mutated and wild-type groups — this needs to be confirmed by the actual KM fit, not assumed.
+
+**To get the actual survival comparison** (KM curves + log-rank p-value), use:
+- **cBioPortal's Survival tab** (linked below — does this natively)
+- **R:** `survival::survfit(Surv(OS_MONTHS, OS_STATUS=="1:DECEASED") ~ group, data=df)` + `survival::survdiff(...)`
+- **Python:** `lifelines.KaplanMeierFitter` per group + `lifelines.statistics.multivariate_logrank_test`
+
+### [View EGFR-mutated vs EGFR-amplified vs EGFR-wildtype survival comparison](https://www.cbioportal.org/comparison/survival?comparisonId=6ab5ba13e497aad53593c252)
+Kaplan-Meier survival analysis comparing EGFR-mutated (70) vs EGFR-amplified, not mutated (11) vs EGFR wild-type (485) in TCGA LUAD PanCancer Atlas.
+
+### [View cohort in Study View](https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018)
+
+Note: EGFR-amplified is a small group (n=11) — any comparison involving it will have wide confidence intervals and limited statistical power.

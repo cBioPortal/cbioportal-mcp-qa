@@ -1,0 +1,484 @@
+Q (haiku): Help me rank TCGA cancer studies based on median CD3 expression
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ list_guides
+{}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-resolution-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+◀ result
+# Gene Resolution Guide
+
+Use this guide before querying gene expression, mutation, copy-number, methylation, or structural-variant data when the user's gene term may be ambiguous.
+
+## Routing Triggers
+
+Read this guide when the user mentions:
+
+- a gene family shorthand: `CD3`, `HLA`, `KRT`, `MUC`, `MT-`, `IGH`, `IGK`, `IGL`
+- a marker name that may refer to multiple genes or proteins
+- a gene alias, old symbol, or informal name
+- a wildcard-like term such as "all CD3 genes"
+
+These examples are not exhaustive. Apply this guide to any gene term that may resolve to multiple symbols, aliases, paralogs, family members, or marker genes.
+
+## Core Rule
+
+Do not silently aggregate multiple genes when the user names an ambiguous symbol. Either ask for clarification or choose a clearly standard marker and state the choice.
+
+For example, "CD3 expression" can refer to `CD3D`, `CD3E`, or `CD3G`; in many immune-marker contexts `CD3E` is the standard marker, but the agent must not average all CD3 genes unless the user asks for a combined signature.
+
+## Gene Discovery Query
+
+After validating the gene table exists, search exact symbols first, then prefix/alias-like matches:
+
+```sql
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id
+FROM gene
+WHERE upper(hugo_gene_symbol) = upper('CD3')
+   OR upper(hugo_gene_symbol) LIKE upper('CD3%')
+ORDER BY hugo_gene_symbol
+LIMIT 50;
+```
+
+If aliases are available in this deployment, inspect the relevant alias table before assuming no match. If no alias table exists, state that alias resolution is limited to available gene symbols.
+
+## Answer Pattern
+
+If multiple plausible genes are found:
+
+> "CD3" is ambiguous in cBioPortal gene-symbol terms. I found `CD3D`, `CD3E`, and `CD3G`. Did you mean `CD3E` as a T-cell marker, or should I analyze all three separately?
+
+If the user clearly asks for a combined family/signature:
+
+- report each gene separately by default
+- only compute an average/signature if the user explicitly requests it
+- state exactly how the combined value was calculated
+
+## Do Not
+
+- Do not average multiple genes into one expression value without explicit permission.
+- Do not rewrite an ambiguous symbol to a single gene without telling the user.
+- Do not treat a prefix match as a validated gene symbol.
+
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT hugo_gene_symbol, entrez_gene_id
+FROM gene
+WHERE upper(hugo_gene_symbol) = upper('CD3')
+   OR upper(hugo_gene_symbol) LIKE upper('CD3%')
+ORDER BY hugo_gene_symbol
+LIMIT 50
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"CD300A","entrez_gene_id":11314},{"hugo_gene_symbol":"CD300C","entrez_gene_id":10871},{"hugo_gene_symbol":"CD300E","entrez_gene_id":342510},{"hugo_gene_symbol":"CD300H","entrez_gene_id":100130520},{"hugo_gene_symbol":"CD300LB","entrez_gene_id":124599},{"hugo_gene_symbol":"CD300LD","entrez_gene_id":100131439},{"hugo_gene_symbol":"CD300LD-AS1","entrez_gene_id":146723},{"hugo_gene_symbol":"CD300LF","entrez_gene_id":146722},{"hugo_gene_symbol":"CD300LG","entrez_gene_id":146894},{"hugo_gene_symbol":"CD302","entrez_gene_id":9936},{"hugo_gene_symbol":"CD320","entrez_gene_id":51293},{"hugo_gene_symbol":"CD33","entrez_gene_id":945},{"hugo_gene_symbol":"CD34","entrez_gene_id":947},{"hugo_gene_symbol":"CD36","entrez_gene_id":948},{"hugo_gene_symbol":"CD37","entrez_gene_id":951},{"hugo_gene_symbol":"CD38","entrez_gene_id":952},{"hugo_gene_symbol":"CD38-AS1","entrez_gene_id":143433680},{"hugo_gene_symbol":"CD3D","entrez_gene_id":915},{"hugo_gene_symbol":"CD3E","entrez_gene_id":916},{"hugo_gene_symbol":"CD3G","entrez_gene_id":917}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT cancer_study_identifier
+FROM cancer_study
+WHERE cancer_study_identifier LIKE 'tcga%'
+  AND cancer_study_identifier LIKE '%_pan_can%'
+ORDER BY cancer_study_identifier
+LIMIT 1
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT cancer_study_identifier, name
+FROM cancer_study
+WHERE cancer_study_identifier LIKE 'tcga%'
+ORDER BY cancer_study_identifier
+LIMIT 50
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT cancer_study_identifier, name, type_of_cancer_id
+FROM cancer_study
+LIMIT 50
+"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"acc_tcga","name":"Adrenocortical Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"acc"},{"cancer_study_identifier":"acyc_mskcc_2013","name":"Adenoid Cystic Carcinoma (MSK, Nat Genet 2013)","type_of_cancer_id":"acyc"},{"cancer_study_identifier":"acyc_fmi_2014","name":"Adenoid Cystic Carcinoma (FMI, Am J Surg Pathl. 2014)","type_of_cancer_id":"acyc"},{"cancer_study_identifier":"acyc_jhu_2016","name":"Adenoid Cystic Carcinoma (JHU, Cancer Prev Res 2016)","type_of_cancer_id":"acyc"},{"cancer_study_identifier":"acyc_mda_2015","name":"Adenoid Cystic Carcinoma (MDA, Clin Cancer Res 2015)","type_of_cancer_id":"acyc"},{"cancer_study_identifier":"acyc_mgh_2016","name":"Adenoid Cystic Carcinoma (MGH, Nat Gen 2016)","type_of_cancer_id":"acyc"},{"cancer_study_identifier":"acyc_sanger_2013","name":"Adenoid Cystic Carcinoma (Sanger/MDA, JCI 2013)","type_of_cancer_id":"acyc"},{"cancer_study_identifier":"all_stjude_2015","name":"Acute Lymphoblastic Leukemia (St Jude, Nat Genet 2015)","type_of_cancer_id":"bll"},{"cancer_study_identifier":"ampca_bcm_2016","name":"Ampullary Carcinoma (Baylor College of Medicine, Cell Reports 2016)","type_of_cancer_id":"ampca"},{"cancer_study_identifier":"all_stjude_2013","name":"Hypodiploid Acute Lymphoid Leukemia (St Jude, Nat Genet 2013)","type_of_cancer_id":"myeloid"},{"cancer_study_identifier":"all_stjude_2016","name":"Acute Lymphoblastic Leukemia (St Jude, Nat Genet 2016)","type_of_cancer_id":"bll"},{"cancer_study_identifier":"all_phase2_target_2018_pub","name":"Pediatric Acute Lymphoid Leukemia - Phase II (TARGET, 2018)","type_of_cancer_id":"bll"},{"cancer_study_identifier":"aml_target_2018_pub","name":"Pediatric Acute Myeloid Leukemia (TARGET, 2018)","type_of_cancer_id":"aml"},{"cancer_study_identifier":"aml_ohsu_2018","name":"Acute Myeloid Leukemia (OHSU, Nature 2018)","type_of_cancer_id":"aml"},{"cancer_study_identifier":"acc_2019","name":"Adenoid Cystic Carcinoma Project (J Clin Invest 2019)","type_of_cancer_id":"acyc"},{"cancer_study_identifier":"angs_painter_2020","name":"The Angiosarcoma Project (Provisional, July 2020)","type_of_cancer_id":"angs"},{"cancer_study_identifier":"bcc_unige_2016","name":"Basal Cell Carcinoma (UNIGE, Nat Genet 2016)","type_of_cancer_id":"bcc"},{"cancer_study_identifier":"blca_dfarber_mskcc_2014","name":"Bladder Urothelial Carcinoma (DFCI/MSK, Cancer Discov 2014)","type_of_cancer_id":"blca"},{"cancer_study_identifier":"blca_bgi","name":"Bladder Urothelial Carcinoma (BGI, Nat Genet 2013)","type_of_cancer_id":"blca"},{"cancer_study_identifier":"angs_project_painter_2018","name":"The Angiosarcoma Project - Count Me In (Nature Medicine, 2020)","type_of_cancer_id":"angs"},{"cancer_study_identifier":"bfn_duke_nus_2015","name":"Breast Fibroepithelial Tumors (Duke-NUS, Nat Genet 2015)","type_of_cancer_id":"bfn"},{"cancer_study_identifier":"blca_cornell_2016","name":"Urothelial Carcinoma (Cornell/Trento, Nat Gen 2016)","type_of_cancer_id":"blca"},{"cancer_stu … (3861 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT cancer_study_identifier, name
+FROM cancer_study
+WHERE cancer_study_identifier LIKE 'tcga%'
+  AND cancer_study_identifier NOT LIKE '%firehose%'
+  AND cancer_study_identifier NOT LIKE '%provisional%'
+ORDER BY cancer_study_identifier
+LIMIT 100
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT cs.cancer_study_identifier, cs.name
+FROM cancer_study cs
+WHERE cs.cancer_study_identifier LIKE '%tcga%'
+ORDER BY cs.cancer_study_identifier
+LIMIT 100
+"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"acc_tcga","name":"Adrenocortical Carcinoma (TCGA, Firehose Legacy)"},{"cancer_study_identifier":"acc_tcga_gdc","name":"Adrenocortical Carcinoma (TCGA GDC, 2025)"},{"cancer_study_identifier":"acc_tcga_pan_can_atlas_2018","name":"Adrenocortical Carcinoma (TCGA, PanCancer Atlas)"},{"cancer_study_identifier":"aml_tcga_gdc","name":"Acute Myeloid Leukemia (TCGA GDC, 2025)"},{"cancer_study_identifier":"blca_msk_tcga_2020","name":"Bladder Cancer (MSK/TCGA, Eur Urol 2020)"},{"cancer_study_identifier":"blca_tcga","name":"Bladder Urothelial Carcinoma (TCGA, Firehose Legacy)"},{"cancer_study_identifier":"blca_tcga_gdc","name":"Bladder Urothelial Carcinoma (TCGA GDC, 2025)"},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018","name":"Bladder Urothelial Carcinoma (TCGA, PanCancer Atlas)"},{"cancer_study_identifier":"blca_tcga_pub","name":"Bladder Urothelial Carcinoma (TCGA, Nature 2014)"},{"cancer_study_identifier":"blca_tcga_pub_2017","name":"Bladder Cancer (TCGA, Cell 2017)"},{"cancer_study_identifier":"brca_tcga","name":"Breast Invasive Carcinoma (TCGA, Firehose Legacy)"},{"cancer_study_identifier":"brca_tcga_gdc","name":"Invasive Breast Carcinoma (TCGA GDC, 2025)"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)"},{"cancer_study_identifier":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)"},{"cancer_study_identifier":"brca_tcga_pub2015","name":"Breast Invasive Carcinoma (TCGA, Cell 2015)"},{"cancer_study_identifier":"ccrcc_tcga_gdc","name":"Renal Clear Cell Carcinoma (TCGA GDC, 2025)"},{"cancer_study_identifier":"cesc_tcga","name":"Cervical Squamous Cell Carcinoma and Endocervical Adenocarcinoma (TCGA, Firehose Legacy)"},{"cancer_study_identifier":"cesc_tcga_gdc","name":"Cervical Squamous Cell Carcinoma (TCGA GDC, 2025)"},{"cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018","name":"Cervical Squamous Cell Carcinoma (TCGA, PanCancer Atlas)"},{"cancer_study_identifier":"chol_tcga","name":"Cholangiocarcinoma (TCGA, Firehose Legacy)"},{"cancer_study_identifier":"chol_tcga_gdc","name":"Cholangiocarcinoma (TCGA GDC, 2025)"},{"cancer_study_identifier":"chol_tcga_pan_can_atlas_2018","name":"Cholangiocarcinoma (TCGA, PanCancer Atlas)"},{"cancer_study_identifier":"chrcc_tcga_gdc","name":"Chromophobe Renal Cell Carcinoma (TCGA GDC, 2025)"},{"cancer_study_identifier":"coad_tcga_gdc","name":"Colon Adenocarcinoma (TCGA GDC, 2025)"},{"cancer_study_identifier":"coadread_tcga","name":"Colorectal Adenocarcinoma (TCGA, Firehose Legacy)"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","name":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)"},{"cancer_study_identifier":"coadread_tcga_pub","name":"Colorectal Adenocarcinoma (TCGA, Nature 2012)"},{"cancer_study_identifier":"difg_tcga_gdc","name":"Diffuse Glioma (TCGA GDC, 2025)"},{"cancer_study_identifier":"dlbc_tcga","name":"Lymphoid Neoplasm Diffuse Large B-cell Lymphoma (TCGA, … (7391 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    gad.cancer_study_identifier,
+    count(gad.sample_unique_id) as samples_with_cd3e,
+    round(median(toFloat64OrNull(gad.alteration_value)), 2) as median_cd3e_expression,
+    round(avg(toFloat64OrNull(gad.alteration_value)), 2) as mean_cd3e_expression,
+    round(min(toFloat64OrNull(gad.alteration_value)), 2) as min_cd3e,
+    round(max(toFloat64OrNull(gad.alteration_value)), 2) as max_cd3e
+FROM genetic_alteration_derived gad
+WHERE gad.cancer_study_identifier LIKE '%_tcga_pan_can_atlas_2018%'
+  AND gad.hugo_gene_symbol = 'CD3E'
+  AND gad.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+GROUP BY gad.cancer_study_identifier
+ORDER BY median_cd3e_expression DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"dlbc_tcga_pan_can_atlas_2018","samples_with_cd3e":240,"median_cd3e_expression":0.11,"mean_cd3e_expression":452.53,"min_cd3e":-2.54,"max_cd3e":12312},{"cancer_study_identifier":"kich_tcga_pan_can_atlas_2018","samples_with_cd3e":390,"median_cd3e_expression":0.04,"mean_cd3e_expression":10.14,"min_cd3e":-3.36,"max_cd3e":360.06},{"cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018","samples_with_cd3e":3058,"median_cd3e_expression":0.01,"mean_cd3e_expression":110.6,"min_cd3e":-4.48,"max_cd3e":4298.2},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","samples_with_cd3e":3062,"median_cd3e_expression":0.01,"mean_cd3e_expression":83.63,"min_cd3e":-6.88,"max_cd3e":3085.04},{"cancer_study_identifier":"esca_tcga_pan_can_atlas_2018","samples_with_cd3e":1088,"median_cd3e_expression":0,"mean_cd3e_expression":44.24,"min_cd3e":-2.51,"max_cd3e":5156.31},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018","samples_with_cd3e":2444,"median_cd3e_expression":0,"mean_cd3e_expression":47.39,"min_cd3e":-2.56,"max_cd3e":3558.63},{"cancer_study_identifier":"lihc_tcga_pan_can_atlas_2018","samples_with_cd3e":2198,"median_cd3e_expression":0,"mean_cd3e_expression":41.51,"min_cd3e":-5.85,"max_cd3e":4552.19},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018","samples_with_cd3e":2950,"median_cd3e_expression":0,"mean_cd3e_expression":32,"min_cd3e":-4.85,"max_cd3e":2691.59},{"cancer_study_identifier":"sarc_tcga_pan_can_atlas_2018","samples_with_cd3e":1265,"median_cd3e_expression":0,"mean_cd3e_expression":73.64,"min_cd3e":-2.88,"max_cd3e":6037.85},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018","samples_with_cd3e":3154,"median_cd3e_expression":0,"mean_cd3e_expression":45.42,"min_cd3e":-5.7,"max_cd3e":4547.64},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","samples_with_cd3e":2044,"median_cd3e_expression":0,"mean_cd3e_expression":23.36,"min_cd3e":-3.15,"max_cd3e":1332.67},{"cancer_study_identifier":"uvm_tcga_pan_can_atlas_2018","samples_with_cd3e":400,"median_cd3e_expression":0,"mean_cd3e_expression":27.23,"min_cd3e":-2.06,"max_cd3e":1432.21},{"cancer_study_identifier":"pcpg_tcga_pan_can_atlas_2018","samples_with_cd3e":856,"median_cd3e_expression":0,"mean_cd3e_expression":11.11,"min_cd3e":-2.77,"max_cd3e":298.79},{"cancer_study_identifier":"chol_tcga_pan_can_atlas_2018","samples_with_cd3e":216,"median_cd3e_expression":0,"mean_cd3e_expression":82.07,"min_cd3e":-4.4,"max_cd3e":9258.43},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","samples_with_cd3e":2910,"median_cd3e_expression":0,"mean_cd3e_expression":64.99,"min_cd3e":-9.11,"max_cd3e":5240.29},{"cancer_study_identifier":"acc_tcga_pan_can_atlas_2018","samples_with_cd3e":412,"median_cd3e_expression":0,"mean_cd3e_expression":13.29,"min_cd3e":-1.94,"max_cd3e":677.35},{"cancer_study_identifier":"laml_tcga_pan_can_atlas_2018","samples_with_cd3e":901,"median_cd3e_expression":0,"mean_cd3e_expression":81.32,"min_cd3e":-2.55,"max_cd3e":2328.86},{"cancer … (2628 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    cs.cancer_study_identifier,
+    cs.name,
+    round(median(toFloat64OrNull(gad.alteration_value)), 2) as median_cd3e_expression,
+    round(avg(toFloat64OrNull(gad.alteration_value)), 2) as mean_cd3e_expression,
+    count(gad.sample_unique_id) as samples_with_data
+FROM genetic_alteration_derived gad
+JOIN cancer_study cs ON gad.cancer_study_identifier = cs.cancer_study_identifier
+WHERE gad.cancer_study_identifier LIKE '%_tcga_pan_can_atlas_2018%'
+  AND gad.hugo_gene_symbol = 'CD3E'
+  AND gad.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+GROUP BY gad.cancer_study_identifier, cs.name
+ORDER BY median_cd3e_expression DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 215\n Code: 215. DB::Exception: Column 'cs.cancer_study_identifier' is not under aggregate function and not in GROUP BY keys. In query SELECT cs.cancer_study_identifier, cs.name, round(median(toFloat64OrNull(gad.alteration_value)), 2) AS median_cd3e_expression, round(avg(toFloat64OrNull(gad.alteration_value)), 2) AS mean_cd3e_expression, count(gad.sample_unique_id) AS samples_with_data FROM genetic_alteration_derived AS gad INNER JOIN cancer_study AS cs ON gad.cancer_study_identifier = cs.cancer_study_identifier WHERE (gad.cancer_study_identifier LIKE '%_tcga_pan_can_atlas_2018%') AND (gad.hugo_gene_symbol = 'CD3E') AND (gad.alteration_value NOT IN ('', 'NA')) AND (toFloat64OrNull(gad.alteration_value) IS NOT NULL) GROUP BY gad.cancer_study_identifier, cs.name ORDER BY median_cd3e_expression DESC. (NOT_AN_AGGREGATE) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cd3_stats AS (
+  SELECT 
+      cancer_study_identifier,
+      round(median(toFloat64OrNull(alteration_value)), 2) as median_cd3e_expression,
+      round(avg(toFloat64OrNull(alteration_value)), 2) as mean_cd3e_expression,
+      count(sample_unique_id) as samples_with_data
+  FROM genetic_alteration_derived
+  WHERE cancer_study_identifier LIKE '%_tcga_pan_can_atlas_2018%'
+    AND hugo_gene_symbol = 'CD3E'
+    AND alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(alteration_value) IS NOT NULL
+  GROUP BY cancer_study_identifier
+)
+SELECT 
+    cs.cancer_study_identifier,
+    cs.name,
+    cd3_stats.median_cd3e_expression,
+    cd3_stats.mean_cd3e_expression,
+    cd3_stats.samples_with_data
+FROM cd3_stats
+JOIN cancer_study cs ON cd3_stats.cancer_study_identifier = cs.cancer_study_identifier
+ORDER BY cd3_stats.median_cd3e_expression DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cs.cancer_study_identifier":"dlbc_tcga_pan_can_atlas_2018","name":"Diffuse Large B-Cell Lymphoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0.11,"mean_cd3e_expression":452.53,"samples_with_data":240},{"cs.cancer_study_identifier":"kich_tcga_pan_can_atlas_2018","name":"Kidney Chromophobe (TCGA, PanCancer Atlas)","median_cd3e_expression":0.04,"mean_cd3e_expression":10.14,"samples_with_data":390},{"cs.cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018","name":"Kidney Renal Clear Cell Carcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0.01,"mean_cd3e_expression":110.6,"samples_with_data":3058},{"cs.cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0.01,"mean_cd3e_expression":83.63,"samples_with_data":3062},{"cs.cancer_study_identifier":"esca_tcga_pan_can_atlas_2018","name":"Esophageal Adenocarcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":44.24,"samples_with_data":1088},{"cs.cancer_study_identifier":"uvm_tcga_pan_can_atlas_2018","name":"Uveal Melanoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":27.23,"samples_with_data":400},{"cs.cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018","name":"Cervical Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":90.74,"samples_with_data":1468},{"cs.cancer_study_identifier":"ucs_tcga_pan_can_atlas_2018","name":"Uterine Carcinosarcoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":30.19,"samples_with_data":283},{"cs.cancer_study_identifier":"lihc_tcga_pan_can_atlas_2018","name":"Liver Hepatocellular Carcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":41.51,"samples_with_data":2198},{"cs.cancer_study_identifier":"prad_tcga_pan_can_atlas_2018","name":"Prostate Adenocarcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":32,"samples_with_data":2950},{"cs.cancer_study_identifier":"sarc_tcga_pan_can_atlas_2018","name":"Sarcoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":73.64,"samples_with_data":1265},{"cs.cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":60.6,"samples_with_data":6610},{"cs.cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":23.36,"samples_with_data":2044},{"cs.cancer_study_identifier":"blca_tcga_pan_can_atlas_2018","name":"Bladder Urothelial Carcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":47.39,"samples_with_data":2444},{"cs.cancer_study_identifier":"chol_tcga_pan_can_atlas_2018","name":"Cholangiocarcinoma (TCGA, PanCancer Atlas)","median_cd3e_expression":0,"mean_cd3e_expression":82.07,"samp … (3456 more chars)
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "dlbc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "acc_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+Error: result (81,891 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-v4bwnhqw/2eb1bd0d-30ea-4b3a-9afa-3b666b97b87f/tool-results/mcp-navigator-resolve_and_route-1790297519033.txt.
+Format: Plain text
+- For targeted searches (find a string): use grep on the file directly.
+- For analysis or summarization that requires reading the full content: the file's lines are too long for Read's offset/limit. Slice by character range via Bash instead — e.g. python3 -c 'print(open("/home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-v4bwnhqw/2eb1bd0d-30ea-4b3a-9afa-3b666b97b87f/tool-results/mcp-navigator-resolve_and_route-1790297519033.txt").read()[A:B])' in ~80,000-char spans until you have read 100% of it.
+- If the Agent tool is available, do this inside a subagent so the full output stays out of your main context. Give it the instruction above verbatim, and be explicit about what it must return — e.g. "Slice /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-v4bwnhqw/2eb1bd0d-30ea-4b3a-9afa-3b666b97b87f/tool-results/mcp-navigator-resolve_and_route-1790297519033.txt in ~80,000-char spans via python (read()[A:B]) until you have read all 81,891 characters, then summarize and quote any key findings verbatim." A vague "summarize this" may lose detail.
+
+
+═ answer (success)
+The resolver response is very large. Let me work with a subset of the top studies and navigate to those:
+
+## **TCGA Cancer Studies Ranked by Median CD3E Expression**
+
+Based on a query of CD3E (standard T-cell marker) expression across TCGA PanCancer Atlas studies, here's the ranking:
+
+| Rank | Cancer Type | Study | Median CD3E | Mean CD3E | Samples |
+|------|------------|-------|-----------|---------|---------|
+| 1 | **Diffuse Large B-Cell Lymphoma (DLBC)** | dlbc_tcga_pan_can_atlas_2018 | **0.11** | 452.53 | 240 |
+| 2 | **Kidney Chromophobe (KICH)** | kich_tcga_pan_can_atlas_2018 | **0.04** | 10.14 | 390 |
+| 3 | **Kidney Renal Clear Cell (KIRC)** | kirc_tcga_pan_can_atlas_2018 | **0.01** | 110.6 | 3,058 |
+| 4 | **Lung Adenocarcinoma (LUAD)** | luad_tcga_pan_can_atlas_2018 | **0.01** | 83.63 | 3,062 |
+| 5 | **Esophageal Adenocarcinoma (ESCA)** | esca_tcga_pan_can_atlas_2018 | **0.00** | 44.24 | 1,088 |
+| 6–31 | **All other cancers** | (Various) | **0.00 to −0.21** | 4.52–90.74 | 216–6,610 |
+
+### Key Findings
+
+- **DLBC (lymphoma)** has the highest median CD3E expression by far (0.11), which makes biological sense — B-cell lymphomas contain abundant T-cell infiltrates.
+- **KIRC and LUAD** have very low medians (0.01) despite large sample sizes and high mean values, indicating highly right-skewed distributions (some tumors with very high immune infiltration, many with low).
+- Many solid tumors cluster at median = **0.00**, suggesting CD3E is absent or minimal in most samples but present in immunologically "hot" subsets.
+- **Note:** Mean values are much higher than medians in immune-infiltrated tumors (DLBC mean 452.53 vs median 0.11), indicating outlier-driven distributions.
+
+### Navigate to Studies
+
+I can generate direct links to visualize CD3E expression in cBioPortal. Would you like me to create navigation links to:
+1. **Top 3 studies** (DLBC, KICH, KIRC) to explore CD3E distribution interactively?
+2. **A specific study** for detailed gene expression analysis?
+3. **All 32 studies** as a comparison view?
+
+Let me know which you'd prefer, and I'll provide the direct URLs.

@@ -1,0 +1,398 @@
+Q (sonnet): How does PTEN alteration (mutations or homozygous deletions) affect pAKT protein levels in lung squamous cell carcinoma?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ list_studies
+{
+ "search": "lung squamous"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"lusc_tcga","name":"Lung Squamous Cell Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"lusc","sample_count":511,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga"},{"cancer_study_identifier":"lusc_tcga_gdc","name":"Lung Squamous Cell Carcinoma (TCGA GDC, 2025)","type_of_cancer_id":"lusc","sample_count":503,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_gdc"},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","name":"Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"lusc","sample_count":487,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lusc_tcga_pub","name":"Lung Squamous Cell Carcinoma (TCGA, Nature 2012)","type_of_cancer_id":"lusc","sample_count":178,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_pub"},{"cancer_study_identifier":"lusc_cptac_gdc","name":"Lung Squamous Cell Carcinoma (CPTAC GDC, 2025)","type_of_cancer_id":"lusc","sample_count":110,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_cptac_gdc"},{"cancer_study_identifier":"lusc_cptac_2021","name":"Lung Squamous Cell Carcinoma (CPTAC, Cell 2021)","type_of_cancer_id":"lusc","sample_count":80,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_cptac_2021"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type FROM genetic_alteration_derived WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018' ORDER BY profile_type"
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"log2CNA"},{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores"},{"profile_type":"rppa"},{"profile_type":"rppa_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT hugo_gene_symbol FROM genetic_alteration_derived WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018' AND profile_type = 'protein_quantification' AND (hugo_gene_symbol ILIKE '%AKT%' OR hugo_gene_symbol ILIKE '%PTEN%')"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT hugo_gene_symbol FROM genetic_alteration_derived WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018' AND profile_type = 'rppa' AND hugo_gene_symbol ILIKE '%AKT%'"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"AKT1"},{"hugo_gene_symbol":"AKT1S1_PT246"},{"hugo_gene_symbol":"AKT1_PS473"},{"hugo_gene_symbol":"AKT1_PT308"},{"hugo_gene_symbol":"AKT2"},{"hugo_gene_symbol":"AKT2_PS473"},{"hugo_gene_symbol":"AKT2_PT308"},{"hugo_gene_symbol":"AKT3"},{"hugo_gene_symbol":"AKT3_PS473"},{"hugo_gene_symbol":"AKT3_PT308"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT hugo_gene_symbol FROM genetic_alteration_derived WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018' AND profile_type = 'rppa' AND hugo_gene_symbol ILIKE '%PTEN%'"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"PTEN"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH pten_altered AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PTEN'
+      AND (
+          (variant_type = 'mutation' AND mutation_status != 'UNCALLED')
+          OR (variant_type = 'cna' AND cna_alteration = -2)
+      )
+),
+pakt AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS pakt_s473
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rppa_Zscores'
+      AND hugo_gene_symbol = 'AKT1_PS473'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+SELECT
+    CASE WHEN p.sample_unique_id IN (SELECT sample_unique_id FROM pten_altered) THEN 'PTEN-altered' ELSE 'PTEN-intact' END AS grp,
+    count() AS n_samples,
+    round(avg(p.pakt_s473),3) AS mean_pakt_s473_zscore,
+    round(stddevPop(p.pakt_s473),3) AS sd,
+    round(median(p.pakt_s473),3) AS median_pakt_s473_zscore
+FROM pakt p
+GROUP BY grp
+"
+}
+
+◀ result
+{"rows":[{"grp":"PTEN-altered","n_samples":67,"mean_pakt_s473_zscore":0.63,"sd":1.097,"median_pakt_s473_zscore":0.579},{"grp":"PTEN-intact","n_samples":250,"mean_pakt_s473_zscore":-0.169,"sd":0.9,"median_pakt_s473_zscore":-0.281}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH pten_altered AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PTEN'
+      AND (
+          (variant_type = 'mutation' AND mutation_status != 'UNCALLED')
+          OR (variant_type = 'cna' AND cna_alteration = -2)
+      )
+),
+pakt AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS pakt_t308
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rppa_Zscores'
+      AND hugo_gene_symbol = 'AKT1_PT308'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+SELECT
+    CASE WHEN p.sample_unique_id IN (SELECT sample_unique_id FROM pten_altered) THEN 'PTEN-altered' ELSE 'PTEN-intact' END AS grp,
+    count() AS n_samples,
+    round(avg(p.pakt_t308),3) AS mean_pakt_t308_zscore,
+    round(median(p.pakt_t308),3) AS median_pakt_t308_zscore
+FROM pakt p
+GROUP BY grp
+"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+  hugo_gene_symbol,
+  variant_type,
+  cna_alteration,
+  mutation_type,
+  count(DISTINCT sample_unique_id) AS n
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'PTEN'
+  AND ((variant_type='mutation' AND mutation_status != 'UNCALLED') OR (variant_type='cna' AND cna_alteration=-2))
+GROUP BY hugo_gene_symbol, variant_type, cna_alteration, mutation_type
+ORDER BY n DESC
+"
+}
+
+◀ result
+{"rows":[{"grp":"PTEN-altered","n_samples":67,"mean_pakt_t308_zscore":0.698,"median_pakt_t308_zscore":0.711},{"grp":"PTEN-intact","n_samples":250,"mean_pakt_t308_zscore":-0.187,"median_pakt_t308_zscore":-0.398}]}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"PTEN","variant_type":"cna","cna_alteration":-2,"mutation_type":"NA","n":48},{"hugo_gene_symbol":"PTEN","variant_type":"mutation","mutation_type":"Missense_Mutation","n":20},{"hugo_gene_symbol":"PTEN","variant_type":"mutation","mutation_type":"Nonsense_Mutation","n":12},{"hugo_gene_symbol":"PTEN","variant_type":"mutation","mutation_type":"Frame_Shift_Del","n":11},{"hugo_gene_symbol":"PTEN","variant_type":"mutation","mutation_type":"Splice_Site","n":4},{"hugo_gene_symbol":"PTEN","variant_type":"mutation","mutation_type":"Frame_Shift_Ins","n":4}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lusc_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"lusc_tcga_pan_can_atlas_2018","name":"Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","sampleCount":487,"studyViewUrl":"https://www.cbioportal.org/study?id=lusc_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["lusc_tcga_pan_can_atlas_2018_gistic","lusc_tcga_pan_can_atlas_2018_log2CNA","lusc_tcga_pan_can_atlas_2018_mutations","lusc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","lusc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lusc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lusc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","lusc_tcga_pan_can_atlas_2018_rppa","lusc_tcga_pan_can_atlas_2018_rppa_Zscores","lusc_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["lusc_tcga_pan_can_atlas_2018_armlevel_cna","lusc_tcga_pan_can_atlas_2018_genetic_ancestry","lusc_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","lusc_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["lusc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lusc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lusc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","lusc_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "lusc_tcga_pan_can_atlas_2018",
+ "geneSpecificQueries": [
+  {
+   "hugoGeneSymbol": "PTEN",
+   "profileType": "mutations"
+  },
+  {
+   "hugoGeneSymbol": "PTEN",
+   "profileType": "gistic"
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"lusc_tcga_pan_can_atlas_2018","geneSpecificCounts":[{"hugoGeneSymbol":"PTEN","profileType":"mutations","counts":[{"value":"Nonsense_Mutation","label":"Nonsense Mutation","count":12},{"value":"Frame_Shift_Ins","label":"Frame Shift Ins","count":4},{"value":"Splice_Site","label":"Splice Site","count":4},{"value":"Frame_Shift_Del","label":"Frame Shift Del","count":11},{"value":"Missense_Mutation","label":"Missense Mutation","count":22}]},{"hugoGeneSymbol":"PTEN","profileType":"gistic","counts":[{"value":"NA","label":"NA","count":0},{"value":"-2","label":"Homozygously deleted","count":48},{"value":"1","label":"Gained","count":36},{"value":"0","label":"Diploid","count":185},{"value":"-1","label":"Heterozygously deleted","count":218}]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "__unparsedToolInput": {
+  "raw": "{\"studyIds\": [\"lusc_tcga_pan_can_atlas_2018\"], \"groups\": [{\"name\":\"PTEN-altered\",\"studyViewFilter\":{\"geneFilters\":[{\"molecularProfileIds\":[\"lusc_tcga_pan_can_atlas_2018_mutations\",\"lusc_tcga_pan_can_atlas_2018_gistic\"],\"geneQueries\":[[{\"hugoGeneSymbol\":\"PTEN\",\"alterations\":[\"HOMDEL\"]}]]}],\"mutationDataFilters\":[{\"hugoGeneSymbol\":\"PTEN\",\"profileType\":\"mutations\",\"categorization\":\"MUTATED\",\"values\":[[{\"value\":\"Nonsense_Mutation\"},{\"value\":\"Frame_Shift_Ins\"},{\"value\":\"Splice_Site\"},{\"value\":\"Frame_Shift_Del\"},{\"value\":\"Missense_Mutation\"}]]}]},{\"name\":\"PTEN-intact\",\"isUnselected\":true}], \"tab\": \"protein\", \"selectedGene\": \"PTEN\"}",
+  "len": 633
+ }
+}
+
+✗ error
+<tool_use_error>InputValidationError: mcp__navigator__navigate_to_group_comparison was called with input that could not be parsed as JSON.
+You sent (first 200 of 633 bytes): {"studyIds": ["lusc_tcga_pan_can_atlas_2018"], "groups": [{"name":"PTEN-altered","studyViewFilter":{"geneFilters":[{"molecularProfileIds":["lusc_tcga_pan_can_atlas_2018_mutations","lusc_tcga_pan_can_a
+Common causes: unescaped backslashes in file paths (use / or \\), unescaped control characters, or truncated output. Retry with valid JSON.</tool_use_error>
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lusc_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "PTEN-altered",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "lusc_tcga_pan_can_atlas_2018_gistic"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PTEN",
+         "alterations": [
+          "HOMDEL"
+         ]
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "PTEN-mutated",
+   "studyViewFilter": {
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "PTEN",
+      "profileType": "mutations",
+      "categorization": "MUTATION_TYPE",
+      "values": [
+       [
+        {
+         "value": "Nonsense_Mutation"
+        },
+        {
+         "value": "Frame_Shift_Ins"
+        },
+        {
+         "value": "Splice_Site"
+        },
+        {
+         "value": "Frame_Shift_Del"
+        },
+        {
+         "value": "Missense_Mutation"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "PTEN-intact",
+   "isUnselected": true
+  }
+ ],
+ "tab": "protein",
+ "selectedGene": "PTEN"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/protein?comparisonId=6ab5cfe1c2115c492d884e19&selectedGene=PTEN","url":"https://www.cbioportal.org/comparison/protein?comparisonId=6ab5cfe1c2115c492d884e19&selectedGene=PTEN","data":{"description":"Group comparison (3 custom groups)","studies":["lusc_tcga_pan_can_atlas_2018"],"totalGroups":3,"groups":[{"name":"PTEN-altered","sampleCount":48},{"name":"PTEN-mutated","sampleCount":51},{"name":"PTEN-intact","sampleCount":390}],"studyViewUrl":"https://www.cbioportal.org/study?id=lusc_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"PTEN-altered","url":"https://www.cbioportal.org/study?id=lusc_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22lusc_tcga_pan_can_atlas_2018_gistic%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PTEN%22%2C%22alterations%22%3A%5B%22HOMDEL%22%5D%7D%5D%5D%7D%5D%7D"},{"groupName":"PTEN-mutated","url":"https://www.cbioportal.org/study?id=lusc_tcga_pan_can_atlas_2018#filterJson=%7B%22mutationDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22PTEN%22%2C%22profileType%22%3A%22mutations%22%2C%22categorization%22%3A%22MUTATION_TYPE%22%2C%22values%22%3A%5B%5B%7B%22value%22%3A%22Nonsense_Mutation%22%7D%2C%7B%22value%22%3A%22Frame_Shift_Ins%22%7D%2C%7B%22value%22%3A%22Splice_Site%22%7D%2C%7B%22value%22%3A%22Frame_Shift_Del%22%7D%2C%7B%22value%22%3A%22Missense_Mutation%22%7D%5D%5D%7D%5D%7D"}],"pageDescription":"Protein expression for all genes compared across PTEN-altered (48) vs PTEN-mutated (51) vs PTEN-intact (390)."}}
+
+═ answer (success)
+## PTEN alteration vs pAKT levels — LUSC (TCGA PanCancer Atlas)
+
+**Cohort:** [Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018), 487 samples. RPPA (reverse-phase protein array) data — the assay's pAKT antibodies target Ser473 (`AKT1_PS473`) and Thr308 (`AKT1_PT308`), the two canonical activating phosphosites.
+
+**PTEN alteration definition** (mutation OR homozygous deletion), among 317 samples with both PTEN genomic and RPPA data:
+- PTEN-altered: 67 samples (48 homozygous deletions, 20 missense, 12 nonsense, 11 frameshift deletions, 4 frameshift insertions, 4 splice-site)
+- PTEN-intact: 250 samples
+
+**pAKT (RPPA z-scores), altered vs intact:**
+
+| Phosphosite | PTEN-altered (n=67) mean / median | PTEN-intact (n=250) mean / median |
+|---|---|---|
+| pAKT-S473 | +0.63 / +0.58 | −0.17 / −0.28 |
+| pAKT-T308 | +0.70 / +0.71 | −0.19 / −0.40 |
+
+Samples with PTEN mutation or homozygous deletion show substantially higher pAKT z-scores at both phosphosites than PTEN-intact samples — an ~0.8–0.9 z-score-unit shift in the mean, consistent with loss of PTEN's inhibitory brake on PI3K/AKT signaling. I have not run a statistical test on this difference (no p-value or effect-size test computed here); use the comparison tool below for that.
+
+[Compare pAKT/protein levels: PTEN-altered vs PTEN-mutated vs PTEN-intact](https://www.cbioportal.org/comparison/protein?comparisonId=6ab5cfe1c2115c492d884e19&selectedGene=PTEN) — groups: PTEN-altered (deep deletion, n=48), PTEN-mutated (n=51), PTEN-intact (n=390, includes shallow/heterozygous loss and gain). This view will run the actual significance test (t-test/Wilcoxon per antibody, including the AKT phosphosites) and let you inspect the full RPPA panel.
+
+[Browse the LUSC cohort / PTEN alteration overview](https://www.cbioportal.org/study?id=lusc_tcga_pan_can_atlas_2018)
+
+Note: this reflects protein-level (RPPA) signal only, not a claim about kinase activity or clinical significance — treat it as a descriptive association from this dataset.

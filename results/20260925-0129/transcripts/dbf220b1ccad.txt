@@ -1,0 +1,553 @@
+Q (haiku): In colorectal cancer do patients with microsatellite instability in the TCGA dataset have a similar prognosis as those in the MSK Gastroenterology 2020 study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ list_studies
+{
+ "search": "TCGA colorectal",
+ "limit": 10,
+ "verbose": true
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ list_studies
+{
+ "search": "MSK Gastroenterology 2020",
+ "limit": 10,
+ "verbose": true
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"coadread_tcga","name":"Colorectal Adenocarcinoma (TCGA, Firehose Legacy)","description":"TCGA Colorectal Adenocarcinoma. Source data from <A HREF=\"http://gdac.broadinstitute.org/runs/stddata__2016_01_28/data/COADREAD/20160128/\">GDAC Firehose</A>. Previously known as TCGA Provisional.","type_of_cancer_id":"coadread","sample_count":640,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=coadread_tcga"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","name":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","description":"Colorectal Adenocarcinoma TCGA PanCancer data. The original data is <a href=\"https://gdc.cancer.gov/about-data/publications/pancanatlas\">here</a>. The publications are <a href=\"https://www.cell.com/pb-assets/consortium/pancanceratlas/pancani3/index.html\">here</a>.","type_of_cancer_id":"coadread","sample_count":594,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=coadread_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"coadread_tcga_pub","name":"Colorectal Adenocarcinoma (TCGA, Nature 2012)","description":"Whole exome sequencing in 224 of the 276 colorectal carcinoma tumor/normal pairs. The Cancer Genome Atlas (TCGA) Colorectal Cancer project.","type_of_cancer_id":"coadread","sample_count":276,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=coadread_tcga_pub"}]}
+
+◀ result
+{"result":[{"cancer_study_identifier":"crc_apc_impact_2020","name":"Colorectal Cancer (MSK, Gastroenterology 2020)","description":"Targeted sequencing of 471 unresectable colorectal tumor/normal pairs via MSK-IMPACT.","type_of_cancer_id":"coadread","sample_count":471,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=crc_apc_impact_2020"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ get_study_guide
+{
+ "study_id": "coadread_tcga_pan_can_atlas_2018"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+# Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)
+
+**Study ID:** `coadread_tcga_pan_can_atlas_2018`
+
+See `_tcga_pancan_template.md` for common TCGA clinical attributes.
+
+## Study-Specific Attributes
+
+### Microsatellite Instability (MSI)
+There is no `MSI_STATUS` attribute. Three attributes carry MSI (594 patients, one sample each):
+
+| Attribute | Definition | MSI-high count |
+|-----------|------------|----------------|
+| `SUBTYPE` | TCGA molecular classification: `COAD_MSI` 60 + `READ_MSI` 3 | **63** |
+| `MSI_SENSOR_SCORE` | MSIsensor score ≥10 (indeterminate 4–10: 10 more) | 78 of 584 scored |
+| `MSI_SCORE_MANTIS` | MANTIS score >0.4 (>0.6 = MSI: 67; 0.4–0.6 indeterminate) | 89 of 557 scored |
+
+**For "MSI-high" questions, use `SUBTYPE` IN (`COAD_MSI`, `READ_MSI`)** (the TCGA molecular classification) and state which definition you used; mention the score-based alternatives if the counts matter. Do not switch to `coadread_tcga_pub` to find MSI; this study has it.
+```sql
+SELECT count(DISTINCT patient_unique_id) AS msi_patients   -- 63
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'SUBTYPE' AND attribute_value IN ('COAD_MSI', 'READ_MSI');
+```
+
+### Molecular Classification (`SUBTYPE`, patients)
+`COAD_CIN` 226, `READ_CIN` 102, `COAD_MSI` 60, `COAD_GS` 49, `READ_GS` 9, `COAD_POLE` 6, `READ_POLE` 4, `READ_MSI` 3, blank 135.
+- **Hypermutated**: no `HYPERMUTATED` attribute. Use `SUBTYPE` MSI + POLE (73 patients), or `TMB_NONSYNONYMOUS` ≥10 (83 samples; all MSI and POLE tumors exceed it).
+- **CMS (consensus molecular subtypes)** are not available in this study.
+
+### Anatomic Location
+There is no `TUMOR_LOCATION` attribute.
+- Colon vs rectum: `TUMOR_TISSUE_SITE` — Colon 436, Rectum 152, blank 6.
+- Subsite (for left vs right): `ICD_O_3_SITE` — right: C18.0 cecum 81, C18.2 ascending 100, C18.3 hepatic flexure 10; transverse C18.4 20; left: C18.5 splenic flexure 5, C18.6 descending 16, C18.7 sigmoid 106, C19.9 rectosigmoid 72, C20.9 rectum 81; C18.9 colon NOS 97 (side unknown).
+
+## Key Genes
+| Gene | Frequency | Clinical Relevance |
+|------|-----------|-------------------|
+| APC | ~80% | Initiating event in most CRC |
+| TP53 | ~55% | Progression marker |
+| KRAS | ~40% | Predicts anti-EGFR resistance |
+| PIK3CA | ~15% | May predict aspirin benefit |
+| BRAF | ~10% | V600E poor prognosis (MSS context) |
+| SMAD4 | ~10% | TGF-β pathway |
+
+## Notes
+- MSI-H tumors respond well to immunotherapy
+- KRAS/NRAS mutations contraindicate anti-EGFR therapy
+- BRAF V600E has different prognosis in MSI-H vs MSS context
+- Left vs right-sided tumors have different biology and outcomes
+
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- TCGA Colorectal Adenocarcinoma: MSI status and survival data
+SELECT
+  'TCGA (PanCancer Atlas)' AS cohort,
+  CASE WHEN attribute_name = 'SUBTYPE' AND attribute_value IN ('COAD_MSI', 'READ_MSI')
+       THEN 'MSI-High' ELSE 'MSS/Other' END AS msi_status,
+  COUNT(DISTINCT patient_unique_id) AS n_patients,
+  SUM(CASE WHEN attribute_name = 'OS_MONTHS' AND toFloat64OrNull(attribute_value) IS NOT NULL THEN 1 ELSE 0 END) AS n_with_os,
+  SUM(CASE WHEN attribute_name = 'OS_STATUS' AND startsWith(attribute_value, '1') THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN attribute_name = 'OS_STATUS' AND startsWith(attribute_value, '0') THEN 1 ELSE 0 END) AS n_censored,
+  quantile(0.5)(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS median_os_months,
+  min(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS min_followup_months,
+  max(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS max_followup_months
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+  AND attribute_name IN ('SUBTYPE', 'OS_MONTHS', 'OS_STATUS')
+GROUP BY msi_status
+ORDER BY msi_status
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cohort":"TCGA (PanCancer Atlas)","msi_status":"MSI-High","n_patients":63,"n_with_os":0,"n_deceased":0,"n_censored":0},{"cohort":"TCGA (PanCancer Atlas)","msi_status":"MSS/Other","n_patients":594,"n_with_os":590,"n_deceased":120,"n_censored":471,"median_os_months":21.073741655,"min_followup_months":0,"max_followup_months":148.0093369}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- MSK Gastroenterology 2020: Check available MSI-related attributes
+SELECT DISTINCT attribute_name, COUNT(*) as count
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'crc_apc_impact_2020'
+GROUP BY attribute_name
+ORDER BY attribute_name
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"attribute_name":"AGE_AT_MET","count":471},{"attribute_name":"APC_GROUPS","count":471},{"attribute_name":"CANCER_TYPE","count":471},{"attribute_name":"CANCER_TYPE_DETAILED","count":471},{"attribute_name":"CARCINOMATOSIS","count":471},{"attribute_name":"DIFFERENTIATION","count":471},{"attribute_name":"ECOG","count":471},{"attribute_name":"FIRST_LINE_MET_TX","count":471},{"attribute_name":"FRACTION_GENOME_ALTERED","count":471},{"attribute_name":"HISTOLOGY","count":471},{"attribute_name":"LST","count":471},{"attribute_name":"METASTASIS_BONE","count":471},{"attribute_name":"METASTASIS_LIVER","count":471},{"attribute_name":"METASTASIS_LUNG","count":471},{"attribute_name":"METASTASIS_OTHER","count":471},{"attribute_name":"MSI_SCORE","count":471},{"attribute_name":"MSI_TYPE","count":471},{"attribute_name":"MUTATION_COUNT","count":471},{"attribute_name":"ONCOTREE_CODE","count":471},{"attribute_name":"OS_MONTHS","count":471},{"attribute_name":"OS_STATUS","count":471},{"attribute_name":"PFS_MONTHS","count":471},{"attribute_name":"PFS_STATUS","count":471},{"attribute_name":"PRIOR_ADJUVANT_CHEMO","count":471},{"attribute_name":"SAMPLE_COUNT","count":471},{"attribute_name":"SEX","count":471},{"attribute_name":"SOMATIC_STATUS","count":471},{"attribute_name":"STAGE_AT_DIAGNOSIS","count":471},{"attribute_name":"SURGERY_PRIMARY_TUMOR","count":471},{"attribute_name":"TIMING_METS","count":471},{"attribute_name":"TMB_NONSYNONYMOUS","count":471},{"attribute_name":"TUMOR_LOCATION","count":471},{"attribute_name":"USED_IN_GENOMIC_ANALYSIS","count":471}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- MSK Gastroenterology 2020: Get distinct MSI_TYPE values to understand categorization
+SELECT DISTINCT attribute_value, COUNT(*) as count
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'crc_apc_impact_2020'
+  AND attribute_name = 'MSI_TYPE'
+GROUP BY attribute_value
+ORDER BY count DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"attribute_value":"Stable","count":428},{"attribute_value":"Instable","count":27},{"attribute_value":"Indeterminate","count":8},{"attribute_value":"Do not report","count":7},{"count":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- MSK Gastroenterology 2020: MSI status and survival data
+SELECT
+  'MSK (Gastroenterology 2020)' AS cohort,
+  CASE WHEN attribute_name = 'MSI_TYPE' AND upper(attribute_value) = 'INSTABLE'
+       THEN 'MSI-High' ELSE 'MSS/Other' END AS msi_status,
+  COUNT(DISTINCT patient_unique_id) AS n_patients,
+  SUM(CASE WHEN attribute_name = 'OS_MONTHS' AND toFloat64OrNull(attribute_value) IS NOT NULL THEN 1 ELSE 0 END) AS n_with_os,
+  SUM(CASE WHEN attribute_name = 'OS_STATUS' AND startsWith(attribute_value, '1') THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN attribute_name = 'OS_STATUS' AND startsWith(attribute_value, '0') THEN 1 ELSE 0 END) AS n_censored,
+  min(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS min_followup_months,
+  max(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS max_followup_months
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'crc_apc_impact_2020'
+  AND attribute_name IN ('MSI_TYPE', 'OS_MONTHS', 'OS_STATUS')
+GROUP BY msi_status
+ORDER BY msi_status
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cohort":"MSK (Gastroenterology 2020)","msi_status":"MSI-High","n_patients":27,"n_with_os":0,"n_deceased":0,"n_censored":0},{"cohort":"MSK (Gastroenterology 2020)","msi_status":"MSS/Other","n_patients":471,"n_with_os":471,"n_deceased":311,"n_censored":160,"min_followup_months":0.6,"max_followup_months":77.5}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Verify TCGA OS data availability - check raw counts
+SELECT
+  cancer_study_identifier,
+  SUM(CASE WHEN attribute_name = 'OS_MONTHS' THEN 1 ELSE 0 END) AS os_months_count,
+  SUM(CASE WHEN attribute_name = 'OS_STATUS' THEN 1 ELSE 0 END) AS os_status_count,
+  COUNT(DISTINCT patient_unique_id) AS total_patients,
+  COUNT(DISTINCT CASE WHEN attribute_name = 'OS_MONTHS' THEN patient_unique_id END) AS patients_with_os_months
+FROM clinical_data_derived
+WHERE cancer_study_identifier IN ('coadread_tcga_pan_can_atlas_2018', 'crc_apc_impact_2020')
+GROUP BY cancer_study_identifier
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","os_months_count":594,"os_status_count":594,"total_patients":594,"patients_with_os_months":594},{"cancer_study_identifier":"crc_apc_impact_2020","os_months_count":471,"os_status_count":471,"total_patients":471,"patients_with_os_months":471}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- TCGA: Proper per-patient aggregation of MSI status and survival
+WITH tcga_patients AS (
+  SELECT
+    patient_unique_id,
+    MAX(CASE WHEN attribute_name = 'SUBTYPE' AND attribute_value IN ('COAD_MSI', 'READ_MSI') THEN 1 ELSE 0 END) AS is_msi,
+    MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS os_months,
+    MAX(CASE WHEN attribute_name = 'OS_STATUS' THEN attribute_value END) AS os_status
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'coadread_tcga_pan_can_atlas_2018'
+    AND attribute_name IN ('SUBTYPE', 'OS_MONTHS', 'OS_STATUS')
+  GROUP BY patient_unique_id
+)
+SELECT
+  'TCGA (PanCancer Atlas)' AS cohort,
+  IF(is_msi = 1, 'MSI-High', 'MSS/Other') AS msi_status,
+  COUNT(*) AS n_patients,
+  SUM(CASE WHEN os_months IS NOT NULL THEN 1 ELSE 0 END) AS n_with_os_data,
+  SUM(CASE WHEN startsWith(os_status, '1') THEN 1 ELSE 0 END) AS n_events,
+  SUM(CASE WHEN startsWith(os_status, '0') THEN 1 ELSE 0 END) AS n_censored,
+  round(quantile(0.5)(os_months), 1) AS median_os_months_raw,
+  round(min(os_months), 1) AS min_followup_months,
+  round(max(os_months), 1) AS max_followup_months
+FROM tcga_patients
+WHERE os_months IS NOT NULL AND os_status != ''
+GROUP BY is_msi
+ORDER BY msi_status
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cohort":"TCGA (PanCancer Atlas)","msi_status":"MSI-High","n_patients":63,"n_with_os_data":63,"n_events":15,"n_censored":48,"median_os_months_raw":22.1,"min_followup_months":0,"max_followup_months":135.6},{"cohort":"TCGA (PanCancer Atlas)","msi_status":"MSS/Other","n_patients":527,"n_with_os_data":527,"n_events":105,"n_censored":422,"median_os_months_raw":21,"min_followup_months":0,"max_followup_months":148}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- MSK: Proper per-patient aggregation of MSI status and survival
+WITH msk_patients AS (
+  SELECT
+    patient_unique_id,
+    MAX(CASE WHEN attribute_name = 'MSI_TYPE' AND upper(attribute_value) = 'INSTABLE' THEN 1 ELSE 0 END) AS is_msi,
+    MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS os_months,
+    MAX(CASE WHEN attribute_name = 'OS_STATUS' THEN attribute_value END) AS os_status
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'crc_apc_impact_2020'
+    AND attribute_name IN ('MSI_TYPE', 'OS_MONTHS', 'OS_STATUS')
+  GROUP BY patient_unique_id
+)
+SELECT
+  'MSK (Gastroenterology 2020)' AS cohort,
+  IF(is_msi = 1, 'MSI-High', 'MSS/Other') AS msi_status,
+  COUNT(*) AS n_patients,
+  SUM(CASE WHEN os_months IS NOT NULL THEN 1 ELSE 0 END) AS n_with_os_data,
+  SUM(CASE WHEN startsWith(os_status, '1') THEN 1 ELSE 0 END) AS n_events,
+  SUM(CASE WHEN startsWith(os_status, '0') THEN 1 ELSE 0 END) AS n_censored,
+  round(min(os_months), 1) AS min_followup_months,
+  round(max(os_months), 1) AS max_followup_months
+FROM msk_patients
+WHERE os_months IS NOT NULL AND os_status != ''
+GROUP BY is_msi
+ORDER BY msi_status
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cohort":"MSK (Gastroenterology 2020)","msi_status":"MSI-High","n_patients":27,"n_with_os_data":27,"n_events":15,"n_censored":12,"min_followup_months":2.2,"max_followup_months":70.9},{"cohort":"MSK (Gastroenterology 2020)","msi_status":"MSS/Other","n_patients":444,"n_with_os_data":444,"n_events":296,"n_censored":148,"min_followup_months":0.6,"max_followup_months":77.5}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "coadread_tcga_pan_can_atlas_2018",
+  "crc_apc_impact_2020"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 2 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":2,"studiesWithMetadata":[{"studyId":"coadread_tcga_pan_can_atlas_2018","name":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":594,"studyViewUrl":"https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["coadread_tcga_pan_can_atlas_2018_gistic","coadread_tcga_pan_can_atlas_2018_log2CNA","coadread_tcga_pan_can_atlas_2018_mutations","coadread_tcga_pan_can_atlas_2018_protein_quantification","coadread_tcga_pan_can_atlas_2018_protein_quantification_zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","coadread_tcga_pan_can_atlas_2018_rppa","coadread_tcga_pan_can_atlas_2018_rppa_Zscores","coadread_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["coadread_tcga_pan_can_atlas_2018_armlevel_cna","coadread_tcga_pan_can_atlas_2018_genetic_ancestry","coadread_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","coadread_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["coadread_tcga_pan_can_atlas_2018_protein_quantification_zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","coadread_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","coadread_tcga_pan_can_atlas_2018_rp … (1172 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "coadread_tcga_pan_can_atlas_2018",
+  "crc_apc_impact_2020"
+ ],
+ "groups": [
+  {
+   "name": "TCGA MSI-High",
+   "studyViewFilter": {
+    "studyIds": [
+     "coadread_tcga_pan_can_atlas_2018"
+    ],
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "COAD_MSI"
+       },
+       {
+        "value": "READ_MSI"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "TCGA MSS/Other",
+   "studyViewFilter": {
+    "studyIds": [
+     "coadread_tcga_pan_can_atlas_2018"
+    ],
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "COAD_CIN"
+       },
+       {
+        "value": "READ_CIN"
+       },
+       {
+        "value": "COAD_GS"
+       },
+       {
+        "value": "READ_GS"
+       },
+       {
+        "value": "COAD_POLE"
+       },
+       {
+        "value": "READ_POLE"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "MSK MSI-High",
+   "studyViewFilter": {
+    "studyIds": [
+     "crc_apc_impact_2020"
+    ],
+    "clinicalDataFilters": [
+     {
+      "attributeId": "MSI_TYPE",
+      "values": [
+       {
+        "value": "Instable"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "MSK MSS/Other",
+   "studyViewFilter": {
+    "studyIds": [
+     "crc_apc_impact_2020"
+    ],
+    "clinicalDataFilters": [
+     {
+      "attributeId": "MSI_TYPE",
+      "values": [
+       {
+        "value": "Stable"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "survival"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ab5d0fce497aad53593c28c","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ab5d0fce497aad53593c28c","data":{"description":"Group comparison (4 custom groups)","studies":["coadread_tcga_pan_can_atlas_2018","crc_apc_impact_2020"],"totalGroups":4,"groups":[{"name":"TCGA MSI-High","sampleCount":63},{"name":"TCGA MSS/Other","sampleCount":396},{"name":"MSK MSI-High","sampleCount":27},{"name":"MSK MSS/Other","sampleCount":428}],"studyViewUrl":"https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018%2Ccrc_apc_impact_2020","groupUrls":[{"groupName":"TCGA MSI-High","url":"https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22COAD_MSI%22%7D%2C%7B%22value%22%3A%22READ_MSI%22%7D%5D%7D%5D%7D"},{"groupName":"TCGA MSS/Other","url":"https://www.cbioportal.org/study?id=coadread_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22COAD_CIN%22%7D%2C%7B%22value%22%3A%22READ_CIN%22%7D%2C%7B%22value%22%3A%22COAD_GS%22%7D%2C%7B%22value%22%3A%22READ_GS%22%7D%2C%7B%22value%22%3A%22COAD_POLE%22%7D%2C%7B%22value%22%3A%22READ_POLE%22%7D%5D%7D%5D%7D"},{"groupName":"MSK MSI-High","url":"https://www.cbioportal.org/study?id=crc_apc_impact_2020#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22MSI_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Instable%22%7D%5D%7D%5D%7D"},{"groupName":"MSK MSS/Other","url":"https://www.cbioportal.org/study?id=crc_apc_impact_2020#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22MSI_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Stable%22%7D%5D%7D%5D%7D"}],"pageDescription":"Kaplan-Meier survival analysis comparing TCGA MSI-High (63) vs TCGA MSS/Other (396) vs MSK MSI-High (27) vs MSK MSS/Other (428)."}}
+
+═ answer (success)
+Perfect! Now let me present the findings:
+
+---
+
+## Prognosis Comparison: MSI Status in TCGA vs MSK Colorectal Cancer
+
+**Important caveat:** I cannot compute p-values, hazard ratios, or claim statistical significance. The following are **descriptive statistics only** — to determine if prognosis differs significantly, you must use the Kaplan-Meier log-rank test in the visualization below.
+
+### Summary Table
+
+| Cohort | MSI Status | N Patients | Survival Events | Censored | Follow-up Range (months) |
+|--------|-----------|-----------|---------|----------|-------------------------|
+| **TCGA (PanCancer Atlas)** | MSI-High | 63 | 15 (24%) | 48 (76%) | 0–135.6 |
+| | MSS/Other | 527 | 105 (20%) | 422 (80%) | 0–148 |
+| **MSK (Gastroenterology 2020)** | MSI-High | 27 | 15 (56%) | 12 (44%) | 2.2–70.9 |
+| | MSS/Other | 444 | 296 (67%) | 148 (33%) | 0.6–77.5 |
+
+### Key Observations
+
+1. **Event rate differences**: The MSK cohort shows **much higher mortality in both groups** (MSI-High 56%, MSS/Other 67%) compared to TCGA (MSI-High 24%, MSS/Other 20%). This likely reflects differences in patient selection — MSK enrolled unresectable/metastatic disease; TCGA is heavily weighted toward resectable stage cases.
+
+2. **MSI-High event rate**: 
+   - TCGA: 24% (15/63)
+   - MSK: 56% (15/27)
+   - The MSK MSI-High cohort is **substantially sicker** despite being smaller.
+
+3. **Follow-up duration**: TCGA has longer maximum follow-up (148 months vs 77.5 months), allowing more time for events to accrue.
+
+4. **Sample definition**: TCGA uses molecular classification (`SUBTYPE` in ['COAD_MSI', 'READ_MSI']) ; MSK uses `MSI_TYPE = 'Instable'` — different assays may affect categorization.
+
+### Next Steps
+
+Use the **[Kaplan-Meier Survival Comparison](https://www.cbioportal.org/comparison/survival?comparisonId=6ab5d0fce497aad53593c28c)** link below to view the full survival curves and compute log-rank p-values for:
+- TCGA MSI-High vs TCGA MSS/Other
+- MSK MSI-High vs MSK MSS/Other
+- Cross-cohort trends
+
+The curves will reveal whether the observed event-rate differences translate to different median overall survival or survival slopes between cohorts.
+
+---
+
+### [View Kaplan-Meier Survival Comparison](https://www.cbioportal.org/comparison/survival?comparisonId=6ab5d0fce497aad53593c28c)
+
+This comparison includes:
+- **TCGA MSI-High** (63 patients)
+- **TCGA MSS/Other** (396 patients with known subtype)
+- **MSK MSI-High** (27 patients)  
+- **MSK MSS/Other** (428 patients)
+
+The survival tab will display KM curves and allow you to estimate median OS and run the log-rank test.

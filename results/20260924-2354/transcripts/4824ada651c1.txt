@@ -1,0 +1,472 @@
+Q (sonnet): How does overall survival compare between prostate cancer patients where TMPRSS2 is acting as the upstream donor to an ERG fusion event and patients without this fusion?
+
+▶ list_guides
+{}
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7083 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ search_oncotree
+{
+ "search_term": "prostate adenocarcinoma"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"result":[{"code":"PRAD","name":"Prostate Adenocarcinoma","score":80,"mainType":"Prostate Cancer","tissue":"Prostate","hierarchy":"PROSTATE > PRAD"}]}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "structural_variant"
+}
+
+▶ list_studies
+{
+ "search": "prostate",
+ "limit": 30
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int64"},{"name":"genetic_profile_id","type":"Int64"},{"name":"sample_id","type":"Int64"},{"name":"site1_entrez_gene_id","type":"Nullable(Int64)"},{"name":"site1_ensembl_transcript_id","type":"Nullable(String)"},{"name":"site1_chromosome","type":"Nullable(String)"},{"name":"site1_region","type":"Nullable(String)"},{"name":"site1_region_number","type":"Nullable(Int64)"},{"name":"site1_contig","type":"Nullable(String)"},{"name":"site1_position","type":"Nullable(Int64)"},{"name":"site1_description","type":"Nullable(String)"},{"name":"site2_entrez_gene_id","type":"Nullable(Int64)"},{"name":"site2_ensembl_transcript_id","type":"Nullable(String)"},{"name":"site2_chromosome","type":"Nullable(String)"},{"name":"site2_region","type":"Nullable(String)"},{"name":"site2_region_number","type":"Nullable(Int64)"},{"name":"site2_contig","type":"Nullable(String)"},{"name":"site2_position","type":"Nullable(Int64)"},{"name":"site2_description","type":"Nullable(String)"},{"name":"site2_effect_on_frame","type":"Nullable(String)"},{"name":"ncbi_build","type":"Nullable(String)"},{"name":"dna_support","type":"Nullable(String)"},{"name":"rna_support","type":"Nullable(String)"},{"name":"normal_read_count","type":"Nullable(Int64)"},{"name":"tumor_read_count","type":"Nullable(Int64)"},{"name":"normal_variant_count","type":"Nullable(Int64)"},{"name":"tumor_variant_count","type":"Nullable(Int64)"},{"name":"normal_paired_end_read_count","type":"Nullable(Int64)"},{"name":"tumor_paired_end_read_count","type":"Nullable(Int64)"},{"name":"normal_split_read_count","type":"Nullable(Int64)"},{"name":"tumor_split_read_count","type":"Nullable(Int64)"},{"name":"annotation","type":"Nullable(String)"},{"name":"breakpoint_type","type":"Nullable(String)"},{"name":"connection_type","type":"Nullable(String)"},{"name":"event_info","type":"Nullable(String)"},{"name":"class","type":"Nullable(String)"},{"name":"length","type":"Nullable(Int64)"},{"name":"comments","type":"Nullable(String)"},{"name":"sv_status","type":"String"},{"name":"annotation_json","type":"Nullable(String)"}]}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"prostate_msk_2024","name":"Prostate Cancer (MSK, Clin Cancer Res 2024)","type_of_cancer_id":"prostate","sample_count":2260,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prostate_msk_2024"},{"cancer_study_identifier":"prad_msk_stopsack_2021","name":"Race Differences in Prostate Cancer (MSK, 2021)","type_of_cancer_id":"prad","sample_count":2069,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_msk_stopsack_2021"},{"cancer_study_identifier":"prad_cdk12_mskcc_2020","name":"Prostate Adenocarcinoma (MSK, Eur Urol 2020)","type_of_cancer_id":"prad","sample_count":1465,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_cdk12_mskcc_2020"},{"cancer_study_identifier":"prad_pik3r1_msk_2021","name":"Prostate Adenocarcinoma (MSK, Clin Cancer Res. 2022)","type_of_cancer_id":"prad","sample_count":1417,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_pik3r1_msk_2021"},{"cancer_study_identifier":"prad_p1000","name":"Prostate Adenocarcinoma (MSK/DFCI, Nature Genetics 2018)","type_of_cancer_id":"prad","sample_count":1013,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_p1000"},{"cancer_study_identifier":"prad_mskcc_2017","name":"Prostate Cancer (MSK, JCO Precis Oncol 2017)","type_of_cancer_id":"prad","sample_count":504,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_mskcc_2017"},{"cancer_study_identifier":"prad_tcga","name":"Prostate Adenocarcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"prad","sample_count":501,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_tcga"},{"cancer_study_identifier":"prad_tcga_gdc","name":"Prostate Adenocarcinoma (TCGA GDC, 2025)","type_of_cancer_id":"prad","sample_count":501,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_tcga_gdc"},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018","name":"Prostate Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"prad","sample_count":494,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"prad_cpcg_2017","name":"Prostate Adenocarcinoma (CPC-GENE, Nature 2017)","type_of_cancer_id":"prad","sample_count":477,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_cpcg_2017"},{"cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","type_of_cancer_id":"prad","sample_count":444,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_su2c_2019"},{"cancer_study_identifier":"prad_mcspc_mskcc_2020","name":"Metastatic castration-sensitive prostate cancer (MSK, Clin Cancer R … (4242 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, structural_variant_sample_count, sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'prad'
+ORDER BY structural_variant_sample_count DESC
+LIMIT 10"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"prad_msk_stopsack_2021","structural_variant_sample_count":921,"sample_count":2069},{"cancer_study_identifier":"prad_pik3r1_msk_2021","structural_variant_sample_count":697,"sample_count":1417},{"cancer_study_identifier":"prad_cdk12_mskcc_2020","structural_variant_sample_count":626,"sample_count":1465},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018","structural_variant_sample_count":431,"sample_count":494},{"cancer_study_identifier":"prad_p1000","structural_variant_sample_count":378,"sample_count":1013},{"cancer_study_identifier":"prad_mskcc_2017","structural_variant_sample_count":201,"sample_count":504},{"cancer_study_identifier":"prad_tcga_pub","structural_variant_sample_count":198,"sample_count":333},{"cancer_study_identifier":"prad_mcspc_mskcc_2020","structural_variant_sample_count":192,"sample_count":424},{"cancer_study_identifier":"prad_su2c_2019","structural_variant_sample_count":178,"sample_count":444},{"cancer_study_identifier":"prad_su2c_2015","structural_variant_sample_count":105,"sample_count":150}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT hugo_gene_symbol, sv_event_info
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+  AND variant_type = 'structural_variant'
+  AND (hugo_gene_symbol = 'TMPRSS2' OR hugo_gene_symbol = 'ERG')
+LIMIT 20"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"ERG","sv_event_info":"TMPRSS2-ERG fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-PLEKHH1 fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-CDHR2 fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"NDRG1-ERG fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-SKOR2 fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-TMPRSS2 fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-TAF8 fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"SLC45A3-ERG fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-SON fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"GUCA2A-ERG fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-KCNJ6 fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-SRPK2 fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"GRHL2-ERG fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-RPS18 fusion"},{"hugo_gene_symbol":"ERG","sv_event_info":"ERG-ABCC4 fusion"},{"hugo_gene_symbol":"TMPRSS2","sv_event_info":"TMPRSS2-ERG fusion"},{"hugo_gene_symbol":"TMPRSS2","sv_event_info":"TMPRSS2-MORC3 fusion"},{"hugo_gene_symbol":"TMPRSS2","sv_event_info":"TMPRSS2-ETV4 fusion"},{"hugo_gene_symbol":"TMPRSS2","sv_event_info":"SIK3-TMPRSS2 fusion"},{"hugo_gene_symbol":"TMPRSS2","sv_event_info":"MESDC2-TMPRSS2 fusion"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT
+  g1.hugo_gene_symbol AS site1_gene,
+  g2.hugo_gene_symbol AS site2_gene,
+  sv.event_info,
+  count(*) AS n
+FROM structural_variant sv
+JOIN genetic_profile gp ON sv.genetic_profile_id = gp.genetic_profile_id
+JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+LEFT JOIN gene g1 ON sv.site1_entrez_gene_id = g1.entrez_gene_id
+LEFT JOIN gene g2 ON sv.site2_entrez_gene_id = g2.entrez_gene_id
+WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+  AND (g1.hugo_gene_symbol IN ('TMPRSS2','ERG') OR g2.hugo_gene_symbol IN ('TMPRSS2','ERG'))
+GROUP BY site1_gene, site2_gene, sv.event_info
+ORDER BY n DESC
+LIMIT 20"
+}
+
+◀ result
+{"rows":[{"site1_gene":"TMPRSS2","site2_gene":"ERG","event_info":"TMPRSS2-ERG fusion","n":189},{"site1_gene":"SLC45A3","site2_gene":"ERG","event_info":"SLC45A3-ERG fusion","n":12},{"site1_gene":"TMPRSS2","site2_gene":"ETV4","event_info":"TMPRSS2-ETV4 fusion","n":8},{"site1_gene":"ERG","site2_gene":"TMPRSS2","event_info":"ERG-TMPRSS2 fusion","n":5},{"site1_gene":"NDRG1","site2_gene":"ERG","event_info":"NDRG1-ERG fusion","n":3},{"site1_gene":"TMPRSS2","site2_gene":"TMEM109","event_info":"TMPRSS2-TMEM109 fusion","n":2},{"site1_gene":"TMPRSS2","site2_gene":"ETV5","event_info":"TMPRSS2-ETV5 fusion","n":2},{"site1_gene":"TMPRSS2","site2_gene":"DGKG","event_info":"TMPRSS2-DGKG fusion","n":2},{"site1_gene":"TMPRSS2","site2_gene":"MORC3","event_info":"TMPRSS2-MORC3 fusion","n":1},{"site1_gene":"TMPRSS2","site2_gene":"PDE9A","event_info":"TMPRSS2-PDE9A fusion","n":1},{"site1_gene":"TMPRSS2","site2_gene":"HDLBP","event_info":"TMPRSS2-HDLBP fusion","n":1},{"site1_gene":"BACE2","site2_gene":"TMPRSS2","event_info":"BACE2-TMPRSS2 fusion","n":1},{"site1_gene":"SLC45A3","site2_gene":"TMPRSS2","event_info":"SLC45A3-TMPRSS2 fusion","n":1},{"site1_gene":"TMPRSS2","site2_gene":"EML4","event_info":"TMPRSS2-EML4 fusion","n":1},{"site1_gene":"ERG","site2_gene":"TAF8","event_info":"ERG-TAF8 fusion","n":1},{"site1_gene":"DLG5","site2_gene":"TMPRSS2","event_info":"DLG5-TMPRSS2 fusion","n":1},{"site1_gene":"ERG","site2_gene":"PLEKHH1","event_info":"ERG-PLEKHH1 fusion","n":1},{"site1_gene":"ATF7IP","site2_gene":"TMPRSS2","event_info":"ATF7IP-TMPRSS2 fusion","n":1},{"site1_gene":"USP28","site2_gene":"TMPRSS2","event_info":"USP28-TMPRSS2 fusion","n":1},{"site1_gene":"PDE9A","site2_gene":"TMPRSS2","event_info":"PDE9A-TMPRSS2 fusion","n":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH tmprss2_erg_samples AS (
+  SELECT DISTINCT sample.stable_id AS sample_id, patient.stable_id AS patient_id
+  FROM structural_variant sv
+  JOIN genetic_profile gp ON sv.genetic_profile_id = gp.genetic_profile_id
+  JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+  JOIN sample ON sv.sample_id = sample.internal_id
+  JOIN patient ON sample.patient_id = patient.internal_id
+  LEFT JOIN gene g1 ON sv.site1_entrez_gene_id = g1.entrez_gene_id
+  LEFT JOIN gene g2 ON sv.site2_entrez_gene_id = g2.entrez_gene_id
+  WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+    AND g1.hugo_gene_symbol = 'TMPRSS2'
+    AND g2.hugo_gene_symbol = 'ERG'
+),
+all_sv_profiled_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+)
+SELECT patient_id FROM tmprss2_erg_samples
+",
+ "max_rows": 300
+}
+
+◀ result
+{"rows":[{"patient_id":"TCGA-2A-A8VL"},{"patient_id":"TCGA-2A-A8VT"},{"patient_id":"TCGA-2A-A8VV"},{"patient_id":"TCGA-2A-AAYU"},{"patient_id":"TCGA-4L-AA1F"},{"patient_id":"TCGA-CH-5739"},{"patient_id":"TCGA-CH-5740"},{"patient_id":"TCGA-CH-5741"},{"patient_id":"TCGA-CH-5743"},{"patient_id":"TCGA-CH-5744"},{"patient_id":"TCGA-CH-5746"},{"patient_id":"TCGA-CH-5752"},{"patient_id":"TCGA-CH-5754"},{"patient_id":"TCGA-CH-5764"},{"patient_id":"TCGA-CH-5765"},{"patient_id":"TCGA-CH-5768"},{"patient_id":"TCGA-CH-5769"},{"patient_id":"TCGA-CH-5789"},{"patient_id":"TCGA-CH-5790"},{"patient_id":"TCGA-CH-5791"},{"patient_id":"TCGA-CH-5794"},{"patient_id":"TCGA-EJ-5495"},{"patient_id":"TCGA-EJ-5496"},{"patient_id":"TCGA-EJ-5497"},{"patient_id":"TCGA-EJ-5498"},{"patient_id":"TCGA-EJ-5499"},{"patient_id":"TCGA-EJ-5502"},{"patient_id":"TCGA-EJ-5503"},{"patient_id":"TCGA-EJ-5506"},{"patient_id":"TCGA-EJ-5507"},{"patient_id":"TCGA-EJ-5508"},{"patient_id":"TCGA-EJ-5512"},{"patient_id":"TCGA-EJ-5516"},{"patient_id":"TCGA-EJ-5521"},{"patient_id":"TCGA-EJ-5522"},{"patient_id":"TCGA-EJ-5524"},{"patient_id":"TCGA-EJ-5525"},{"patient_id":"TCGA-EJ-5526"},{"patient_id":"TCGA-EJ-5527"},{"patient_id":"TCGA-EJ-5530"},{"patient_id":"TCGA-EJ-5542"},{"patient_id":"TCGA-EJ-7315"},{"patient_id":"TCGA-EJ-7321"},{"patient_id":"TCGA-EJ-7325"},{"patient_id":"TCGA-EJ-7327"},{"patient_id":"TCGA-EJ-7328"},{"patient_id":"TCGA-EJ-7783"},{"patient_id":"TCGA-EJ-7784"},{"patient_id":"TCGA-EJ-7785"},{"patient_id":"TCGA-EJ-7793"},{"patient_id":"TCGA-EJ-7797"},{"patient_id":"TCGA-EJ-8469"},{"patient_id":"TCGA-EJ-8472"},{"patient_id":"TCGA-EJ-A46D"},{"patient_id":"TCGA-EJ-A46F"},{"patient_id":"TCGA-EJ-A46I"},{"patient_id":"TCGA-EJ-A65D"},{"patient_id":"TCGA-EJ-A65F"},{"patient_id":"TCGA-EJ-A7NF"},{"patient_id":"TCGA-EJ-A7NK"},{"patient_id":"TCGA-EJ-A8FO"},{"patient_id":"TCGA-FC-7708"},{"patient_id":"TCGA-G9-6329"},{"patient_id":"TCGA-G9-6332"},{"patient_id":"TCGA-G9-6336"},{"patient_id":"TCGA-G9-6342"},{"patient_id":"TCGA-G9-6351"},{"patient_id":"TCGA-G9-6353"},{"patient_id":"TCGA-G9-6354"},{"patient_id":"TCGA-G9-6356"},{"patient_id":"TCGA-G9-6361"},{"patient_id":"TCGA-G9-6362"},{"patient_id":"TCGA-G9-6363"},{"patient_id":"TCGA-G9-6364"},{"patient_id":"TCGA-G9-6365"},{"patient_id":"TCGA-G9-6373"},{"patient_id":"TCGA-G9-6377"},{"patient_id":"TCGA-G9-6384"},{"patient_id":"TCGA-G9-6385"},{"patient_id":"TCGA-G9-7509"},{"patient_id":"TCGA-G9-7525"},{"patient_id":"TCGA-G9-A9S7"},{"patient_id":"TCGA-H9-A6BY"},{"patient_id":"TCGA-HC-7077"},{"patient_id":"TCGA-HC-7081"},{"patient_id":"TCGA-HC-7209"},{"patient_id":"TCGA-HC-7211"},{"patient_id":"TCGA-HC-7212"},{"patient_id":"TCGA-HC-7213"},{"patient_id":"TCGA-HC-7230"},{"patient_id":"TCGA-HC-7231"},{"patient_id":"TCGA-HC-7232"},{"patient_id":"TCGA-HC-7744"},{"patient_id":"TCGA-HC-7745"},{"patient_id":"TCGA-HC-7747"},{"patient_id":"TCGA-HC-7818"},{"patient_id":"TCGA-HC-7819"},{"patient_id":"TCGA-HC-8213"},{"patient_id":"TCGA-HC-8257"},{"patient_id":"TCGA-H … (2680 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH tmprss2_erg_patients AS (
+  SELECT DISTINCT patient.stable_id AS patient_id
+  FROM structural_variant sv
+  JOIN genetic_profile gp ON sv.genetic_profile_id = gp.genetic_profile_id
+  JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+  JOIN sample ON sv.sample_id = sample.internal_id
+  JOIN patient ON sample.patient_id = patient.internal_id
+  LEFT JOIN gene g1 ON sv.site1_entrez_gene_id = g1.entrez_gene_id
+  LEFT JOIN gene g2 ON sv.site2_entrez_gene_id = g2.entrez_gene_id
+  WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+    AND g1.hugo_gene_symbol = 'TMPRSS2'
+    AND g2.hugo_gene_symbol = 'ERG'
+),
+sv_profiled_patients AS (
+  SELECT DISTINCT patient.stable_id AS patient_id
+  FROM structural_variant sv
+  JOIN genetic_profile gp ON sv.genetic_profile_id = gp.genetic_profile_id
+  JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+  JOIN sample ON sv.sample_id = sample.internal_id
+  JOIN patient ON sample.patient_id = patient.internal_id
+  WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+),
+os_data AS (
+  SELECT
+    patient_unique_id,
+    MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN attribute_value END) AS os_months,
+    MAX(CASE WHEN attribute_name = 'OS_STATUS' THEN attribute_value END) AS os_status
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+    AND attribute_name IN ('OS_MONTHS','OS_STATUS')
+  GROUP BY patient_unique_id
+)
+SELECT
+  CASE WHEN o.patient_unique_id IN (SELECT patient_id FROM tmprss2_erg_patients) THEN 'TMPRSS2->ERG fusion (donor)'
+       ELSE 'No TMPRSS2->ERG fusion' END AS group_label,
+  count(*) AS n_patients,
+  countIf(o.os_status = '1:DECEASED') AS n_events,
+  countIf(o.os_status = '0:LIVING') AS n_censored,
+  min(toFloat64OrNull(o.os_months)) AS min_followup,
+  max(toFloat64OrNull(o.os_months)) AS max_followup
+FROM os_data o
+WHERE o.patient_unique_id IN (SELECT patient_id FROM sv_profiled_patients)
+  AND o.os_months IS NOT NULL AND o.os_status IS NOT NULL
+GROUP BY group_label
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT attribute_name, count(*) 
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+  AND attribute_name IN ('OS_MONTHS','OS_STATUS')
+GROUP BY attribute_name
+"
+}
+
+◀ result
+{"rows":[{"attribute_name":"OS_STATUS","count()":494},{"attribute_name":"OS_MONTHS","count()":494}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT patient_unique_id FROM clinical_data_derived
+WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+LIMIT 5
+"
+}
+
+◀ result
+{"rows":[{"patient_unique_id":"prad_tcga_pan_can_atlas_2018_TCGA-2A-A8VL"},{"patient_unique_id":"prad_tcga_pan_can_atlas_2018_TCGA-2A-A8VO"},{"patient_unique_id":"prad_tcga_pan_can_atlas_2018_TCGA-2A-A8VT"},{"patient_unique_id":"prad_tcga_pan_can_atlas_2018_TCGA-2A-A8VV"},{"patient_unique_id":"prad_tcga_pan_can_atlas_2018_TCGA-2A-A8VX"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH tmprss2_erg_patients AS (
+  SELECT DISTINCT concat('prad_tcga_pan_can_atlas_2018_', patient.stable_id) AS patient_unique_id
+  FROM structural_variant sv
+  JOIN genetic_profile gp ON sv.genetic_profile_id = gp.genetic_profile_id
+  JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+  JOIN sample ON sv.sample_id = sample.internal_id
+  JOIN patient ON sample.patient_id = patient.internal_id
+  LEFT JOIN gene g1 ON sv.site1_entrez_gene_id = g1.entrez_gene_id
+  LEFT JOIN gene g2 ON sv.site2_entrez_gene_id = g2.entrez_gene_id
+  WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+    AND g1.hugo_gene_symbol = 'TMPRSS2'
+    AND g2.hugo_gene_symbol = 'ERG'
+),
+sv_profiled_patients AS (
+  SELECT DISTINCT concat('prad_tcga_pan_can_atlas_2018_', patient.stable_id) AS patient_unique_id
+  FROM structural_variant sv
+  JOIN genetic_profile gp ON sv.genetic_profile_id = gp.genetic_profile_id
+  JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+  JOIN sample ON sv.sample_id = sample.internal_id
+  JOIN patient ON sample.patient_id = patient.internal_id
+  WHERE cs.cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+),
+os_data AS (
+  SELECT
+    patient_unique_id,
+    MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN attribute_value END) AS os_months,
+    MAX(CASE WHEN attribute_name = 'OS_STATUS' THEN attribute_value END) AS os_status
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'prad_tcga_pan_can_atlas_2018'
+    AND attribute_name IN ('OS_MONTHS','OS_STATUS')
+  GROUP BY patient_unique_id
+)
+SELECT
+  CASE WHEN o.patient_unique_id IN (SELECT patient_unique_id FROM tmprss2_erg_patients) THEN 'TMPRSS2->ERG fusion (donor)'
+       ELSE 'No TMPRSS2->ERG fusion' END AS group_label,
+  count(*) AS n_patients,
+  countIf(o.os_status = '1:DECEASED') AS n_events,
+  countIf(o.os_status = '0:LIVING') AS n_censored,
+  min(toFloat64OrNull(o.os_months)) AS min_followup,
+  max(toFloat64OrNull(o.os_months)) AS max_followup,
+  round(avg(toFloat64OrNull(o.os_months)),1) AS mean_os_months_NOTE_not_median
+FROM os_data o
+WHERE o.patient_unique_id IN (SELECT patient_unique_id FROM sv_profiled_patients)
+  AND o.os_months IS NOT NULL AND o.os_status IS NOT NULL
+GROUP BY group_label
+"
+}
+
+◀ result
+{"rows":[{"group_label":"No TMPRSS2->ERG fusion","n_patients":242,"n_events":6,"n_censored":236,"min_followup":0.756156097,"max_followup":114.3768288,"mean_os_months_NOTE_not_median":33},{"group_label":"TMPRSS2->ERG fusion (donor)","n_patients":189,"n_events":4,"n_censored":185,"min_followup":1.019166913,"max_followup":165.1707927,"mean_os_months_NOTE_not_median":38.1}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "prad_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"prad_tcga_pan_can_atlas_2018","name":"Prostate Adenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":494,"studyViewUrl":"https://www.cbioportal.org/study?id=prad_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["prad_tcga_pan_can_atlas_2018_gistic","prad_tcga_pan_can_atlas_2018_log2CNA","prad_tcga_pan_can_atlas_2018_mutations","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","prad_tcga_pan_can_atlas_2018_rppa","prad_tcga_pan_can_atlas_2018_rppa_Zscores","prad_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["prad_tcga_pan_can_atlas_2018_armlevel_cna","prad_tcga_pan_can_atlas_2018_genetic_ancestry","prad_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","prad_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","prad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","prad_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "prad_tcga_pan_can_atlas_2018",
+ "geneSpecificQueries": [
+  {
+   "hugoGeneSymbol": "TMPRSS2",
+   "profileType": "structural_variants"
+  },
+  {
+   "hugoGeneSymbol": "ERG",
+   "profileType": "structural_variants"
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"prad_tcga_pan_can_atlas_2018","geneSpecificCounts":[{"hugoGeneSymbol":"TMPRSS2","profileType":"structural_variants","bins":[]},{"hugoGeneSymbol":"ERG","profileType":"structural_variants","bins":[]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "prad_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "TMPRSS2-ERG fusion (TMPRSS2 donor)",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "prad_tcga_pan_can_atlas_2018_structural_variants"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "TMPRSS2"
+        },
+        {
+         "hugoGeneSymbol": "ERG"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "No TMPRSS2-ERG fusion",
+   "isUnselected": true
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ab5ca16e497aad53593c275","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ab5ca16e497aad53593c275","data":{"description":"Group comparison (2 custom groups)","studies":["prad_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"TMPRSS2-ERG fusion (TMPRSS2 donor)","sampleCount":218},{"name":"No TMPRSS2-ERG fusion","sampleCount":276}],"studyViewUrl":"https://www.cbioportal.org/study?id=prad_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"TMPRSS2-ERG fusion (TMPRSS2 donor)","url":"https://www.cbioportal.org/study?id=prad_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22prad_tcga_pan_can_atlas_2018_structural_variants%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TMPRSS2%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22ERG%22%7D%5D%5D%7D%5D%7D"}],"pageDescription":"Kaplan-Meier survival analysis comparing TMPRSS2-ERG fusion (TMPRSS2 donor) (218) vs No TMPRSS2-ERG fusion (276)."}}
+
+═ answer (success)
+Note: the group-comparison filter (218 samples) selects any sample where both TMPRSS2 and ERG are structural-variant-altered — this is a broader "both genes altered" filter and isn't restricted to the strict site1=TMPRSS2/site2=ERG donor orientation I confirmed via direct SQL (189 patients). I'll flag this discrepancy clearly to the user.
+
+## Overall Survival: TMPRSS2→ERG Fusion (TMPRSS2 as 5′ Donor) vs. No Fusion
+
+**Cohort:** TCGA Prostate Adenocarcinoma (PanCancer Atlas), restricted to patients profiled for structural variants (431 patients total).
+
+**Fusion definition used for the SQL analysis:** I queried the raw `structural_variant` table directly and confirmed orientation via `site1_entrez_gene_id` (5′ partner) / `site2_entrez_gene_id` (3′ partner) — i.e., TMPRSS2 = site1 (donor), ERG = site2 (acceptor). This is the canonical TMPRSS2::ERG fusion architecture (189 of 194 TMPRSS2–ERG gene-pair events in this study have this exact orientation; 5 have the reverse ERG→TMPRSS2 orientation and were excluded as a distinct event).
+
+**Note on ClickHouse limitations (per statistical-tests-guide):** I cannot compute Kaplan-Meier median survival, hazard ratios, or p-values in SQL — survival data is censored, and `AVG()`/`quantile()` over `OS_MONTHS` ignores that. Below are the raw descriptive counts; true survival comparison requires KM estimation + log-rank test.
+
+| Group | N patients | Events (Deceased) | Censored (Living) | Follow-up range (months) |
+|---|---|---|---|---|
+| TMPRSS2→ERG fusion (TMPRSS2 as donor) | 189 | 4 | 185 | 1.0 – 165.2 |
+| No TMPRSS2→ERG fusion | 242 | 6 | 236 | 0.8 – 114.4 |
+
+Event rates are very low in both groups (4/189 = 2.1% vs. 6/242 = 2.5%), consistent with the generally indolent, long-survival nature of localized/primary prostate adenocarcinoma in TCGA. With so few events, a KM median is very likely **not reached** in either group, and any comparison will have low statistical power. I cannot report a median OS or p-value from this — you'll need Kaplan-Meier + log-rank (R `survival::survfit`/`survdiff`, Python `lifelines`, or cBioPortal's Survival tab, linked below) to properly assess this.
+
+### Navigate
+
+⚠️ **Caveat on the link below:** the Group Comparison tool builds fusion groups using cBioPortal's standard "both genes altered in the structural variant profile" filter, which selects **any** TMPRSS2/ERG fusion pairing (218 vs. 276 samples) — it does not let me restrict to the strict donor/acceptor orientation confirmed in my SQL query above (189 vs. 242 patients). The visual KM curve and log-rank result on this page will reflect the broader definition, not the orientation-specific one.
+
+[View Kaplan-Meier Survival Comparison: TMPRSS2-ERG fusion vs. No fusion](https://www.cbioportal.org/comparison/survival?comparisonId=6ab5ca16e497aad53593c275)
+
+- TMPRSS2-ERG fusion (both genes altered): 218 samples
+- No TMPRSS2-ERG fusion: 276 samples
+
+[Explore the full TCGA PRAD PanCancer Atlas cohort](https://www.cbioportal.org/study?id=prad_tcga_pan_can_atlas_2018)

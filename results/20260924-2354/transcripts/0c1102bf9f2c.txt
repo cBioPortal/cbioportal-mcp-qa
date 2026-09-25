@@ -1,0 +1,551 @@
+Q (sonnet): What are the most frequently mutated genes in copy-number high subtype endometrial cancers compared to other subtypes?
+
+▶ list_guides
+{}
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7083 more chars)
+
+▶ list_studies
+{
+ "search": "endometrial"
+}
+
+▶ search_oncotree
+{
+ "search_term": "endometrial"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"ucec_ancestry_cds_msk_2023","name":"Endometrial Cancer (MSK, Cancer Discovery 2023)","type_of_cancer_id":"ucec","sample_count":1882,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_ancestry_cds_msk_2023"},{"cancer_study_identifier":"ucec_tcga","name":"Uterine Corpus Endometrial Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"ucec","sample_count":549,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_tcga"},{"cancer_study_identifier":"ucec_tcga_gdc","name":"Endometrial Carcinoma (TCGA GDC, 2025)","type_of_cancer_id":"ucec","sample_count":547,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_gdc"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"ucec","sample_count":529,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucec_tcga_pub","name":"Uterine Corpus Endometrial Carcinoma (TCGA, Nature 2013)","type_of_cancer_id":"ucec","sample_count":373,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_pub"},{"cancer_study_identifier":"ucec_msk_2018","name":"Endometrial Cancer (MSK, 2018)","type_of_cancer_id":"ucec","sample_count":197,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_msk_2018"},{"cancer_study_identifier":"ucec_ccr_msk_2022","name":"Endometrial Carcinoma MSI (MSK, Clin Cancer Res 2022)","type_of_cancer_id":"ucec","sample_count":181,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_ccr_msk_2022"},{"cancer_study_identifier":"ucec_cptac_2020","name":"Endometrial Carcinoma (CPTAC, Cell 2020)","type_of_cancer_id":"ucec","sample_count":81,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_cptac_2020"},{"cancer_study_identifier":"ucs_msk_2024","name":"Endometrial Carcinoma (MSK, Molecular Oncology 2024)","type_of_cancer_id":"ucec","sample_count":69,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucs_msk_2024"},{"cancer_study_identifier":"ucec_ccr_cfdna_msk_2022","name":"Endometrial Carcinoma cfDNA (MSK, Clin Cancer Res 2022)","type_of_cancer_id":"ucec","sample_count":44,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_ccr_cfdna_msk_2022"},{"cancer_study_identifier":"ucec_msk_2024","name":"Endometrial and Ovarian Cancer (MSK, Nature Medicine 2024)","type_of_cancer_id":"mixed","sample_count":33,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_msk_2024"},{"cancer_study_identifier":"uec_msk_2024","name":"Endometrial cancer HR-positive (MSK, 2024)","type_of_cancer_id":"ucec","sample_count":24,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=uec_msk_2024"},{"cancer_study_identifier":"uccc_nih_2017","name":"Uterine Clear Cell Carcinoma (NIH, Cancer 2017)","type_of_cancer_id … (447 more chars)
+
+◀ result
+{"result":[{"code":"ESS","name":"Endometrial Stromal Sarcoma","score":60,"mainType":"Uterine Sarcoma","tissue":"Uterus","hierarchy":"UTERUS > USARC > ESS"},{"code":"UCEC","name":"Endometrial Carcinoma","score":60,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC"},{"code":"HGESS","name":"High-Grade Endometrial Stromal Sarcoma","score":50,"mainType":"Uterine Sarcoma","tissue":"Uterus","hierarchy":"UTERUS > USARC > ESS > HGESS"},{"code":"LGESS","name":"Low-Grade Endometrial Stromal Sarcoma","score":50,"mainType":"Uterine Sarcoma","tissue":"Uterus","hierarchy":"UTERUS > USARC > ESS > LGESS"},{"code":"UMEC","name":"Uterine Mixed Endometrial Carcinoma","score":50,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UMEC"},{"code":"OUTT","name":"Other Uterine Tumor","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > OUTT"},{"code":"UASC","name":"Uterine Adenosquamous Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UASC"},{"code":"UCCC","name":"Uterine Clear Cell Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UCCC"},{"code":"UCS","name":"Uterine Carcinosarcoma/Uterine Malignant Mixed Mullerian Tumor","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UCS"},{"code":"UDDC","name":"Uterine Dedifferentiated Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UDDC"},{"code":"UEC","name":"Uterine Endometrioid Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UEC"},{"code":"UMC","name":"Uterine Mucinous Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UMC"},{"code":"UMNC","name":"Uterine Mesonephric Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UMNC"},{"code":"UNEC","name":"Uterine Neuroendocrine Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UNEC"},{"code":"UPDC","name":"Poorly Differentiated Carcinoma of the Uterus","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UPDC"},{"code":"USC","name":"Uterine Serous Carcinoma/Uterine Papillary Serous Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > USC"},{"code":"UUC","name":"Uterine Undifferentiated Carcinoma","score":45,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UUC"}]}
+
+▶ get_study_guide
+{
+ "study_id": "ucec_tcga_pan_can_atlas_2018"
+}
+
+◀ result
+# Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)
+
+**Study ID:** `ucec_tcga_pan_can_atlas_2018`
+
+See `_tcga_pancan_template.md` for common TCGA clinical attributes.
+
+## Study-Specific Attributes
+
+### Molecular Classification (TCGA)
+| Attribute | Description | Values (patients) |
+|-----------|-------------|--------|
+| `SUBTYPE` | TCGA molecular subtype | `UCEC_CN_HIGH` 163, `UCEC_MSI` 148, `UCEC_CN_LOW` 147, `UCEC_POLE` 49, blank 22 |
+
+### Histology
+There is no `HISTOLOGICAL_TYPE` attribute; use `CANCER_TYPE_DETAILED`, plus `GRADE` for grade.
+
+| Attribute | Values (samples) |
+|-----------|--------|
+| `CANCER_TYPE_DETAILED` | Uterine Endometrioid Carcinoma 399, Uterine Serous Carcinoma/Uterine Papillary Serous Carcinoma 109, Uterine Mixed Endometrial Carcinoma 21 |
+| `GRADE` | G3 302, G2 119, G1 97, High Grade 11 |
+
+`AJCC_PATHOLOGIC_TUMOR_STAGE` is blank for all samples.
+
+## Molecular Subtypes
+| Subtype | Characteristics | Prognosis |
+|---------|-----------------|-----------|
+| **POLE** | Ultra-hypermutated (>100 mut/Mb), POLE exonuclease mutations | Excellent |
+| **MSI** | Hypermutated, microsatellite instability, MLH1 silencing | Intermediate |
+| **CN-low** | Microsatellite stable, few copy number alterations | Intermediate |
+| **CN-high** | Serous-like, TP53 mutations, extensive CNA | Poor |
+
+## Key Genes
+| Gene | Frequency | Subtype Association |
+|------|-----------|---------------------|
+| PTEN | ~65% | CN-low, MSI |
+| PIK3CA | ~50% | All subtypes |
+| PIK3R1 | ~30% | CN-low |
+| ARID1A | ~35% | MSI |
+| TP53 | ~25% | CN-high (>90% in this subtype) |
+| KRAS | ~20% | Various |
+| CTNNB1 | ~20% | CN-low |
+| POLE | ~7% | Defines POLE subtype |
+
+## Notes
+- TCGA molecular classification has prognostic value and guides treatment
+- POLE and MSI subtypes are hypermutated but have different mechanisms
+- TP53 mutations with CN-high pattern indicate serous-like behavior regardless of histology
+- POLE mutations should be in exonuclease domain (proofreading) to be driver
+- MSI-H tumors respond well to immunotherapy
+
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT attribute_name FROM clinical_data_derived WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018' AND (upper(attribute_name) LIKE '%SUBTYPE%' OR upper(attribute_name) LIKE '%COPY%' OR upper(attribute_name) LIKE '%MSI%' OR upper(attribute_name) LIKE '%GENOME%')"
+}
+
+◀ result
+{"rows":[{"attribute_name":"SUBTYPE"},{"attribute_name":"FRACTION_GENOME_ALTERED"},{"attribute_name":"MSI_SCORE_MANTIS"},{"attribute_name":"MSI_SENSOR_SCORE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH subtype AS (
+    SELECT patient_unique_id,
+           any(attribute_value) AS subtype
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND attribute_name = 'SUBTYPE'
+    GROUP BY patient_unique_id
+),
+sample_group AS (
+    SELECT cd.sample_unique_id,
+           cd.patient_unique_id,
+           if(s.subtype = 'UCEC_CN_HIGH', 'CN-High', 'Other') AS grp
+    FROM (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived
+          WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018') cd
+    JOIN subtype s USING (patient_unique_id)
+    WHERE s.subtype IS NOT NULL AND s.subtype != ''
+),
+group_totals AS (
+    SELECT grp, COUNT(DISTINCT sample_unique_id) AS total_samples
+    FROM sample_group
+    GROUP BY grp
+),
+mut AS (
+    SELECT sg.grp,
+           ged.hugo_gene_symbol,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN sample_group sg ON ged.sample_unique_id = sg.sample_unique_id
+    WHERE ged.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.off_panel = 0
+    GROUP BY sg.grp, ged.hugo_gene_symbol
+)
+SELECT m.grp, m.hugo_gene_symbol, m.altered_samples, gt.total_samples,
+       round(m.altered_samples * 100.0 / gt.total_samples, 1) AS frequency_pct
+FROM mut m
+JOIN group_totals gt USING (grp)
+ORDER BY m.grp, m.altered_samples DESC
+LIMIT 40
+",
+ "max_rows": 40
+}
+
+◀ result
+{"rows":[{"grp":"CN-High","hugo_gene_symbol":"TP53","altered_samples":141,"total_samples":164,"frequency_pct":86},{"grp":"CN-High","hugo_gene_symbol":"PIK3CA","altered_samples":54,"total_samples":164,"frequency_pct":32.9},{"grp":"CN-High","hugo_gene_symbol":"PPP2R1A","altered_samples":50,"total_samples":164,"frequency_pct":30.5},{"grp":"CN-High","hugo_gene_symbol":"TTN","altered_samples":32,"total_samples":164,"frequency_pct":19.5},{"grp":"CN-High","hugo_gene_symbol":"FBXW7","altered_samples":30,"total_samples":164,"frequency_pct":18.3},{"grp":"CN-High","hugo_gene_symbol":"PTEN","altered_samples":28,"total_samples":164,"frequency_pct":17.1},{"grp":"CN-High","hugo_gene_symbol":"CHD4","altered_samples":25,"total_samples":164,"frequency_pct":15.2},{"grp":"CN-High","hugo_gene_symbol":"PIK3R1","altered_samples":23,"total_samples":164,"frequency_pct":14},{"grp":"CN-High","hugo_gene_symbol":"CSMD3","altered_samples":20,"total_samples":164,"frequency_pct":12.2},{"grp":"CN-High","hugo_gene_symbol":"ARHGAP35","altered_samples":18,"total_samples":164,"frequency_pct":11},{"grp":"CN-High","hugo_gene_symbol":"MUC16","altered_samples":17,"total_samples":164,"frequency_pct":10.4},{"grp":"CN-High","hugo_gene_symbol":"SPOP","altered_samples":13,"total_samples":164,"frequency_pct":7.9},{"grp":"CN-High","hugo_gene_symbol":"RYR2","altered_samples":13,"total_samples":164,"frequency_pct":7.9},{"grp":"CN-High","hugo_gene_symbol":"FOXA2","altered_samples":12,"total_samples":164,"frequency_pct":7.3},{"grp":"CN-High","hugo_gene_symbol":"DMD","altered_samples":12,"total_samples":164,"frequency_pct":7.3},{"grp":"CN-High","hugo_gene_symbol":"TAF1","altered_samples":12,"total_samples":164,"frequency_pct":7.3},{"grp":"CN-High","hugo_gene_symbol":"KMT2D","altered_samples":11,"total_samples":164,"frequency_pct":6.7},{"grp":"CN-High","hugo_gene_symbol":"MUC4","altered_samples":11,"total_samples":164,"frequency_pct":6.7},{"grp":"CN-High","hugo_gene_symbol":"ZFHX4","altered_samples":11,"total_samples":164,"frequency_pct":6.7},{"grp":"CN-High","hugo_gene_symbol":"SYNE1","altered_samples":10,"total_samples":164,"frequency_pct":6.1},{"grp":"CN-High","hugo_gene_symbol":"DNAH8","altered_samples":10,"total_samples":164,"frequency_pct":6.1},{"grp":"CN-High","hugo_gene_symbol":"FLG","altered_samples":10,"total_samples":164,"frequency_pct":6.1},{"grp":"CN-High","hugo_gene_symbol":"AHNAK2","altered_samples":9,"total_samples":164,"frequency_pct":5.5},{"grp":"CN-High","hugo_gene_symbol":"ZFHX3","altered_samples":9,"total_samples":164,"frequency_pct":5.5},{"grp":"CN-High","hugo_gene_symbol":"FAT4","altered_samples":9,"total_samples":164,"frequency_pct":5.5},{"grp":"CN-High","hugo_gene_symbol":"FAT1","altered_samples":9,"total_samples":164,"frequency_pct":5.5},{"grp":"CN-High","hugo_gene_symbol":"PLXNB2","altered_samples":8,"total_samples":164,"frequency_pct":4.9},{"grp":"CN-High","hugo_gene_symbol":"HERC1","altered_samples":8,"total_samples":164,"frequency_pct":4.9},{"grp":"CN-High","hugo_gene_s … (1233 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH subtype AS (
+    SELECT patient_unique_id,
+           any(attribute_value) AS subtype
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND attribute_name = 'SUBTYPE'
+    GROUP BY patient_unique_id
+),
+sample_group AS (
+    SELECT cd.sample_unique_id,
+           cd.patient_unique_id,
+           if(s.subtype = 'UCEC_CN_HIGH', 'CN-High', 'Other') AS grp
+    FROM (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived
+          WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018') cd
+    JOIN subtype s USING (patient_unique_id)
+    WHERE s.subtype IS NOT NULL AND s.subtype != ''
+),
+group_totals AS (
+    SELECT grp, COUNT(DISTINCT sample_unique_id) AS total_samples
+    FROM sample_group
+    GROUP BY grp
+),
+mut AS (
+    SELECT sg.grp,
+           ged.hugo_gene_symbol,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN sample_group sg ON ged.sample_unique_id = sg.sample_unique_id
+    WHERE ged.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.off_panel = 0
+      AND sg.grp = 'Other'
+    GROUP BY sg.grp, ged.hugo_gene_symbol
+)
+SELECT m.grp, m.hugo_gene_symbol, m.altered_samples, gt.total_samples,
+       round(m.altered_samples * 100.0 / gt.total_samples, 1) AS frequency_pct
+FROM mut m
+JOIN group_totals gt USING (grp)
+ORDER BY m.altered_samples DESC
+LIMIT 15
+",
+ "max_rows": 15
+}
+
+◀ result
+{"rows":[{"grp":"Other","hugo_gene_symbol":"PTEN","altered_samples":303,"total_samples":345,"frequency_pct":87.8},{"grp":"Other","hugo_gene_symbol":"ARID1A","altered_samples":216,"total_samples":345,"frequency_pct":62.6},{"grp":"Other","hugo_gene_symbol":"PIK3CA","altered_samples":200,"total_samples":345,"frequency_pct":58},{"grp":"Other","hugo_gene_symbol":"TTN","altered_samples":171,"total_samples":345,"frequency_pct":49.6},{"grp":"Other","hugo_gene_symbol":"PIK3R1","altered_samples":134,"total_samples":345,"frequency_pct":38.8},{"grp":"Other","hugo_gene_symbol":"KMT2D","altered_samples":132,"total_samples":345,"frequency_pct":38.3},{"grp":"Other","hugo_gene_symbol":"CTNNB1","altered_samples":126,"total_samples":345,"frequency_pct":36.5},{"grp":"Other","hugo_gene_symbol":"MUC16","altered_samples":125,"total_samples":345,"frequency_pct":36.2},{"grp":"Other","hugo_gene_symbol":"CTCF","altered_samples":123,"total_samples":345,"frequency_pct":35.7},{"grp":"Other","hugo_gene_symbol":"RYR2","altered_samples":112,"total_samples":345,"frequency_pct":32.5},{"grp":"Other","hugo_gene_symbol":"ZFHX3","altered_samples":112,"total_samples":345,"frequency_pct":32.5},{"grp":"Other","hugo_gene_symbol":"KMT2B","altered_samples":111,"total_samples":345,"frequency_pct":32.2},{"grp":"Other","hugo_gene_symbol":"OBSCN","altered_samples":110,"total_samples":345,"frequency_pct":31.9},{"grp":"Other","hugo_gene_symbol":"MUC5B","altered_samples":109,"total_samples":345,"frequency_pct":31.6},{"grp":"Other","hugo_gene_symbol":"SYNE1","altered_samples":104,"total_samples":345,"frequency_pct":30.1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH subtype AS (
+    SELECT patient_unique_id, any(attribute_value) AS subtype
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018' AND attribute_name = 'SUBTYPE'
+    GROUP BY patient_unique_id
+),
+sample_group AS (
+    SELECT cd.sample_unique_id, cd.patient_unique_id,
+           if(s.subtype = 'UCEC_CN_HIGH', 'CN-High', 'Other') AS grp
+    FROM (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived
+          WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018') cd
+    JOIN subtype s USING (patient_unique_id)
+    WHERE s.subtype IS NOT NULL AND s.subtype != ''
+),
+group_totals AS (SELECT grp, COUNT(DISTINCT sample_unique_id) AS total_samples FROM sample_group GROUP BY grp)
+SELECT sg.grp, COUNT(DISTINCT ged.sample_unique_id) AS altered, gt.total_samples,
+       round(COUNT(DISTINCT ged.sample_unique_id)*100.0/gt.total_samples,1) AS pct
+FROM genomic_event_derived ged
+JOIN sample_group sg ON ged.sample_unique_id = sg.sample_unique_id
+JOIN group_totals gt USING (grp)
+WHERE ged.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+  AND ged.variant_type='mutation' AND ged.mutation_status!='UNCALLED' AND ged.off_panel=0
+  AND ged.hugo_gene_symbol = 'TP53'
+GROUP BY sg.grp, gt.total_samples
+"
+}
+
+◀ result
+{"rows":[{"sg.grp":"Other","altered":50,"total_samples":345,"pct":14.5},{"sg.grp":"CN-High","altered":141,"total_samples":164,"pct":86}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529,"studyViewUrl":"https://www.cbioportal.org/study?id=ucec_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["ucec_tcga_pan_can_atlas_2018_gistic","ucec_tcga_pan_can_atlas_2018_log2CNA","ucec_tcga_pan_can_atlas_2018_mutations","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","ucec_tcga_pan_can_atlas_2018_rppa","ucec_tcga_pan_can_atlas_2018_rppa_Zscores","ucec_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["ucec_tcga_pan_can_atlas_2018_armlevel_cna","ucec_tcga_pan_can_atlas_2018_genetic_ancestry","ucec_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","ucec_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","ucec_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "ucec_tcga_pan_can_atlas_2018",
+ "attributeIds": [
+  "SUBTYPE"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"ucec_tcga_pan_can_atlas_2018","attributes":[{"attributeId":"SUBTYPE","displayName":"Subtype","description":"Subtype","datatype":"STRING","values":["UCEC_MSI","UCEC_CN_HIGH","UCEC_POLE","NA","UCEC_CN_LOW"]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "CN-High",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "UCEC_CN_HIGH"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Other subtypes",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "UCEC_MSI"
+       },
+       {
+        "value": "UCEC_POLE"
+       },
+       {
+        "value": "UCEC_CN_LOW"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "alterations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/alterations?comparisonId=6ab4a04de497aad53593bef1","url":"https://www.cbioportal.org/comparison/alterations?comparisonId=6ab4a04de497aad53593bef1","data":{"description":"Group comparison (2 custom groups)","studies":["ucec_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"CN-High","sampleCount":163},{"name":"Other subtypes","sampleCount":344}],"studyViewUrl":"https://www.cbioportal.org/study?id=ucec_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"CN-High","url":"https://www.cbioportal.org/study?id=ucec_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22UCEC_CN_HIGH%22%7D%5D%7D%5D%7D"},{"groupName":"Other subtypes","url":"https://www.cbioportal.org/study?id=ucec_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22UCEC_MSI%22%7D%2C%7B%22value%22%3A%22UCEC_POLE%22%7D%2C%7B%22value%22%3A%22UCEC_CN_LOW%22%7D%5D%7D%5D%7D"}],"pageDescription":"Comparison of genomic alteration rates across CN-High (163) vs Other subtypes (344)."}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ],
+ "filterJson": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "SUBTYPE",
+    "values": [
+     {
+      "value": "UCEC_CN_HIGH"
+     }
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22UCEC_CN_HIGH%22%7D%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22UCEC_CN_HIGH%22%7D%5D%7D%5D%7D","data":{"studyIds":["ucec_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+**Explore in cBioPortal:**
+
+- [Group Comparison: CN-High vs. Other Subtypes — Genomic Alterations](https://www.cbioportal.org/comparison/alterations?comparisonId=6ab4a04de497aad53593bef1) — CN-High (163 samples) vs. pooled MSI/POLE/CN-Low (344 samples), with per-gene enrichment statistics (Fisher's exact) available in the Mutations/Alterations sub-tab.
+- [Study View: CN-High Subtype Cohort](https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22UCEC_CN_HIGH%22%7D%5D%7D%5D%7D) — cohort overview filtered to the 163 CN-High samples.
+
+The Group Comparison page will compute formal enrichment p-values per gene, which the raw frequencies above do not provide.
