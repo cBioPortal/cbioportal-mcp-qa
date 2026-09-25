@@ -53,7 +53,12 @@ async def _render_one(browser, url: str, shots_dir: Path, rel_dir: str) -> Rende
             name = screenshot_name(url)
             await page.screenshot(path=shots_dir / name, type="jpeg", quality=60)
             return Render(
-                url, False, "", "page content did not render within 60s", f"{rel_dir}/{name}", time.monotonic() - started
+                url,
+                False,
+                "",
+                "page content did not render within 60s",
+                f"{rel_dir}/{name}",
+                time.monotonic() - started,
             )
         try:
             await page.wait_for_load_state("networkidle", timeout=30_000)

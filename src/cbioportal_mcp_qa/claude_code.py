@@ -87,7 +87,8 @@ def tool_setup(
     loaded = probe_mcp_servers(setup, workdir, env)
     if wanted not in loaded:
         raise RuntimeError(
-            f"claude.ai connector {connector!r} is not connected for this Claude home: {sorted(loaded)}"
+            f"claude.ai connector {connector!r} did not load for this Claude home — it may need you to sign in "
+            f"again (claude.ai → Settings → Connectors, or /mcp in claude); loaded: {sorted(loaded)}"
         )
     # Every other claude.ai connector would otherwise be visible to the model.
     setup.disallowed = [f"mcp__{s}" for s in sorted(loaded) if s.startswith("claude_ai_") and s != wanted]
@@ -170,6 +171,23 @@ def short_tool_name(name: str) -> str:
 
 
 RESULT_CHARS = 3000
+
+
+def connector_needs_signin(lines: list[str], connector: str) -> bool:
+    """Whether the claude.ai connector's login has expired: its init status or a tool error says so."""
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        event = json.loads(line)
+        if event.get("subtype") == "init":
+            for server in event.get("mcp_servers") or []:
+                if server.get("name") == connector and server.get("status") == "needs-auth":
+                    return True
+        for block in (event.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error"):
+                if "sign in" in json.dumps(block.get("content")):
+                    return True
+    return False
 
 
 def format_transcript(lines: list[str]) -> str:
@@ -270,6 +288,7 @@ class ClaudeCodeClient:
     ):
         self.system_prompt = system_prompt
         self.transcript_dir = transcript_dir
+        self.signin_expired = False
         self.timeout_s = timeout_s
         self.retries = retries
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
@@ -283,12 +302,19 @@ class ClaudeCodeClient:
     async def aclose(self) -> None:
         self._workdir.cleanup()
 
+    def signin_message(self) -> str:
+        return f"claude.ai connector {self.setup.connector!r} needs you to sign in again"
+
     async def ask(self, question: str, model: str) -> AgentReply:
         started = time.time()
         retries = connector_misses = 0
         while True:
+            if self.signin_expired:
+                return AgentReply("", None, None, self.signin_message(), 0.0, started)
             reply = await self._run(question, model, started)
             if reply.error is None:
+                return reply
+            if self.signin_expired:
                 return reply
             if "did not load in this session" in reply.error:
                 # The attempt never had the database tools; retry it without using up a regular retry.
@@ -322,6 +348,11 @@ class ClaudeCodeClient:
             )
         lines = stdout.decode().splitlines()
         reply = parse_stream(lines, started, time.monotonic() - t0)
+        if self.setup.connector and connector_needs_signin(lines, self.setup.connector):
+            self.signin_expired = True
+            reply.status = None
+            reply.error = self.signin_message()
+            return reply
         if self.setup.connector and connector_tool_prefix(self.setup.connector) not in (
             loaded_servers(lines) or set()
         ):
