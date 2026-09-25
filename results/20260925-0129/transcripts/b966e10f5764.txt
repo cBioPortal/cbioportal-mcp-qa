@@ -1,0 +1,308 @@
+Q (haiku): In the Breast Invasive Carcinoma TCGA study what are the top 5 down-regulated genes in TP53 mutated samples compared to non-mutated ones?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+▶ list_studies
+{
+ "search": "breast invasive carcinoma TCGA"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"brca","sample_count":1084,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"brca_tcga","name":"Breast Invasive Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"brca","sample_count":1108,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga"},{"cancer_study_identifier":"brca_tcga_gdc","name":"Invasive Breast Carcinoma (TCGA GDC, 2025)","type_of_cancer_id":"brca","sample_count":1102,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_gdc"},{"cancer_study_identifier":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","type_of_cancer_id":"brca","sample_count":825,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pub"},{"cancer_study_identifier":"brca_tcga_pub2015","name":"Breast Invasive Carcinoma (TCGA, Cell 2015)","type_of_cancer_id":"brca","sample_count":818,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pub2015"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND profile_type LIKE '%mrna%'
+ORDER BY profile_type
+LIMIT 100
+"
+}
+
+◀ result
+{"rows":[{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get TP53 mutated and non-mutated samples
+WITH tp53_status AS (
+  SELECT DISTINCT sample_unique_id,
+         CASE WHEN hugo_gene_symbol = 'TP53' AND variant_type = 'mutation' 
+              AND mutation_status != 'UNCALLED' THEN 'mutated' ELSE 'wildtype' END AS tp53_status
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+    AND off_panel = 0
+),
+-- Get all samples (mark as wildtype if not found in mutation list)
+all_samples AS (
+  SELECT DISTINCT sample_unique_id
+  FROM genetic_alteration_derived
+  WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+),
+tp53_assignments AS (
+  SELECT s.sample_unique_id,
+         COALESCE(t.tp53_status, 'wildtype') AS tp53_status
+  FROM all_samples s
+  LEFT JOIN tp53_status t USING (sample_unique_id)
+),
+-- Get expression data and assign TP53 status
+expr_with_status AS (
+  SELECT g.hugo_gene_symbol,
+         t.tp53_status,
+         toFloat64OrNull(g.alteration_value) AS expr_value,
+         g.sample_unique_id
+  FROM genetic_alteration_derived g
+  JOIN tp53_assignments t USING (sample_unique_id)
+  WHERE g.cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+    AND g.profile_type = 'rna_seq_v2_mrna_median_Zscores'
+    AND g.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+    AND g.hugo_gene_symbol NOT IN ('', 'NA')
+),
+-- Compute mean expression per gene per TP53 status
+gene_means AS (
+  SELECT hugo_gene_symbol,
+         tp53_status,
+         AVG(expr_value) AS mean_expr,
+         COUNT(*) AS n_samples
+  FROM expr_with_status
+  GROUP BY hugo_gene_symbol, tp53_status
+),
+-- Calculate fold change (mutated vs wildtype)
+gene_comparison AS (
+  SELECT mutated.hugo_gene_symbol,
+         mutated.mean_expr AS mean_mutated,
+         wildtype.mean_expr AS mean_wildtype,
+         mutated.n_samples AS n_mutated,
+         wildtype.n_samples AS n_wildtype,
+         (mutated.mean_expr - wildtype.mean_expr) AS expr_diff
+  FROM gene_means mutated
+  JOIN gene_means wildtype 
+    ON mutated.hugo_gene_symbol = wildtype.hugo_gene_symbol
+       AND mutated.tp53_status = 'mutated'
+       AND wildtype.tp53_status = 'wildtype'
+  WHERE mutated.n_samples >= 5 AND wildtype.n_samples >= 5
+)
+SELECT hugo_gene_symbol,
+       mean_mutated,
+       mean_wildtype,
+       expr_diff,
+       n_mutated,
+       n_wildtype
+FROM gene_comparison
+ORDER BY expr_diff ASC  -- Most down-regulated (most negative difference) first
+LIMIT 5
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"FGF4","mean_mutated":5.629154466858832,"mean_wildtype":49.461638775509705,"expr_diff":-43.832484308650876,"n_mutated":347,"n_wildtype":1078},{"hugo_gene_symbol":"CCDC172","mean_mutated":0.10024726224783863,"mean_wildtype":9.920616604824252,"expr_diff":-9.820369342576413,"n_mutated":347,"n_wildtype":1078},{"hugo_gene_symbol":"PRM1","mean_mutated":-0.052085302593660114,"mean_wildtype":8.789605009276492,"expr_diff":-8.841690311870153,"n_mutated":347,"n_wildtype":1078},{"hugo_gene_symbol":"PSG11","mean_mutated":0.057010662824207844,"mean_wildtype":5.672054545454717,"expr_diff":-5.615043882630509,"n_mutated":347,"n_wildtype":1078},{"hugo_gene_symbol":"ADAM5","mean_mutated":0.21272247838616837,"mean_wildtype":4.861539424860712,"expr_diff":-4.648816946474544,"n_mutated":347,"n_wildtype":1078}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["brca_tcga_pan_can_atlas_2018_gistic","brca_tcga_pan_can_atlas_2018_log2CNA","brca_tcga_pan_can_atlas_2018_mutations","brca_tcga_pan_can_atlas_2018_protein_quantification","brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa","brca_tcga_pan_can_atlas_2018_rppa_Zscores","brca_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["brca_tcga_pan_can_atlas_2018_armlevel_cna","brca_tcga_pan_can_atlas_2018_genetic_ancestry","brca_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","brca_tcga_pan_can_atlas_2018_methylation_hm450","brca_tcga_pan_can_atlas_2018_phosphoprotein_quantification"],"heatmapProfileIds":["brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_anc … (83 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "TP53 Mutated",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "brca_tcga_pan_can_atlas_2018_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "TP53"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "TP53 Wildtype",
+   "studyViewFilter": {
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "TP53",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "NOT_MUTATED"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "mrna"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/mrna?comparisonId=69b1b02e32b378b55477162a","url":"https://www.cbioportal.org/comparison/mrna?comparisonId=69b1b02e32b378b55477162a","data":{"description":"Group comparison (2 custom groups)","studies":["brca_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"TP53 Mutated","sampleCount":347},{"name":"TP53 Wildtype","sampleCount":719}],"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"TP53 Mutated","url":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22brca_tcga_pan_can_atlas_2018_mutations%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%5D%5D%7D%5D%7D"},{"groupName":"TP53 Wildtype","url":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018#filterJson=%7B%22mutationDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%2C%22profileType%22%3A%22mutations%22%2C%22categorization%22%3A%22MUTATED%22%2C%22values%22%3A%5B%5B%7B%22value%22%3A%22NOT_MUTATED%22%7D%5D%5D%7D%5D%7D"}],"pageDescription":"mRNA expression for all genes compared across TP53 Mutated (347) vs TP53 Wildtype (719)."}}
+
+═ answer (success)
+## Top 5 Down-Regulated Genes in TP53-Mutated Breast Cancer
+
+Based on analysis of **Breast Invasive Carcinoma (TCGA, PanCancer Atlas)** using mRNA expression Z-scores:
+
+| Gene | Mean Expr (TP53 mut) | Mean Expr (TP53 WT) | Difference | N Mutated | N Wildtype |
+|---|---|---|---|---|---|
+| **FGF4** | 5.6 | 49.5 | −43.8 | 347 | 1,078 |
+| **CCDC172** | 0.1 | 9.9 | −9.8 | 347 | 1,078 |
+| **PRM1** | −0.05 | 8.8 | −8.8 | 347 | 1,078 |
+| **PSG11** | 0.06 | 5.7 | −5.6 | 347 | 1,078 |
+| **ADAM5** | 0.2 | 4.9 | −4.6 | 347 | 1,078 |
+
+**Key Finding:** FGF4 shows the most dramatic down-regulation in TP53-mutated samples, with a mean expression difference of −43.8 Z-score units. The other four genes show moderate down-regulation (5–10 Z-score units).
+
+**Note:** Expression values are median-centered Z-scores from RNA-Seq, providing normalized comparisons across the cohort. These represent associations, not necessarily causal relationships with TP53 mutation status.
+
+### Explore Further
+[View mRNA expression comparison (TP53 Mutated vs Wildtype)](https://www.cbioportal.org/comparison/mrna?comparisonId=69b1b02e32b378b55477162a)
+
+This interactive comparison allows you to:
+- Search and rank genes by expression difference
+- Run statistical tests (t-test) on any gene
+- Filter by expression magnitude or significance

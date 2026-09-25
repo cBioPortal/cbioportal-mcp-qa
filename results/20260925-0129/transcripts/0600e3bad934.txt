@@ -1,0 +1,229 @@
+Q (sonnet): Is CDK4 mRNA expression significantly higher in samples with CDK4 amplification compared to diploid samples?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ list_studies
+{
+ "search": "sarcoma pan_can_atlas"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"sarc_tcga_pan_can_atlas_2018","name":"Sarcoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"soft_tissue","sample_count":255,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=sarc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucs_tcga_pan_can_atlas_2018","name":"Uterine Carcinosarcoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"ucs","sample_count":57,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucs_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type FROM genetic_alteration_derived WHERE cancer_study_identifier = 'sarc_tcga_pan_can_atlas_2018' ORDER BY profile_type"
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"log2CNA"},{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rppa"},{"profile_type":"rppa_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cna AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS cna_value
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'sarc_tcga_pan_can_atlas_2018'
+      AND profile_type = 'gistic'
+      AND hugo_gene_symbol = 'CDK4'
+      AND alteration_value NOT IN ('', 'NA')
+),
+expr AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS expr_value
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'sarc_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND hugo_gene_symbol = 'CDK4'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+SELECT
+    CASE WHEN cna.cna_value = 2 THEN 'AMP' WHEN cna.cna_value = 0 THEN 'DIPLOID' ELSE 'OTHER' END AS cna_group,
+    count() AS n,
+    avg(log2(expr.expr_value + 1)) AS mean_log2_expr,
+    quantile(0.5)(log2(expr.expr_value + 1)) AS median_log2_expr,
+    min(log2(expr.expr_value + 1)) AS min_log2_expr,
+    max(log2(expr.expr_value + 1)) AS max_log2_expr
+FROM cna
+INNER JOIN expr USING (sample_unique_id)
+GROUP BY cna_group
+ORDER BY cna_group
+"
+}
+
+◀ result
+{"rows":[{"cna_group":"AMP","n":44,"mean_log2_expr":15.907909502449172,"median_log2_expr":16.022728935423576,"min_log2_expr":12.954430801989668,"max_log2_expr":18.359015983284944},{"cna_group":"DIPLOID","n":117,"mean_log2_expr":11.679878987064713,"median_log2_expr":11.614005806473257,"min_log2_expr":10.589913260672201,"max_log2_expr":13.174026838169365},{"cna_group":"OTHER","n":90,"mean_log2_expr":11.839065909326473,"median_log2_expr":11.621199048418335,"min_log2_expr":10.075439036927389,"max_log2_expr":17.34516265173335}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "sarc_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"sarc_tcga_pan_can_atlas_2018","name":"Sarcoma (TCGA, PanCancer Atlas)","sampleCount":255,"studyViewUrl":"https://www.cbioportal.org/study?id=sarc_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT"],"molecularProfileIds":["sarc_tcga_pan_can_atlas_2018_gistic","sarc_tcga_pan_can_atlas_2018_log2CNA","sarc_tcga_pan_can_atlas_2018_mutations","sarc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","sarc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","sarc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","sarc_tcga_pan_can_atlas_2018_rppa","sarc_tcga_pan_can_atlas_2018_rppa_Zscores","sarc_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["sarc_tcga_pan_can_atlas_2018_armlevel_cna","sarc_tcga_pan_can_atlas_2018_genetic_ancestry","sarc_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","sarc_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["sarc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","sarc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","sarc_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "sarc_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "CDK4 Amplified",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "CDK4",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "2"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "CDK4 Diploid",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "CDK4",
+      "profileType": "gistic",
+      "values": [
+       {
+        "value": "0"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "mrna",
+ "selectedGene": "CDK4"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/mrna?comparisonId=6ab5cf44e497aad53593c280&selectedGene=CDK4","url":"https://www.cbioportal.org/comparison/mrna?comparisonId=6ab5cf44e497aad53593c280&selectedGene=CDK4","data":{"description":"Group comparison (2 custom groups)","studies":["sarc_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"CDK4 Amplified","sampleCount":44},{"name":"CDK4 Diploid","sampleCount":118}],"studyViewUrl":"https://www.cbioportal.org/study?id=sarc_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"CDK4 Amplified","url":"https://www.cbioportal.org/study?id=sarc_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22CDK4%22%2C%22profileType%22%3A%22gistic%22%2C%22values%22%3A%5B%7B%22value%22%3A%222%22%7D%5D%7D%5D%7D"},{"groupName":"CDK4 Diploid","url":"https://www.cbioportal.org/study?id=sarc_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22CDK4%22%2C%22profileType%22%3A%22gistic%22%2C%22values%22%3A%5B%7B%22value%22%3A%220%22%7D%5D%7D%5D%7D"}],"pageDescription":"mRNA expression for all genes compared across CDK4 Amplified (44) vs CDK4 Diploid (118)."}}
+
+═ answer (success)
+Here is the group comparison, pre-configured to run the actual test and show CDK4 mRNA expression directly:
+
+**[View CDK4 Amplified vs Diploid — mRNA Expression Comparison](https://www.cbioportal.org/comparison/mrna?comparisonId=6ab5cf44e497aad53593c280&selectedGene=CDK4)**
+
+- CDK4 Amplified group: 44 samples
+- CDK4 Diploid group: 118 samples
+- mRNA expression for all genes compared across the two groups; CDK4 is pre-selected. This page runs the actual statistical test (t-test by default) and will report the p-value directly.
+
+**Summary of what I found from the raw data (Sarcoma TCGA PanCancer Atlas, N=255 samples total):**
+- CDK4-amplified samples (n=44): mean log2 RNA-seq expression 15.91, median 16.02
+- CDK4-diploid samples (n=117): mean log2 expression 11.68, median 11.61
+
+That's roughly a 4.2 log2-unit (≈18-fold) difference in mean expression, with essentially non-overlapping ranges between groups — a large, biologically expected effect of gene dosage. However, I did not compute a p-value myself; the linked comparison page will calculate the Student's t-test result (or you can pull the values into R/Python as noted above) to confirm statistical significance.

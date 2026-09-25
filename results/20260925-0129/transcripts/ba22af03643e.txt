@@ -1,0 +1,340 @@
+Q (sonnet): "In samples with both KRAS and NRAS mutations, what is the distribution of variant allele frequencies suggesting clonal vs subclonal events?"
+
+▶ list_guides
+{}
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://common-pitfalls"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+# Common Query Pitfalls Guide
+
+## Overview
+This guide highlights frequent mistakes when analyzing cBioPortal data and provides solutions to avoid them.
+
+## Critical Pitfalls
+
+### 1. 🚨 CRITICAL MUTATION FREQUENCY ERRORS
+
+#### ❌ WRONG: Using study-wide totals for gene frequencies
+```sql
+-- INCORRECT - This gives wrong frequencies!
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples,
+    (SELECT COUNT(DISTINCT sample_unique_id)
+     FROM genomic_event_derived
+     WHERE cancer_study_identifier = 'your_study_id') as total_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND cancer_study_identifier = 'your_study_id'
+GROUP BY hugo_gene_symbol;
+```
+**Problem**: Different genes have different profiling coverage - you can't use study-wide totals!
+
+#### ❌ WRONG: Not using gene-specific profiling denominators
+```sql
+-- INCORRECT - Missing gene-specific denominators
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+GROUP BY hugo_gene_symbol;
+-- Missing: WHERE ARE THE DENOMINATORS FOR EACH GENE?
+```
+
+#### ❌ WRONG: Skipping individual gene profiling queries
+**Problem**: Failing to run separate profiling queries for EACH gene in results.
+**Each gene has different coverage**: TP53 might be profiled in 25,040 samples, MUC16 in 23,000, etc.
+
+#### ✅ CORRECT: Complete gene-specific workflow
+```sql
+-- STEP 1: Get altered counts per gene
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id,
+    COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
+    COUNT(*) AS totalMutationEvents
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY entrez_gene_id, hugo_gene_symbol
+ORDER BY numberOfAlteredSamplesOnPanel DESC;
+
+-- STEP 2: FOR EACH GENE, run this profiling query:
+SELECT COUNT(DISTINCT stgp.sample_unique_id) AS numberOfProfiledSamples
+FROM sample_to_gene_panel_derived stgp
+JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+  AND g.hugo_gene_symbol = 'TP53'  -- Replace with each gene from Step 1
+  AND stgp.cancer_study_identifier = 'your_study_id';
+
+-- STEP 3: Calculate frequency = numberOfAlteredSamplesOnPanel / numberOfProfiledSamples * 100
+```
+
+#### 🚨 WORKFLOW REQUIREMENTS VIOLATIONS:
+- **Missing denominator columns**: Must show gene-specific profiled samples per row
+- **Wrong table format**: Should be | Gene | # Mutations | # Samples | Profiled Samples | Sample % |
+- **Not replacing gene symbols**: Must replace 'TP53' with actual gene for each query
+- **Using study totals**: Never use genomic_event_derived for total sample counts
+
+### 2. 🚨 OFF-PANEL MUTATION INCLUSION
+
+#### ❌ Wrong: Including off-panel mutations
+```sql
+-- INCORRECT - Includes mutations outside gene panels
+SELEC … (37891 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation"
+}
+
+◀ result
+{"columns":[{"name":"mutation_event_id","type":"Int64","comment":"References mutation_event.mutation_event_id."},{"name":"genetic_profile_id","type":"Int64","comment":"References genetic_profile.genetic_profile_id."},{"name":"sample_id","type":"Int64","comment":"References sample.internal_id."},{"name":"entrez_gene_id","type":"Int64","comment":"References gene.entrez_gene_id."},{"name":"center","type":"Nullable(String)","comment":"Center where sequencing was performed."},{"name":"sequencer","type":"Nullable(String)","comment":"Sequencing platform used."},{"name":"mutation_status","type":"Nullable(String)","comment":"Mutation status: Germline,\n    Somatic,\n    or LOH."},{"name":"validation_status","type":"Nullable(String)","comment":"Validation status."},{"name":"tumor_seq_allele1","type":"Nullable(String)","comment":"Tumor allele 1 sequence."},{"name":"tumor_seq_allele2","type":"Nullable(String)","comment":"Tumor allele 2 sequence."},{"name":"matched_norm_sample_barcode","type":"Nullable(String)","comment":"Matched normal sample barcode."},{"name":"match_norm_seq_allele1","type":"Nullable(String)","comment":"Matched normal allele 1 sequence."},{"name":"match_norm_seq_allele2","type":"Nullable(String)","comment":"Matched normal allele 2 sequence."},{"name":"tumor_validation_allele1","type":"Nullable(String)","comment":"Tumor validation allele 1 sequence."},{"name":"tumor_validation_allele2","type":"Nullable(String)","comment":"Tumor validation allele 2 sequence."},{"name":"match_norm_validation_allele1","type":"Nullable(String)","comment":"Matched normal validation allele 1."},{"name":"match_norm_validation_allele2","type":"Nullable(String)","comment":"Matched normal validation allele 2."},{"name":"verification_status","type":"Nullable(String)","comment":"Verification status."},{"name":"sequencing_phase","type":"Nullable(String)","comment":"Sequencing phase."},{"name":"sequence_source","type":"String","comment":"Source of sequencing data."},{"name":"validation_method","type":"Nullable(String)","comment":"Validation method used."},{"name":"score","type":"Nullable(String)","comment":"Score or quality metric."},{"name":"bam_file","type":"Nullable(String)","comment":"Associated BAM file."},{"name":"tumor_alt_count","type":"Nullable(Int64)","comment":"Tumor alternate allele count."},{"name":"tumor_ref_count","type":"Nullable(Int64)","comment":"Tumor reference allele count."},{"name":"normal_alt_count","type":"Nullable(Int64)","comment":"Normal alternate allele count."},{"name":"normal_ref_count","type":"Nullable(Int64)","comment":"Normal reference allele count."},{"name":"amino_acid_change","type":"Nullable(String)","comment":"Amino acid change from mutation."},{"name":"annotation_json","type":"Nullable(String)","comment":"JSON-formatted annotations."}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation_event"
+}
+
+◀ result
+{"columns":[{"name":"molecularProfileId","type":"String","comment":"Stable ID of the genetic profile"},{"name":"sampleId","type":"String","comment":"Stable ID of the sample"},{"name":"sampleInternalId","type":"Int64"},{"name":"patientId","type":"String","comment":"Stable ID of the patient"},{"name":"entrezGeneId","type":"Int64","comment":"Entrez Gene ID from mutation table (NOT NULL)"},{"name":"studyId","type":"String","comment":"Cancer study identifier"},{"name":"center","type":"Nullable(String)","comment":"Sequencing center"},{"name":"mutationStatus","type":"Nullable(String)","comment":"Mutation status (e.g., Somatic, Germline)"},{"name":"validationStatus","type":"Nullable(String)","comment":"Validation status"},{"name":"tumorAltCount","type":"Nullable(Int64)","comment":"Tumor alternate allele count"},{"name":"tumorRefCount","type":"Nullable(Int64)","comment":"Tumor reference allele count"},{"name":"normalAltCount","type":"Nullable(Int64)","comment":"Normal alternate allele count"},{"name":"normalRefCount","type":"Nullable(Int64)","comment":"Normal reference allele count"},{"name":"aminoAcidChange","type":"Nullable(String)","comment":"Amino acid change"},{"name":"chr","type":"Nullable(String)","comment":"Chromosome"},{"name":"startPosition","type":"Nullable(Int64)","comment":"Start position"},{"name":"endPosition","type":"Nullable(Int64)","comment":"End position"},{"name":"referenceAllele","type":"Nullable(String)","comment":"Reference allele"},{"name":"tumorSeqAllele","type":"Nullable(String)","comment":"Tumor sequence allele"},{"name":"proteinChange","type":"Nullable(String)","comment":"Protein change"},{"name":"mutationType","type":"Nullable(String)","comment":"Type of mutation"},{"name":"ncbiBuild","type":"Nullable(String)","comment":"NCBI build version"},{"name":"variantType","type":"Nullable(String)","comment":"Variant type"},{"name":"refseqMrnaId","type":"Nullable(String)","comment":"RefSeq mRNA ID"},{"name":"proteinPosStart","type":"Nullable(Int64)","comment":"Protein position start"},{"name":"proteinPosEnd","type":"Nullable(Int64)","comment":"Protein position end"},{"name":"keyword","type":"Nullable(String)","comment":"Keyword"},{"name":"annotationJSON","type":"Nullable(String)","comment":"Annotation JSON"},{"name":"driverFilter","type":"Nullable(String)","comment":"Driver filter"},{"name":"driverFilterAnnotation","type":"Nullable(String)","comment":"Driver filter annotation"},{"name":"driverTiersFilter","type":"Nullable(String)","comment":"Driver tiers filter"},{"name":"driverTiersFilterAnnotation","type":"Nullable(String)","comment":"Driver tiers filter annotation"},{"name":"GENE.entrezGeneId","type":"Nullable(Int64)","comment":"Gene entrez ID"},{"name":"GENE.hugoGeneSymbol","type":"Nullable(String)","comment":"HUGO gene symbol"},{"name":"GENE.type","type":"Nullable(String)","comment":"Gene type"},{"name":"alleleSpecificCopyNumber.ascnIntegerCopyNumber","type":"Nullable(Int64)","comment":"ASCN integer copy number"},{"name":"alleleSpe … (756 more chars)
+
+◀ result
+{"columns":[{"name":"mutation_event_id","type":"Int64"},{"name":"entrez_gene_id","type":"Int64"},{"name":"chr","type":"Nullable(String)"},{"name":"start_position","type":"Nullable(Int64)"},{"name":"end_position","type":"Nullable(Int64)"},{"name":"reference_allele","type":"Nullable(String)"},{"name":"tumor_seq_allele","type":"Nullable(String)"},{"name":"protein_change","type":"Nullable(String)"},{"name":"mutation_type","type":"Nullable(String)"},{"name":"ncbi_build","type":"Nullable(String)"},{"name":"strand","type":"Nullable(String)"},{"name":"variant_type","type":"Nullable(String)"},{"name":"db_snp_rs","type":"Nullable(String)"},{"name":"db_snp_val_status","type":"Nullable(String)"},{"name":"refseq_mrna_id","type":"Nullable(String)"},{"name":"codon_change","type":"Nullable(String)"},{"name":"uniprot_accession","type":"Nullable(String)"},{"name":"protein_pos_start","type":"Nullable(Int64)"},{"name":"protein_pos_end","type":"Nullable(Int64)"},{"name":"canonical_transcript","type":"Nullable(Int32)"},{"name":"keyword","type":"Nullable(String)"}]}
+
+▶ list_studies
+{
+ "search": "MSK-IMPACT",
+ "limit": 10
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, count() AS n_rows, countIf(tumor_alt_count IS NOT NULL AND tumor_ref_count IS NOT NULL) AS n_with_counts
+FROM mutation m
+JOIN genetic_profile gp ON m.genetic_profile_id = gp.genetic_profile_id
+WHERE gp.cancer_study_identifier IN ('msk_impact_2017','msk_chord_2024','msk_impact_2020')
+GROUP BY cancer_study_identifier"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_impact_50k_2026","name":"MSK-IMPACT 50K Clinical Sequencing Cohort (MSK, Cancer Cell 2026)","type_of_cancer_id":"mixed","sample_count":54331,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_impact_50k_2026"},{"cancer_study_identifier":"msk_ch_2023","name":"Cancer Therapy and Clonal Hematopoiesis (MSK, Blood Adv 2023)","type_of_cancer_id":"mixed","sample_count":42714,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_ch_2023"},{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"},{"cancer_study_identifier":"msk_ch_2020","name":"Cancer Therapy and Clonal Hematopoiesis (MSK, Nat Genet 2020)","type_of_cancer_id":"mixed","sample_count":24146,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_ch_2020"},{"cancer_study_identifier":"msk_impact_2017","name":"MSK-IMPACT Clinical Sequencing Cohort (MSK, Nat Med 2017)","type_of_cancer_id":"mixed","sample_count":10945,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_impact_2017"},{"cancer_study_identifier":"crc_msk_2026","name":"Colorectal Adenocarcinoma (MSK, 2026)","type_of_cancer_id":"read","sample_count":7237,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=crc_msk_2026"},{"cancer_study_identifier":"breast_msk_2026","name":"CCNE1 Amplifications in Breast Cancer (MSK, 2026)","type_of_cancer_id":"breast","sample_count":6318,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2026"},{"cancer_study_identifier":"pancan_mimsi_msk_2024","name":"Mixed Tumors - MiMSI Cohort (MSK, Nat Commun 2024)","type_of_cancer_id":"mixed","sample_count":5033,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pancan_mimsi_msk_2024"},{"cancer_study_identifier":"breast_msk_2025","name":"Breast Cancer (MSK, Nat Genet 2025)","type_of_cancer_id":"brca","sample_count":3879,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2025"},{"cancer_study_identifier":"mycf_msk_2026","name":"MYC Family Amplifications in MSK-IMPACT Solid Tumors (MSK, 2026)","type_of_cancer_id":"mixed","sample_count":3442,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=mycf_msk_2026"}]}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `cancer_study_identifier` in scope SELECT cancer_study_identifier, count() AS n_rows, countIf((tumor_alt_count IS NOT NULL) AND (tumor_ref_count IS NOT NULL)) AS n_with_counts FROM mutation AS m INNER JOIN genetic_profile AS gp ON m.genetic_profile_id = gp.genetic_profile_id WHERE gp.cancer_study_identifier IN ('msk_impact_2017', 'msk_chord_2024', 'msk_impact_2020') GROUP BY cancer_study_identifier. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT studyId, count() AS n_rows,
+       countIf(tumorAltCount IS NOT NULL AND tumorRefCount IS NOT NULL AND (tumorAltCount+tumorRefCount)>0) AS n_with_counts
+FROM mutation_derived
+WHERE studyId IN ('msk_impact_2017','msk_chord_2024','msk_impact_50k_2026')
+GROUP BY studyId"
+}
+
+◀ result
+{"rows":[{"studyId":"msk_impact_2017","n_rows":78142,"n_with_counts":78142},{"studyId":"msk_chord_2024","n_rows":208232,"n_with_counts":208232},{"studyId":"msk_impact_50k_2026","n_rows":478790,"n_with_counts":478785}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH kras AS (
+    SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'KRAS'
+      AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+),
+nras AS (
+    SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'NRAS'
+      AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+)
+SELECT count() FROM kras WHERE sample_unique_id IN (SELECT sample_unique_id FROM nras)
+"
+}
+
+◀ result
+{"rows":[{"count()":40}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "sample"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int64","comment":"Primary key. Unique internal identifier for the sample."},{"name":"stable_id","type":"String","comment":"Stable identifier for the sample within the study. Combined with cancer_study_identifier forms sample_unique_id."},{"name":"patient_id","type":"Int64","comment":"Foreign key to patient.internal_id. Links sample to its patient."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH kras AS (
+    SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'KRAS'
+      AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+),
+nras AS (
+    SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'NRAS'
+      AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+),
+comut AS (
+    SELECT sample_unique_id FROM kras WHERE sample_unique_id IN (SELECT sample_unique_id FROM nras)
+)
+SELECT
+    md.sampleId,
+    md.studyId,
+    g.GENE.hugoGeneSymbol AS gene,
+    md.proteinChange,
+    md.mutationType,
+    md.tumorAltCount AS alt,
+    md.tumorRefCount AS ref,
+    round(md.tumorAltCount * 100.0 / nullif(md.tumorAltCount + md.tumorRefCount,0), 1) AS vaf_pct
+FROM mutation_derived md
+JOIN (SELECT * FROM mutation_derived) g ON 1=1  -- placeholder, will fix
+WHERE 1=0
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH kras AS (
+    SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'KRAS'
+      AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+),
+nras AS (
+    SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'NRAS'
+      AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+),
+comut AS (
+    SELECT sample_unique_id FROM kras WHERE sample_unique_id IN (SELECT sample_unique_id FROM nras)
+)
+SELECT
+    md.sampleId,
+    md.`GENE.hugoGeneSymbol` AS gene,
+    md.proteinChange,
+    md.mutationType,
+    md.tumorAltCount AS alt,
+    md.tumorRefCount AS ref,
+    round(md.tumorAltCount * 100.0 / nullif(md.tumorAltCount + md.tumorRefCount,0), 1) AS vaf_pct
+FROM mutation_derived md
+WHERE md.studyId = 'msk_chord_2024'
+  AND concat('msk_chord_2024_', md.sampleId) IN (SELECT sample_unique_id FROM comut)
+  AND md.`GENE.hugoGeneSymbol` IN ('KRAS','NRAS')
+  AND md.tumorAltCount IS NOT NULL AND md.tumorRefCount IS NOT NULL
+ORDER BY md.sampleId, gene
+"
+}
+
+◀ result
+{"rows":[{"sampleId":"P-0001237-T01-IM3","gene":"KRAS","proteinChange":"G13D","mutationType":"Missense_Mutation","alt":20,"ref":259,"vaf_pct":7.2},{"sampleId":"P-0001237-T01-IM3","gene":"NRAS","proteinChange":"D105Tfs*9","mutationType":"Frame_Shift_Del","alt":16,"ref":179,"vaf_pct":8.2},{"sampleId":"P-0006141-T01-IM5","gene":"KRAS","proteinChange":"G12V","mutationType":"Missense_Mutation","alt":31,"ref":446,"vaf_pct":6.5},{"sampleId":"P-0006141-T01-IM5","gene":"NRAS","proteinChange":"Q61K","mutationType":"Missense_Mutation","alt":20,"ref":598,"vaf_pct":3.2},{"sampleId":"P-0007076-T03-IM5","gene":"KRAS","proteinChange":"E63K","mutationType":"Missense_Mutation","alt":250,"ref":1716,"vaf_pct":12.7},{"sampleId":"P-0007076-T03-IM5","gene":"NRAS","proteinChange":"G13S","mutationType":"Missense_Mutation","alt":75,"ref":917,"vaf_pct":7.6},{"sampleId":"P-0007592-T01-IM5","gene":"KRAS","proteinChange":"G12A","mutationType":"Missense_Mutation","alt":272,"ref":688,"vaf_pct":28.3},{"sampleId":"P-0007592-T01-IM5","gene":"NRAS","proteinChange":"Q61K","mutationType":"Missense_Mutation","alt":347,"ref":795,"vaf_pct":30.4},{"sampleId":"P-0009660-T01-IM5","gene":"KRAS","proteinChange":"G12C","mutationType":"Missense_Mutation","alt":307,"ref":445,"vaf_pct":40.8},{"sampleId":"P-0009660-T01-IM5","gene":"NRAS","proteinChange":"P34R","mutationType":"Missense_Mutation","alt":219,"ref":255,"vaf_pct":46.2},{"sampleId":"P-0009715-T01-IM5","gene":"KRAS","proteinChange":"A59T","mutationType":"Missense_Mutation","alt":654,"ref":160,"vaf_pct":80.3},{"sampleId":"P-0009715-T01-IM5","gene":"NRAS","proteinChange":"Y40D","mutationType":"Missense_Mutation","alt":285,"ref":131,"vaf_pct":68.5},{"sampleId":"P-0011533-T01-IM5","gene":"KRAS","proteinChange":"G12D","mutationType":"Missense_Mutation","alt":210,"ref":464,"vaf_pct":31.2},{"sampleId":"P-0011533-T01-IM5","gene":"NRAS","proteinChange":"A91V","mutationType":"Missense_Mutation","alt":144,"ref":525,"vaf_pct":21.5},{"sampleId":"P-0011554-T01-IM5","gene":"KRAS","proteinChange":"G12D","mutationType":"Missense_Mutation","alt":94,"ref":735,"vaf_pct":11.3},{"sampleId":"P-0011554-T01-IM5","gene":"NRAS","proteinChange":"K5*","mutationType":"Nonsense_Mutation","alt":80,"ref":616,"vaf_pct":11.5},{"sampleId":"P-0012402-T01-IM5","gene":"KRAS","proteinChange":"K117N","mutationType":"Missense_Mutation","alt":95,"ref":545,"vaf_pct":14.8},{"sampleId":"P-0012402-T01-IM5","gene":"NRAS","proteinChange":"R167*","mutationType":"Nonsense_Mutation","alt":160,"ref":933,"vaf_pct":14.6},{"sampleId":"P-0013266-T01-IM5","gene":"KRAS","proteinChange":"G13D","mutationType":"Missense_Mutation","alt":17,"ref":24,"vaf_pct":41.5},{"sampleId":"P-0013266-T01-IM5","gene":"NRAS","proteinChange":"M1?","mutationType":"Translation_Start_Site","alt":15,"ref":61,"vaf_pct":19.7},{"sampleId":"P-0016091-T01-IM6","gene":"KRAS","proteinChange":"A146T","mutationType":"Missense_Mutation","alt":77,"ref":187,"vaf_pct":29.2},{"sampleId":"P-0016091-T01-IM6","gene":"NRAS","proteinChang … (8310 more chars)
+
+═ answer (success)
+I have full VAF data for 40 KRAS+NRAS co-mutated samples (with one sample carrying two KRAS variants). Let me summarize the distribution.
+
+**KRAS VAF** (n=41 mutations, 40 samples): range 2.4%–80.3%, values span roughly: <10% (7), 10–20% (10), 20–30% (10), 30–40% (7), ≥40% (7)
+**NRAS VAF** (n=40): range 3.2%–68.5%, similar broad spread: <10% (11), 10–20% (10), 20–30% (7), 30–40% (8), ≥40% (4)
+
+## Summary — MSK-CHORD cohort, KRAS+NRAS co-mutated samples
+
+**Cohort:** [MSK-CHORD (MSK, Nature 2024)](https://www.cbioportal.org/study/summary?id=msk_chord_2024) — 25,040 samples total. **40 samples** (patients) carry a somatic mutation in both KRAS and NRAS simultaneously — this is a small, biologically atypical subset, since these two paralogous RAS genes are normally near-mutually-exclusive oncogenic drivers.
+
+**VAF distributions** (VAF = tumor_alt_count / (tumor_alt_count + tumor_ref_count) from raw MAF read counts):
+
+| Gene | N mutations | Min | Median (approx.) | Max |
+|------|------------|-----|--------|-----|
+| KRAS | 41 | 2.4% | ~25–26% | 80.3% |
+| NRAS | 40 | 3.2% | ~19–20% | 68.5% |
+
+Within individual samples, the two genes' VAFs are sometimes close (e.g., P-0021518: KRAS 31.5% vs NRAS 34.0%; P-0009660: KRAS 40.8% vs NRAS 46.2% — consistent with both being early/clonal events, or reflecting similar tumor purity) and sometimes very discordant (e.g., P-0037971: KRAS 2.4% vs NRAS 24.6%; P-0048091: KRAS 3.0% vs NRAS 48.8% — a pattern more consistent with one being a later subclonal event superimposed on a clonal driver, or reflecting intratumoral heterogeneity/multiple subclones).
+
+**Important caveats before drawing clonality conclusions:**
+- cBioPortal does not store a validated clonal/subclonal classification (no cancer cell fraction, purity, or ploidy correction here) — I'm reporting **raw variant allele frequency**, not tumor-purity-adjusted cancer cell fraction (CCF). A high VAF in a low-purity sample can look "subclonal" by raw VAF alone, and vice versa.
+- Distinguishing true clonal (present in all tumor cells) from subclonal events rigorously requires tumor purity/ploidy estimates and a CCF calculation (e.g., ABSOLUTE, PyClone-VI), which is not part of this dataset.
+- With only 40 samples, this is descriptive, not a statistical test of clonality patterns — I have not run (and cannot fabricate) any significance test on this distribution.
+- MSK-CHORD is a targeted panel (MSK-IMPACT), not whole-genome/whole-exome, so VAF reflects panel-depth sequencing, generally high-depth and reliable for this purpose, but tumor purity per sample is not incorporated here.
+
+You can inspect these 40 co-mutated cases directly, including sample-level detail and mutation tab VAF context, here:
+
+[View KRAS+NRAS co-mutated samples in MSK-CHORD — Mutations Tab](https://www.cbioportal.org/results/mutations?cancer_study_list=msk_chord_2024&gene_list=KRAS%20NRAS&tab_index=tab_visualize&Action=Submit)
+
+If you'd like, I can rebuild this with a specific tumor-purity-adjusted CCF approach if you have that data, or restrict to a specific cancer type (e.g., colorectal, where RAS pathway mutations concentrate) — let me know.

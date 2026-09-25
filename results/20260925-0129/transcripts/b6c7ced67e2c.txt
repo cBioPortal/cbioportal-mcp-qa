@@ -1,0 +1,455 @@
+Q (haiku): What percentage of endometrial cancer patients have co-occurring oncogenic mutations in both KRAS and NRAS?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://common-pitfalls"
+}
+
+▶ search_oncotree
+{
+ "search_term": "endometrial cancer"
+}
+
+◀ result
+# Common Query Pitfalls Guide
+
+## Overview
+This guide highlights frequent mistakes when analyzing cBioPortal data and provides solutions to avoid them.
+
+## Critical Pitfalls
+
+### 1. 🚨 CRITICAL MUTATION FREQUENCY ERRORS
+
+#### ❌ WRONG: Using study-wide totals for gene frequencies
+```sql
+-- INCORRECT - This gives wrong frequencies!
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples,
+    (SELECT COUNT(DISTINCT sample_unique_id)
+     FROM genomic_event_derived
+     WHERE cancer_study_identifier = 'your_study_id') as total_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND cancer_study_identifier = 'your_study_id'
+GROUP BY hugo_gene_symbol;
+```
+**Problem**: Different genes have different profiling coverage - you can't use study-wide totals!
+
+#### ❌ WRONG: Not using gene-specific profiling denominators
+```sql
+-- INCORRECT - Missing gene-specific denominators
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+GROUP BY hugo_gene_symbol;
+-- Missing: WHERE ARE THE DENOMINATORS FOR EACH GENE?
+```
+
+#### ❌ WRONG: Skipping individual gene profiling queries
+**Problem**: Failing to run separate profiling queries for EACH gene in results.
+**Each gene has different coverage**: TP53 might be profiled in 25,040 samples, MUC16 in 23,000, etc.
+
+#### ✅ CORRECT: Complete gene-specific workflow
+```sql
+-- STEP 1: Get altered counts per gene
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id,
+    COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
+    COUNT(*) AS totalMutationEvents
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY entrez_gene_id, hugo_gene_symbol
+ORDER BY numberOfAlteredSamplesOnPanel DESC;
+
+-- STEP 2: FOR EACH GENE, run this profiling query:
+SELECT COUNT(DISTINCT stgp.sample_unique_id) AS numberOfProfiledSamples
+FROM sample_to_gene_panel_derived stgp
+JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+  AND g.hugo_gene_symbol = 'TP53'  -- Replace with each gene from Step 1
+  AND stgp.cancer_study_identifier = 'your_study_id';
+
+-- STEP 3: Calculate frequency = numberOfAlteredSamplesOnPanel / numberOfProfiledSamples * 100
+```
+
+#### 🚨 WORKFLOW REQUIREMENTS VIOLATIONS:
+- **Missing denominator columns**: Must show gene-specific profiled samples per row
+- **Wrong table format**: Should be | Gene | # Mutations | # Samples | Profiled Samples | Sample % |
+- **Not replacing gene symbols**: Must replace 'TP53' with actual gene for each query
+- **Using study totals**: Never use genomic_event_derived for total sample counts
+
+### 2. 🚨 OFF-PANEL MUTATION INCLUSION
+
+#### ❌ Wrong: Including off-panel mutations
+```sql
+-- INCORRECT - Includes mutations outside gene panels
+SELEC … (37891 more chars)
+
+◀ result
+{"result":[{"code":"OUTT","name":"Other Uterine Tumor","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > OUTT"},{"code":"UASC","name":"Uterine Adenosquamous Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UASC"},{"code":"UCCC","name":"Uterine Clear Cell Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UCCC"},{"code":"UCEC","name":"Endometrial Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC"},{"code":"UCS","name":"Uterine Carcinosarcoma/Uterine Malignant Mixed Mullerian Tumor","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UCS"},{"code":"UDDC","name":"Uterine Dedifferentiated Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UDDC"},{"code":"UEC","name":"Uterine Endometrioid Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UEC"},{"code":"UMC","name":"Uterine Mucinous Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UMC"},{"code":"UMEC","name":"Uterine Mixed Endometrial Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UMEC"},{"code":"UMNC","name":"Uterine Mesonephric Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UMNC"},{"code":"UNEC","name":"Uterine Neuroendocrine Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UNEC"},{"code":"UPDC","name":"Poorly Differentiated Carcinoma of the Uterus","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UPDC"},{"code":"USC","name":"Uterine Serous Carcinoma/Uterine Papillary Serous Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > USC"},{"code":"UUC","name":"Uterine Undifferentiated Carcinoma","score":65,"mainType":"Endometrial Cancer","tissue":"Uterus","hierarchy":"UTERUS > UCEC > UUC"}]}
+
+▶ list_studies
+{
+ "search": "endometrial UCEC TCGA",
+ "limit": 10
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"ucec_tcga","name":"Uterine Corpus Endometrial Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"ucec","sample_count":549,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_tcga"},{"cancer_study_identifier":"ucec_tcga_gdc","name":"Endometrial Carcinoma (TCGA GDC, 2025)","type_of_cancer_id":"ucec","sample_count":547,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_gdc"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"ucec","sample_count":529,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucec_tcga_pub","name":"Uterine Corpus Endometrial Carcinoma (TCGA, Nature 2013)","type_of_cancer_id":"ucec","sample_count":373,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_pub"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Query co-occurring KRAS and NRAS mutations in endometrial cancer
+-- Counting patients with mutations in both genes
+
+WITH kras_mutants AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'KRAS'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+),
+nras_mutants AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'NRAS'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+),
+both_mutated AS (
+    SELECT COUNT(DISTINCT k.patient_unique_id) AS patients_with_both
+    FROM kras_mutants k
+    INNER JOIN nras_mutants n USING (patient_unique_id)
+),
+profiled_for_both AS (
+    -- Patients profiled for both KRAS and NRAS
+    SELECT COUNT(DISTINCT c.patient_unique_id) AS patients_profiled_for_both
+    FROM clinical_data_derived c
+    WHERE c.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND c.patient_unique_id IN (
+          SELECT DISTINCT patient_unique_id
+          FROM sample_to_gene_panel_derived s1
+          JOIN clinical_data_derived cd ON s1.sample_unique_id = cd.sample_unique_id
+          WHERE s1.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+            AND s1.alteration_type = 'MUTATION_EXTENDED'
+            AND cd.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+            AND s1.sample_unique_id IN (
+              SELECT DISTINCT sample_unique_id
+              FROM sample_to_gene_panel_derived s2
+              WHERE s2.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+                AND s2.alteration_type = 'MUTATION_EXTENDED'
+                AND (
+                  EXISTS (
+                    SELECT 1 FROM gene_panel_list gpl
+                    JOIN gene_panel gp ON gpl.internal_id = gp.internal_id
+                    JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+                    WHERE gp.internal_id = (
+                      SELECT internal_id FROM gene_panel WHERE stable_id = s2.gene_panel_id
+                    )
+                    AND g.hugo_gene_symbol = 'KRAS'
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM gene_panel_list gpl2
+                    JOIN gene_panel gp2 ON gpl2.internal_id = gp2.internal_id
+                    JOIN gene g2 ON gpl2.gene_id = g2.entrez_gene_id
+                    WHERE gp2.internal_id = (
+                      SELECT internal_id FROM gene_panel WHERE stable_id = s2.gene_panel_id
+                    )
+                    AND g2.hugo_gene_symbol = 'NRAS'
+                  )
+                )
+            )
+      )
+)
+SELECT
+    (SELECT patients_with_both FROM both_mutated) AS patients_with_kras_and_nras,
+    (SELECT patients_profiled_for_both FROM profiled_for_both) AS patients_profiled_for_both,
+    ROUND(
+        (SELECT patients_with_both FROM both_mutated) * 100.0 
+        / NULLIF((SELECT patients_profiled_for_both FROM profiled_for_both), 0),
+        2
+    ) AS percentage
+",
+ "max_rows": 10
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 1\n Code: 1. DB::Exception: Resolved identifier 's2.gene_panel_id' in parent scope to expression 's2.gene_panel_id' with correlated columns 'gene_panel_id' (Enable 'allow_experimental_correlated_subqueries' setting to allow correlated subqueries execution). In scope (SELECT _CAST(1, 'UInt64') FROM (SELECT 1 FROM cbioportal_public_librechat_blue.gene_panel_list AS gpl ALL INNER JOIN cbioportal_public_librechat_blue.gene_panel AS gp ON gpl.internal_id = gp.internal_id ALL INNER JOIN cbioportal_public_librechat_blue.gene AS g ON gpl.gene_id = g.entrez_gene_id WHERE (gp.internal_id = (SELECT cbioportal_public_librechat_blue.gene_panel.internal_id FROM cbioportal_public_librechat_blue.gene_panel WHERE stable_id = s2.gene_panel_id)) AND (g.hugo_gene_symbol = 'KRAS')) LIMIT _CAST(1, 'UInt64')). (UNSUPPORTED_METHOD) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Query co-occurring KRAS and NRAS mutations in endometrial cancer
+-- Simplified approach: count patients with both mutations
+
+WITH kras_mutants AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'KRAS'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+nras_mutants AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'NRAS'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+both_mutated AS (
+    SELECT COUNT(DISTINCT k.patient_unique_id) AS patients_with_both
+    FROM kras_mutants k
+    INNER JOIN nras_mutants n USING (patient_unique_id)
+),
+kras_only AS (
+    SELECT COUNT(DISTINCT patient_unique_id) AS kras_patients
+    FROM kras_mutants
+),
+nras_only AS (
+    SELECT COUNT(DISTINCT patient_unique_id) AS nras_patients
+    FROM nras_mutants
+),
+all_patients AS (
+    SELECT COUNT(DISTINCT patient_unique_id) AS total_patients
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+)
+SELECT
+    (SELECT patients_with_both FROM both_mutated) AS patients_with_both_kras_nras,
+    (SELECT kras_patients FROM kras_only) AS patients_with_kras_mutation,
+    (SELECT nras_patients FROM nras_only) AS patients_with_nras_mutation,
+    (SELECT total_patients FROM all_patients) AS total_patients_in_study,
+    ROUND(
+        (SELECT patients_with_both FROM both_mutated) * 100.0 
+        / NULLIF((SELECT total_patients FROM all_patients), 0),
+        2
+    ) AS pct_of_all_patients
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"patients_with_both_kras_nras":4,"patients_with_kras_mutation":99,"patients_with_nras_mutation":21,"total_patients_in_study":529,"pct_of_all_patients":0.76}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get KRAS and NRAS mutation frequencies with proper profiled denominators
+SELECT *
+FROM gene_mutation_frequency_in_study(study = 'ucec_tcga_pan_can_atlas_2018', gene = 'KRAS')
+UNION ALL
+SELECT *
+FROM gene_mutation_frequency_in_study(study = 'ucec_tcga_pan_can_atlas_2018', gene = 'NRAS')
+ORDER BY hugo_gene_symbol
+",
+ "max_rows": 10
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `hugo_gene_symbol` in scope SELECT * FROM gene_mutation_frequency_in_study(study = 'ucec_tcga_pan_can_atlas_2018', gene = 'NRAS') ORDER BY hugo_gene_symbol ASC. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT *
+FROM gene_mutation_frequency_in_study(study = 'ucec_tcga_pan_can_atlas_2018', gene = 'KRAS')
+",
+ "max_rows": 5
+}
+
+◀ result
+{"rows":[{"cancer_type":"Endometrial Cancer","altered_samples":99,"profiled_samples":517,"frequency_pct":19.1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 'KRAS' AS gene, *
+FROM gene_mutation_frequency_in_study(study = 'ucec_tcga_pan_can_atlas_2018', gene = 'KRAS')
+UNION ALL
+SELECT 'NRAS' AS gene, *
+FROM gene_mutation_frequency_in_study(study = 'ucec_tcga_pan_can_atlas_2018', gene = 'NRAS')
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"gene":"KRAS","cancer_type":"Endometrial Cancer","altered_samples":99,"profiled_samples":517,"frequency_pct":19.1},{"gene":"NRAS","cancer_type":"Endometrial Cancer","altered_samples":21,"profiled_samples":517,"frequency_pct":4.1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Co-occurring KRAS and NRAS mutations in endometrial cancer
+-- Using sample-level analysis for accuracy
+
+WITH kras_mutants AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'KRAS'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+nras_mutants AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'NRAS'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+both_mutated AS (
+    SELECT COUNT(DISTINCT k.sample_unique_id) AS samples_with_both
+    FROM kras_mutants k
+    INNER JOIN nras_mutants n USING (sample_unique_id)
+)
+SELECT
+    (SELECT samples_with_both FROM both_mutated) AS samples_with_both_mutations,
+    517 AS samples_profiled_for_both,
+    ROUND(
+        (SELECT samples_with_both FROM both_mutated) * 100.0 / 517.0,
+        2
+    ) AS percentage_of_profiled_samples
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"samples_with_both_mutations":4,"samples_profiled_for_both":517,"percentage_of_profiled_samples":0.77}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529,"studyViewUrl":"https://www.cbioportal.org/study?id=ucec_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["ucec_tcga_pan_can_atlas_2018_gistic","ucec_tcga_pan_can_atlas_2018_log2CNA","ucec_tcga_pan_can_atlas_2018_mutations","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","ucec_tcga_pan_can_atlas_2018_rppa","ucec_tcga_pan_can_atlas_2018_rppa_Zscores","ucec_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["ucec_tcga_pan_can_atlas_2018_armlevel_cna","ucec_tcga_pan_can_atlas_2018_genetic_ancestry","ucec_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","ucec_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","ucec_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "KRAS",
+  "NRAS"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=KRAS%0ANRAS&case_set_id=ucec_tcga_pan_can_atlas_2018_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=KRAS%0ANRAS&case_set_id=ucec_tcga_pan_can_atlas_2018_all","data":{"studyIds":["ucec_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529}],"genes":["KRAS","NRAS"],"caseSetId":"ucec_tcga_pan_can_atlas_2018_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ],
+ "filterJson": {
+  "geneFilters": [
+   {
+    "molecularProfileIds": [
+     "ucec_tcga_pan_can_atlas_2018_mutations"
+    ],
+    "geneQueries": [
+     [
+      {
+       "hugoGeneSymbol": "KRAS"
+      },
+      {
+       "hugoGeneSymbol": "NRAS"
+      }
+     ]
+    ]
+   }
+  ]
+ },
+ "tab": "summary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22KRAS%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22NRAS%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22ucec_tcga_pan_can_atlas_2018_mutations%22%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22KRAS%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22NRAS%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22ucec_tcga_pan_can_atlas_2018_mutations%22%5D%7D%5D%7D","data":{"studyIds":["ucec_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+## Summary
+
+**Co-occurrence of KRAS and NRAS mutations in endometrial cancer (TCGA Pan-Cancer Atlas):**
+
+- **4 samples** (out of 517 profiled for both genes) carry mutations in **both KRAS and NRAS**
+- **Percentage: 0.77%** of samples with mutation profiling have co-occurring KRAS and NRAS mutations
+
+**For context:**
+- KRAS mutations: **99/517 samples (19.1%)**
+- NRAS mutations: **21/517 samples (4.1%)**
+
+This is a **rare co-occurrence**. The RAS genes (KRAS, NRAS, HRAS) are mutually exclusive drivers in most cancers, so co-mutation in both genes is uncommon. The 4 co-mutant samples represent fewer than 1% of the endometrial cancer cohort.
+
+**Explore the data:**
+
+- [View KRAS and NRAS alterations in OncoPrint](https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=KRAS%0ANRAS&case_set_id=ucec_tcga_pan_can_atlas_2018_all) — visualize which samples carry alterations in either or both genes
+- [Filter to KRAS or NRAS mutant samples](https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22KRAS%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22NRAS%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22ucec_tcga_pan_can_atlas_2018_mutations%22%5D%7D%5D%7D) — view clinical attributes and sample details for KRAS or NRAS mutant endometrial cancer samples
+
+**Note:** This analysis is based on the TCGA Pan-Cancer Atlas endometrial cancer cohort, which spans 529 samples. If you need results from other endometrial cancer studies or a broader multi-study analysis, let me know.

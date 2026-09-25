@@ -1,0 +1,747 @@
+Q (haiku): Are there differences in chromosome arm 7p copy number between lower grade glioma molecular subtypes?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ list_studies
+{
+ "search": "lower grade glioma",
+ "limit": 20
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- First, check what copy number profile types are available in LGG studies
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND profile_type ILIKE '%cna%'
+ORDER BY profile_type
+LIMIT 10
+",
+ "max_rows": 20
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"rows":[{"profile_type":"linear_CNA"},{"profile_type":"log2CNA"}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check what clinical attributes are available for molecular subtypes in LGG
+SELECT DISTINCT attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND (attribute_name ILIKE '%subtype%' 
+       OR attribute_name ILIKE '%codel%'
+       OR attribute_name ILIKE '%idhwt%'
+       OR attribute_name ILIKE '%1p%'
+       OR attribute_name ILIKE '%19q%'
+       OR attribute_name ILIKE 'IDH%'
+       OR attribute_name ILIKE '%MUTATION%')
+ORDER BY attribute_name
+",
+ "max_rows": 30
+}
+
+◀ result
+{"rows":[{"attribute_name":"IDH1_MUTATION"},{"attribute_name":"IDH1_MUTATION_TEST_INDICATOR"},{"attribute_name":"IDH1_MUTATION_TEST_METHOD"},{"attribute_name":"MUTATION_COUNT"},{"attribute_name":"SUBTYPE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get the molecular subtypes first
+SELECT DISTINCT attribute_value
+FROM clinical_data_derived
+WHERE cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND attribute_name = 'SUBTYPE'
+  AND attribute_value != ''
+ORDER BY attribute_value
+",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"attribute_value":"LGG_IDHmut-codel"},{"attribute_value":"LGG_IDHmut-non-codel"},{"attribute_value":"LGG_IDHwt"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Analyze chromosome 7p genes and their copy number distribution by LGG subtype
+-- Using genes known to be on 7p: EGFR, MET, TP63, etc.
+-- First get all 7p genes available in the data
+SELECT DISTINCT hugo_gene_symbol
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND profile_type IN ('linear_CNA', 'log2CNA')
+  AND hugo_gene_symbol IN ('EGFR', 'MET', 'TP63', 'INHBA', 'CFTR', 'PDGFA', 'HOXA', 'FOXP1', 'IKZF1', 'MAD1L1', 'IKZF3', 'ZAN', 'GLI3', 'GPATCH2')
+ORDER BY hugo_gene_symbol
+",
+ "max_rows": 30
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"CFTR"},{"hugo_gene_symbol":"EGFR"},{"hugo_gene_symbol":"FOXP1"},{"hugo_gene_symbol":"GLI3"},{"hugo_gene_symbol":"GPATCH2"},{"hugo_gene_symbol":"IKZF1"},{"hugo_gene_symbol":"IKZF3"},{"hugo_gene_symbol":"INHBA"},{"hugo_gene_symbol":"MAD1L1"},{"hugo_gene_symbol":"MET"},{"hugo_gene_symbol":"PDGFA"},{"hugo_gene_symbol":"TP63"},{"hugo_gene_symbol":"ZAN"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Analyze chromosome 7p copy number across LGG molecular subtypes
+-- Focus on key 7p genes: EGFR (most frequently altered on 7p in LGG)
+WITH lgg_samples AS (
+  SELECT DISTINCT s.sample_unique_id, s.cancer_study_identifier
+  FROM genetic_alteration_derived s
+  WHERE s.cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+    AND s.profile_type IN ('linear_CNA', 'log2CNA')
+  LIMIT 100000
+),
+subtype_data AS (
+  SELECT 
+    sample_unique_id,
+    attribute_value AS subtype
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+),
+cna_data AS (
+  SELECT 
+    s.sample_unique_id,
+    s.cancer_study_identifier,
+    g.hugo_gene_symbol,
+    g.profile_type,
+    toFloat64OrNull(g.alteration_value) AS cn_value,
+    sub.subtype
+  FROM genetic_alteration_derived g
+  INNER JOIN lgg_samples s USING (sample_unique_id, cancer_study_identifier)
+  LEFT JOIN subtype_data sub USING (sample_unique_id)
+  WHERE g.profile_type IN ('linear_CNA', 'log2CNA')
+    AND g.hugo_gene_symbol = 'EGFR'
+    AND g.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+)
+SELECT 
+  subtype,
+  profile_type,
+  COUNT(DISTINCT sample_unique_id) AS n_samples,
+  round(AVG(cn_value), 3) AS mean_cn,
+  round(quantile(0.5)(cn_value), 3) AS median_cn,
+  round(arrayElement(quantileArray(0.25, 0.75)(cn_value), 1), 3) AS q1,
+  round(arrayElement(quantileArray(0.25, 0.75)(cn_value), 2), 3) AS q3,
+  round(min(cn_value), 3) AS min_cn,
+  round(max(cn_value), 3) AS max_cn
+FROM cna_data
+WHERE subtype IS NOT NULL
+GROUP BY subtype, profile_type
+ORDER BY subtype
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `sample_unique_id` in scope WITH lgg_samples AS (SELECT DISTINCT s.sample_unique_id, s.cancer_study_identifier FROM genetic_alteration_derived AS s WHERE (s.cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')) AND (s.profile_type IN ('linear_CNA', 'log2CNA')) LIMIT 100000), subtype_data AS (SELECT sample_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE (cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')) AND (attribute_name = 'SUBTYPE') AND (attribute_value != '')), cna_data AS (SELECT s.sample_unique_id, s.cancer_study_identifier, g.hugo_gene_symbol, g.profile_type, toFloat64OrNull(g.alteration_value) AS cn_value, sub.subtype FROM genetic_alteration_derived AS g INNER JOIN lgg_samples AS s USING (sample_unique_id, cancer_study_identifier) LEFT JOIN subtype_data AS sub USING (sample_unique_id) WHERE (g.profile_type IN ('linear_CNA', 'log2CNA')) AND (g.hugo_gene_symbol = 'EGFR') AND (g.alteration_value NOT IN ('', 'NA')) AND (toFloat64OrNull(g.alteration_value) IS NOT NULL)) SELECT subtype, profile_type, COUNTDistinct(sample_unique_id) AS n_samples, round(AVG(cn_value), 3) AS mean_cn, round(quantile(0.5)(cn_value), 3) AS median_cn, round(arrayElement(quantileArray(0.25, 0.75)(cn_value), 1), 3) AS q1, round(arrayElement(quantileArray(0.25, 0.75)(cn_value), 2), 3) AS q3, round(min(cn_value), 3) AS min_cn, round(max(cn_value), 3) AS max_cn FROM cna_data WHERE subtype IS NOT NULL GROUP BY subtype, profile_type ORDER BY subtype ASC. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Analyze EGFR copy number across LGG molecular subtypes
+-- Step 1: Join copy number data with subtype data
+SELECT 
+  c.attribute_value AS subtype,
+  g.profile_type,
+  g.hugo_gene_symbol,
+  COUNT(DISTINCT g.sample_unique_id) AS n_samples,
+  round(AVG(toFloat64OrNull(g.alteration_value)), 3) AS mean_cn,
+  round(quantile(0.5)(toFloat64OrNull(g.alteration_value)), 3) AS median_cn,
+  round(min(toFloat64OrNull(g.alteration_value)), 3) AS min_cn,
+  round(max(toFloat64OrNull(g.alteration_value)), 3) AS max_cn
+FROM genetic_alteration_derived g
+INNER JOIN clinical_data_derived c ON g.sample_unique_id = c.sample_unique_id
+  AND g.cancer_study_identifier = c.cancer_study_identifier
+WHERE g.cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND c.cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND g.profile_type IN ('linear_CNA', 'log2CNA')
+  AND g.hugo_gene_symbol = 'EGFR'
+  AND c.attribute_name = 'SUBTYPE'
+  AND c.attribute_value != ''
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+GROUP BY c.attribute_value, g.profile_type, g.hugo_gene_symbol
+ORDER BY c.attribute_value
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- First, check if subtype data exists
+SELECT COUNT(*), COUNT(DISTINCT sample_unique_id)
+FROM clinical_data_derived
+WHERE cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND attribute_name = 'SUBTYPE'
+",
+ "max_rows": 5
+}
+
+◀ result
+{"rows":[{"COUNT()":514,"COUNTDistinct(sample_unique_id)":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check SUBTYPE data structure
+SELECT DISTINCT type, COUNT(*) as count
+FROM clinical_data_derived
+WHERE cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND attribute_name = 'SUBTYPE'
+GROUP BY type
+",
+ "max_rows": 5
+}
+
+◀ result
+{"rows":[{"type":"patient","count":514}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Map samples to patients, then join with subtype
+-- Get sample to patient mapping
+SELECT 
+  c.attribute_value AS subtype,
+  g.profile_type,
+  g.hugo_gene_symbol,
+  COUNT(DISTINCT g.sample_unique_id) AS n_samples,
+  round(AVG(toFloat64OrNull(g.alteration_value)), 3) AS mean_cn,
+  round(quantile(0.5)(toFloat64OrNull(g.alteration_value)), 3) AS median_cn,
+  round(min(toFloat64OrNull(g.alteration_value)), 3) AS min_cn,
+  round(max(toFloat64OrNull(g.alteration_value)), 3) AS max_cn
+FROM genetic_alteration_derived g
+INNER JOIN clinical_data_derived c ON g.cancer_study_identifier = c.cancer_study_identifier
+WHERE g.cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND c.cancer_study_identifier IN ('lgg_tcga', 'lgg_tcga_pan_can_atlas_2018')
+  AND g.profile_type IN ('linear_CNA', 'log2CNA')
+  AND g.hugo_gene_symbol = 'EGFR'
+  AND c.attribute_name = 'SUBTYPE'
+  AND c.attribute_value != ''
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+  -- Match by extracting patient ID from sample_unique_id
+  AND SUBSTRING(g.sample_unique_id, 1, POSITION('_' IN g.sample_unique_id) + 12) = c.patient_unique_id
+GROUP BY c.attribute_value, g.profile_type, g.hugo_gene_symbol
+ORDER BY c.attribute_value
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check sample IDs and patient IDs in clinical data
+SELECT sample_unique_id, patient_unique_id, COUNT(*) as n
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'SUBTYPE'
+GROUP BY sample_unique_id, patient_unique_id
+LIMIT 5
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"patient_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-HT-7858","n":1},{"patient_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-FG-A6J1","n":1},{"patient_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-TM-A84M","n":1},{"patient_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-HT-7879","n":1},{"patient_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-DU-A76L","n":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get EGFR 7p copy number by molecular subtype using patient IDs
+-- First get unique samples and their patient IDs from CNA data
+WITH egfr_cna AS (
+  SELECT DISTINCT 
+    g.sample_unique_id,
+    g.cancer_study_identifier,
+    toFloat64OrNull(g.alteration_value) AS cn_value
+  FROM genetic_alteration_derived g
+  WHERE g.cancer_study_identifier IN ('lgg_tcga_pan_can_atlas_2018')
+    AND g.profile_type IN ('linear_CNA', 'log2CNA')
+    AND g.hugo_gene_symbol = 'EGFR'
+    AND g.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+),
+-- Get patient-to-sample mapping from ANY clinical attribute (to get patient_unique_id)
+patient_map AS (
+  SELECT DISTINCT 
+    sample_unique_id,
+    patient_unique_id,
+    cancer_study_identifier
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND sample_unique_id != ''
+),
+-- Get subtype info
+subtypes AS (
+  SELECT DISTINCT
+    patient_unique_id,
+    cancer_study_identifier,
+    attribute_value AS subtype
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+)
+SELECT 
+  st.subtype,
+  COUNT(DISTINCT e.sample_unique_id) AS n_samples,
+  round(AVG(e.cn_value), 3) AS mean_cn,
+  round(quantile(0.5)(e.cn_value), 3) AS median_cn,
+  round(min(e.cn_value), 3) AS min_cn,
+  round(max(e.cn_value), 3) AS max_cn,
+  round(arrayElement(quantileArray(0.25, 0.75)(e.cn_value), 1), 3) AS q1,
+  round(arrayElement(quantileArray(0.25, 0.75)(e.cn_value), 2), 3) AS q3
+FROM egfr_cna e
+INNER JOIN patient_map pm ON e.sample_unique_id = pm.sample_unique_id 
+  AND e.cancer_study_identifier = pm.cancer_study_identifier
+INNER JOIN subtypes st ON pm.patient_unique_id = st.patient_unique_id 
+  AND pm.cancer_study_identifier = st.cancer_study_identifier
+GROUP BY st.subtype
+ORDER BY st.subtype
+",
+ "max_rows": 50
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 43\n Code: 43. DB::Exception: Illegal type Float64 of argument for aggregate function with Array suffix. Must be array. (ILLEGAL_TYPE_OF_ARGUMENT) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get EGFR 7p copy number by molecular subtype
+WITH egfr_cna AS (
+  SELECT DISTINCT 
+    g.sample_unique_id,
+    g.cancer_study_identifier,
+    toFloat64OrNull(g.alteration_value) AS cn_value
+  FROM genetic_alteration_derived g
+  WHERE g.cancer_study_identifier IN ('lgg_tcga_pan_can_atlas_2018')
+    AND g.profile_type IN ('linear_CNA', 'log2CNA')
+    AND g.hugo_gene_symbol = 'EGFR'
+    AND g.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+),
+patient_map AS (
+  SELECT DISTINCT 
+    sample_unique_id,
+    patient_unique_id,
+    cancer_study_identifier
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND sample_unique_id != ''
+),
+subtypes AS (
+  SELECT DISTINCT
+    patient_unique_id,
+    cancer_study_identifier,
+    attribute_value AS subtype
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+)
+SELECT 
+  st.subtype,
+  COUNT(DISTINCT e.sample_unique_id) AS n_samples,
+  round(AVG(e.cn_value), 3) AS mean_cn,
+  round(quantile(0.5)(e.cn_value), 3) AS median_cn,
+  round(min(e.cn_value), 3) AS min_cn,
+  round(max(e.cn_value), 3) AS max_cn,
+  round(quantile(0.25)(e.cn_value), 3) AS q1,
+  round(quantile(0.75)(e.cn_value), 3) AS q3
+FROM egfr_cna e
+INNER JOIN patient_map pm ON e.sample_unique_id = pm.sample_unique_id 
+  AND e.cancer_study_identifier = pm.cancer_study_identifier
+INNER JOIN subtypes st ON pm.patient_unique_id = st.patient_unique_id 
+  AND pm.cancer_study_identifier = st.cancer_study_identifier
+GROUP BY st.subtype
+ORDER BY st.subtype
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHmut-codel","n_samples":167,"mean_cn":0.044,"median_cn":0.002,"min_cn":-0.147,"max_cn":0.901,"q1":0,"q3":0.01},{"subtype":"LGG_IDHmut-non-codel","n_samples":248,"mean_cn":0.102,"median_cn":0.012,"min_cn":-0.162,"max_cn":1.77,"q1":0.001,"q3":0.046},{"subtype":"LGG_IDHwt","n_samples":92,"mean_cn":1.653,"median_cn":0.736,"min_cn":-0.916,"max_cn":3.66,"q1":0.095,"q3":3.66}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Analyze multiple 7p genes by molecular subtype
+-- Include: EGFR (most common), MET, TP63, FOXP1
+WITH cna_data AS (
+  SELECT DISTINCT 
+    g.sample_unique_id,
+    g.cancer_study_identifier,
+    g.hugo_gene_symbol,
+    toFloat64OrNull(g.alteration_value) AS cn_value
+  FROM genetic_alteration_derived g
+  WHERE g.cancer_study_identifier IN ('lgg_tcga_pan_can_atlas_2018')
+    AND g.profile_type IN ('linear_CNA', 'log2CNA')
+    AND g.hugo_gene_symbol IN ('EGFR', 'MET', 'TP63', 'FOXP1')
+    AND g.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+),
+patient_map AS (
+  SELECT DISTINCT 
+    sample_unique_id,
+    patient_unique_id,
+    cancer_study_identifier
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND sample_unique_id != ''
+),
+subtypes AS (
+  SELECT DISTINCT
+    patient_unique_id,
+    cancer_study_identifier,
+    attribute_value AS subtype
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+)
+SELECT 
+  st.subtype,
+  c.hugo_gene_symbol,
+  COUNT(DISTINCT c.sample_unique_id) AS n_samples,
+  round(AVG(c.cn_value), 3) AS mean_cn,
+  round(quantile(0.5)(c.cn_value), 3) AS median_cn,
+  round(min(c.cn_value), 3) AS min_cn,
+  round(max(c.cn_value), 3) AS max_cn
+FROM cna_data c
+INNER JOIN patient_map pm ON c.sample_unique_id = pm.sample_unique_id 
+  AND c.cancer_study_identifier = pm.cancer_study_identifier
+INNER JOIN subtypes st ON pm.patient_unique_id = st.patient_unique_id 
+  AND pm.cancer_study_identifier = st.cancer_study_identifier
+GROUP BY st.subtype, c.hugo_gene_symbol
+ORDER BY st.subtype, c.hugo_gene_symbol
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"EGFR","n_samples":167,"mean_cn":0.044,"median_cn":0.002,"min_cn":-0.147,"max_cn":0.901},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"FOXP1","n_samples":167,"mean_cn":-0.007,"median_cn":0,"min_cn":-0.976,"max_cn":0.831},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"MET","n_samples":167,"mean_cn":0.106,"median_cn":0.002,"min_cn":-0.652,"max_cn":1.46},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TP63","n_samples":167,"mean_cn":-0.003,"median_cn":0,"min_cn":-0.395,"max_cn":0.274},{"subtype":"LGG_IDHmut-non-codel","hugo_gene_symbol":"EGFR","n_samples":248,"mean_cn":0.102,"median_cn":0.012,"min_cn":-0.162,"max_cn":1.77},{"subtype":"LGG_IDHmut-non-codel","hugo_gene_symbol":"FOXP1","n_samples":248,"mean_cn":-0.043,"median_cn":0.002,"min_cn":-1.26,"max_cn":0.519},{"subtype":"LGG_IDHmut-non-codel","hugo_gene_symbol":"MET","n_samples":248,"mean_cn":0.231,"median_cn":0.03,"min_cn":-0.273,"max_cn":2.11},{"subtype":"LGG_IDHmut-non-codel","hugo_gene_symbol":"TP63","n_samples":248,"mean_cn":-0.043,"median_cn":0.001,"min_cn":-0.901,"max_cn":1.09},{"subtype":"LGG_IDHwt","hugo_gene_symbol":"EGFR","n_samples":92,"mean_cn":1.653,"median_cn":0.736,"min_cn":-0.916,"max_cn":3.66},{"subtype":"LGG_IDHwt","hugo_gene_symbol":"FOXP1","n_samples":92,"mean_cn":-0.051,"median_cn":0,"min_cn":-0.971,"max_cn":0.663},{"subtype":"LGG_IDHwt","hugo_gene_symbol":"MET","n_samples":92,"mean_cn":0.515,"median_cn":0.506,"min_cn":-0.005,"max_cn":3.66},{"subtype":"LGG_IDHwt","hugo_gene_symbol":"TP63","n_samples":92,"mean_cn":-0.017,"median_cn":0,"min_cn":-0.97,"max_cn":0.806}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Frequency of 7p amplifications (CN gain) across subtypes
+-- Threshold: CN > 0.2 for gain (using log2 scale convention)
+WITH egfr_cna AS (
+  SELECT DISTINCT 
+    g.sample_unique_id,
+    g.cancer_study_identifier,
+    toFloat64OrNull(g.alteration_value) AS cn_value
+  FROM genetic_alteration_derived g
+  WHERE g.cancer_study_identifier IN ('lgg_tcga_pan_can_atlas_2018')
+    AND g.profile_type IN ('linear_CNA', 'log2CNA')
+    AND g.hugo_gene_symbol = 'EGFR'
+    AND g.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+),
+patient_map AS (
+  SELECT DISTINCT 
+    sample_unique_id,
+    patient_unique_id,
+    cancer_study_identifier
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND sample_unique_id != ''
+),
+subtypes AS (
+  SELECT DISTINCT
+    patient_unique_id,
+    cancer_study_identifier,
+    attribute_value AS subtype
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+)
+SELECT 
+  st.subtype,
+  COUNT(DISTINCT e.sample_unique_id) AS total_samples,
+  COUNT(DISTINCT CASE WHEN e.cn_value > 0.2 THEN e.sample_unique_id END) AS n_gain,
+  COUNT(DISTINCT CASE WHEN e.cn_value < -0.2 THEN e.sample_unique_id END) AS n_loss,
+  round(100.0 * COUNT(DISTINCT CASE WHEN e.cn_value > 0.2 THEN e.sample_unique_id END) / COUNT(DISTINCT e.sample_unique_id), 1) AS pct_gain,
+  round(100.0 * COUNT(DISTINCT CASE WHEN e.cn_value < -0.2 THEN e.sample_unique_id END) / COUNT(DISTINCT e.sample_unique_id), 1) AS pct_loss
+FROM egfr_cna e
+INNER JOIN patient_map pm ON e.sample_unique_id = pm.sample_unique_id 
+  AND e.cancer_study_identifier = pm.cancer_study_identifier
+INNER JOIN subtypes st ON pm.patient_unique_id = st.patient_unique_id 
+  AND pm.cancer_study_identifier = st.cancer_study_identifier
+GROUP BY st.subtype
+ORDER BY st.subtype
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHmut-codel","total_samples":167,"n_gain":10,"n_loss":0,"pct_gain":6,"pct_loss":0},{"subtype":"LGG_IDHmut-non-codel","total_samples":248,"n_gain":32,"n_loss":0,"pct_gain":12.9,"pct_loss":0},{"subtype":"LGG_IDHwt","total_samples":92,"n_gain":68,"n_loss":1,"pct_gain":73.9,"pct_loss":1.1}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","sampleCount":514,"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["lgg_tcga_pan_can_atlas_2018_gistic","lgg_tcga_pan_can_atlas_2018_log2CNA","lgg_tcga_pan_can_atlas_2018_mutations","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa","lgg_tcga_pan_can_atlas_2018_rppa_Zscores","lgg_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["lgg_tcga_pan_can_atlas_2018_armlevel_cna","lgg_tcga_pan_can_atlas_2018_genetic_ancestry","lgg_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","lgg_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "lgg_tcga_pan_can_atlas_2018",
+ "attributeIds": [
+  "SUBTYPE"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"lgg_tcga_pan_can_atlas_2018","attributes":[{"attributeId":"SUBTYPE","displayName":"Subtype","description":"Subtype","datatype":"STRING","values":["NA","LGG_IDHwt","LGG_IDHmut-non-codel","LGG_IDHmut-codel"]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "LGG_IDHwt",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHwt"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "LGG_IDHmut-non-codel",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHmut-non-codel"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "LGG_IDHmut-codel",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHmut-codel"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "clinical"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5c92fc2115c492d884e08","url":"https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5c92fc2115c492d884e08","data":{"description":"Group comparison (3 custom groups)","studies":["lgg_tcga_pan_can_atlas_2018"],"totalGroups":3,"groups":[{"name":"LGG_IDHwt","sampleCount":92},{"name":"LGG_IDHmut-non-codel","sampleCount":248},{"name":"LGG_IDHmut-codel","sampleCount":167}],"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"LGG_IDHwt","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHwt%22%7D%5D%7D%5D%7D"},{"groupName":"LGG_IDHmut-non-codel","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHmut-non-codel%22%7D%5D%7D%5D%7D"},{"groupName":"LGG_IDHmut-codel","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHmut-codel%22%7D%5D%7D%5D%7D"}],"pageDescription":"Clinical attribute distributions compared across LGG_IDHwt (92) vs LGG_IDHmut-non-codel (248) vs LGG_IDHmut-codel (167)."}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "EGFR"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=lgg_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=lgg_tcga_pan_can_atlas_2018_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=lgg_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=lgg_tcga_pan_can_atlas_2018_all","data":{"studyIds":["lgg_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","sampleCount":514}],"genes":["EGFR"],"caseSetId":"lgg_tcga_pan_can_atlas_2018_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## Summary
+
+**Yes, there are striking differences in chromosome 7p copy number between lower-grade glioma (LGG) molecular subtypes.** The data comes from **514 lower-grade glioma samples** from the TCGA PanCancer Atlas study, stratified by three molecular subtypes:
+
+### Key Findings
+
+**EGFR (7p11.2) — the most clinically relevant 7p gene:**
+
+| Molecular Subtype | N Samples | Mean CN | Median CN | Gain Rate |
+|---|---|---|---|---|
+| **LGG_IDHwt** | 92 | **1.65** | **0.74** | **73.9%** |
+| **LGG_IDHmut-non-codel** | 248 | 0.10 | 0.01 | 12.9% |
+| **LGG_IDHmut-codel** | 167 | 0.04 | 0.00 | 6.0% |
+
+**EGFR amplification (7p11) is dramatically enriched in IDH wild-type gliomas.** ~74% of IDHwt samples have EGFR gains compared to only 6–13% in IDH-mutant subtypes.
+
+### Other 7p Genes:
+
+| Gene | IDHwt (n=92) | IDHmut-non-codel (n=248) | IDHmut-codel (n=167) |
+|---|---|---|---|
+| **MET** | 0.51 (median) | 0.03 | 0.00 |
+| **TP63** | −0.02 | 0.00 | 0.00 |
+| **FOXP1** | −0.05 | 0.00 | 0.00 |
+
+MET (7q31, technically 7q not 7p, but often co-amplified) also shows higher gains in IDHwt. TP63 and FOXP1 show minimal variation across subtypes.
+
+### Interpretation
+
+This pattern reflects the **molecular-genetic divergence of LGG subtypes**: IDH-mutant gliomas (particularly 1p/19q-codeleted) are characterized by chromosomal stability and fewer copy number events, whereas IDH wild-type gliomas carry frequent 7p amplifications, marking them as a more genomically aggressive subtype with poorer prognosis.
+
+---
+
+## Explore the Data
+
+**[View LGG molecular subtype comparison](https://www.cbioportal.org/comparison/clinical?comparisonId=6ab5c92fc2115c492d884e08)** — Clinical and genomic distributions across all three subtypes
+
+**[Visualize EGFR alterations in LGG (OncoPrint)](https://www.cbioportal.org/results/oncoprint?cancer_study_list=lgg_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=lgg_tcga_pan_can_atlas_2018_all)** — Sample-by-sample EGFR copy number and mutation status

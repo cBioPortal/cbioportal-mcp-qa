@@ -1,0 +1,601 @@
+Q (haiku): In lower grade glioma, are there genes which are overexpressed in any of the molecular subtypes?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ search_oncotree
+{
+ "search_term": "lower grade glioma"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+▶ list_studies
+{
+ "search": "glioma lower grade",
+ "limit": 20
+}
+
+◀ result
+{"result":[]}
+
+◀ result
+{"result":[{"cancer_study_identifier":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+ORDER BY profile_type
+",
+ "max_rows": 50
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT attribute_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+ORDER BY attribute_id
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"log2CNA"},{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rppa"},{"profile_type":"rppa_Zscores"}]}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `attribute_id` in scope SELECT DISTINCT attribute_id FROM clinical_data_derived WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018' ORDER BY attribute_id ASC. Maybe you meant: ['attribute_name']. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+ORDER BY attribute_name
+LIMIT 50
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"attribute_name":"AGE"},{"attribute_name":"AJCC_PATHOLOGIC_TUMOR_STAGE"},{"attribute_name":"AJCC_STAGING_EDITION"},{"attribute_name":"ANEUPLOIDY_SCORE"},{"attribute_name":"BUFFA_HYPOXIA_SCORE"},{"attribute_name":"CANCER_TYPE"},{"attribute_name":"CANCER_TYPE_ACRONYM"},{"attribute_name":"CANCER_TYPE_DETAILED"},{"attribute_name":"DAYS_LAST_FOLLOWUP"},{"attribute_name":"DAYS_TO_BIRTH"},{"attribute_name":"DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS"},{"attribute_name":"DFS_MONTHS"},{"attribute_name":"DFS_STATUS"},{"attribute_name":"DSS_MONTHS"},{"attribute_name":"DSS_STATUS"},{"attribute_name":"ETHNICITY"},{"attribute_name":"FORM_COMPLETION_DATE"},{"attribute_name":"FRACTION_GENOME_ALTERED"},{"attribute_name":"GENETIC_ANCESTRY_LABEL"},{"attribute_name":"GRADE"},{"attribute_name":"HISTORY_NEOADJUVANT_TRTYN"},{"attribute_name":"ICD_10"},{"attribute_name":"ICD_O_3_HISTOLOGY"},{"attribute_name":"ICD_O_3_SITE"},{"attribute_name":"INFORMED_CONSENT_VERIFIED"},{"attribute_name":"IN_PANCANPATHWAYS_FREEZE"},{"attribute_name":"MSI_SCORE_MANTIS"},{"attribute_name":"MSI_SENSOR_SCORE"},{"attribute_name":"MUTATION_COUNT"},{"attribute_name":"NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT"},{"attribute_name":"ONCOTREE_CODE"},{"attribute_name":"OS_MONTHS"},{"attribute_name":"OS_STATUS"},{"attribute_name":"OTHER_PATIENT_ID"},{"attribute_name":"PATH_M_STAGE"},{"attribute_name":"PATH_N_STAGE"},{"attribute_name":"PATH_T_STAGE"},{"attribute_name":"PERSON_NEOPLASM_CANCER_STATUS"},{"attribute_name":"PFS_MONTHS"},{"attribute_name":"PFS_STATUS"},{"attribute_name":"PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT"},{"attribute_name":"PRIOR_DX"},{"attribute_name":"RACE"},{"attribute_name":"RADIATION_THERAPY"},{"attribute_name":"RAGNUM_HYPOXIA_SCORE"},{"attribute_name":"SAMPLE_COUNT"},{"attribute_name":"SAMPLE_TYPE"},{"attribute_name":"SEX"},{"attribute_name":"SOMATIC_STATUS"},{"attribute_name":"SUBTYPE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT attribute_name, COUNT(DISTINCT attribute_value) as value_count
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+GROUP BY attribute_name
+ORDER BY attribute_name
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"attribute_name":"AGE","value_count":61},{"attribute_name":"AJCC_PATHOLOGIC_TUMOR_STAGE","value_count":1},{"attribute_name":"AJCC_STAGING_EDITION","value_count":1},{"attribute_name":"ANEUPLOIDY_SCORE","value_count":25},{"attribute_name":"BUFFA_HYPOXIA_SCORE","value_count":29},{"attribute_name":"CANCER_TYPE","value_count":1},{"attribute_name":"CANCER_TYPE_ACRONYM","value_count":1},{"attribute_name":"CANCER_TYPE_DETAILED","value_count":4},{"attribute_name":"DAYS_LAST_FOLLOWUP","value_count":365},{"attribute_name":"DAYS_TO_BIRTH","value_count":503},{"attribute_name":"DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","value_count":2},{"attribute_name":"DFS_MONTHS","value_count":126},{"attribute_name":"DFS_STATUS","value_count":3},{"attribute_name":"DSS_MONTHS","value_count":432},{"attribute_name":"DSS_STATUS","value_count":3},{"attribute_name":"ETHNICITY","value_count":3},{"attribute_name":"FORM_COMPLETION_DATE","value_count":171},{"attribute_name":"FRACTION_GENOME_ALTERED","value_count":408},{"attribute_name":"GENETIC_ANCESTRY_LABEL","value_count":9},{"attribute_name":"GRADE","value_count":3},{"attribute_name":"HISTORY_NEOADJUVANT_TRTYN","value_count":4},{"attribute_name":"ICD_10","value_count":7},{"attribute_name":"ICD_O_3_HISTOLOGY","value_count":6},{"attribute_name":"ICD_O_3_SITE","value_count":7},{"attribute_name":"INFORMED_CONSENT_VERIFIED","value_count":2},{"attribute_name":"IN_PANCANPATHWAYS_FREEZE","value_count":2},{"attribute_name":"MSI_SCORE_MANTIS","value_count":358},{"attribute_name":"MSI_SENSOR_SCORE","value_count":31},{"attribute_name":"MUTATION_COUNT","value_count":74},{"attribute_name":"NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","value_count":3},{"attribute_name":"ONCOTREE_CODE","value_count":4},{"attribute_name":"OS_MONTHS","value_count":433},{"attribute_name":"OS_STATUS","value_count":3},{"attribute_name":"OTHER_PATIENT_ID","value_count":514},{"attribute_name":"PATH_M_STAGE","value_count":1},{"attribute_name":"PATH_N_STAGE","value_count":1},{"attribute_name":"PATH_T_STAGE","value_count":1},{"attribute_name":"PERSON_NEOPLASM_CANCER_STATUS","value_count":3},{"attribute_name":"PFS_MONTHS","value_count":428},{"attribute_name":"PFS_STATUS","value_count":3},{"attribute_name":"PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","value_count":1},{"attribute_name":"PRIOR_DX","value_count":4},{"attribute_name":"RACE","value_count":5},{"attribute_name":"RADIATION_THERAPY","value_count":3},{"attribute_name":"RAGNUM_HYPOXIA_SCORE","value_count":20},{"attribute_name":"SAMPLE_COUNT","value_count":1},{"attribute_name":"SAMPLE_TYPE","value_count":1},{"attribute_name":"SEX","value_count":3},{"attribute_name":"SOMATIC_STATUS","value_count":1},{"attribute_name":"SUBTYPE","value_count":4}],"truncated":true,"returned_rows":50,"note":"Result truncated to 50 rows; more rows matched but the exact total is unknown because the query was capped during execution for efficiency. Narrow the query (add a LIMIT, aggregate, or filter) or pass a larger max_rows (up to 10000) to … (12 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT attribute_value as subtype, COUNT(*) as sample_count
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'SUBTYPE'
+GROUP BY attribute_value
+ORDER BY sample_count DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHmut-non-codel","sample_count":248},{"subtype":"LGG_IDHmut-codel","sample_count":167},{"subtype":"LGG_IDHwt","sample_count":92},{"sample_count":7}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- For each subtype, identify genes significantly overexpressed (positive Z-scores)
+WITH subtype_samples AS (
+  SELECT 
+    cd.attribute_value as subtype,
+    cd.sample_id,
+    cd.patient_id,
+    cd.cancer_study_identifier
+  FROM clinical_data_derived cd
+  WHERE cd.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND cd.attribute_name = 'SUBTYPE'
+),
+expression_by_subtype AS (
+  SELECT 
+    ss.subtype,
+    gad.hugo_gene_symbol,
+    COUNT(*) as sample_count,
+    AVG(toFloat64OrNull(gad.alteration_value)) as mean_zscore,
+    COUNT(*) FILTER (WHERE toFloat64OrNull(gad.alteration_value) > 1.5) as samples_high_zscore,
+    COUNT(*) FILTER (WHERE toFloat64OrNull(gad.alteration_value) > 2) as samples_very_high_zscore
+  FROM subtype_samples ss
+  INNER JOIN genetic_alteration_derived gad 
+    ON ss.sample_id = gad.sample_unique_id
+  WHERE gad.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND gad.profile_type = 'rna_seq_v2_mrna_median_Zscores'
+    AND gad.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+  GROUP BY ss.subtype, gad.hugo_gene_symbol
+)
+SELECT 
+  subtype,
+  hugo_gene_symbol,
+  sample_count,
+  ROUND(mean_zscore, 2) as mean_zscore,
+  samples_high_zscore,
+  ROUND(100.0 * samples_high_zscore / sample_count, 1) as pct_samples_high_zscore,
+  samples_very_high_zscore
+FROM expression_by_subtype
+WHERE mean_zscore > 0.5
+ORDER BY subtype, mean_zscore DESC
+LIMIT 200
+",
+ "max_rows": 200
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'cd.sample_id' cannot be resolved from table with name cd. In scope  subtype_samples AS ss. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- For each subtype, identify genes significantly overexpressed (positive Z-scores)
+WITH subtype_samples AS (
+  SELECT 
+    attribute_value as subtype,
+    sample_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+),
+expression_by_subtype AS (
+  SELECT 
+    ss.subtype,
+    gad.hugo_gene_symbol,
+    COUNT(*) as sample_count,
+    AVG(toFloat64OrNull(gad.alteration_value)) as mean_zscore,
+    COUNT(*) FILTER (WHERE toFloat64OrNull(gad.alteration_value) > 1.5) as samples_high_zscore
+  FROM subtype_samples ss
+  INNER JOIN genetic_alteration_derived gad 
+    ON ss.sample_unique_id = gad.sample_unique_id
+  WHERE gad.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND gad.profile_type = 'rna_seq_v2_mrna_median_Zscores'
+    AND gad.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+  GROUP BY ss.subtype, gad.hugo_gene_symbol
+)
+SELECT 
+  subtype,
+  hugo_gene_symbol,
+  sample_count,
+  ROUND(mean_zscore, 2) as mean_zscore,
+  samples_high_zscore,
+  ROUND(100.0 * samples_high_zscore / sample_count, 1) as pct_high_zscore
+FROM expression_by_subtype
+WHERE mean_zscore > 0.8
+ORDER BY subtype, mean_zscore DESC
+LIMIT 100
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- For each subtype, identify genes with highest average Z-scores (overexpressed)
+WITH subtype_samples AS (
+  SELECT 
+    attribute_value as subtype,
+    sample_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+),
+expression_by_subtype AS (
+  SELECT 
+    ss.subtype,
+    gad.hugo_gene_symbol,
+    COUNT(*) as sample_count,
+    AVG(toFloat64OrNull(gad.alteration_value)) as mean_zscore
+  FROM subtype_samples ss
+  INNER JOIN genetic_alteration_derived gad 
+    ON ss.sample_unique_id = gad.sample_unique_id
+  WHERE gad.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND gad.profile_type = 'rna_seq_v2_mrna_median_Zscores'
+    AND gad.alteration_value NOT IN ('', 'NA')
+    AND toFloat64OrNull(gad.alteration_value) IS NOT NULL
+  GROUP BY ss.subtype, gad.hugo_gene_symbol
+  HAVING mean_zscore > 0
+)
+SELECT 
+  subtype,
+  hugo_gene_symbol,
+  sample_count,
+  ROUND(mean_zscore, 3) as mean_zscore
+FROM expression_by_subtype
+ORDER BY subtype, mean_zscore DESC
+LIMIT 150
+",
+ "max_rows": 150
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check if subtype samples can be matched with expression data
+SELECT COUNT(*) as total_subtype_records
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'SUBTYPE'
+  AND attribute_value != ''
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"total_subtype_records":507}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check how many expression values exist
+SELECT COUNT(*) as expression_count
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND profile_type = 'rna_seq_v2_mrna_median_Zscores'
+  AND alteration_value NOT IN ('', 'NA')
+LIMIT 10
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"expression_count":10204442}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- First, get sample IDs with subtypes
+SELECT DISTINCT subtype, COUNT(*) as count
+FROM (
+  SELECT 
+    attribute_value as subtype,
+    sample_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+)
+GROUP BY subtype
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHwt","count":92},{"subtype":"LGG_IDHmut-codel","count":167},{"subtype":"LGG_IDHmut-non-codel","count":248}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check if samples from clinical data match samples in expression data
+WITH subtype_samples AS (
+  SELECT 
+    attribute_value as subtype,
+    sample_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+  LIMIT 5
+)
+SELECT COUNT(*) as matched_with_expression
+FROM subtype_samples ss
+INNER JOIN genetic_alteration_derived gad 
+  ON ss.sample_unique_id = gad.sample_unique_id
+WHERE gad.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND gad.profile_type = 'rna_seq_v2_mrna_median_Zscores'
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"matched_with_expression":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check sample ID formats in clinical vs expression data
+SELECT 'clinical_data' as source, sample_unique_id FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'SUBTYPE'
+LIMIT 3
+UNION ALL
+SELECT 'genetic_alteration' as source, sample_unique_id FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND profile_type = 'rna_seq_v2_mrna_median_Zscores'
+LIMIT 3
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"source":"clinical_data"},{"source":"clinical_data"},{"source":"clinical_data"},{"source":"genetic_alteration","sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4938-01"},{"source":"genetic_alteration","sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4941-01"},{"source":"genetic_alteration","sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4942-01"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check what type SUBTYPE is
+SELECT DISTINCT type FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'SUBTYPE'
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"type":"patient"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- For each subtype, identify genes overexpressed
+-- SUBTYPE is patient-level, so we need to join via patient
+WITH patient_subtype AS (
+  SELECT 
+    patient_unique_id,
+    attribute_value as subtype
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+),
+patient_samples AS (
+  SELECT DISTINCT
+    ps.subtype,
+    cd.sample_unique_id
+  FROM patient_subtype ps
+  INNER JOIN clinical_data_derived cd 
+    ON ps.patient_unique_id = cd.patient_unique_id
+  WHERE cd.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND cd.attribute_name = 'SAMPLE_TYPE'  -- get sample-level records
+),
+expression_by_subtype AS (
+  SELECT 
+    psamp.subtype,
+    gad.hugo_gene_symbol,
+    COUNT(*) as sample_count,
+    AVG(toFloat64OrNull(gad.alteration_value)) as mean_zscore
+  FROM patient_samples psamp
+  INNER JOIN genetic_alteration_derived gad 
+    ON psamp.sample_unique_id = gad.sample_unique_id
+  WHERE gad.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND gad.profile_type = 'rna_seq_v2_mrna_median_Zscores'
+    AND gad.alteration_value NOT IN ('', 'NA')
+  GROUP BY psamp.subtype, gad.hugo_gene_symbol
+)
+SELECT 
+  subtype,
+  hugo_gene_symbol,
+  sample_count,
+  ROUND(mean_zscore, 3) as mean_zscore
+FROM expression_by_subtype
+WHERE mean_zscore > 0.3
+ORDER BY subtype, mean_zscore DESC
+LIMIT 100
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"PRAMEF18","sample_count":167,"mean_zscore":6.861},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TNNT1","sample_count":167,"mean_zscore":2.567},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"LIN28A","sample_count":167,"mean_zscore":1.936},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"RLN3","sample_count":167,"mean_zscore":1.914},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"KRTDAP","sample_count":167,"mean_zscore":1.755},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"ATCAY","sample_count":167,"mean_zscore":1.27},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"NPPA","sample_count":167,"mean_zscore":1.25},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"ZBTB8B","sample_count":167,"mean_zscore":1.151},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"SYCE2","sample_count":167,"mean_zscore":1.149},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"HTR6","sample_count":167,"mean_zscore":1.14},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"MADCAM1","sample_count":167,"mean_zscore":1.125},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"FEM1A","sample_count":167,"mean_zscore":1.124},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"CACNG2","sample_count":167,"mean_zscore":1.097},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TMX2","sample_count":167,"mean_zscore":1.096},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TRPC3","sample_count":167,"mean_zscore":1.094},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"LRP8","sample_count":167,"mean_zscore":1.05},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"CHGB","sample_count":167,"mean_zscore":1.042},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"GTF2F1","sample_count":167,"mean_zscore":1.042},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"ZFR2","sample_count":167,"mean_zscore":1.03},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"ZNF99","sample_count":167,"mean_zscore":1.021},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"CYP2A6","sample_count":167,"mean_zscore":1.014},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"LINC02731","sample_count":167,"mean_zscore":0.994},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"PTGFR","sample_count":167,"mean_zscore":0.981},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"KCNK3","sample_count":167,"mean_zscore":0.978},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"DRG2","sample_count":167,"mean_zscore":0.968},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"GABRA3","sample_count":167,"mean_zscore":0.966},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"LRRTM4","sample_count":167,"mean_zscore":0.964},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"NCAN","sample_count":167,"mean_zscore":0.946},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TDRKH","sample_count":167,"mean_zscore":0.933},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"SEZ6L2","sample_count":167,"mean_zscore":0.93},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"NALF1","sample_count":167,"m … (6743 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- For each subtype, get top 30 overexpressed genes (positive Z-scores)
+WITH patient_subtype AS (
+  SELECT 
+    patient_unique_id,
+    attribute_value as subtype
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND attribute_name = 'SUBTYPE'
+    AND attribute_value != ''
+),
+patient_samples AS (
+  SELECT DISTINCT
+    ps.subtype,
+    cd.sample_unique_id
+  FROM patient_subtype ps
+  INNER JOIN clinical_data_derived cd 
+    ON ps.patient_unique_id = cd.patient_unique_id
+  WHERE cd.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND cd.attribute_name = 'SAMPLE_TYPE'
+),
+expression_by_subtype AS (
+  SELECT 
+    psamp.subtype,
+    gad.hugo_gene_symbol,
+    COUNT(*) as sample_count,
+    AVG(toFloat64OrNull(gad.alteration_value)) as mean_zscore,
+    ROW_NUMBER() OVER (PARTITION BY psamp.subtype ORDER BY AVG(toFloat64OrNull(gad.alteration_value)) DESC) as rank_within_subtype
+  FROM patient_samples psamp
+  INNER JOIN genetic_alteration_derived gad 
+    ON psamp.sample_unique_id = gad.sample_unique_id
+  WHERE gad.cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+    AND gad.profile_type = 'rna_seq_v2_mrna_median_Zscores'
+    AND gad.alteration_value NOT IN ('', 'NA')
+  GROUP BY psamp.subtype, gad.hugo_gene_symbol
+)
+SELECT 
+  subtype,
+  hugo_gene_symbol,
+  ROUND(mean_zscore, 2) as mean_zscore,
+  rank_within_subtype
+FROM expression_by_subtype
+WHERE rank_within_subtype <= 30
+ORDER BY subtype, rank_within_subtype
+",
+ "max_rows": 120
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"PRAMEF18","mean_zscore":6.86,"rank_within_subtype":1},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TNNT1","mean_zscore":2.57,"rank_within_subtype":2},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"LIN28A","mean_zscore":1.94,"rank_within_subtype":3},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"RLN3","mean_zscore":1.91,"rank_within_subtype":4},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"KRTDAP","mean_zscore":1.75,"rank_within_subtype":5},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"ATCAY","mean_zscore":1.27,"rank_within_subtype":6},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"NPPA","mean_zscore":1.25,"rank_within_subtype":7},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"ZBTB8B","mean_zscore":1.15,"rank_within_subtype":8},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"SYCE2","mean_zscore":1.15,"rank_within_subtype":9},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"HTR6","mean_zscore":1.14,"rank_within_subtype":10},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"MADCAM1","mean_zscore":1.13,"rank_within_subtype":11},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"FEM1A","mean_zscore":1.12,"rank_within_subtype":12},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"CACNG2","mean_zscore":1.1,"rank_within_subtype":13},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TMX2","mean_zscore":1.1,"rank_within_subtype":14},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TRPC3","mean_zscore":1.09,"rank_within_subtype":15},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"LRP8","mean_zscore":1.05,"rank_within_subtype":16},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"CHGB","mean_zscore":1.04,"rank_within_subtype":17},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"GTF2F1","mean_zscore":1.04,"rank_within_subtype":18},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"ZFR2","mean_zscore":1.03,"rank_within_subtype":19},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"ZNF99","mean_zscore":1.02,"rank_within_subtype":20},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"CYP2A6","mean_zscore":1.01,"rank_within_subtype":21},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"LINC02731","mean_zscore":0.99,"rank_within_subtype":22},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"PTGFR","mean_zscore":0.98,"rank_within_subtype":23},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"KCNK3","mean_zscore":0.98,"rank_within_subtype":24},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"DRG2","mean_zscore":0.97,"rank_within_subtype":25},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"GABRA3","mean_zscore":0.97,"rank_within_subtype":26},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"LRRTM4","mean_zscore":0.96,"rank_within_subtype":27},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"NCAN","mean_zscore":0.95,"rank_within_subtype":28},{"subtype":"LGG_IDHmut-codel","hugo_gene_symbol":"TDRKH","mean_zscore":0.93,"rank_within_subtype":29},{"subtype":"LGG_IDHmut-codel","hugo_ … (6129 more chars)
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","sampleCount":514,"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["lgg_tcga_pan_can_atlas_2018_gistic","lgg_tcga_pan_can_atlas_2018_log2CNA","lgg_tcga_pan_can_atlas_2018_mutations","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa","lgg_tcga_pan_can_atlas_2018_rppa_Zscores","lgg_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["lgg_tcga_pan_can_atlas_2018_armlevel_cna","lgg_tcga_pan_can_atlas_2018_genetic_ancestry","lgg_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","lgg_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","lgg_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+═ answer (success)
+## Yes, Lower Grade Glioma Has Genes Overexpressed in Molecular Subtypes
+
+In the **Brain Lower Grade Glioma (TCGA, PanCancer Atlas)** cohort, there are **three distinct molecular subtypes** based on IDH and chromosome 1p/19q status, and each has a unique expression signature:
+
+### **1. LGG_IDHmut-codel (167 samples)**
+Top overexpressed genes (Z-score mean):
+- **PRAMEF18** (Z = 6.86) — dramatically overexpressed
+- **TNNT1** (Z = 2.57)
+- **LIN28A** (Z = 1.94)
+- **RLN3** (Z = 1.91)
+- **KRTDAP** (Z = 1.75)
+- Plus 25 additional genes with Z-scores 0.8–1.3
+
+This subtype (IDH-mutant with 1p/19q codeletion) shows elevated expression primarily in neuron-related and developmental genes.
+
+### **2. LGG_IDHmut-non-codel (248 samples)**
+Top overexpressed genes:
+- **SLCO1B1** (Z = 10.61) — very high
+- **OR7G2** (Z = 7.28)
+- **CEACAM16** (Z = 6.01)
+- **OR6W1P** (Z = 3.32)
+- **MAGEA2** (Z = 3.12)
+- Plus 25 additional genes
+
+This subtype shows enrichment in metabolic transporters and olfactory receptors.
+
+### **3. LGG_IDHwt (92 samples)**
+Top overexpressed genes (strikingly high Z-scores):
+- **SEPTIN14** (Z = 235.92) — massive overexpression ⚠️
+- **KLK11** (Z = 31.38)
+- **SEC61G** (Z = 23.45)
+- **CYP27B1** (Z = 20.86)
+- **EGFR** (Z = 5.94) — notably present in IDH-wildtype
+- **CDK4** (Z = 5.41)
+
+The IDH-wildtype subtype exhibits the most extreme expression changes and includes known glioma-associated genes like **EGFR** and **CDK4**, suggesting a more aggressive phenotype.
+
+---
+
+### Interactive Exploration
+
+[View Brain Lower Grade Glioma study in cBioPortal](https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018)
+
+You can filter by SUBTYPE in StudyView and examine individual gene expression profiles using the mRNA expression (Z-scores) data in the Plots or Heatmap tabs.

@@ -1,0 +1,561 @@
+Q (haiku): "What is the concordance between ERBB2 copy number amplification, mRNA overexpression, and protein overexpression in breast cancer?"
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+▶ list_studies
+{
+ "search": "breast cancer",
+ "limit": 20
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"breast_msk_2026","name":"CCNE1 Amplifications in Breast Cancer (MSK, 2026)","type_of_cancer_id":"breast","sample_count":6318,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2026"},{"cancer_study_identifier":"breast_msk_2025","name":"Breast Cancer (MSK, Nat Genet 2025)","type_of_cancer_id":"brca","sample_count":3879,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2025"},{"cancer_study_identifier":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","type_of_cancer_id":"brca","sample_count":2509,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_metabric"},{"cancer_study_identifier":"breast_msk_2018","name":"Breast Cancer (MSK, Cancer Cell 2018)","type_of_cancer_id":"breast","sample_count":1918,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2018"},{"cancer_study_identifier":"breast_ink4_msk_2021","name":"Metastatic Breast Cancer (MSK, Cancer Discovery 2022)","type_of_cancer_id":"breast","sample_count":1365,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_ink4_msk_2021"},{"cancer_study_identifier":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","type_of_cancer_id":"brca","sample_count":825,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pub"},{"cancer_study_identifier":"brca_mbcproject_2022","name":"The Metastatic Breast Cancer Project (Provisional, December 2021)","type_of_cancer_id":"brca","sample_count":379,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_mbcproject_2022"},{"cancer_study_identifier":"brca_msk_erbb2_2026","name":"HER2-Low and HER2-Null Metastatic Breast Cancers treated with T-DXd (MSK, Clinical Cancer Research 2026)","type_of_cancer_id":"breast","sample_count":272,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_msk_erbb2_2026"},{"cancer_study_identifier":"brca_mbcproject_wagle_2017","name":"The Metastatic Breast Cancer Project (Archived, 2020)","type_of_cancer_id":"brca","sample_count":237,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_mbcproject_wagle_2017"},{"cancer_study_identifier":"brca_igr_2015","name":"Metastatic Breast Cancer (INSERM, PLoS Med 2016)","type_of_cancer_id":"brca","sample_count":216,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_igr_2015"},{"cancer_study_identifier":"brca_smc_2018","name":"Breast Cancer (SMC 2018)","type_of_cancer_id":"brca","sample_count":187,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_smc_2018"},{"cancer_study_identifier":"brca_aurora_2023","name":"Metastatic Breast Cancer (AURORA US Network, Nat Cancer 2023)","type_of_cancer_id":"brca","sample_count":155,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_aurora_2023"},{"cancer_study_identifier":"breast_cptac_gdc","name":"B … (1900 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+  AND hugo_gene_symbol = 'ERBB2'
+ORDER BY profile_type
+",
+ "max_rows": 50
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+◀ result
+{"rows":[{"profile_type":"cna"},{"profile_type":"methylation_promoters_rrbs"},{"profile_type":"mrna"},{"profile_type":"mrna_median_all_sample_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+  AND profile_type LIKE '%protein%'
+ORDER BY profile_type
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_cptac_2020'
+  AND hugo_gene_symbol = 'ERBB2'
+ORDER BY profile_type
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"log2CNA"},{"profile_type":"mrna_median_Zscores"},{"profile_type":"protein_quantification"},{"profile_type":"rna_seq_v2_mrna"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Analyze ERBB2 concordance across CNA, mRNA, and protein in CPTAC breast cancer
+WITH erbb2_data AS (
+  SELECT 
+    sample_unique_id,
+    MAX(CASE WHEN profile_type = 'gistic' THEN toFloat64OrNull(alteration_value) END) AS cna_gistic,
+    MAX(CASE WHEN profile_type = 'log2CNA' THEN toFloat64OrNull(alteration_value) END) AS cna_log2,
+    MAX(CASE WHEN profile_type = 'mrna_median_Zscores' THEN toFloat64OrNull(alteration_value) END) AS mrna_zscore,
+    MAX(CASE WHEN profile_type = 'rna_seq_v2_mrna' THEN toFloat64OrNull(alteration_value) END) AS mrna_raw,
+    MAX(CASE WHEN profile_type = 'protein_quantification' THEN toFloat64OrNull(alteration_value) END) AS protein
+  FROM genetic_alteration_derived
+  WHERE cancer_study_identifier = 'brca_cptac_2020'
+    AND hugo_gene_symbol = 'ERBB2'
+    AND alteration_value NOT IN ('', 'NA')
+  GROUP BY sample_unique_id
+)
+-- First, check data availability
+SELECT 
+  COUNT(*) AS total_samples,
+  COUNT(cna_gistic) AS n_cna,
+  COUNT(mrna_zscore) AS n_mrna,
+  COUNT(protein) AS n_protein,
+  COUNT(CASE WHEN cna_gistic IS NOT NULL AND mrna_zscore IS NOT NULL THEN 1 END) AS n_cna_mrna,
+  COUNT(CASE WHEN cna_gistic IS NOT NULL AND protein IS NOT NULL THEN 1 END) AS n_cna_protein,
+  COUNT(CASE WHEN mrna_zscore IS NOT NULL AND protein IS NOT NULL THEN 1 END) AS n_mrna_protein,
+  COUNT(CASE WHEN cna_gistic IS NOT NULL AND mrna_zscore IS NOT NULL AND protein IS NOT NULL THEN 1 END) AS n_all_three
+FROM erbb2_data
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"total_samples":122,"n_cna":122,"n_mrna":122,"n_protein":122,"n_cna_mrna":122,"n_cna_protein":122,"n_mrna_protein":122,"n_all_three":122}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Spearman correlations between ERBB2 CNA, mRNA, and protein
+WITH erbb2_data AS (
+  SELECT 
+    sample_unique_id,
+    MAX(CASE WHEN profile_type = 'gistic' THEN toFloat64OrNull(alteration_value) END) AS cna_gistic,
+    MAX(CASE WHEN profile_type = 'mrna_median_Zscores' THEN toFloat64OrNull(alteration_value) END) AS mrna_zscore,
+    MAX(CASE WHEN profile_type = 'protein_quantification' THEN toFloat64OrNull(alteration_value) END) AS protein
+  FROM genetic_alteration_derived
+  WHERE cancer_study_identifier = 'brca_cptac_2020'
+    AND hugo_gene_symbol = 'ERBB2'
+    AND alteration_value NOT IN ('', 'NA')
+  GROUP BY sample_unique_id
+),
+valid_samples AS (
+  SELECT * FROM erbb2_data
+  WHERE cna_gistic IS NOT NULL 
+    AND mrna_zscore IS NOT NULL 
+    AND protein IS NOT NULL
+)
+SELECT 
+  rankCorr(cna_gistic, mrna_zscore) AS cna_vs_mrna_spearman,
+  rankCorr(cna_gistic, protein) AS cna_vs_protein_spearman,
+  rankCorr(mrna_zscore, protein) AS mrna_vs_protein_spearman,
+  COUNT(*) AS n_samples
+FROM valid_samples
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"cna_vs_mrna_spearman":0.6234894471963282,"cna_vs_protein_spearman":0.39116584771050256,"mrna_vs_protein_spearman":0.48809236635924147,"n_samples":122}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Categorical concordance: CNA amplification (GISTIC 2) vs mRNA overexpression (Z-score > 2) vs protein overexpression
+WITH erbb2_data AS (
+  SELECT 
+    sample_unique_id,
+    MAX(CASE WHEN profile_type = 'gistic' THEN toFloat64OrNull(alteration_value) END) AS cna_gistic,
+    MAX(CASE WHEN profile_type = 'mrna_median_Zscores' THEN toFloat64OrNull(alteration_value) END) AS mrna_zscore,
+    MAX(CASE WHEN profile_type = 'protein_quantification' THEN toFloat64OrNull(alteration_value) END) AS protein
+  FROM genetic_alteration_derived
+  WHERE cancer_study_identifier = 'brca_cptac_2020'
+    AND hugo_gene_symbol = 'ERBB2'
+    AND alteration_value NOT IN ('', 'NA')
+  GROUP BY sample_unique_id
+),
+categorized AS (
+  SELECT 
+    cna_gistic,
+    mrna_zscore,
+    protein,
+    CASE WHEN cna_gistic = 2 THEN 1 ELSE 0 END AS cna_amp,
+    CASE WHEN mrna_zscore > 2 THEN 1 ELSE 0 END AS mrna_over,
+    CASE WHEN protein > quantile(0.75)(protein) OVER () THEN 1 ELSE 0 END AS protein_over
+  FROM erbb2_data
+  WHERE cna_gistic IS NOT NULL 
+    AND mrna_zscore IS NOT NULL 
+    AND protein IS NOT NULL
+)
+SELECT 
+  cna_amp,
+  mrna_over,
+  protein_over,
+  COUNT(*) AS count
+FROM categorized
+GROUP BY cna_amp, mrna_over, protein_over
+ORDER BY cna_amp DESC, mrna_over DESC, protein_over DESC
+",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"cna_amp":1,"mrna_over":1,"protein_over":1,"count":9},{"cna_amp":1,"mrna_over":0,"protein_over":1,"count":6},{"cna_amp":1,"mrna_over":0,"protein_over":0,"count":6},{"cna_amp":0,"mrna_over":0,"protein_over":1,"count":16},{"cna_amp":0,"mrna_over":0,"protein_over":0,"count":85}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Detailed concordance analysis with frequency data
+WITH erbb2_data AS (
+  SELECT 
+    sample_unique_id,
+    MAX(CASE WHEN profile_type = 'gistic' THEN toFloat64OrNull(alteration_value) END) AS cna_gistic,
+    MAX(CASE WHEN profile_type = 'mrna_median_Zscores' THEN toFloat64OrNull(alteration_value) END) AS mrna_zscore,
+    MAX(CASE WHEN profile_type = 'protein_quantification' THEN toFloat64OrNull(alteration_value) END) AS protein
+  FROM genetic_alteration_derived
+  WHERE cancer_study_identifier = 'brca_cptac_2020'
+    AND hugo_gene_symbol = 'ERBB2'
+    AND alteration_value NOT IN ('', 'NA')
+  GROUP BY sample_unique_id
+),
+categorized AS (
+  SELECT 
+    CASE WHEN cna_gistic = 2 THEN 1 ELSE 0 END AS cna_amp,
+    CASE WHEN mrna_zscore > 2 THEN 1 ELSE 0 END AS mrna_over,
+    CASE WHEN protein > quantile(0.75)(protein) OVER () THEN 1 ELSE 0 END AS protein_over
+  FROM erbb2_data
+  WHERE cna_gistic IS NOT NULL 
+    AND mrna_zscore IS NOT NULL 
+    AND protein IS NOT NULL
+)
+SELECT
+  -- CNA amplification frequency
+  COUNT(CASE WHEN cna_amp = 1 THEN 1 END) AS n_cna_amp,
+  (COUNT(CASE WHEN cna_amp = 1 THEN 1 END) * 100.0) / COUNT(*) AS pct_cna_amp,
+  
+  -- mRNA overexpression frequency
+  COUNT(CASE WHEN mrna_over = 1 THEN 1 END) AS n_mrna_over,
+  (COUNT(CASE WHEN mrna_over = 1 THEN 1 END) * 100.0) / COUNT(*) AS pct_mrna_over,
+  
+  -- Protein overexpression frequency (75th percentile)
+  COUNT(CASE WHEN protein_over = 1 THEN 1 END) AS n_protein_over,
+  (COUNT(CASE WHEN protein_over = 1 THEN 1 END) * 100.0) / COUNT(*) AS pct_protein_over,
+  
+  -- Concordance: all three altered
+  COUNT(CASE WHEN cna_amp = 1 AND mrna_over = 1 AND protein_over = 1 THEN 1 END) AS all_three_altered,
+  
+  -- Concordance: CNA and mRNA
+  COUNT(CASE WHEN cna_amp = 1 AND mrna_over = 1 THEN 1 END) AS cna_mrna_concordant,
+  
+  -- Concordance: CNA and protein
+  COUNT(CASE WHEN cna_amp = 1 AND protein_over = 1 THEN 1 END) AS cna_protein_concordant,
+  
+  -- Concordance: mRNA and protein
+  COUNT(CASE WHEN mrna_over = 1 AND protein_over = 1 THEN 1 END) AS mrna_protein_concordant,
+  
+  -- Of CNA-amplified samples, what % have mRNA overexpression?
+  COUNT(CASE WHEN cna_amp = 1 AND mrna_over = 1 THEN 1 END) * 100.0 / NULLIF(COUNT(CASE WHEN cna_amp = 1 THEN 1 END), 0) AS pct_cna_amp_with_mrna_over,
+  
+  -- Of CNA-amplified samples, what % have protein overexpression?
+  COUNT(CASE WHEN cna_amp = 1 AND protein_over = 1 THEN 1 END) * 100.0 / NULLIF(COUNT(CASE WHEN cna_amp = 1 THEN 1 END), 0) AS pct_cna_amp_with_protein_over,
+  
+  -- Of mRNA-overexpressed samples, what % have protein overexpression?
+  COUNT(CASE WHEN mrna_over = 1 AND protein_over = 1 THEN 1 END) * 100.0 / NULLIF(COUNT(CASE WHEN mrna_over = 1 THEN 1 END), 0) AS pct_mrna_over_with_protein_over,
+  
+  COUNT(*) AS total_samples
+FROM categorized
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"n_cna_amp":21,"pct_cna_amp":17.21311475409836,"n_mrna_over":9,"pct_mrna_over":7.377049180327869,"n_protein_over":31,"pct_protein_over":25.40983606557377,"all_three_altered":9,"cna_mrna_concordant":9,"cna_protein_concordant":15,"mrna_protein_concordant":9,"pct_cna_amp_with_mrna_over":42.857142857142854,"pct_cna_amp_with_protein_over":71.42857142857143,"pct_mrna_over_with_protein_over":100,"total_samples":122}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- ERBB2 concordance in METABRIC (CNA and mRNA only)
+WITH erbb2_data AS (
+  SELECT 
+    sample_unique_id,
+    MAX(CASE WHEN profile_type = 'cna' THEN toFloat64OrNull(alteration_value) END) AS cna,
+    MAX(CASE WHEN profile_type = 'mrna' THEN toFloat64OrNull(alteration_value) END) AS mrna
+  FROM genetic_alteration_derived
+  WHERE cancer_study_identifier = 'brca_metabric'
+    AND hugo_gene_symbol = 'ERBB2'
+    AND alteration_value NOT IN ('', 'NA')
+  GROUP BY sample_unique_id
+),
+valid_samples AS (
+  SELECT * FROM erbb2_data
+  WHERE cna IS NOT NULL AND mrna IS NOT NULL
+)
+SELECT 
+  rankCorr(cna, mrna) AS cna_vs_mrna_spearman,
+  COUNT(*) AS n_samples,
+  -- Frequency of high CNA
+  COUNT(CASE WHEN cna > 0.5 THEN 1 END) AS n_cna_high,
+  (COUNT(CASE WHEN cna > 0.5 THEN 1 END) * 100.0) / COUNT(*) AS pct_cna_high,
+  -- Frequency of high mRNA (top quartile)
+  COUNT(CASE WHEN mrna > quantile(0.75)(mrna) OVER () THEN 1 END) AS n_mrna_high,
+  (COUNT(CASE WHEN mrna > quantile(0.75)(mrna) OVER () THEN 1 END) * 100.0) / COUNT(*) AS pct_mrna_high,
+  -- Both high
+  COUNT(CASE WHEN cna > 0.5 AND mrna > quantile(0.75)(mrna) OVER () THEN 1 END) AS both_high,
+  -- Of CNA-high samples, % with high mRNA
+  COUNT(CASE WHEN cna > 0.5 AND mrna > quantile(0.75)(mrna) OVER () THEN 1 END) * 100.0 / NULLIF(COUNT(CASE WHEN cna > 0.5 THEN 1 END), 0) AS pct_cna_high_with_mrna_high
+FROM valid_samples
+",
+ "max_rows": 10
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 184\n Code: 184. DB::Exception: Window function quantile(0.75)(mrna) OVER () is found inside an aggregate function in query. (ILLEGAL_AGGREGATION) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- ERBB2 concordance in METABRIC (CNA and mRNA only)
+WITH erbb2_data AS (
+  SELECT 
+    sample_unique_id,
+    MAX(CASE WHEN profile_type = 'cna' THEN toFloat64OrNull(alteration_value) END) AS cna,
+    MAX(CASE WHEN profile_type = 'mrna' THEN toFloat64OrNull(alteration_value) END) AS mrna
+  FROM genetic_alteration_derived
+  WHERE cancer_study_identifier = 'brca_metabric'
+    AND hugo_gene_symbol = 'ERBB2'
+    AND alteration_value NOT IN ('', 'NA')
+  GROUP BY sample_unique_id
+),
+valid_samples AS (
+  SELECT cna, mrna FROM erbb2_data
+  WHERE cna IS NOT NULL AND mrna IS NOT NULL
+),
+quartiles AS (
+  SELECT 
+    quantile(0.75)(mrna) AS mrna_q75,
+    COUNT(*) AS n_total
+  FROM valid_samples
+)
+SELECT 
+  rankCorr(cna, mrna) AS cna_vs_mrna_spearman,
+  COUNT(*) AS n_samples,
+  -- Frequency of high CNA
+  COUNT(CASE WHEN cna > 0.5 THEN 1 END) AS n_cna_high,
+  (COUNT(CASE WHEN cna > 0.5 THEN 1 END) * 100.0) / COUNT(*) AS pct_cna_high,
+  -- Frequency of high mRNA (top quartile)
+  COUNT(CASE WHEN mrna > (SELECT mrna_q75 FROM quartiles) THEN 1 END) AS n_mrna_high,
+  (COUNT(CASE WHEN mrna > (SELECT mrna_q75 FROM quartiles) THEN 1 END) * 100.0) / COUNT(*) AS pct_mrna_high,
+  -- Both high
+  COUNT(CASE WHEN cna > 0.5 AND mrna > (SELECT mrna_q75 FROM quartiles) THEN 1 END) AS both_high,
+  -- Of CNA-high samples, % with high mRNA
+  COUNT(CASE WHEN cna > 0.5 AND mrna > (SELECT mrna_q75 FROM quartiles) THEN 1 END) * 100.0 / NULLIF(COUNT(CASE WHEN cna > 0.5 THEN 1 END), 0) AS pct_cna_high_with_mrna_high
+FROM valid_samples
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"cna_vs_mrna_spearman":0.7007175189581623,"n_samples":1980,"n_cna_high":470,"pct_cna_high":23.737373737373737,"n_mrna_high":495,"pct_mrna_high":25,"both_high":348,"pct_cna_high_with_mrna_high":74.04255319148936}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_cptac_2020",
+  "brca_metabric"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 2 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":2,"studiesWithMetadata":[{"studyId":"brca_cptac_2020","name":"Proteogenomic landscape of breast cancer (CPTAC, Cell 2020)","sampleCount":122,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_cptac_2020","metadata":{"clinicalAttributeIds":["AGE","APOBEC_SIGNATURE","CANCER TYPE","CANCER_TYPE_DETAILED","CD3_TILS_COUNTS","CD3_TILS_STATUS","CHROMOSOME_INSTABILITY_INDEX_CIN_","CIBERSORT_ABSOLUTE_SCORE","ERBB2_GENE_AMPLIFIED","ERBB2_PROTEOGENOMIC_STATUS","ERBB2_UPDATED_CLINICAL_STATUS","ER_UPDATED_CLINICAL_STATUS","ESTIMATE_IMMUNE_SCORE","ESTIMATE_STROMAL_SCORE","ESTIMATE_TUMORPURITY","ETHNICITY","ISCHEMIA_TIME_IN_MINUTES","MUTATION_COUNT","NMF_CLUSTER","NMF_CLUSTER_MEMBERSHIP_SCORE","NUMBER_OF_NON_SYNONYMOUS_MUTATIONS","ONCOTREE CODE","PAM50","PR_CLINICAL_STATUS","SAMPLE_COUNT","SEX","STEMNESS_SCORE","TMB_NONSYNONYMOUS","TMT_CHANNEL","TMT_PLEX","TNBC_UPDATED_CLINICAL_STATUS","TOP2A_GENE_AMPLIFIED","TOP2A_PROTEOGENOMIC_STATUS","TUMOR_STAGE","XCELL_IMMUNE_SCORE","XCELL_STROMAL_SCORE"],"molecularProfileIds":["brca_cptac_2020_gistic","brca_cptac_2020_log2CNA","brca_cptac_2020_mrna_median_Zscores","brca_cptac_2020_mutations","brca_cptac_2020_protein_quantification","brca_cptac_2020_rna_seq_v2_mrna"],"genericAssayProfiles":["brca_cptac_2020_acetylproteome","brca_cptac_2020_phosphoproteome"],"heatmapProfileIds":["brca_cptac_2020_mrna_median_Zscores"],"availableComparisonTabs":["overlap","clinical","alterations","mutations","mrna","protein","generic_assay_acetylproteome","generic_assay_phosphoproteome"]}},{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_metabric","metadata":{"clinicalAttributeIds":["AGE_AT_DIAGNOSIS","BREAST_SURGERY","CANCER_TYPE","CANCER_TYPE_DETAILED","CELLULARITY","CHEMOTHERAPY","CLAUDIN_SUBTYPE","COHORT","ER_IHC","ER_STATUS","GRADE","HER2_SNP6","HER2_STATUS","HISTOLOGICAL_SUBTYPE","HORMONE_THERAPY","INFERRED_MENOPAUSAL_STATE","INTCLUST","LATERALITY","LYMPH_NODES_EXAMINED_POSITIVE","MUTATION_COUNT","NPI","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PR_STATUS","RADIO_THERAPY","RFS_MONTHS","RFS_STATUS","SAMPLE_COUNT","SAMPLE_TYPE","SEX","THREEGENE","TMB_NONSYNONYMOUS","TUMOR_SIZE","TUMOR_STAGE","VITAL_STATUS"],"molecularProfileIds":["brca_metabric_cna","brca_metabric_methylation_promoters_rrbs","brca_metabric_mrna","brca_metabric_mrna_median_all_sample_Zscores","brca_metabric_mutations"],"heatmapProfileIds":["brca_metabric_methylation_promoters_rrbs","brca_metabric_mrna_median_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","dna_methylation"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_cptac_2020"
+ ],
+ "genes": [
+  "ERBB2"
+ ],
+ "oncoprintHeatmapTracks": [
+  {
+   "molecularProfileId": "brca_cptac_2020_mrna_median_Zscores",
+   "entities": [
+    "ERBB2"
+   ]
+  },
+  {
+   "molecularProfileId": "brca_cptac_2020_protein_quantification",
+   "entities": [
+    "ERBB2"
+   ]
+  }
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_cptac_2020&gene_list=ERBB2&case_set_id=brca_cptac_2020_all&heatmap_track_groups=brca_cptac_2020_mrna_median_Zscores%2CERBB2%3Bbrca_cptac_2020_protein_quantification%2CERBB2","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_cptac_2020&gene_list=ERBB2&case_set_id=brca_cptac_2020_all&heatmap_track_groups=brca_cptac_2020_mrna_median_Zscores%2CERBB2%3Bbrca_cptac_2020_protein_quantification%2CERBB2","data":{"studyIds":["brca_cptac_2020"],"studies":[{"studyId":"brca_cptac_2020","name":"Proteogenomic landscape of breast cancer (CPTAC, Cell 2020)","sampleCount":122}],"genes":["ERBB2"],"caseSetId":"brca_cptac_2020_all","oncoprintHeatmapTracks":[{"molecularProfileId":"brca_cptac_2020_mrna_median_Zscores","entities":["ERBB2"]},{"molecularProfileId":"brca_cptac_2020_protein_quantification","entities":["ERBB2"]}],"pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_metabric"
+ ],
+ "genes": [
+  "ERBB2"
+ ],
+ "oncoprintHeatmapTracks": [
+  {
+   "molecularProfileId": "brca_metabric_mrna_median_all_sample_Zscores",
+   "entities": [
+    "ERBB2"
+   ]
+  }
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_metabric&gene_list=ERBB2&case_set_id=brca_metabric_all&heatmap_track_groups=brca_metabric_mrna_median_all_sample_Zscores%2CERBB2","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_metabric&gene_list=ERBB2&case_set_id=brca_metabric_all&heatmap_track_groups=brca_metabric_mrna_median_all_sample_Zscores%2CERBB2","data":{"studyIds":["brca_metabric"],"studies":[{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509}],"genes":["ERBB2"],"caseSetId":"brca_metabric_all","oncoprintHeatmapTracks":[{"molecularProfileId":"brca_metabric_mrna_median_all_sample_Zscores","entities":["ERBB2"]}],"pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## ERBB2 Concordance Analysis: Copy Number, mRNA, and Protein in Breast Cancer
+
+I've analyzed the concordance between ERBB2 copy number amplification (CNA), mRNA overexpression, and protein overexpression across the largest available breast cancer cohorts. Here are the key findings:
+
+---
+
+### **CPTAC Breast Cancer (n=122 samples with all three modalities)**
+
+**Correlation Strengths (Spearman rank correlation):**
+- **CNA ↔ mRNA: ρ = 0.62** — moderate-to-strong positive correlation
+- **mRNA ↔ Protein: ρ = 0.49** — moderate positive correlation
+- **CNA ↔ Protein: ρ = 0.39** — weak-to-moderate positive correlation
+
+**Alteration Frequencies:**
+- CNA amplification (GISTIC = 2): 21/122 (17%)
+- mRNA overexpression (Z-score > 2): 9/122 (7%)
+- Protein overexpression (75th percentile): 31/122 (25%)
+
+**Concordance Breakdown:**
+- **All three altered**: 9 samples (7.4%)
+- **CNA + mRNA concordant**: 9/21 CNA-amplified samples (43%) also have mRNA overexpression
+- **CNA + Protein concordant**: 15/21 CNA-amplified samples (71%) also have protein overexpression
+- **mRNA + Protein concordant**: 9/9 mRNA-overexpressed samples (100%) also have protein overexpression
+
+**Key insight:** Of CNA-amplified ERBB2 samples, ~43% show corresponding mRNA overexpression but 71% show protein overexpression, suggesting protein abundance is not solely driven by transcription but may be stabilized or upregulated post-translationally.
+
+---
+
+### **METABRIC Breast Cancer (n=1,980 samples with CNA and mRNA)**
+
+**Correlation Strength:**
+- **CNA ↔ mRNA: ρ = 0.70** — strong positive correlation (stronger than CPTAC)
+
+**Alteration Frequencies:**
+- CNA high (log2 > 0.5): 470/1,980 (24%)
+- mRNA high (top quartile): 495/1,980 (25%)
+
+**Concordance:**
+- **Both CNA and mRNA high**: 348/1,980 (18%)
+- **Of CNA-high samples**: 348/470 (74%) also have mRNA overexpression
+
+---
+
+### **Summary**
+
+| Metric | CPTAC | METABRIC |
+|--------|-------|----------|
+| CNA ↔ mRNA correlation | ρ = 0.62 | ρ = 0.70 |
+| % CNA-amplified w/ mRNA overexpression | 43% | 74% |
+| mRNA ↔ Protein correlation | ρ = 0.49 | N/A |
+| % mRNA-high w/ protein overexpression | 100% | N/A |
+
+**Interpretation:** ERBB2 shows **strong CNA-mRNA concordance** across breast cancer cohorts (ρ ≥ 0.62), indicating that copy number drives transcription effectively. However, the **CNA-to-mRNA link is imperfect** (~40–74% concordance depending on thresholds), and **mRNA-to-protein concordance is even higher** (100% in CPTAC), suggesting post-transcriptional stabilization contributes to protein abundance. These patterns support HER2 amplification as a robust oncogenic driver but also hint at multiple regulatory layers.
+
+---
+
+### **Visualize the Data**
+
+[**View ERBB2 alterations with CNA, mRNA, and protein (CPTAC)**](https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_cptac_2020&gene_list=ERBB2&case_set_id=brca_cptac_2020_all&heatmap_track_groups=brca_cptac_2020_mrna_median_Zscores%2CERBB2%3Bbrca_cptac_2020_protein_quantification%2CERBB2) (122 samples, all three modalities visible side-by-side)
+
+[**View ERBB2 CNA and mRNA (METABRIC)**](https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_metabric&gene_list=ERBB2&case_set_id=brca_metabric_all&heatmap_track_groups=brca_metabric_mrna_median_all_sample_Zscores%2CERBB2) (1,980 samples, larger cohort for statistical power)

@@ -1,0 +1,481 @@
+Q (haiku): "In breast cancer, what is the correlation coefficient between EGFR expression levels and PIK3CA mutation status considering only patients who also have a homozygous deletion of PTEN?"
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ list_studies
+{
+ "search": "breast",
+ "limit": 10
+}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"breast_msk_2026","name":"CCNE1 Amplifications in Breast Cancer (MSK, 2026)","type_of_cancer_id":"breast","sample_count":6318,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2026"},{"cancer_study_identifier":"breast_msk_2025","name":"Breast Cancer (MSK, Nat Genet 2025)","type_of_cancer_id":"brca","sample_count":3879,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2025"},{"cancer_study_identifier":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","type_of_cancer_id":"brca","sample_count":2509,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_metabric"},{"cancer_study_identifier":"breast_msk_2018","name":"Breast Cancer (MSK, Cancer Cell 2018)","type_of_cancer_id":"breast","sample_count":1918,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2018"},{"cancer_study_identifier":"breast_ink4_msk_2021","name":"Metastatic Breast Cancer (MSK, Cancer Discovery 2022)","type_of_cancer_id":"breast","sample_count":1365,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_ink4_msk_2021"},{"cancer_study_identifier":"brca_tcga","name":"Breast Invasive Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"brca","sample_count":1108,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga"},{"cancer_study_identifier":"brca_tcga_gdc","name":"Invasive Breast Carcinoma (TCGA GDC, 2025)","type_of_cancer_id":"brca","sample_count":1102,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_gdc"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"brca","sample_count":1084,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","type_of_cancer_id":"brca","sample_count":825,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pub"}]}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+    profile_type,
+    COUNT(DISTINCT sample_unique_id) AS samples_with_egfr_expr
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+  AND hugo_gene_symbol = 'EGFR'
+  AND alteration_value NOT IN ('', 'NA')
+GROUP BY profile_type
+ORDER BY profile_type
+LIMIT 100
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"profile_type":"cna","samples_with_egfr_expr":2173},{"profile_type":"methylation_promoters_rrbs","samples_with_egfr_expr":1418},{"profile_type":"mrna","samples_with_egfr_expr":1980},{"profile_type":"mrna_median_all_sample_Zscores","samples_with_egfr_expr":1980}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check PTEN HOMDEL and PIK3CA mutations in METABRIC
+SELECT
+    'PTEN_HOMDEL' AS event_type,
+    COUNT(DISTINCT sample_unique_id) AS sample_count
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+  AND hugo_gene_symbol = 'PTEN'
+  AND variant_type = 'cna'
+  AND cna_alteration = -2
+  AND off_panel = 0
+
+UNION ALL
+
+SELECT
+    'PIK3CA_MUT' AS event_type,
+    COUNT(DISTINCT sample_unique_id) AS sample_count
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+  AND hugo_gene_symbol = 'PIK3CA'
+  AND variant_type = 'mutation'
+  AND mutation_status != 'UNCALLED'
+  AND off_panel = 0
+
+UNION ALL
+
+SELECT
+    'BOTH_EVENTS' AS event_type,
+    COUNT(DISTINCT g1.sample_unique_id) AS sample_count
+FROM genomic_event_derived g1
+INNER JOIN genomic_event_derived g2 ON g1.sample_unique_id = g2.sample_unique_id
+WHERE g1.cancer_study_identifier = 'brca_metabric'
+  AND g1.hugo_gene_symbol = 'PTEN'
+  AND g1.variant_type = 'cna'
+  AND g1.cna_alteration = -2
+  AND g1.off_panel = 0
+  AND g2.cancer_study_identifier = 'brca_metabric'
+  AND g2.hugo_gene_symbol = 'PIK3CA'
+  AND g2.variant_type = 'mutation'
+  AND g2.mutation_status != 'UNCALLED'
+  AND g2.off_panel = 0
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"event_type":"PTEN_HOMDEL","sample_count":44},{"event_type":"PIK3CA_MUT","sample_count":975},{"event_type":"BOTH_EVENTS","sample_count":7}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Among samples with PTEN HOMDEL, what's the PIK3CA mutation breakdown?
+-- And can we get EGFR expression data?
+
+WITH pten_homdel AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'PTEN'
+      AND variant_type = 'cna'
+      AND cna_alteration = -2
+      AND off_panel = 0
+),
+pik3ca_mut AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+egfr_expr AS (
+    SELECT 
+        sample_unique_id,
+        toFloat64OrNull(alteration_value) AS egfr_expr
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'EGFR'
+      AND profile_type = 'mrna'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+
+SELECT
+    COUNT(DISTINCT p.sample_unique_id) AS total_pten_homdel,
+    COUNT(DISTINCT CASE WHEN pic.sample_unique_id IS NOT NULL THEN p.sample_unique_id END) AS pten_homdel_with_pik3ca_mut,
+    COUNT(DISTINCT CASE WHEN e.sample_unique_id IS NOT NULL THEN p.sample_unique_id END) AS pten_homdel_with_egfr_expr,
+    COUNT(DISTINCT CASE WHEN pic.sample_unique_id IS NOT NULL AND e.sample_unique_id IS NOT NULL THEN p.sample_unique_id END) AS pten_homdel_with_both
+FROM pten_homdel p
+LEFT JOIN pik3ca_mut pic ON p.sample_unique_id = pic.sample_unique_id
+LEFT JOIN egfr_expr e ON p.sample_unique_id = e.sample_unique_id
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"total_pten_homdel":44,"pten_homdel_with_pik3ca_mut":44,"pten_homdel_with_egfr_expr":44,"pten_homdel_with_both":44}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Spearman correlation between EGFR expression and PIK3CA mutation status
+-- Among PTEN HOMDEL patients only
+
+WITH pten_homdel_samples AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'PTEN'
+      AND variant_type = 'cna'
+      AND cna_alteration = -2
+      AND off_panel = 0
+),
+
+pik3ca_status AS (
+    SELECT DISTINCT sample_unique_id, 1 AS pik3ca_mutated
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+
+egfr_expr AS (
+    SELECT 
+        sample_unique_id,
+        toFloat64OrNull(alteration_value) AS egfr_value
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'EGFR'
+      AND profile_type = 'mrna'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+
+combined_data AS (
+    SELECT
+        p.sample_unique_id,
+        e.egfr_value,
+        COALESCE(pic.pik3ca_mutated, 0) AS pik3ca_mutated
+    FROM pten_homdel_samples p
+    INNER JOIN egfr_expr e ON p.sample_unique_id = e.sample_unique_id
+    LEFT JOIN pik3ca_status pic ON p.sample_unique_id = pic.sample_unique_id
+)
+
+SELECT
+    rankCorr(egfr_value, pik3ca_mutated) AS spearman_correlation,
+    COUNT(*) AS num_samples,
+    COUNT(DISTINCT CASE WHEN pik3ca_mutated = 1 THEN sample_unique_id END) AS pik3ca_mutant_count,
+    COUNT(DISTINCT CASE WHEN pik3ca_mutated = 0 THEN sample_unique_id END) AS pik3ca_wildtype_count,
+    avg(egfr_value) AS mean_egfr_all,
+    avg(CASE WHEN pik3ca_mutated = 1 THEN egfr_value ELSE NULL END) AS mean_egfr_mutant,
+    avg(CASE WHEN pik3ca_mutated = 0 THEN egfr_value ELSE NULL END) AS mean_egfr_wildtype
+FROM combined_data
+",
+ "max_rows": 50
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `sample_unique_id` in scope WITH pten_homdel_samples AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE (cancer_study_identifier = 'brca_metabric') AND (hugo_gene_symbol = 'PTEN') AND (variant_type = 'cna') AND (cna_alteration = -2) AND (off_panel = 0)), pik3ca_status AS (SELECT DISTINCT sample_unique_id, 1 AS pik3ca_mutated FROM genomic_event_derived WHERE (cancer_study_identifier = 'brca_metabric') AND (hugo_gene_symbol = 'PIK3CA') AND (variant_type = 'mutation') AND (mutation_status != 'UNCALLED') AND (off_panel = 0)), egfr_expr AS (SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS egfr_value FROM genetic_alteration_derived WHERE (cancer_study_identifier = 'brca_metabric') AND (hugo_gene_symbol = 'EGFR') AND (profile_type = 'mrna') AND (alteration_value NOT IN ('', 'NA')) AND (toFloat64OrNull(alteration_value) IS NOT NULL)), combined_data AS (SELECT p.sample_unique_id, e.egfr_value, COALESCE(pic.pik3ca_mutated, 0) AS pik3ca_mutated FROM pten_homdel_samples AS p INNER JOIN egfr_expr AS e ON p.sample_unique_id = e.sample_unique_id LEFT JOIN pik3ca_status AS pic ON p.sample_unique_id = pic.sample_unique_id) SELECT rankCorr(egfr_value, pik3ca_mutated) AS spearman_correlation, COUNT(*) AS num_samples, COUNTDistinct(multiIf(pik3ca_mutated = 1, sample_unique_id, NULL)) AS pik3ca_mutant_count, COUNTDistinct(multiIf(pik3ca_mutated = 0, sample_unique_id, NULL)) AS pik3ca_wildtype_count, avg(egfr_value) AS mean_egfr_all, avg(multiIf(pik3ca_mutated = 1, egfr_value, NULL)) AS mean_egfr_mutant, avg(multiIf(pik3ca_mutated = 0, egfr_value, NULL)) AS mean_egfr_wildtype FROM combined_data. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Spearman correlation: EGFR expression vs PIK3CA mutation status
+-- Restricted to PTEN HOMDEL samples in METABRIC
+
+WITH pten_homdel_samples AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'PTEN'
+      AND variant_type = 'cna'
+      AND cna_alteration = -2
+      AND off_panel = 0
+),
+
+pik3ca_status AS (
+    SELECT DISTINCT sample_unique_id, 1 AS pik3ca_mutated
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+
+egfr_expr AS (
+    SELECT 
+        sample_unique_id,
+        toFloat64OrNull(alteration_value) AS egfr_value
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'EGFR'
+      AND profile_type = 'mrna'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+
+SELECT
+    rankCorr(e.egfr_value, COALESCE(pic.pik3ca_mutated, 0)) AS spearman_correlation,
+    COUNT(e.sample_unique_id) AS num_samples,
+    COUNT(DISTINCT CASE WHEN pic.pik3ca_mutated = 1 THEN e.sample_unique_id END) AS pik3ca_mutant_count,
+    COUNT(DISTINCT CASE WHEN pic.pik3ca_mutated IS NULL THEN e.sample_unique_id END) AS pik3ca_wildtype_count,
+    avg(e.egfr_value) AS mean_egfr_all,
+    avg(CASE WHEN pic.pik3ca_mutated = 1 THEN e.egfr_value ELSE NULL END) AS mean_egfr_mutant,
+    avg(CASE WHEN pic.pik3ca_mutated IS NULL THEN e.egfr_value ELSE NULL END) AS mean_egfr_wildtype
+FROM pten_homdel_samples p
+INNER JOIN egfr_expr e ON p.sample_unique_id = e.sample_unique_id
+LEFT JOIN pik3ca_status pic ON e.sample_unique_id = pic.sample_unique_id
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"spearman_correlation":0.340045377197958,"num_samples":42,"pik3ca_mutant_count":6,"pik3ca_wildtype_count":0,"mean_egfr_all":6.444000996331458,"mean_egfr_mutant":6.628333883712735}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Detailed breakdown for debugging
+
+WITH pten_homdel_samples AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'PTEN'
+      AND variant_type = 'cna'
+      AND cna_alteration = -2
+      AND off_panel = 0
+),
+
+pik3ca_status AS (
+    SELECT DISTINCT sample_unique_id, 1 AS pik3ca_mutated
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+
+egfr_expr AS (
+    SELECT 
+        sample_unique_id,
+        toFloat64OrNull(alteration_value) AS egfr_value
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND hugo_gene_symbol = 'EGFR'
+      AND profile_type = 'mrna'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+
+combined_data AS (
+    SELECT
+        e.sample_unique_id,
+        e.egfr_value,
+        COALESCE(pic.pik3ca_mutated, 0) AS pik3ca_status_binary
+    FROM pten_homdel_samples p
+    INNER JOIN egfr_expr e ON p.sample_unique_id = e.sample_unique_id
+    LEFT JOIN pik3ca_status pic ON e.sample_unique_id = pic.sample_unique_id
+)
+
+SELECT
+    rankCorr(egfr_value, pik3ca_status_binary) AS spearman_correlation,
+    COUNT(*) AS num_samples,
+    COUNT(CASE WHEN pik3ca_status_binary = 1 THEN 1 END) AS pik3ca_mutant_count,
+    COUNT(CASE WHEN pik3ca_status_binary = 0 THEN 1 END) AS pik3ca_wildtype_count,
+    avg(egfr_value) AS mean_egfr_all,
+    avg(CASE WHEN pik3ca_status_binary = 1 THEN egfr_value END) AS mean_egfr_mutant,
+    avg(CASE WHEN pik3ca_status_binary = 0 THEN egfr_value END) AS mean_egfr_wildtype
+FROM combined_data
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"spearman_correlation":0.340045377197958,"num_samples":42,"pik3ca_mutant_count":6,"pik3ca_wildtype_count":36,"mean_egfr_all":6.444000996331458,"mean_egfr_mutant":6.628333883712735,"mean_egfr_wildtype":6.413278848434579}]}
+
+═ answer (success)
+Perfect. Now let me get the study information for navigation:
+
+---
+
+## Results
+
+**Study:** [Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)](https://www.cbioportal.org/study/summary?id=brca_metabric)
+
+### Correlation Analysis: EGFR Expression vs PIK3CA Mutation Status  
+(Restricted to Patients with PTEN Homozygous Deletion)
+
+| Metric | Value |
+|--------|-------|
+| **Spearman Correlation Coefficient** | **0.340** |
+| **Sample Size (n)** | 42 |
+| **PIK3CA Mutant Samples** | 6 |
+| **PIK3CA Wild-Type Samples** | 36 |
+| **Mean EGFR Expression (All)** | 6.44 |
+| **Mean EGFR Expression (PIK3CA Mutant)** | 6.63 |
+| **Mean EGFR Expression (PIK3CA Wild-Type)** | 6.41 |
+
+### Interpretation
+
+Among the **42 METABRIC breast cancer patients with PTEN homozygous deletion**, there is a **moderate positive Spearman correlation of 0.340** between EGFR mRNA expression levels and PIK3CA mutation status (where 0 = wild-type, 1 = mutated). 
+
+This suggests:
+- Patients with **PIK3CA mutations tend to have slightly higher EGFR expression** (mean 6.63 vs. 6.41)
+- The relationship is **moderate in strength** (0.340 on the [−1, 1] scale)
+- The **small mutant subgroup (n=6)** limits statistical power
+
+### Important Caveats
+
+1. **Sample size:** Only 42 patients with PTEN HOMDEL limits generalizability. The PIK3CA mutant subgroup is particularly small (n=6).
+2. **No statistical significance test:** ClickHouse cannot compute p-values. To determine if this correlation is statistically significant, you would run this in R (`cor.test(method="spearman")`), Python (`scipy.stats.spearmanr`), or cBioPortal's Group Comparison tool.
+3. **EGFR expression type:** This uses the **mRNA (raw counts)** profile, not Z-scores. The correlation direction and magnitude would be identical using the Z-scored version, but absolute values would differ.
+
+### Next Steps
+
+To formally test the significance of this correlation and visualize the relationship, [view the filtered METABRIC cohort with these alterations](https://www.cbioportal.org/study/summary?id=brca_metabric).

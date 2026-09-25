@@ -1,0 +1,213 @@
+Q (sonnet): Which patients have a TP53 G199V mutation? Which are somatic vs germline?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://germline-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+Germline Variant Guide
+======================
+
+Overview
+--------
+cBioPortal stores both somatic AND germline variant data. Many cBioPortal features work identically for both variant types. This guide explains how to query germline variants and what to be aware of.
+
+How Germline Data is Stored
+---------------------------
+
+### mutation_status is free text — always compare case-insensitively
+Each study loads its own spelling. Germline calls appear as `'Germline'`, `'GERMLINE'` and `'germline'`; somatic calls as `'Somatic'`, `'SOMATIC'` and `'somatic'`; unannotated mutations as `'NA'`, `'.'`, `'Unknown'`, `'UNKNOWN'`, `'__UNKNOWN__'` and others. Matching one spelling silently drops whole studies (`mutation_status = 'Germline'` misses `all_stjude_2013`, `aml_stjude_2024` and `pog570_bcgsc_2020`).
+
+- **Germline:** `upper(mutation_status) = 'GERMLINE'`
+- **Somatic:** `upper(mutation_status) = 'SOMATIC'` — but only when the user asks for somatic-only. Many studies label their somatic calls `'NA'` or `'UNKNOWN'`, so for ordinary mutation questions follow common-pitfalls #3 and exclude only `'UNCALLED'`.
+- When unsure, list the values first: `SELECT mutation_status, count() FROM genomic_event_derived WHERE cancer_study_identifier = '{study_id}' AND variant_type = 'mutation' GROUP BY mutation_status`
+
+### Where the column lives
+- `genomic_event_derived.mutation_status` (preferred): mutations, and structural variants (from `sv_status`: `'SOMATIC'`, `'Somatic'`, `'GERMLINE'`)
+- `mutation_derived.mutationStatus`: the same values for mutations
+
+Identifying Studies with Germline Data
+--------------------------------------
+Not all studies include germline data. Always check before querying:
+
+```sql
+-- Find studies containing germline mutations
+SELECT cancer_study_identifier, COUNT(*) as germline_count
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+  AND upper(mutation_status) = 'GERMLINE'
+GROUP BY cancer_study_identifier
+ORDER BY germline_count DESC
+```
+
+Common Query Patterns
+---------------------
+
+### Count germline vs somatic mutations per gene in a study
+```sql
+SELECT hugo_gene_symbol, upper(mutation_status) AS status, COUNT(*) as count
+FROM genomic_event_derived
+WHERE cancer_study_identifier = '{study_id}'
+  AND variant_type = 'mutation'
+  AND upper(mutation_status) IN ('GERMLINE', 'SOMATIC')
+GROUP BY hugo_gene_symbol, status
+ORDER BY count DESC
+LIMIT 20
+```
+
+### Find patients with germline mutations in a specific gene
+```sql
+SELECT DISTINCT patient_unique_id, sample_unique_id, mutation_variant, mutation_type
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = '{GENE}'
+  AND upper(mutation_status) = 'GERMLINE'
+  AND cancer_study_identifier = '{study_id}'
+  AND variant_type = 'mutation'
+```
+
+### Germline mutation frequency
+The numerator is samples with a germline mutation in the gene; the denominator is samples **profiled** for the gene — not samples that happen to have a mutation in it. Take the denominator from mutation-frequency-guide Step 2 (or … (2222 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT
+    cancer_study_identifier,
+    patient_unique_id,
+    sample_unique_id,
+    mutation_variant,
+    mutation_type,
+    mutation_status
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'TP53'
+  AND variant_type = 'mutation'
+  AND mutation_variant = 'G199V'
+ORDER BY cancer_study_identifier, patient_unique_id",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"alk_msk_2026","patient_unique_id":"alk_msk_2026_C-RPRH27","sample_unique_id":"alk_msk_2026_s_C_RPRH27_X001_d01","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"NA"},{"cancer_study_identifier":"blca_tcga_gdc","patient_unique_id":"blca_tcga_gdc_TCGA-XF-A9ST","sample_unique_id":"blca_tcga_gdc_TCGA-XF-A9ST-01","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"Somatic"},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018","patient_unique_id":"blca_tcga_pan_can_atlas_2018_TCGA-XF-A9ST","sample_unique_id":"blca_tcga_pan_can_atlas_2018_TCGA-XF-A9ST-01","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"."},{"cancer_study_identifier":"blca_tcga_pub_2017","patient_unique_id":"blca_tcga_pub_2017_TCGA-XF-A9ST","sample_unique_id":"blca_tcga_pub_2017_TCGA-XF-A9ST-01","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"Somatic"},{"cancer_study_identifier":"bm_nsclc_mskcc_2023","patient_unique_id":"bm_nsclc_mskcc_2023_P-0049559","sample_unique_id":"bm_nsclc_mskcc_2023_P-0049559-T01-IM6","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"SOMATIC"},{"cancer_study_identifier":"bowel_colitis_msk_2022","patient_unique_id":"bowel_colitis_msk_2022_TRF117586","sample_unique_id":"bowel_colitis_msk_2022_TRF117586","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"NA"},{"cancer_study_identifier":"braf_msk_impact_2024","patient_unique_id":"braf_msk_impact_2024_P-0046745","sample_unique_id":"braf_msk_impact_2024_P-0046745-T01-IM6","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"SOMATIC"},{"cancer_study_identifier":"brca_metabric","patient_unique_id":"brca_metabric_MB-2632","sample_unique_id":"brca_metabric_MB-2632","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"NA"},{"cancer_study_identifier":"brca_tcga","patient_unique_id":"brca_tcga_TCGA-A2-A0SX","sample_unique_id":"brca_tcga_TCGA-A2-A0SX-01","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"Somatic"},{"cancer_study_identifier":"brca_tcga","patient_unique_id":"brca_tcga_TCGA-C8-A27A","sample_unique_id":"brca_tcga_TCGA-C8-A27A-01","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"Somatic"},{"cancer_study_identifier":"brca_tcga_gdc","patient_unique_id":"brca_tcga_gdc_TCGA-A2-A0SX","sample_unique_id":"brca_tcga_gdc_TCGA-A2-A0SX-01","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"Somatic"},{"cancer_study_identifier":"brca_tcga_gdc","patient_unique_id":"brca_tcga_gdc_TCGA-C8-A27A","sample_unique_id":"brca_tcga_gdc_TCGA-C8-A27A-01","mutation_variant":"G199V","mutation_type":"Missense_Mutation","mutation_status":"Somatic"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","patient_unique_id":"brca_tcga_pan_can_atlas_2018_TCGA-A2-A … (44379 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT upper(mutation_status) AS status, count() AS n_records, uniqExact(cancer_study_identifier) as n_studies
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'TP53'
+  AND variant_type = 'mutation'
+  AND mutation_variant = 'G199V'
+GROUP BY status
+ORDER BY n_records DESC"
+}
+
+◀ result
+{"rows":[{"status":"SOMATIC","n_records":156,"n_studies":43},{"status":"NA","n_records":32,"n_studies":21},{"status":".","n_records":5,"n_studies":4},{"status":"UNKNOWN","n_records":1,"n_studies":1},{"status":"GERMLINE","n_records":1,"n_studies":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT
+    cancer_study_identifier,
+    patient_unique_id,
+    sample_unique_id,
+    upper(mutation_status) AS status
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'TP53'
+  AND variant_type = 'mutation'
+  AND mutation_variant = 'G199V'
+  AND upper(mutation_status) = 'GERMLINE'
+ORDER BY cancer_study_identifier"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-A2-A0SX","sample_unique_id":"brca_tcga_pub_TCGA-A2-A0SX-01","status":"GERMLINE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT
+    cancer_study_identifier,
+    patient_unique_id,
+    sample_unique_id,
+    upper(mutation_status) AS status
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'TP53'
+  AND variant_type = 'mutation'
+  AND mutation_variant = 'G199V'
+  AND cancer_study_identifier IN ('brca_tcga_pub','brca_tcga','brca_tcga_gdc','brca_tcga_pan_can_atlas_2018','brca_tcga_pub2015')
+ORDER BY patient_unique_id, cancer_study_identifier"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"brca_tcga","patient_unique_id":"brca_tcga_TCGA-A2-A0SX","sample_unique_id":"brca_tcga_TCGA-A2-A0SX-01","status":"SOMATIC"},{"cancer_study_identifier":"brca_tcga","patient_unique_id":"brca_tcga_TCGA-C8-A27A","sample_unique_id":"brca_tcga_TCGA-C8-A27A-01","status":"SOMATIC"},{"cancer_study_identifier":"brca_tcga_gdc","patient_unique_id":"brca_tcga_gdc_TCGA-A2-A0SX","sample_unique_id":"brca_tcga_gdc_TCGA-A2-A0SX-01","status":"SOMATIC"},{"cancer_study_identifier":"brca_tcga_gdc","patient_unique_id":"brca_tcga_gdc_TCGA-C8-A27A","sample_unique_id":"brca_tcga_gdc_TCGA-C8-A27A-01","status":"SOMATIC"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","patient_unique_id":"brca_tcga_pan_can_atlas_2018_TCGA-A2-A0SX","sample_unique_id":"brca_tcga_pan_can_atlas_2018_TCGA-A2-A0SX-01","status":"."},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","patient_unique_id":"brca_tcga_pan_can_atlas_2018_TCGA-C8-A27A","sample_unique_id":"brca_tcga_pan_can_atlas_2018_TCGA-C8-A27A-01","status":"."},{"cancer_study_identifier":"brca_tcga_pub2015","patient_unique_id":"brca_tcga_pub2015_TCGA-A2-A0SX","sample_unique_id":"brca_tcga_pub2015_TCGA-A2-A0SX-01","status":"NA"},{"cancer_study_identifier":"brca_tcga_pub2015","patient_unique_id":"brca_tcga_pub2015_TCGA-C8-A27A","sample_unique_id":"brca_tcga_pub2015_TCGA-C8-A27A-01","status":"NA"},{"cancer_study_identifier":"brca_tcga_pub","patient_unique_id":"brca_tcga_pub_TCGA-A2-A0SX","sample_unique_id":"brca_tcga_pub_TCGA-A2-A0SX-01","status":"GERMLINE"}]}
+
+═ answer (success)
+This confirms it: **TCGA-A2-A0SX** is one physical patient loaded into five different TCGA breast cancer study versions. Only the original `brca_tcga_pub` study explicitly annotated this variant as `GERMLINE`; the other four loads (including the current TCGA PanCancer Atlas) simply carry an unannotated (`Somatic`/`NA`/`.`) status for the same call — i.e., they did not re-derive germline/somatic status, they inherited whatever the original MAF said or left it blank.
+
+## Summary
+
+**TP53 G199V** (a missense mutation) appears in cBioPortal across ~40+ studies, but most of these are overlapping/redundant loads of the same underlying cohorts (TCGA studies reloaded 4–5×; MSK-IMPACT patients reloaded across `msk_impact_2017`, `msk_impact_50k_2026`, `msk_chord_2024`, `msk_met_2021`, and various disease-specific MSK subsets). Deduplicating to **distinct real-world patients** across all annotated studies:
+
+**Germline (1 patient):**
+- **TCGA-A2-A0SX** — explicitly labeled `Germline` only in the original [TCGA Breast Cancer (Nature 2012)](https://www.cbioportal.org/study/summary?id=brca_tcga_pub) study (`brca_tcga_pub`). This same patient's TP53 G199V call also appears in `brca_tcga`, `brca_tcga_gdc`, `brca_tcga_pan_can_atlas_2018`, and `brca_tcga_pub2015`, but those loads carry unannotated status (`Somatic`, `NA`, or `.`) for the identical call rather than re-confirming germline origin — so **only one study explicitly flags it as germline**, and this deserves cautious interpretation (see caveat below).
+
+**Somatic (explicitly annotated, distinct patients — selected examples across dozens of studies):**
+- TCGA-XF-A9ST (bladder), TCGA-C8-A27A (breast), TCGA-AD-6901 (colorectal), TCGA-06-0152 (glioblastoma), TCGA-EJ-8472 (prostate), C3N-02529 / C3L-03976 (lung adenocarcinoma, CPTAC), C3N-02944 (pancreatic, CPTAC), and many MSK-IMPACT patients (e.g., P-0049559, P-0007144, P-0034389, P-0037120, P-0025741, P-0006595, and dozens more) spanning lung, colorectal, prostate, breast, bladder, sarcoma, and pan-cancer MSK cohorts.
+
+**Unannotated status** (`NA`, `.`, `UNKNOWN` — status not determined, **not confirmed somatic**): a large number of records, mostly from studies that don't classify mutation origin (e.g., METABRIC, several MSK-IMPACT early loads, CCLE cell lines, GLASS, several China-based cohorts).
+
+**Important caveat:** Since TCGA‑A2‑A0SX's germline call is only preserved in one legacy study version and every newer reload of the same patient drops that annotation, I'd treat the germline classification as based on the original study's variant calling and not independently re-verified across reprocessed versions.
+
+For a focused look, here are direct links to two illustrative patients:
+
+[TCGA-A2-A0SX (germline-annotated) — Patient View, brca_tcga_pub](https://www.cbioportal.org/patient?studyId=brca_tcga_pub&caseId=TCGA-A2-A0SX)
+
+[TP53 G199V across the TCGA PanCancer Atlas cohort — Mutations tab](https://www.cbioportal.org/results/mutations?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=TP53&genetic_profile_ids_PROFILE_MUTATION_EXTENDED=brca_tcga_pan_can_atlas_2018_mutations&case_set_id=brca_tcga_pan_can_atlas_2018_all)
+
+If you'd like, I can restrict this to one specific study or cancer type (e.g., only MSK-IMPACT, or only TCGA) to give a cleaner non-overlapping patient count, or generate a direct link to browse every G199V-carrying patient in a chosen cohort.

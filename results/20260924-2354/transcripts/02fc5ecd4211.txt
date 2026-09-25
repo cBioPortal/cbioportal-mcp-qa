@@ -1,0 +1,562 @@
+Q (haiku): In the “Pan-cancer analysis of whole genomes” study what is the survival difference and the corresponding statistical significance between patients with mutations in both TP53 and KRAS versus patients with only a KRAS mutation?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ resolve_and_route
+{
+ "studyKeywords": "[\"Pan-cancer\", \"whole genomes\"]"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+✗ error
+<tool_use_error>Error: No such tool available: mcp__claude_ai_cBioPortal_MCP__resolve_and_route</tool_use_error>
+
+▶ list_studies
+{
+ "search": "Pan-cancer whole genomes",
+ "verbose": true
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"pancan_pcawg_2020","name":"Pan-cancer analysis of whole genomes (ICGC/TCGA, Nature 2020)","description":"WGS changes cataloged in 2,583 whole-cancer genomes and their matched normal tissues across 38 tumor types. Source data from <A HREF=\"https://xenabrowser.net/datapages/?cohort=PCAWG%20(specimen%20centric)&addHub=https%3A%2F%2Fpcawg.xenahubs.net&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443\">UCSC Xena</A> and <A HREF=\"https://dcc.icgc.org/releases/PCAWG/\">ICGC Data Portal</A>.","type_of_cancer_id":"mixed","sample_count":2922,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pancan_pcawg_2020"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Identify patient mutation status: both TP53+KRAS vs only KRAS
+WITH patient_mutations AS (
+  SELECT
+    patient_unique_id,
+    MAX(CASE WHEN hugo_gene_symbol = 'TP53' THEN 1 ELSE 0 END) AS has_tp53_mut,
+    MAX(CASE WHEN hugo_gene_symbol = 'KRAS' THEN 1 ELSE 0 END) AS has_kras_mut
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+    AND hugo_gene_symbol IN ('TP53', 'KRAS')
+    AND variant_type = 'mutation'
+    AND mutation_status != 'UNCALLED'
+    AND off_panel = FALSE
+  GROUP BY patient_unique_id
+),
+
+-- Classify patients into groups
+patient_groups AS (
+  SELECT
+    patient_unique_id,
+    CASE
+      WHEN has_tp53_mut = 1 AND has_kras_mut = 1 THEN 'TP53+KRAS'
+      WHEN has_tp53_mut = 0 AND has_kras_mut = 1 THEN 'KRAS_only'
+      ELSE NULL
+    END AS group_status
+  FROM patient_mutations
+  WHERE (has_tp53_mut = 1 AND has_kras_mut = 1) OR (has_tp53_mut = 0 AND has_kras_mut = 1)
+),
+
+-- Get survival data
+survival_data AS (
+  SELECT
+    pg.group_status,
+    cd.patient_unique_id,
+    MAX(CASE WHEN cd.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(cd.attribute_value) END) AS os_months,
+    MAX(CASE WHEN cd.attribute_name = 'OS_STATUS' THEN cd.attribute_value END) AS os_status
+  FROM patient_groups pg
+  LEFT JOIN clinical_data_derived cd ON pg.patient_unique_id = cd.patient_unique_id
+    AND cd.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND cd.type = 'patient'
+  GROUP BY pg.group_status, cd.patient_unique_id
+)
+
+SELECT
+  group_status,
+  COUNT(DISTINCT patient_unique_id) AS n_patients,
+  SUM(CASE WHEN os_status = '1:DECEASED' THEN 1 ELSE 0 END) AS n_events,
+  SUM(CASE WHEN os_status = '0:LIVING' THEN 1 ELSE 0 END) AS n_censored,
+  COUNT(DISTINCT CASE WHEN os_months IS NOT NULL THEN patient_unique_id END) AS n_with_os_data,
+  ROUND(quantile(0.5)(os_months), 2) AS median_os_months,
+  ROUND(min(os_months), 2) AS min_os_months,
+  ROUND(max(os_months), 2) AS max_os_months
+FROM survival_data
+WHERE group_status IS NOT NULL
+GROUP BY group_status
+ORDER BY group_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `patient_unique_id` in scope WITH patient_mutations AS (SELECT patient_unique_id, MAX(multiIf(hugo_gene_symbol = 'TP53', 1, 0)) AS has_tp53_mut, MAX(multiIf(hugo_gene_symbol = 'KRAS', 1, 0)) AS has_kras_mut FROM genomic_event_derived WHERE (cancer_study_identifier = 'pancan_pcawg_2020') AND (hugo_gene_symbol IN ('TP53', 'KRAS')) AND (variant_type = 'mutation') AND (mutation_status != 'UNCALLED') AND (off_panel = false) GROUP BY patient_unique_id), patient_groups AS (SELECT patient_unique_id, multiIf((has_tp53_mut = 1) AND (has_kras_mut = 1), 'TP53+KRAS', (has_tp53_mut = 0) AND (has_kras_mut = 1), 'KRAS_only', NULL) AS group_status FROM patient_mutations WHERE ((has_tp53_mut = 1) AND (has_kras_mut = 1)) OR ((has_tp53_mut = 0) AND (has_kras_mut = 1))), survival_data AS (SELECT pg.group_status, cd.patient_unique_id, MAX(multiIf(cd.attribute_name = 'OS_MONTHS', toFloat64OrNull(cd.attribute_value), NULL)) AS os_months, MAX(multiIf(cd.attribute_name = 'OS_STATUS', cd.attribute_value, NULL)) AS os_status FROM patient_groups AS pg LEFT JOIN clinical_data_derived AS cd ON (pg.patient_unique_id = cd.patient_unique_id) AND (cd.cancer_study_identifier = 'pancan_pcawg_2020') AND (cd.type = 'patient') GROUP BY pg.group_status, cd.patient_unique_id) SELECT group_status, COUNTDistinct(patient_unique_id) AS n_patients, SUM(multiIf(os_status = '1:DECEASED', 1, 0)) AS n_events, SUM(multiIf(os_status = '0:LIVING', 1, 0)) AS n_censored, COUNTDistinct(multiIf(os_months IS NOT NULL, patient_unique_id, NULL)) AS n_with_os_data, ROUND(quantile(0.5)(os_months), 2) AS median_os_months, ROUND(min(os_months), 2) AS min_os_months, ROUND(max(os_months), 2) AS max_os_months FROM survival_data WHERE group_status IS NOT NULL GROUP BY group_status ORDER BY group_status DESC. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- First, identify patients with KRAS mutations and check for TP53
+SELECT
+  DISTINCT g.patient_unique_id,
+  MAX(CASE WHEN g.hugo_gene_symbol = 'TP53' THEN 1 ELSE 0 END) AS has_tp53,
+  MAX(CASE WHEN g.hugo_gene_symbol = 'KRAS' THEN 1 ELSE 0 END) AS has_kras
+INTO tmp_mutations
+FROM genomic_event_derived g
+WHERE g.cancer_study_identifier = 'pancan_pcawg_2020'
+  AND g.hugo_gene_symbol IN ('TP53', 'KRAS')
+  AND g.variant_type = 'mutation'
+  AND g.mutation_status != 'UNCALLED'
+  AND g.off_panel = FALSE
+GROUP BY g.patient_unique_id
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 62\n Code: 62. DB::Exception: Syntax error: failed at position 273 (INTO) (line 6, col 1): INTO tmp_mutations\nFROM genomic_event_derived g\nWHERE g.cancer_study_identifier = 'pancan_pcawg_2020'\n  AND g.hugo_gene_symbol IN ('TP53', 'KRAS')\n  AND g.variant_t... Expected one of: token, Comma, FROM, PREWHERE, WHERE, GROUP BY, WITH, HAVING, WINDOW, QUALIFY, ORDER BY, LIMIT, OFFSET, FETCH, SETTINGS, UNION, EXCEPT, INTERSECT, alias, AS. (SYNTAX_ERROR) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+  CASE
+    WHEN tp53_count > 0 AND kras_count > 0 THEN 'TP53+KRAS'
+    WHEN tp53_count = 0 AND kras_count > 0 THEN 'KRAS_only'
+  END AS group_status,
+  patient_id,
+  os_months,
+  os_status
+FROM (
+  SELECT
+    g.patient_unique_id AS patient_id,
+    COUNT(DISTINCT CASE WHEN g.hugo_gene_symbol = 'TP53' THEN g.hugo_gene_symbol END) AS tp53_count,
+    COUNT(DISTINCT CASE WHEN g.hugo_gene_symbol = 'KRAS' THEN g.hugo_gene_symbol END) AS kras_count,
+    MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS os_months,
+    MAX(CASE WHEN c.attribute_name = 'OS_STATUS' THEN c.attribute_value END) AS os_status
+  FROM genomic_event_derived g
+  LEFT JOIN clinical_data_derived c
+    ON g.patient_unique_id = c.patient_unique_id
+    AND c.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND c.type = 'patient'
+  WHERE g.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND g.hugo_gene_symbol IN ('TP53', 'KRAS')
+    AND g.variant_type = 'mutation'
+    AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = FALSE
+  GROUP BY g.patient_unique_id
+)
+WHERE (tp53_count > 0 AND kras_count > 0) OR (tp53_count = 0 AND kras_count > 0)
+ORDER BY group_status
+LIMIT 10
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO34264","os_status":"1:DECEASED"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO32875","os_status":"1:DECEASED"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO33184","os_status":"1:DECEASED"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO35136","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO32972","os_status":"1:DECEASED"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO49460","os_status":"1:DECEASED"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO51548","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO8360","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO35230","os_status":"1:DECEASED"},{"group_status":"KRAS_only","patient_id":"pancan_pcawg_2020_DO51549","os_status":"0:LIVING"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+  CASE
+    WHEN tp53_count > 0 AND kras_count > 0 THEN 'TP53+KRAS'
+    WHEN tp53_count = 0 AND kras_count > 0 THEN 'KRAS_only'
+  END AS group_status,
+  COUNT(DISTINCT patient_id) AS n_patients,
+  SUM(CASE WHEN os_status = '1:DECEASED' THEN 1 ELSE 0 END) AS n_events,
+  SUM(CASE WHEN os_status = '0:LIVING' THEN 1 ELSE 0 END) AS n_censored,
+  COUNT(DISTINCT CASE WHEN os_months IS NOT NULL THEN patient_id END) AS n_with_os_data,
+  ROUND(avg(os_months), 2) AS mean_os_months,
+  ROUND(min(os_months), 2) AS min_os_months,
+  ROUND(max(os_months), 2) AS max_os_months
+FROM (
+  SELECT
+    g.patient_unique_id AS patient_id,
+    COUNT(DISTINCT CASE WHEN g.hugo_gene_symbol = 'TP53' THEN g.hugo_gene_symbol END) AS tp53_count,
+    COUNT(DISTINCT CASE WHEN g.hugo_gene_symbol = 'KRAS' THEN g.hugo_gene_symbol END) AS kras_count,
+    MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS os_months,
+    MAX(CASE WHEN c.attribute_name = 'OS_STATUS' THEN c.attribute_value END) AS os_status
+  FROM genomic_event_derived g
+  LEFT JOIN clinical_data_derived c
+    ON g.patient_unique_id = c.patient_unique_id
+    AND c.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND c.type = 'patient'
+  WHERE g.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND g.hugo_gene_symbol IN ('TP53', 'KRAS')
+    AND g.variant_type = 'mutation'
+    AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = FALSE
+  GROUP BY g.patient_unique_id
+)
+WHERE (tp53_count > 0 AND kras_count > 0) OR (tp53_count = 0 AND kras_count > 0)
+GROUP BY group_status
+ORDER BY group_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"group_status":"TP53+KRAS","n_patients":187,"n_events":122,"n_censored":65,"n_with_os_data":1,"mean_os_months":33.52,"min_os_months":33.52,"max_os_months":33.52},{"group_status":"KRAS_only","n_patients":85,"n_events":41,"n_censored":44,"n_with_os_data":3,"mean_os_months":9.87,"min_os_months":0,"max_os_months":29.61}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check what OS data is available in this study
+SELECT
+  attribute_name,
+  COUNT(DISTINCT patient_unique_id) AS n_patients_with_this_attr
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+  AND type = 'patient'
+  AND attribute_name IN ('OS_MONTHS', 'OS_STATUS', 'OS', 'OVERALL_SURVIVAL')
+GROUP BY attribute_name
+LIMIT 20
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"attribute_name":"OS_STATUS","n_patients_with_this_attr":2658},{"attribute_name":"OS_MONTHS","n_patients_with_this_attr":2658}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get patients in each group with their complete OS data
+WITH patient_groups AS (
+  SELECT
+    g.patient_unique_id,
+    SUM(CASE WHEN g.hugo_gene_symbol = 'TP53' THEN 1 ELSE 0 END) AS has_tp53,
+    SUM(CASE WHEN g.hugo_gene_symbol = 'KRAS' THEN 1 ELSE 0 END) AS has_kras
+  FROM genomic_event_derived g
+  WHERE g.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND g.hugo_gene_symbol IN ('TP53', 'KRAS')
+    AND g.variant_type = 'mutation'
+    AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = FALSE
+  GROUP BY g.patient_unique_id
+)
+
+SELECT
+  CASE
+    WHEN pg.has_tp53 > 0 AND pg.has_kras > 0 THEN 'TP53+KRAS'
+    WHEN pg.has_tp53 = 0 AND pg.has_kras > 0 THEN 'KRAS_only'
+  END AS group_status,
+  pg.patient_unique_id,
+  MAX(CASE WHEN cd.attribute_name = 'OS_MONTHS' THEN cd.attribute_value END) AS os_months,
+  MAX(CASE WHEN cd.attribute_name = 'OS_STATUS' THEN cd.attribute_value END) AS os_status
+FROM patient_groups pg
+LEFT JOIN clinical_data_derived cd
+  ON pg.patient_unique_id = cd.patient_unique_id
+  AND cd.cancer_study_identifier = 'pancan_pcawg_2020'
+  AND cd.type = 'patient'
+WHERE (pg.has_tp53 > 0 AND pg.has_kras > 0) OR (pg.has_tp53 = 0 AND pg.has_kras > 0)
+GROUP BY group_status, pg.patient_unique_id
+LIMIT 20
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO35305","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO49451","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_unique_id":"pancan_pcawg_2020_DO32875","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO49481","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO44087","os_status":"1:DECEASED"},{"group_status":"KRAS_only","patient_unique_id":"pancan_pcawg_2020_DO8360","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_unique_id":"pancan_pcawg_2020_DO49129","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO8730","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_unique_id":"pancan_pcawg_2020_DO49439","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO220176","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO7801","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO35236","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO36969","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_unique_id":"pancan_pcawg_2020_DO51600","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO9074","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_unique_id":"pancan_pcawg_2020_DO36115","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO33200","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO33248","os_status":"1:DECEASED"},{"group_status":"KRAS_only","patient_unique_id":"pancan_pcawg_2020_DO36080","os_status":"0:LIVING"},{"group_status":"KRAS_only","patient_unique_id":"pancan_pcawg_2020_DO35216","os_status":"1:DECEASED"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check a sample patient's clinical data
+SELECT
+  patient_unique_id,
+  attribute_name,
+  attribute_value
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+  AND patient_unique_id = 'pancan_pcawg_2020_DO35305'
+  AND type = 'patient'
+LIMIT 20
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"AGE","attribute_value":"70"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"ALCOHOL","attribute_value":"Don't know/Not sure"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"ALCOHOL_HISTORY_INTENSITY","attribute_value":"Not Documented"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"FIRST THERAPY_RESPONSE","attribute_value":"Complete Response"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"FIRST_THERAPY","attribute_value":"Chemotherapy"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"OS_MONTHS"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"OS_STATUS","attribute_value":"1:DECEASED"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"SAMPLE_COUNT","attribute_value":"1"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"SEX","attribute_value":"Male"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"TOBACCO_SMOKING_HISTORY_INDICATOR","attribute_value":"Smoking history not documented"},{"patient_unique_id":"pancan_pcawg_2020_DO35305","attribute_name":"TOBACCO_SMOKING_INTENSITY"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Find patients with KRAS mutations and available OS_MONTHS data
+WITH kras_patients AS (
+  SELECT DISTINCT
+    g.patient_unique_id
+  FROM genomic_event_derived g
+  WHERE g.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND g.hugo_gene_symbol = 'KRAS'
+    AND g.variant_type = 'mutation'
+    AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = FALSE
+),
+
+os_data AS (
+  SELECT
+    patient_unique_id,
+    MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN attribute_value END) AS os_months_val,
+    MAX(CASE WHEN attribute_name = 'OS_STATUS' THEN attribute_value END) AS os_status_val
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+    AND type = 'patient'
+    AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+  GROUP BY patient_unique_id
+  HAVING os_months_val IS NOT NULL AND os_months_val != ''
+)
+
+SELECT
+  COUNT(DISTINCT kp.patient_unique_id) AS n_kras_patients_with_os_data
+FROM kras_patients kp
+INNER JOIN os_data od ON kp.patient_unique_id = od.patient_unique_id
+LIMIT 10
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"n_kras_patients_with_os_data":4}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check OS data availability 
+SELECT
+  COUNT(DISTINCT patient_unique_id) AS n_patients_with_os_status,
+  SUM(CASE WHEN attribute_name = 'OS_MONTHS' AND (attribute_value IS NOT NULL AND attribute_value != '') THEN 1 ELSE 0 END) AS n_with_os_months,
+  COUNT(DISTINCT CASE WHEN attribute_name = 'OS_MONTHS' AND (attribute_value IS NOT NULL AND attribute_value != '') THEN patient_unique_id END) AS n_unique_patients_os_months
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+  AND type = 'patient'
+  AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+LIMIT 10
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"n_patients_with_os_status":2658,"n_with_os_months":282,"n_unique_patients_os_months":282}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get summary statistics for TP53+KRAS vs KRAS_only groups
+WITH patient_groups AS (
+  SELECT
+    g.patient_unique_id,
+    MAX(CASE WHEN g.hugo_gene_symbol = 'TP53' THEN 1 ELSE 0 END) AS has_tp53,
+    MAX(CASE WHEN g.hugo_gene_symbol = 'KRAS' THEN 1 ELSE 0 END) AS has_kras
+  FROM genomic_event_derived g
+  WHERE g.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND g.hugo_gene_symbol IN ('TP53', 'KRAS')
+    AND g.variant_type = 'mutation'
+    AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = FALSE
+  GROUP BY g.patient_unique_id
+),
+
+os_data AS (
+  SELECT
+    patient_unique_id,
+    MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END) AS os_months,
+    MAX(CASE WHEN attribute_name = 'OS_STATUS' THEN attribute_value END) AS os_status
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+    AND type = 'patient'
+    AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+  GROUP BY patient_unique_id
+)
+
+SELECT
+  CASE
+    WHEN pg.has_tp53 > 0 AND pg.has_kras > 0 THEN 'TP53+KRAS'
+    WHEN pg.has_tp53 = 0 AND pg.has_kras > 0 THEN 'KRAS_only'
+  END AS group_status,
+  COUNT(DISTINCT pg.patient_unique_id) AS n_patients,
+  COUNT(DISTINCT CASE WHEN od.os_months IS NOT NULL THEN pg.patient_unique_id END) AS n_with_os_data,
+  COUNT(DISTINCT CASE WHEN od.os_status = '1:DECEASED' THEN pg.patient_unique_id END) AS n_deceased,
+  COUNT(DISTINCT CASE WHEN od.os_status = '0:LIVING' THEN pg.patient_unique_id END) AS n_censored,
+  ROUND(quantile(0.5)(od.os_months), 2) AS median_os_months,
+  ROUND(min(od.os_months), 2) AS min_os_months,
+  ROUND(max(od.os_months), 2) AS max_os_months
+FROM patient_groups pg
+LEFT JOIN os_data od ON pg.patient_unique_id = od.patient_unique_id
+WHERE (pg.has_tp53 > 0 AND pg.has_kras > 0) OR (pg.has_tp53 = 0 AND pg.has_kras > 0)
+GROUP BY group_status
+ORDER BY group_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"group_status":"TP53+KRAS","n_patients":187,"n_with_os_data":1,"n_deceased":122,"n_censored":65,"median_os_months":33.52,"min_os_months":33.52,"max_os_months":33.52},{"group_status":"KRAS_only","n_patients":85,"n_with_os_data":3,"n_deceased":41,"n_censored":44,"median_os_months":0,"min_os_months":0,"max_os_months":29.61}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Double-check by showing actual individual records
+WITH patient_groups AS (
+  SELECT
+    g.patient_unique_id,
+    MAX(CASE WHEN g.hugo_gene_symbol = 'TP53' THEN 1 ELSE 0 END) AS has_tp53,
+    MAX(CASE WHEN g.hugo_gene_symbol = 'KRAS' THEN 1 ELSE 0 END) AS has_kras
+  FROM genomic_event_derived g
+  WHERE g.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND g.hugo_gene_symbol IN ('TP53', 'KRAS')
+    AND g.variant_type = 'mutation'
+    AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = FALSE
+  GROUP BY g.patient_unique_id
+)
+
+SELECT
+  CASE
+    WHEN pg.has_tp53 > 0 AND pg.has_kras > 0 THEN 'TP53+KRAS'
+    WHEN pg.has_tp53 = 0 AND pg.has_kras > 0 THEN 'KRAS_only'
+  END AS group_status,
+  pg.patient_unique_id,
+  MAX(CASE WHEN cd.attribute_name = 'OS_MONTHS' THEN cd.attribute_value END) AS os_months_raw,
+  MAX(CASE WHEN cd.attribute_name = 'OS_STATUS' THEN cd.attribute_value END) AS os_status
+FROM patient_groups pg
+LEFT JOIN clinical_data_derived cd
+  ON pg.patient_unique_id = cd.patient_unique_id
+  AND cd.cancer_study_identifier = 'pancan_pcawg_2020'
+  AND cd.type = 'patient'
+WHERE (pg.has_tp53 > 0 AND pg.has_kras > 0) OR (pg.has_tp53 = 0 AND pg.has_kras > 0)
+GROUP BY group_status, pg.patient_unique_id
+ORDER BY group_status DESC, os_months_raw DESC NULLS LAST
+LIMIT 50
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO46586","os_months_raw":"33.51973684","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO35236","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO36969","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO9074","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO34616","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO49113","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51478","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51518","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO35290","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO33344","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO34288","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51525","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO49135","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO35454","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51495","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO33168","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51522","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51538","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO34640","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51504","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO33368","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO35200","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51485","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO49478","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO50453","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO32893","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO44091","os_status":"0:LIVING"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO49172","os_status":"1:DECEASED"},{"group_status":"TP53+KRAS","patient_unique_id":"pancan_pcawg_2020_DO51481","os_status":"1:DECEASED"},{"group_status":"TP53+KR … (2104 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Final summary: TP53+KRAS vs KRAS_only with all survival metrics
+WITH patient_groups AS (
+  SELECT
+    g.patient_unique_id,
+    MAX(CASE WHEN g.hugo_gene_symbol = 'TP53' THEN 1 ELSE 0 END) AS has_tp53,
+    MAX(CASE WHEN g.hugo_gene_symbol = 'KRAS' THEN 1 ELSE 0 END) AS has_kras
+  FROM genomic_event_derived g
+  WHERE g.cancer_study_identifier = 'pancan_pcawg_2020'
+    AND g.hugo_gene_symbol IN ('TP53', 'KRAS')
+    AND g.variant_type = 'mutation'
+    AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = FALSE
+  GROUP BY g.patient_unique_id
+),
+
+os_data_full AS (
+  SELECT
+    patient_unique_id,
+    MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN attribute_value END) AS os_months_str,
+    MAX(CASE WHEN attribute_name = 'OS_STATUS' THEN attribute_value END) AS os_status
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+    AND type = 'patient'
+    AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+  GROUP BY patient_unique_id
+)
+
+SELECT
+  CASE
+    WHEN pg.has_tp53 > 0 AND pg.has_kras > 0 THEN 'TP53+KRAS'
+    WHEN pg.has_tp53 = 0 AND pg.has_kras > 0 THEN 'KRAS_only'
+  END AS group_status,
+  COUNT(DISTINCT pg.patient_unique_id) AS total_patients,
+  SUM(CASE WHEN od.os_months_str IS NOT NULL AND od.os_months_str != '' THEN 1 ELSE 0 END) AS n_with_os_months,
+  SUM(CASE WHEN od.os_status = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased_events,
+  SUM(CASE WHEN od.os_status = '0:LIVING' THEN 1 ELSE 0 END) AS n_living_censored,
+  SUM(CASE WHEN od.os_status IS NOT NULL AND od.os_status != '' THEN 1 ELSE 0 END) AS n_with_os_status
+FROM patient_groups pg
+LEFT JOIN os_data_full od ON pg.patient_unique_id = od.patient_unique_id
+WHERE (pg.has_tp53 > 0 AND pg.has_kras > 0) OR (pg.has_tp53 = 0 AND pg.has_kras > 0)
+GROUP BY group_status
+ORDER BY group_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"group_status":"TP53+KRAS","total_patients":187,"n_with_os_months":1,"n_deceased_events":122,"n_living_censored":65,"n_with_os_status":187},{"group_status":"KRAS_only","total_patients":85,"n_with_os_months":3,"n_deceased_events":41,"n_living_censored":44,"n_with_os_status":85}]}
+
+═ answer (success)
+Perfect. Now let me present this finding clearly based on the guide I read. This is a survival comparison that requires Kaplan-Meier analysis:
+
+---
+
+## Summary
+
+I've identified patients with mutations in both **TP53 and KRAS** versus those with **only KRAS** mutations in the *Pan-cancer analysis of whole genomes* study (`pancan_pcawg_2020`).
+
+### Study Cohort Definitions
+
+| Group | N Patients | Events (Deceased) | Censored (Living) |
+|-------|-----------|-----------------|-------------------|
+| **TP53 + KRAS** | 187 | 122 | 65 |
+| **KRAS only** | 85 | 41 | 44 |
+
+### Critical Finding: Insufficient OS_MONTHS Data
+
+**I cannot compute a survival difference or p-value** for the following reason:
+
+Although both groups have complete **OS_STATUS** (vital status) data, only **4 of 272 patients** (1.5%) have **OS_MONTHS** (follow-up time) values populated:
+- TP53+KRAS: 1 patient with OS_MONTHS
+- KRAS only: 3 patients with OS_MONTHS
+
+**Why this matters:** Survival analysis requires the **OS_MONTHS/OS_STATUS pair** to estimate Kaplan-Meier curves. Without OS_MONTHS for ~98.5% of the cohort, median survival and log-rank p-values cannot be reliably computed.
+
+### Recommended Next Steps
+
+To analyze survival differences between these groups, you can:
+
+1. **Use cBioPortal's Group Comparison tool** (Survival tab) — it may use alternative time-to-event fields if available
+2. **Check the original PCAWG data** — follow-up times may be documented in an external clinical file not yet integrated into this cBioPortal instance
+3. **Contact the study depositors** — check if OS_MONTHS was censored for privacy (common in pan-cancer studies)
+
+Would you like me to check for alternative survival fields (e.g., DFS_MONTHS, PFS_MONTHS, DSS_MONTHS) or explore other clinical endpoints in this cohort?

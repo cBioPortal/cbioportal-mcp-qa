@@ -1,0 +1,445 @@
+Q (sonnet): write me python code that can query the timeline files for msk-chord
+
+▶ list_guides
+{}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+◀ result
+{"result":[{"uri":"cbioportal://mutation-frequency-guide","description":"Comprehensive guide for calculating gene mutation frequencies with gene-specific profiling denominators"},{"uri":"cbioportal://clinical-data-guide","description":"Guide for querying clinical data including patient vs sample level considerations"},{"uri":"cbioportal://sample-filtering-guide","description":"Guide for filtering samples and studies in cBioPortal queries"},{"uri":"cbioportal://common-pitfalls","description":"Guide to avoid common mistakes when querying cBioPortal data. If you already know which numbered pitfall applies, fetch just that section via read_guide(\"cbioportal://common-pitfalls#<number>\") (e.g. #16) instead of the full guide"},{"uri":"cbioportal://treatment-guide","description":"Guide for querying treatment/clinical event data including drug agents, timelines, and linking to genomic data"},{"uri":"cbioportal://faq-guide","description":"General cBioPortal FAQ: history, how to cite, data types, reference genome, abbreviations, GISTIC thresholds, API access"},{"uri":"cbioportal://statistical-tests-guide","description":"Statistical test selection guide — decision matrix for choosing Fisher's exact, Wilcoxon, chi-squared, t-test, ANOVA, etc. based on data type and group count"},{"uri":"cbioportal://gene-expression-guide","description":"Gene expression / copy-number / methylation analysis. Covers genetic_alteration_derived, profile_type discovery, and the gene_pair_coexpression view for Spearman correlation between two genes"},{"uri":"cbioportal://external-resources-guide","description":"Guide for finding external linked resources such as imaging, pathology, Minerva, HTAN, or other resource_* table links before declaring data unavailable"},{"uri":"cbioportal://gene-resolution-guide","description":"Guide for resolving ambiguous gene symbols, aliases, gene families, and shorthand such as CD3 before querying expression or alteration data"},{"uri":"cbioportal://study-resolution-guide","description":"Guide for resolving requested studies, avoiding silent substitute cohorts, and redirecting to known external cBioPortal instances when data is not in this deployment"},{"uri":"cbioportal://germline-guide","description":"Guide for querying germline variant data — storage columns, study discovery, query patterns, and somatic vs germline considerations"},{"uri":"cbioportal://study-guide/{study_id}","description":"Dynamic study-specific guide - use get_study_guide(study_id) tool to generate"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_event_derived"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+◀ result
+{"columns":[{"name":"clinical_event_id","type":"Int64"},{"name":"patient_id","type":"Nullable(Int64)"},{"name":"patient_stable_id","type":"String"},{"name":"start_date","type":"Nullable(Int64)"},{"name":"stop_date","type":"Nullable(Int64)"},{"name":"event_type","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://treatment-guide"
+}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+# Treatment Data Query Guide
+
+## Overview
+
+Treatment data in cBioPortal is stored in **clinical event tables**, separate from clinical attributes. This allows for timeline-based treatment records with start/stop dates.
+
+## Start Here: Treatment Views
+
+For "most common treatments / agents / regimens in study X", use the parameterized views (documented in `cbioportal://clinical-data-guide`, Study-View Chart Counts):
+
+```sql
+-- Patients per agent (the portal's Treatment chart), with type/subtype arrays
+SELECT * FROM treatment_counts_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 20;
+
+-- Same-day agent combinations (investigational, prior-medication and radiation events excluded)
+SELECT * FROM treatment_regimens_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 20;
+```
+
+Write raw event queries (below) only for subgroups, timelines or keys the views do not expose.
+
+## Key Tables
+
+| Table | Description |
+|-------|-------------|
+| `clinical_event` | Event records with patient_id, event_type, start_date, stop_date |
+| `clinical_event_data` | Key-value pairs linked to each clinical_event_id |
+
+## Schema
+
+```
+clinical_event
+├── clinical_event_id (PK)
+├── patient_id (FK → patient.internal_id)
+├── event_type (Treatment, TREATMENT, Diagnosis, SURGERY, etc.)
+├── start_date (days from diagnosis)
+└── stop_date (days from diagnosis)
+
+clinical_event_data
+├── clinical_event_id (FK)
+├── key (AGENT, SUBTYPE, etc.)
+└── value
+```
+
+## Event Types
+
+Not all studies have all event types. Common ones include:
+
+| Event Type | Description |
+|------------|-------------|
+| `Treatment` / `TREATMENT` | Drug/therapy administration |
+| `SURGERY` | Surgical procedures |
+| `Diagnosis` | Diagnosis events |
+| `LAB_TEST` | Laboratory results |
+| `Sequencing` | Sequencing events |
+| `Sample acquisition` | Sample collection |
+| `PATHOLOGY` / `Pathology` | Pathology reports |
+
+## Basic Treatment Queries
+
+### List Available Event Types in a Study
+
+```sql
+SELECT DISTINCT ce.event_type, COUNT(*) as event_count
+FROM clinical_event ce
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier = 'your_study_id'
+GROUP BY ce.event_type
+ORDER BY event_count DESC;
+```
+
+### List Treatment Data Keys in a Study
+
+```sql
+SELECT DISTINCT ced.key, COUNT(*) as cnt
+FROM clinical_event ce
+JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier = 'your_study_id'
+  AND ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY ced.key
+ORDER BY cnt DESC;
+```
+
+### Get Most Common Treatment Agents
+
+```sql
+SELECT 
+    ced.value as agent,
+    COUNT(DISTINCT ce.patient_id) as patient_count
+FROM clinical_event ce
+JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_stud … (6220 more chars)
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_event_data_derived"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT event_type, count() AS n FROM clinical_event_derived WHERE cancer_study_identifier = 'msk_chord_2024' GROUP BY event_type ORDER BY n DESC"
+}
+
+◀ result
+{"columns":[{"name":"patient_unique_id","type":"String"},{"name":"key","type":"String"},{"name":"value","type":"String"},{"name":"start_date","type":"Int32"},{"name":"stop_date","type":"Int32"},{"name":"event_type","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"}]}
+
+◀ result
+{"rows":[{"event_type":"Diagnosis","n":1486868},{"event_type":"Lab_Test","n":480739},{"event_type":"Treatment","n":183652},{"event_type":"Surgery","n":76301},{"event_type":"Sample acquisition","n":25040},{"event_type":"Sequencing","n":25040},{"event_type":"Pathology","n":16731}]}
+
+═ answer (success)
+I now have everything needed. Note: `clinical_event_derived` uses `patient_unique_id` (not raw `patient_id`) and its companion key/value table is `clinical_event_data_derived` — this is the correct pairing to use, joined on `(patient_unique_id, start_date, stop_date, event_type, cancer_study_identifier)` is not reliable since there's no explicit event ID in the derived table; the safer join key is via the base tables (`clinical_event_id`). I'll write the Python code using the base `clinical_event` + `clinical_event_data` tables (which have a proper `clinical_event_id` join key), matching the treatment guide's pattern, and expose it as a general-purpose "query timeline files" utility for MSK-CHORD.
+
+```python
+"""
+query_msk_chord_timeline.py
+
+Query the clinical "timeline" event data (Treatment, Surgery, Diagnosis,
+Lab_Test, Sample acquisition, Sequencing, Pathology, etc.) for the
+MSK-CHORD study (msk_chord_2024) from the cBioPortal ClickHouse database.
+
+Timeline data is NOT stored in a single "timeline file" table in the
+database -- it lives in two related tables:
+
+    clinical_event        -- one row per timeline event
+                              (clinical_event_id, patient_id, event_type,
+                               start_date, stop_date)
+    clinical_event_data   -- key/value attributes attached to each event
+                              (clinical_event_id, key, value)
+
+These correspond exactly to the rows you'd see in the study's
+`data_timeline_*.txt` files on the cBioPortal datahub (one file per
+event_type, e.g. data_timeline_treatment.txt, data_timeline_surgery.txt).
+
+Requires: clickhouse-connect  (pip install clickhouse-connect)
+"""
+
+import argparse
+import sys
+from typing import Optional
+
+import clickhouse_connect
+
+STUDY_ID = "msk_chord_2024"
+
+
+def get_client(host: str, port: int, username: str, password: str, database: str):
+    """Create a ClickHouse client connection."""
+    return clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        database=database,
+    )
+
+
+def list_event_types(client, study_id: str = STUDY_ID):
+    """List all timeline event types available for the study, with counts."""
+    query = """
+        SELECT event_type, count() AS n_events
+        FROM clinical_event
+        JOIN patient ON clinical_event.patient_id = patient.internal_id
+        JOIN cancer_study ON patient.cancer_study_id = cancer_study.cancer_study_id
+        WHERE cancer_study.cancer_study_identifier = {study_id:String}
+        GROUP BY event_type
+        ORDER BY n_events DESC
+    """
+    return client.query(query, parameters={"study_id": study_id}).result_rows
+
+
+def list_event_keys(client, event_type: str, study_id: str = STUDY_ID):
+    """List the distinct data keys (columns) available for a given event_type."""
+    query = """
+        SELECT ced.key AS key, count() AS n
+        FROM clinical_event ce
+        JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+        JOIN patient p ON ce.patient_id = p.internal_id
+        JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+        WHERE cs.cancer_study_identifier = {study_id:String}
+          AND ce.event_type = {event_type:String}
+        GROUP BY ced.key
+        ORDER BY n DESC
+    """
+    return client.query(
+        query, parameters={"study_id": study_id, "event_type": event_type}
+    ).result_rows
+
+
+def get_timeline_for_patient(client, patient_id: str, study_id: str = STUDY_ID):
+    """
+    Retrieve the full timeline (all event types) for a single patient,
+    pivoted so each event's key/value pairs are aggregated into a single
+    row per event -- similar to reconstructing a timeline file row.
+    """
+    query = """
+        SELECT
+            ce.clinical_event_id AS event_id,
+            ce.event_type        AS event_type,
+            ce.start_date        AS start_date,
+            ce.stop_date         AS stop_date,
+            groupArray((ced.key, ced.value)) AS attributes
+        FROM clinical_event ce
+        JOIN patient p ON ce.patient_id = p.internal_id
+        JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+        LEFT JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+        WHERE cs.cancer_study_identifier = {study_id:String}
+          AND p.stable_id = {patient_id:String}
+        GROUP BY ce.clinical_event_id, ce.event_type, ce.start_date, ce.stop_date
+        ORDER BY ce.start_date
+    """
+    return client.query(
+        query, parameters={"study_id": study_id, "patient_id": patient_id}
+    ).result_rows
+
+
+def get_events_by_type(
+    client,
+    event_type: str,
+    study_id: str = STUDY_ID,
+    patient_id: Optional[str] = None,
+    limit: int = 1000,
+):
+    """
+    Retrieve events of a specific type (e.g. 'Treatment', 'Surgery',
+    'Diagnosis', 'Lab_Test', 'Sample acquisition', 'Sequencing',
+    'Pathology') across the study, or for a single patient if specified.
+    """
+    query = """
+        SELECT
+            p.stable_id          AS patient_id,
+            ce.clinical_event_id AS event_id,
+            ce.start_date        AS start_date,
+            ce.stop_date         AS stop_date,
+            groupArray((ced.key, ced.value)) AS attributes
+        FROM clinical_event ce
+        JOIN patient p ON ce.patient_id = p.internal_id
+        JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+        LEFT JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+        WHERE cs.cancer_study_identifier = {study_id:String}
+          AND ce.event_type = {event_type:String}
+    """
+    params = {"study_id": study_id, "event_type": event_type}
+
+    if patient_id:
+        query += " AND p.stable_id = {patient_id:String}"
+        params["patient_id"] = patient_id
+
+    query += """
+        GROUP BY p.stable_id, ce.clinical_event_id, ce.start_date, ce.stop_date
+        ORDER BY p.stable_id, ce.start_date
+        LIMIT {limit:UInt32}
+    """
+    params["limit"] = limit
+
+    return client.query(query, parameters=params).result_rows
+
+
+def get_treatment_agents(client, study_id: str = STUDY_ID, subtype: Optional[str] = None, limit: int = 20):
+    """
+    Convenience query: most common treatment agents (AGENT key on
+    Treatment events), optionally filtered by SUBTYPE (Chemo, Immuno,
+    Targeted, Hormone, Radiation Therapy, etc.). Raw patient counts only --
+    treatment ascertainment is incomplete, so percentages are not meaningful.
+    """
+    query = """
+        SELECT
+            agent.value AS agent,
+            count(DISTINCT ce.patient_id) AS patients
+        FROM clinical_event ce
+        JOIN clinical_event_data agent
+            ON ce.clinical_event_id = agent.clinical_event_id AND agent.key = 'AGENT'
+    """
+    params = {"study_id": study_id, "limit": limit}
+
+    if subtype:
+        query += """
+        JOIN clinical_event_data subtype
+            ON ce.clinical_event_id = subtype.clinical_event_id
+           AND subtype.key = 'SUBTYPE' AND subtype.value = {subtype:String}
+        """
+        params["subtype"] = subtype
+
+    query += """
+        JOIN patient p ON ce.patient_id = p.internal_id
+        JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+        WHERE cs.cancer_study_identifier = {study_id:String}
+          AND ce.event_type = 'Treatment'
+        GROUP BY agent.value
+        ORDER BY patients DESC
+        LIMIT {limit:UInt32}
+    """
+    return client.query(query, parameters=params).result_rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Query MSK-CHORD timeline data")
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8123)
+    parser.add_argument("--username", default="default")
+    parser.add_argument("--password", default="")
+    parser.add_argument("--database", default="default")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("event-types", help="List event types and counts")
+
+    p_keys = sub.add_parser("event-keys", help="List keys for an event type")
+    p_keys.add_argument("event_type")
+
+    p_patient = sub.add_parser("patient", help="Get full timeline for a patient")
+    p_patient.add_argument("patient_id")
+
+    p_events = sub.add_parser("events", help="Get events of a given type")
+    p_events.add_argument("event_type")
+    p_events.add_argument("--patient-id", default=None)
+    p_events.add_argument("--limit", type=int, default=1000)
+
+    p_tx = sub.add_parser("treatments", help="Top treatment agents")
+    p_tx.add_argument("--subtype", default=None)
+    p_tx.add_argument("--limit", type=int, default=20)
+
+    args = parser.parse_args()
+
+    client = get_client(args.host, args.port, args.username, args.password, args.database)
+
+    if args.command == "event-types":
+        for row in list_event_types(client):
+            print(row)
+    elif args.command == "event-keys":
+        for row in list_event_keys(client, args.event_type):
+            print(row)
+    elif args.command == "patient":
+        for row in get_timeline_for_patient(client, args.patient_id):
+            print(row)
+    elif args.command == "events":
+        for row in get_events_by_type(
+            client, args.event_type, patient_id=args.patient_id, limit=args.limit
+        ):
+            print(row)
+    elif args.command == "treatments":
+        for row in get_treatment_agents(client, subtype=args.subtype, limit=args.limit):
+            print(row)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+**Notes:**
+- MSK-CHORD's timeline event types (confirmed live in the database): `Diagnosis` (1,486,868 events), `Lab_Test` (480,739), `Treatment` (183,652), `Surgery` (76,301), `Sample acquisition` (25,040), `Sequencing` (25,040), `Pathology` (16,731).
+- Fill in your actual ClickHouse `host`/`port`/`username`/`password`/`database` — these are placeholders since I don't have your connection credentials.
+- Example CLI usage:
+  ```bash
+  python query_msk_chord_timeline.py --host <host> --password <pw> event-types
+  python query_msk_chord_timeline.py --host <host> --password <pw> event-keys Treatment
+  python query_msk_chord_timeline.py --host <host> --password <pw> treatments --subtype Chemo
+  python query_msk_chord_timeline.py --host <host> --password <pw> patient P-0000001
+  ```
+- Per the treatment-guide caveat baked into `get_treatment_agents`: treatment ascertainment is incomplete in MSK-CHORD, so only raw patient counts are returned — no percentages.
+
+Would you like me to also generate a direct cBioPortal link (e.g. Patient View timeline, or Study View treatment chart) for MSK-CHORD alongside this code?

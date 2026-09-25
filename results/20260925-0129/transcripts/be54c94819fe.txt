@@ -1,0 +1,276 @@
+Q (haiku): Which genomic alterations are associated with immunotherapy response in melanoma patients from the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://treatment-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "MSK-CHORD"
+}
+
+◀ result
+# Treatment Data Query Guide
+
+## Overview
+
+Treatment data in cBioPortal is stored in **clinical event tables**, separate from clinical attributes. This allows for timeline-based treatment records with start/stop dates.
+
+## Start Here: Treatment Views
+
+For "most common treatments / agents / regimens in study X", use the parameterized views (documented in `cbioportal://clinical-data-guide`, Study-View Chart Counts):
+
+```sql
+-- Patients per agent (the portal's Treatment chart), with type/subtype arrays
+SELECT * FROM treatment_counts_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 20;
+
+-- Same-day agent combinations (investigational, prior-medication and radiation events excluded)
+SELECT * FROM treatment_regimens_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 20;
+```
+
+Write raw event queries (below) only for subgroups, timelines or keys the views do not expose.
+
+## Key Tables
+
+| Table | Description |
+|-------|-------------|
+| `clinical_event` | Event records with patient_id, event_type, start_date, stop_date |
+| `clinical_event_data` | Key-value pairs linked to each clinical_event_id |
+
+## Schema
+
+```
+clinical_event
+├── clinical_event_id (PK)
+├── patient_id (FK → patient.internal_id)
+├── event_type (Treatment, TREATMENT, Diagnosis, SURGERY, etc.)
+├── start_date (days from diagnosis)
+└── stop_date (days from diagnosis)
+
+clinical_event_data
+├── clinical_event_id (FK)
+├── key (AGENT, SUBTYPE, etc.)
+└── value
+```
+
+## Event Types
+
+Not all studies have all event types. Common ones include:
+
+| Event Type | Description |
+|------------|-------------|
+| `Treatment` / `TREATMENT` | Drug/therapy administration |
+| `SURGERY` | Surgical procedures |
+| `Diagnosis` | Diagnosis events |
+| `LAB_TEST` | Laboratory results |
+| `Sequencing` | Sequencing events |
+| `Sample acquisition` | Sample collection |
+| `PATHOLOGY` / `Pathology` | Pathology reports |
+
+## Basic Treatment Queries
+
+### List Available Event Types in a Study
+
+```sql
+SELECT DISTINCT ce.event_type, COUNT(*) as event_count
+FROM clinical_event ce
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier = 'your_study_id'
+GROUP BY ce.event_type
+ORDER BY event_count DESC;
+```
+
+### List Treatment Data Keys in a Study
+
+```sql
+SELECT DISTINCT ced.key, COUNT(*) as cnt
+FROM clinical_event ce
+JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier = 'your_study_id'
+  AND ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY ced.key
+ORDER BY cnt DESC;
+```
+
+### Get Most Common Treatment Agents
+
+```sql
+SELECT 
+    ced.value as agent,
+    COUNT(DISTINCT ce.patient_id) as patient_count
+FROM clinical_event ce
+JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_stud … (6220 more chars)
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+| `brca_metabric` | ESR1 | PGR | `mrna` | 0.487 | 1980 |
+
+ESR1↔PGR is the textbook breast-cancer estrogen-receptor coregula … (2785 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+▶ search_oncotree
+{
+ "search_term": "melanoma"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+◀ result
+{"result":[{"code":"MEL","name":"Melanoma","score":80,"mainType":"Melanoma","tissue":"Skin","hierarchy":"SKIN > MEL"},{"code":"ACRM","name":"Acral Melanoma","score":65,"mainType":"Melanoma","tissue":"Skin","hierarchy":"SKIN > MEL > ACRM"},{"code":"ARMM","name":"Anorectal Mucosal Melanoma","score":65,"mainType":"Melanoma","tissue":"Bowel","hierarchy":"BOWEL > ARMM"},{"code":"CM","name":"Conjunctival Melanoma","score":65,"mainType":"Melanoma","tissue":"Eye","hierarchy":"EYE > OM > CM"},{"code":"DESM","name":"Desmoplastic Melanoma","score":65,"mainType":"Melanoma","tissue":"Skin","hierarchy":"SKIN > MEL > DESM"},{"code":"ESMM","name":"Mucosal Melanoma of the Esophagus","score":65,"mainType":"Melanoma","tissue":"Esophagus/Stomach","hierarchy":"STOMACH > ESMM"},{"code":"HNMUCM","name":"Head and Neck Mucosal Melanoma","score":65,"mainType":"Melanoma","tissue":"Head and Neck","hierarchy":"HEAD_NECK > HNMUCM"},{"code":"MUP","name":"Melanoma of Unknown Primary","score":65,"mainType":"Melanoma","tissue":"Skin","hierarchy":"SKIN > MEL > MUP"},{"code":"OM","name":"Ocular Melanoma","score":65,"mainType":"Melanoma","tissue":"Eye","hierarchy":"EYE > OM"},{"code":"PCNSM","name":"Primary CNS Melanoma","score":65,"mainType":"Melanoma","tissue":"CNS/Brain","hierarchy":"BRAIN > PCNSMT > PCNSM"},{"code":"SKCM","name":"Cutaneous Melanoma","score":65,"mainType":"Melanoma","tissue":"Skin","hierarchy":"SKIN > MEL > SKCM"},{"code":"SKCN","name":"Congenital Nevus","score":65,"mainType":"Melanoma","tissue":"Skin","hierarchy":"SKIN > MEL > SKCN"},{"code":"SKLMM","name":"Lentigo Maligna Melanoma","score":65,"mainType":"Melanoma","tissue":"Skin","hierarchy":"SKIN > MEL > SKLMM"},{"code":"SPZM","name":"Spitzoid Melanoma","score":65,"mainType":"Melanoma","tissue":"Skin","hierarchy":"SKIN > MEL > SPZM"},{"code":"UM","name":"Uveal Melanoma","score":65,"mainType":"Melanoma","tissue":"Eye","hierarchy":"EYE > OM > UM"},{"code":"URMM","name":"Mucosal Melanoma of the Urethra","score":65,"mainType":"Melanoma","tissue":"Bladder/Urinary Tract","hierarchy":"BLADDER > URMM","replacedCodes":["GMUCM"]},{"code":"VMM","name":"Mucosal Melanoma of the Vulva/Vagina","score":65,"mainType":"Melanoma","tissue":"Vulva/Vagina","hierarchy":"VULVA > VMM"},{"code":"ADPA","name":"Aggressive Digital Papillary Adenocarcinoma","score":45,"mainType":"Skin Cancer, Non-Melanoma","tissue":"Skin","hierarchy":"SKIN > ADPA"},{"code":"AECA","name":"Sweat Gland Carcinoma/Apocrine Eccrine Carcinoma","score":45,"mainType":"Skin Cancer, Non-Melanoma","tissue":"Skin","hierarchy":"SKIN > AECA"},{"code":"AFX","name":"Atypical Fibroxanthoma","score":45,"mainType":"Skin Cancer, Non-Melanoma","tissue":"Skin","hierarchy":"SKIN > AFX"},{"code":"AN","name":"Atypical Nevus","score":45,"mainType":"Skin Cancer, Non-Melanoma","tissue":"Skin","hierarchy":"SKIN > AN"},{"code":"BCC","name":"Basal Cell Carcinoma","score":45,"mainType":"Skin Cancer, Non-Melanoma","tissue":"Skin","hierarchy":"SKIN > BCC"},{"code":"CSCC","name":"Cutaneous S … (395 more chars)
+
+▶ list_studies
+{
+ "search": "melanoma",
+ "verbose": true
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"mel_mskimpact_2020","name":"Melanoma (MSK, Clin Cancer Res 2021)","description":"Targeted sequencing (MSK-IMPACT) of 696 melanoma tumor/normal pairs.","type_of_cancer_id":"skcm","sample_count":696,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=mel_mskimpact_2020"},{"cancer_study_identifier":"skcm_tcga","name":"Skin Cutaneous Melanoma (TCGA, Firehose Legacy)","description":"TCGA Skin Cutaneous Melanoma. Source data from <A HREF=\"http://gdac.broadinstitute.org/runs/stddata__2016_01_28/data/SKCM/20160128/\">GDAC Firehose</A>. Previously known as TCGA Provisional.","type_of_cancer_id":"skcm","sample_count":480,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=skcm_tcga"},{"cancer_study_identifier":"skcm_tcga_gdc","name":"Cutaneous Melanoma (TCGA GDC, 2025)","description":"TCGA Cutaneous Melanoma. Source data from <A HREF=\"https://gdc.cancer.gov\">NCI GDC</A> and generated in Aug 2025 using <A HREF=\"https://cda.readthedocs.io/en/latest/\">Cancer Data Aggregator</A>.","type_of_cancer_id":"skcm","sample_count":473,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=skcm_tcga_gdc"},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018","name":"Skin Cutaneous Melanoma (TCGA, PanCancer Atlas)","description":"Skin Cutaneous Melanoma TCGA PanCancer data. The original data is <a href=\"https://gdc.cancer.gov/about-data/publications/pancanatlas\">here</a>. The publications are <a href=\"https://www.cell.com/pb-assets/consortium/pancanceratlas/pancani3/index.html\">here</a>.","type_of_cancer_id":"skcm","sample_count":448,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=skcm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"skcm_tcga_pub_2015","name":"Melanomas (TCGA, Cell 2015)","description":"Whole-exome sequencing of 333 primary and/or metastatic melanomas.","type_of_cancer_id":"skcm","sample_count":359,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=skcm_tcga_pub_2015"},{"cancer_study_identifier":"mixed_allen_2018","name":"MSS Mixed Solid Tumors (Broad/Dana-Farber, Nat Genet 2018)","description":"Whole exome sequencing of tumor/normal pairs and corresponding clinical outcomes from patients treated with immune checkpoint inhibitors across multiple cancer types including melanoma, non-small cell lung cancer, head and neck cancer, and bladder cancer.","type_of_cancer_id":"mixed","sample_count":249,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=mixed_allen_2018"},{"cancer_study_identifier":"skcm_yale","name":"Skin Cutaneous Melanoma (Yale, Nat Genet 2012)","description":"Exome sequencing of 147 melanoma samples with 99 matched normals.","type_of_cancer_id":"skcm","sample_count":147,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=skcm_yale"},{"cancer_study_identifier":"mel_dfci_2019","name":"Metastatic Melanoma (DFCI, Nature Medicine 2019)","description":"Whole-exome sequenci … (6169 more chars)
+
+═ answer (success)
+Excellent! There are several melanoma datasets with immunotherapy response data. The most relevant ones for your question are:
+
+1. **[Metastatic Melanoma (DFCI, Nature Medicine 2019) - iAtlas Harmonized](https://www.cbioportal.org/study/summary?id=mel_iatlas_liu_2019)** — 122 metastatic melanoma patients treated with anti-PD-1 ICB, whole-exome sequencing with neoantigen annotations
+   
+2. **[Melanoma (MSK, Cell 2017) - iAtlas Harmonized](https://www.cbioportal.org/study/summary?id=mel_iatlas_riaz_nivolumab_2017)** — 64 advanced melanoma patients before/after nivolumab treatment
+
+3. **[Metastatic Melanoma (Immunotherapy Trial, Cancer Cell 2019) - iAtlas Harmonized](https://www.cbioportal.org/study/summary?id=mel_iatlas_gide_2019)** — 158 metastatic melanomas treated with anti-PD-1 monotherapy or combined anti-PD-1/anti-CTLA-4
+
+4. **[Metastatic Melanoma (UCLA, Cell 2016)](https://www.cbioportal.org/study/summary?id=mel_ucla_2016)** — 38 pre-treated melanoma samples (pembrolizumab, nivolumab)
+
+5. **[Melanoma (MSK, Clin Cancer Res 2021)](https://www.cbioportal.org/study/summary?id=mel_mskimpact_2020)** — 696 melanoma samples from MSK-IMPACT
+
+---
+
+**Would you like me to:**
+1. Query one of these melanoma immunotherapy studies for genomic alterations associated with response?
+2. Focus on a specific alteration type (mutations, copy number, TMB, neoantigen load)?
+3. Compare responders vs non-responders if response data is available?
+
+Let me know which study or combination interests you most, and I can retrieve the relevant genomic data!

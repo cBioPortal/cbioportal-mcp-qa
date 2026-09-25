@@ -1,0 +1,743 @@
+Q (haiku): show me the distribution of mutations in the tert promoter across cancer types
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT preference_name, COUNT(*) AS studies, any(notes) AS notes
+FROM cancer_study_query_preferences
+GROUP BY preference_name
+ORDER BY preference_name
+"
+}
+
+◀ result
+{"rows":[{"preference_name":"all_studies_non_redundant","studies":241,"notes":"cBioPortal curated non-redundant set"},{"preference_name":"large_genomic_cohort","studies":1,"notes":"Biggest single MSK-IMPACT cohort; use for max statistical power on genomic patterns (mutation frequency, co-occurrence)."},{"preference_name":"pan_cancer_tcga","studies":32,"notes":"TCGA PanCancer Atlas 2018"},{"preference_name":"treatment_outcomes","studies":1,"notes":"Rich treatment and outcomes data in clinical_event_derived; use for treatment-related cross-cancer questions."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT
+    c.cancer_study_identifier,
+    gp.genetic_profile_id,
+    gp.genetic_alteration_type,
+    gp.datatype,
+    gp.name
+FROM genetic_profile gp
+JOIN cancer_study c ON gp.cancer_study_id = c.cancer_study_id
+WHERE c.cancer_study_identifier IN (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+)
+AND (
+    lower(gp.genetic_profile_id) LIKE '%promoter%'
+    OR lower(gp.name) LIKE '%promoter%'
+)
+ORDER BY c.cancer_study_identifier, gp.genetic_profile_id
+LIMIT 20
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 43\n Code: 43. DB::Exception: Illegal type Int64 of argument of function lower: In scope SELECT DISTINCT c.cancer_study_identifier, gp.genetic_profile_id, gp.genetic_alteration_type, gp.datatype, gp.name FROM genetic_profile AS gp INNER JOIN cancer_study AS c ON gp.cancer_study_id = c.cancer_study_id WHERE (c.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')) AND ((lower(gp.genetic_profile_id) LIKE '%promoter%') OR (lower(gp.name) LIKE '%promoter%')) ORDER BY c.cancer_study_identifier ASC, gp.genetic_profile_id ASC LIMIT 20. (ILLEGAL_TYPE_OF_ARGUMENT) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_profile"
+}
+
+◀ result
+{"columns":[{"name":"genetic_profile_id","type":"Int64"},{"name":"stable_id","type":"String"},{"name":"cancer_study_id","type":"Int64"},{"name":"genetic_alteration_type","type":"String"},{"name":"generic_assay_type","type":"Nullable(String)"},{"name":"datatype","type":"String"},{"name":"name","type":"String"},{"name":"description","type":"Nullable(String)"},{"name":"show_profile_in_analysis_tab","type":"Int32"},{"name":"pivot_threshold","type":"Nullable(Float64)"},{"name":"sort_order","type":"Nullable(String)"},{"name":"patient_level","type":"Nullable(Int32)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT
+    c.cancer_study_identifier,
+    gp.stable_id,
+    gp.genetic_alteration_type,
+    gp.datatype,
+    gp.name
+FROM genetic_profile gp
+JOIN cancer_study c ON gp.cancer_study_id = c.cancer_study_id
+WHERE c.cancer_study_identifier IN (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+)
+AND (
+    gp.stable_id LIKE '%promoter%'
+    OR gp.name LIKE '%promoter%'
+)
+ORDER BY c.cancer_study_identifier, gp.stable_id
+LIMIT 20
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT
+    hugo_gene_symbol,
+    mutation_variant,
+    mutation_type,
+    COUNT(DISTINCT sample_unique_id) as sample_count
+FROM genomic_event_derived
+WHERE cancer_study_identifier IN (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+)
+AND hugo_gene_symbol = 'TERT'
+AND variant_type = 'mutation'
+AND mutation_status != 'UNCALLED'
+GROUP BY hugo_gene_symbol, mutation_variant, mutation_type
+ORDER BY sample_count DESC
+LIMIT 30
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"TERT","mutation_variant":"R889Q","mutation_type":"Missense_Mutation","sample_count":3},{"hugo_gene_symbol":"TERT","mutation_variant":"A855V","mutation_type":"Missense_Mutation","sample_count":2},{"hugo_gene_symbol":"TERT","mutation_variant":"P614L","mutation_type":"Missense_Mutation","sample_count":2},{"hugo_gene_symbol":"TERT","mutation_variant":"R742C","mutation_type":"Missense_Mutation","sample_count":2},{"hugo_gene_symbol":"TERT","mutation_variant":"C1015F","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"K1027N","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"V741L","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"P627H","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"R859Q","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"G498W","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"F1032Sfs*16","mutation_type":"Frame_Shift_Del","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"V207D","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"T1110M","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"S802N","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"K1050N","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"R208M","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"A210P","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"R470H","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"R489M","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"R696C","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"H925Y","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"R599L","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"D1038N","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"E439D","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"V251I","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"X862_splice","mutation_type":"Splice_Region","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"R646H","mutation_type":"Missense_Mutation","sample_count":1},{"hugo_gene_symbol":"TERT","mutation_variant":"A242V","mutation_ … (261 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation"
+}
+
+◀ result
+{"columns":[{"name":"mutation_event_id","type":"Int64","comment":"References mutation_event.mutation_event_id."},{"name":"genetic_profile_id","type":"Int64","comment":"References genetic_profile.genetic_profile_id."},{"name":"sample_id","type":"Int64","comment":"References sample.internal_id."},{"name":"entrez_gene_id","type":"Int64","comment":"References gene.entrez_gene_id."},{"name":"center","type":"Nullable(String)","comment":"Center where sequencing was performed."},{"name":"sequencer","type":"Nullable(String)","comment":"Sequencing platform used."},{"name":"mutation_status","type":"Nullable(String)","comment":"Mutation status: Germline,\n    Somatic,\n    or LOH."},{"name":"validation_status","type":"Nullable(String)","comment":"Validation status."},{"name":"tumor_seq_allele1","type":"Nullable(String)","comment":"Tumor allele 1 sequence."},{"name":"tumor_seq_allele2","type":"Nullable(String)","comment":"Tumor allele 2 sequence."},{"name":"matched_norm_sample_barcode","type":"Nullable(String)","comment":"Matched normal sample barcode."},{"name":"match_norm_seq_allele1","type":"Nullable(String)","comment":"Matched normal allele 1 sequence."},{"name":"match_norm_seq_allele2","type":"Nullable(String)","comment":"Matched normal allele 2 sequence."},{"name":"tumor_validation_allele1","type":"Nullable(String)","comment":"Tumor validation allele 1 sequence."},{"name":"tumor_validation_allele2","type":"Nullable(String)","comment":"Tumor validation allele 2 sequence."},{"name":"match_norm_validation_allele1","type":"Nullable(String)","comment":"Matched normal validation allele 1."},{"name":"match_norm_validation_allele2","type":"Nullable(String)","comment":"Matched normal validation allele 2."},{"name":"verification_status","type":"Nullable(String)","comment":"Verification status."},{"name":"sequencing_phase","type":"Nullable(String)","comment":"Sequencing phase."},{"name":"sequence_source","type":"String","comment":"Source of sequencing data."},{"name":"validation_method","type":"Nullable(String)","comment":"Validation method used."},{"name":"score","type":"Nullable(String)","comment":"Score or quality metric."},{"name":"bam_file","type":"Nullable(String)","comment":"Associated BAM file."},{"name":"tumor_alt_count","type":"Nullable(Int64)","comment":"Tumor alternate allele count."},{"name":"tumor_ref_count","type":"Nullable(Int64)","comment":"Tumor reference allele count."},{"name":"normal_alt_count","type":"Nullable(Int64)","comment":"Normal alternate allele count."},{"name":"normal_ref_count","type":"Nullable(Int64)","comment":"Normal reference allele count."},{"name":"amino_acid_change","type":"Nullable(String)","comment":"Amino acid change from mutation."},{"name":"annotation_json","type":"Nullable(String)","comment":"JSON-formatted annotations."}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation_event"
+}
+
+◀ result
+{"columns":[{"name":"mutation_event_id","type":"Int64"},{"name":"entrez_gene_id","type":"Int64"},{"name":"chr","type":"Nullable(String)"},{"name":"start_position","type":"Nullable(Int64)"},{"name":"end_position","type":"Nullable(Int64)"},{"name":"reference_allele","type":"Nullable(String)"},{"name":"tumor_seq_allele","type":"Nullable(String)"},{"name":"protein_change","type":"Nullable(String)"},{"name":"mutation_type","type":"Nullable(String)"},{"name":"ncbi_build","type":"Nullable(String)"},{"name":"strand","type":"Nullable(String)"},{"name":"variant_type","type":"Nullable(String)"},{"name":"db_snp_rs","type":"Nullable(String)"},{"name":"db_snp_val_status","type":"Nullable(String)"},{"name":"refseq_mrna_id","type":"Nullable(String)"},{"name":"codon_change","type":"Nullable(String)"},{"name":"uniprot_accession","type":"Nullable(String)"},{"name":"protein_pos_start","type":"Nullable(Int64)"},{"name":"protein_pos_end","type":"Nullable(Int64)"},{"name":"canonical_transcript","type":"Nullable(Int32)"},{"name":"keyword","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    me.chr,
+    me.start_position,
+    me.end_position,
+    me.reference_allele,
+    me.tumor_seq_allele,
+    me.protein_change,
+    me.keyword,
+    COUNT(DISTINCT m.sample_id) as sample_count
+FROM mutation_event me
+LEFT JOIN mutation m ON me.mutation_event_id = m.mutation_event_id
+WHERE me.entrez_gene_id = (SELECT entrez_gene_id FROM gene WHERE hugo_gene_symbol = 'TERT')
+AND me.protein_change IS NOT NULL
+GROUP BY me.chr, me.start_position, me.end_position, me.reference_allele, me.tumor_seq_allele, me.protein_change, me.keyword
+ORDER BY sample_count DESC
+LIMIT 30
+"
+}
+
+◀ result
+{"rows":[{"chr":"5","start_position":1295228,"end_position":1295228,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":13001},{"chr":"5","start_position":1295250,"end_position":1295250,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":3136},{"chr":"5","start_position":1295250,"end_position":1295254,"reference_allele":"GAGGG","tumor_seq_allele":"AAGGA","protein_change":"Promoter","sample_count":691},{"chr":"5","start_position":1295113,"end_position":1295113,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":266},{"chr":"5","start_position":1295242,"end_position":1295243,"reference_allele":"GG","tumor_seq_allele":"AA","protein_change":"Promoter","sample_count":265},{"chr":"5","start_position":1295228,"end_position":1295228,"reference_allele":"G","tumor_seq_allele":"T","protein_change":"Promoter","sample_count":226},{"chr":"5","start_position":1295228,"end_position":1295229,"reference_allele":"GG","tumor_seq_allele":"AA","protein_change":"Promoter","sample_count":191},{"chr":"5","start_position":1295205,"end_position":1295205,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":91},{"chr":"5","start_position":1295135,"end_position":1295135,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":81},{"chr":"5","start_position":1294665,"end_position":1294665,"reference_allele":"G","tumor_seq_allele":"-","protein_change":"E113Rfs*15","keyword":"TERT truncating","sample_count":72},{"chr":"5","start_position":1295230,"end_position":1295230,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":40},{"chr":"5","start_position":1264586,"end_position":1264586,"reference_allele":"C","tumor_seq_allele":"T","protein_change":"G926S","keyword":"TERT G926 missense","sample_count":38},{"chr":"5","start_position":1294163,"end_position":1294163,"reference_allele":"C","tumor_seq_allele":"T","protein_change":"E280K","keyword":"TERT E280 missense","sample_count":32},{"chr":"5","start_position":1279527,"end_position":1279527,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"A670V","keyword":"TERT A670 missense","sample_count":32},{"chr":"5","start_position":1295253,"end_position":1295253,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":32},{"chr":"5","start_position":1255456,"end_position":1255456,"reference_allele":"C","tumor_seq_allele":"T","protein_change":"V1035I","keyword":"TERT V1035 missense","sample_count":32},{"chr":"5","start_position":1295204,"end_position":1295204,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":29},{"chr":"5","start_position":1295242,"end_position":1295242,"reference_allele":"G","tumor_seq_allele":"A","protein_change":"Promoter","sample_count":28},{"chr":"5","start_position":1295250,"end_position":1295253,"reference_allele":"GAGG","tum … (2022 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = 'CANCER_TYPE'
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.hugo_gene_symbol = 'TERT'
+      AND ged.off_panel = 0
+      AND ged.mutation_variant = 'Promoter'
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM mutation_panel_gene_coverage
+    WHERE hugo_gene_symbol = 'TERT'
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM mutation_wes_coverage
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples >= 50
+ORDER BY frequency_pct DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT
+    ged.mutation_variant,
+    COUNT(DISTINCT ged.sample_unique_id) as sample_count
+FROM genomic_event_derived ged
+WHERE ged.cancer_study_identifier IN (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+)
+AND ged.hugo_gene_symbol = 'TERT'
+AND ged.variant_type = 'mutation'
+AND ged.mutation_status != 'UNCALLED'
+AND ged.mutation_variant LIKE '%Promoter%'
+GROUP BY ged.mutation_variant
+ORDER BY sample_count DESC
+"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cohort_studies AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cs.cancer_study_identifier, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort_studies cs ON cd.cancer_study_identifier = cs.cancer_study_identifier
+    WHERE cd.attribute_name = 'CANCER_TYPE'
+),
+tert_promoter AS (
+    SELECT DISTINCT
+        m.sample_id,
+        m.genetic_profile_id,
+        me.protein_change,
+        me.chr,
+        me.start_position,
+        me.reference_allele,
+        me.tumor_seq_allele
+    FROM mutation m
+    JOIN mutation_event me ON m.mutation_event_id = me.mutation_event_id
+    JOIN genetic_profile gp ON m.genetic_profile_id = gp.genetic_profile_id
+    JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+    WHERE cs.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort_studies)
+      AND me.entrez_gene_id = (SELECT entrez_gene_id FROM gene WHERE hugo_gene_symbol = 'TERT')
+      AND me.protein_change = 'Promoter'
+      AND m.mutation_status IN ('Somatic', 'UNKNOWN') OR m.mutation_status IS NULL
+),
+sample_tert_promoter AS (
+    SELECT DISTINCT
+        tp.sample_id,
+        cs.cancer_study_identifier,
+        sct.cancer_type
+    FROM tert_promoter tp
+    JOIN sample s ON tp.sample_id = s.internal_id
+    JOIN cancer_study cs ON s.cancer_study_id = cs.cancer_study_id
+    JOIN sample_cancer_type sct ON s.internal_id = sct.sample_unique_id AND cs.cancer_study_identifier = sct.cancer_study_identifier
+),
+altered_counts AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT s.sample_id) AS altered_samples
+    FROM tert_promoter tp
+    JOIN sample s ON tp.sample_id = s.internal_id
+    JOIN cancer_study cs ON s.cancer_study_id = cs.cancer_study_id
+    JOIN sample_cancer_type sct ON s.internal_id = sct.sample_unique_id AND cs.cancer_study_identifier = sct.cancer_study_identifier
+    GROUP BY sct.cancer_type
+)
+SELECT ac.cancer_type,
+       ac.altered_samples
+FROM altered_counts ac
+ORDER BY ac.altered_samples DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 's.cancer_study_id' cannot be resolved from table with name s. In scope  altered_counts AS ac. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cohort_studies AS (
+    SELECT cancer_study_identifier, cancer_study_id
+    FROM cancer_study
+    WHERE cancer_study_identifier IN (
+        SELECT cancer_study_identifier
+        FROM cancer_study_query_preferences
+        WHERE preference_name = 'pan_cancer_tcga'
+    )
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.cancer_study_identifier, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    WHERE cd.attribute_name = 'CANCER_TYPE'
+      AND cd.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort_studies)
+),
+tert_promoter_mutations AS (
+    SELECT DISTINCT
+        m.sample_id,
+        cs.cancer_study_identifier,
+        sct.cancer_type
+    FROM mutation m
+    JOIN mutation_event me ON m.mutation_event_id = me.mutation_event_id
+    JOIN genetic_profile gp ON m.genetic_profile_id = gp.genetic_profile_id
+    JOIN cohort_studies cs ON gp.cancer_study_id = cs.cancer_study_id
+    JOIN sample s ON m.sample_id = s.internal_id
+    JOIN sample_cancer_type sct ON concat(cs.cancer_study_identifier, '_', s.stable_id) = sct.sample_unique_id
+    WHERE me.entrez_gene_id = (SELECT entrez_gene_id FROM gene WHERE hugo_gene_symbol = 'TERT')
+      AND me.protein_change = 'Promoter'
+)
+SELECT tpm.cancer_type,
+       COUNT(DISTINCT tpm.sample_id) AS altered_samples
+FROM tert_promoter_mutations tpm
+GROUP BY tpm.cancer_type
+ORDER BY altered_samples DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT s.sample_unique_id, cs.cancer_study_identifier, s.stable_id
+FROM sample s
+JOIN cancer_study cs ON s.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier IN (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+)
+LIMIT 5
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 's.cancer_study_id' cannot be resolved from table with name s. In scope SELECT DISTINCT s.sample_unique_id, cs.cancer_study_identifier, s.stable_id FROM sample AS s INNER JOIN cancer_study AS cs ON s.cancer_study_id = cs.cancer_study_id WHERE cs.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga') LIMIT 5. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "sample"
+}
+
+◀ result
+{"error_message":"Query timed out after 30 seconds"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check genomic_event_derived for any TERT records with positions matching known promoter mutations
+SELECT DISTINCT ged.cancer_study_identifier, COUNT(DISTINCT ged.sample_unique_id) as tert_samples
+FROM genomic_event_derived ged
+WHERE ged.cancer_study_identifier IN (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+)
+AND ged.hugo_gene_symbol = 'TERT'
+AND ged.variant_type = 'mutation'
+AND ged.mutation_status != 'UNCALLED'
+GROUP BY ged.cancer_study_identifier
+ORDER BY ged.cancer_study_identifier
+",
+ "max_rows": 40
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 241\n Code: 241. DB::Exception: (total) memory limit exceeded: would use 30.52 GiB (attempt to allocate chunk of 0.00 B), current RSS: 30.52 GiB, maximum: 28.80 GiB. (MEMORY_LIMIT_EXCEEDED)\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT *
+FROM gene_mutation_frequency_by_cancer_type(
+    preference = 'pan_cancer_tcga',
+    gene = 'TERT'
+)
+ORDER BY frequency_pct DESC
+",
+ "max_rows": 40
+}
+
+◀ result
+{"rows":[{"cancer_type":"Melanoma","altered_samples":19,"profiled_samples":440,"frequency_pct":4.3},{"cancer_type":"Endometrial Cancer","altered_samples":21,"profiled_samples":574,"frequency_pct":3.7},{"cancer_type":"Renal Non-Clear Cell Carcinoma","altered_samples":8,"profiled_samples":341,"frequency_pct":2.3},{"cancer_type":"Pancreatic Cancer","altered_samples":3,"profiled_samples":179,"frequency_pct":1.7},{"cancer_type":"Sarcoma","altered_samples":4,"profiled_samples":255,"frequency_pct":1.6},{"cancer_type":"Esophagogastric Cancer","altered_samples":9,"profiled_samples":618,"frequency_pct":1.5},{"cancer_type":"Cervical Cancer","altered_samples":4,"profiled_samples":291,"frequency_pct":1.4},{"cancer_type":"Glioblastoma","altered_samples":5,"profiled_samples":397,"frequency_pct":1.3},{"cancer_type":"Non-Small Cell Lung Cancer","altered_samples":13,"profiled_samples":1050,"frequency_pct":1.2},{"cancer_type":"Pleural Mesothelioma","altered_samples":1,"profiled_samples":86,"frequency_pct":1.2},{"cancer_type":"Colorectal Cancer","altered_samples":6,"profiled_samples":534,"frequency_pct":1.1},{"cancer_type":"Adrenocortical Carcinoma","altered_samples":1,"profiled_samples":91,"frequency_pct":1.1},{"cancer_type":"Bladder Cancer","altered_samples":4,"profiled_samples":410,"frequency_pct":1},{"cancer_type":"Head and Neck Cancer","altered_samples":3,"profiled_samples":515,"frequency_pct":0.6},{"cancer_type":"Breast Cancer","altered_samples":6,"profiled_samples":1066,"frequency_pct":0.6},{"cancer_type":"Thyroid Cancer","altered_samples":3,"profiled_samples":490,"frequency_pct":0.6},{"cancer_type":"Renal Clear Cell Carcinoma","altered_samples":2,"profiled_samples":402,"frequency_pct":0.5},{"cancer_type":"Hepatobiliary Cancer","altered_samples":2,"profiled_samples":366,"frequency_pct":0.5},{"cancer_type":"Glioma","altered_samples":2,"profiled_samples":514,"frequency_pct":0.4},{"cancer_type":"Ovarian Epithelial Tumor","altered_samples":1,"profiled_samples":523,"frequency_pct":0.2}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Query the raw mutation data filtered by promoter mutations to get distribution by cancer type
+WITH cohort_studies AS (
+    SELECT cancer_study_id, cancer_study_identifier
+    FROM cancer_study
+    WHERE cancer_study_identifier IN (
+        SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga'
+    )
+)
+SELECT 
+    cs.cancer_study_identifier,
+    COUNT(DISTINCT m.sample_id) as promoter_mutation_samples
+FROM mutation m
+JOIN mutation_event me ON m.mutation_event_id = me.mutation_event_id
+JOIN genetic_profile gp ON m.genetic_profile_id = gp.genetic_profile_id
+JOIN cohort_studies cs ON gp.cancer_study_id = cs.cancer_study_id
+WHERE me.entrez_gene_id = (SELECT entrez_gene_id FROM gene WHERE hugo_gene_symbol = 'TERT')
+  AND me.protein_change = 'Promoter'
+  AND (m.mutation_status IS NULL OR m.mutation_status IN ('Somatic', 'UNKNOWN'))
+GROUP BY cs.cancer_study_identifier
+ORDER BY promoter_mutation_samples DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Sample a few TERT variants in one study
+SELECT DISTINCT 
+    ged.cancer_study_identifier,
+    ged.mutation_variant,
+    ged.mutation_type,
+    COUNT(*) as count
+FROM genomic_event_derived ged
+WHERE ged.hugo_gene_symbol = 'TERT'
+  AND ged.variant_type = 'mutation'
+  AND ged.mutation_status != 'UNCALLED'
+  AND ged.cancer_study_identifier LIKE '%skcm%'  -- Melanoma, which should have promoter mutations
+GROUP BY ged.cancer_study_identifier, ged.mutation_variant, ged.mutation_type
+ORDER BY count DESC
+LIMIT 20
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"skcm_vanderbilt_mskcc_2015","mutation_variant":"Promoter","mutation_type":"5'Flank","count":7},{"cancer_study_identifier":"skcm_tcga","mutation_variant":"A758T","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018","mutation_variant":"T878I","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018","mutation_variant":"H752N","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018","mutation_variant":"A758T","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_broad_brafresist_2012","mutation_variant":"R535C","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018","mutation_variant":"R821S","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_pub_2015","mutation_variant":"V920I","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga","mutation_variant":"D628N","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga","mutation_variant":"P721R","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga","mutation_variant":"H752N","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_gdc","mutation_variant":"A966T","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_gdc","mutation_variant":"S1095*","mutation_type":"Nonsense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_gdc","mutation_variant":"S311L","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_gdc","mutation_variant":"S1095P","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018","mutation_variant":"R1105L","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_broad_brafresist_2012","mutation_variant":"V728I","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_pub_2015","mutation_variant":"G967E","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_tcga_pub_2015","mutation_variant":"D628N","mutation_type":"Missense_Mutation","count":1},{"cancer_study_identifier":"skcm_broad_brafresist_2012","mutation_variant":"Q1071*","mutation_type":"Nonsense_Mutation","count":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = 'CANCER_TYPE'
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.hugo_gene_symbol = 'TERT'
+      AND ged.mutation_variant = 'Promoter'
+      AND ged.off_panel = 0
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM mutation_panel_gene_coverage
+    WHERE hugo_gene_symbol = 'TERT'
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM mutation_wes_coverage
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples >= 50
+ORDER BY frequency_pct DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT ged.cancer_study_identifier,
+       COUNT(DISTINCT ged.sample_unique_id) as promoter_samples
+FROM genomic_event_derived ged
+WHERE ged.hugo_gene_symbol = 'TERT'
+  AND ged.variant_type = 'mutation'
+  AND ged.mutation_variant = 'Promoter'
+  AND ged.mutation_status != 'UNCALLED'
+GROUP BY ged.cancer_study_identifier
+ORDER BY promoter_samples DESC
+LIMIT 20
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_impact_50k_2026","promoter_samples":6634},{"cancer_study_identifier":"msk_met_2021","promoter_samples":2472},{"cancer_study_identifier":"msk_impact_2017","promoter_samples":1325},{"cancer_study_identifier":"paired_bladder_2022","promoter_samples":1170},{"cancer_study_identifier":"pan_origimed_2020","promoter_samples":734},{"cancer_study_identifier":"glioma_mskcc_2019","promoter_samples":594},{"cancer_study_identifier":"mel_mskimpact_2020","promoter_samples":572},{"cancer_study_identifier":"tmb_mskcc_2018","promoter_samples":489},{"cancer_study_identifier":"msk_chord_2024","promoter_samples":378},{"cancer_study_identifier":"bladder_msk_2023","promoter_samples":367},{"cancer_study_identifier":"ccle_broad_2025","promoter_samples":251},{"cancer_study_identifier":"hcc_msk_2024","promoter_samples":221},{"cancer_study_identifier":"mycf_msk_2026","promoter_samples":199},{"cancer_study_identifier":"blca_msk_2025","promoter_samples":188},{"cancer_study_identifier":"hcc_clca_2024","promoter_samples":170},{"cancer_study_identifier":"pancan_mimsi_msk_2024","promoter_samples":161},{"cancer_study_identifier":"crc_msk_2026","promoter_samples":156},{"cancer_study_identifier":"msk_ctdna_vte_2024","promoter_samples":154},{"cancer_study_identifier":"pancan_hcmi_2025","promoter_samples":153},{"cancer_study_identifier":"blca_msk_2024","promoter_samples":140}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_impact_50k_2026"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_impact_50k_2026","name":"MSK-IMPACT 50K Clinical Sequencing Cohort (MSK, Cancer Cell 2026)","sampleCount":54331,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_impact_50k_2026","metadata":{"clinicalAttributeIds":["AGE_AT_DX","ANCESTRY_LABEL","CANCER_TYPE","CANCER_TYPE_DETAILED","DISEASE_STATUS","FACETS_PLOIDY","FACETS_PURITY","FACETS_QC","FACETS_SUITE_VERSION","FACETS_WGD","FRACTION_GENOME_ALTERED","GENE_PANEL","HLA-A1","HLA-A2","HLA-B1","HLA-B2","HLA-C1","HLA-C2","HLA_A1_LOH","HLA_A2_LOH","HLA_B1_LOH","HLA_B2_LOH","HLA_C1_LOH","HLA_C2_LOH","HLA_GENOTYPE_AVAILABLE","METASTATIC_SITE","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","N_OTHER_CANCER_TYPES","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PRIMARY_SITE","PURITY_ESTIMATE_FROM_MUTATIONS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SEX","SOMATIC_STATUS","TMB_SCORE","TUMOR_PURITY"],"molecularProfileIds":["msk_impact_50k_2026_gistic","msk_impact_50k_2026_mutations","msk_impact_50k_2026_structural_variants"],"genericAssayProfiles":["msk_impact_50k_2026_armlevel_cna","msk_impact_50k_2026_loh_hla","msk_impact_50k_2026_mutational_signatures_contribution_v2"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","generic_assay_armlevel_cna","generic_assay_loh_hla","generic_assay_mutational_signature"]}}]}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'msk_impact_50k_2026'
+      AND cd.attribute_name = 'CANCER_TYPE_DETAILED'
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.cancer_study_identifier = 'msk_impact_50k_2026'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.hugo_gene_symbol = 'TERT'
+      AND ged.mutation_variant = 'Promoter'
+      AND ged.off_panel = 0
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    SELECT DISTINCT sample_unique_id
+    FROM mutation_panel_gene_coverage
+    WHERE hugo_gene_symbol = 'TERT'
+      AND cancer_study_identifier = 'msk_impact_50k_2026'
+    UNION ALL
+    SELECT DISTINCT sample_unique_id
+    FROM mutation_wes_coverage
+    WHERE cancer_study_identifier = 'msk_impact_50k_2026'
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples >= 50
+ORDER BY frequency_pct DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_type":"Oligodendroglioma, IDH-mutant, and 1p/19q-Codeleted","altered_samples":205,"profiled_samples":210,"frequency_pct":97.6},{"cancer_type":"Myxoid/Round-Cell Liposarcoma","altered_samples":55,"profiled_samples":67,"frequency_pct":82.1},{"cancer_type":"Glioblastoma, IDH-Wildtype","altered_samples":1240,"profiled_samples":1543,"frequency_pct":80.4},{"cancer_type":"Cutaneous Melanoma","altered_samples":750,"profiled_samples":958,"frequency_pct":78.3},{"cancer_type":"Anaplastic Thyroid Cancer","altered_samples":91,"profiled_samples":117,"frequency_pct":77.8},{"cancer_type":"Melanoma of Unknown Primary","altered_samples":137,"profiled_samples":183,"frequency_pct":74.9},{"cancer_type":"Bladder Urothelial Carcinoma","altered_samples":1465,"profiled_samples":1966,"frequency_pct":74.5},{"cancer_type":"Basal Cell Carcinoma","altered_samples":37,"profiled_samples":50,"frequency_pct":74},{"cancer_type":"Cutaneous Squamous Cell Carcinoma","altered_samples":85,"profiled_samples":138,"frequency_pct":61.6},{"cancer_type":"Melanoma","altered_samples":125,"profiled_samples":205,"frequency_pct":61},{"cancer_type":"Upper Tract Urothelial Carcinoma","altered_samples":234,"profiled_samples":392,"frequency_pct":59.7},{"cancer_type":"Poorly Differentiated Thyroid Cancer","altered_samples":112,"profiled_samples":188,"frequency_pct":59.6},{"cancer_type":"Papillary Thyroid Cancer","altered_samples":235,"profiled_samples":394,"frequency_pct":59.6},{"cancer_type":"Oral Cavity Squamous Cell Carcinoma","altered_samples":101,"profiled_samples":185,"frequency_pct":54.6},{"cancer_type":"Hepatocellular Carcinoma","altered_samples":158,"profiled_samples":292,"frequency_pct":54.1},{"cancer_type":"Granulosa Cell Tumor","altered_samples":27,"profiled_samples":58,"frequency_pct":46.6},{"cancer_type":"Solitary Fibrous Tumor/Hemangiopericytoma","altered_samples":31,"profiled_samples":71,"frequency_pct":43.7},{"cancer_type":"Hurthle Cell Thyroid Cancer","altered_samples":21,"profiled_samples":55,"frequency_pct":38.2},{"cancer_type":"Head and Neck Squamous Cell Carcinoma","altered_samples":58,"profiled_samples":171,"frequency_pct":33.9},{"cancer_type":"Squamous Cell Carcinoma, NOS","altered_samples":26,"profiled_samples":102,"frequency_pct":25.5},{"cancer_type":"Undifferentiated Malignant Neoplasm","altered_samples":16,"profiled_samples":69,"frequency_pct":23.2},{"cancer_type":"Medulloblastoma","altered_samples":12,"profiled_samples":53,"frequency_pct":22.6},{"cancer_type":"Clear Cell Ovarian Cancer","altered_samples":29,"profiled_samples":149,"frequency_pct":19.5},{"cancer_type":"Oropharynx Squamous Cell Carcinoma","altered_samples":24,"profiled_samples":127,"frequency_pct":18.9},{"cancer_type":"Papillary Renal Cell Carcinoma","altered_samples":18,"profiled_samples":108,"frequency_pct":16.7},{"cancer_type":"Poorly Differentiated Carcinoma, NOS","altered_samples":26,"profiled_samples":171,"frequency_pct":15.2},{"cancer_type":"Cancer of Unknown Primary, NOS","altered_sa … (2836 more chars)
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "msk_impact_50k_2026"
+ ],
+ "filterJson": {
+  "geneFilters": [
+   {
+    "molecularProfileIds": [
+     "msk_impact_50k_2026_mutations"
+    ],
+    "geneQueries": [
+     [
+      {
+       "hugoGeneSymbol": "TERT"
+      }
+     ]
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=msk_impact_50k_2026#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TERT%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_impact_50k_2026_mutations%22%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=msk_impact_50k_2026#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TERT%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_impact_50k_2026_mutations%22%5D%7D%5D%7D","data":{"studyIds":["msk_impact_50k_2026"],"studies":[{"studyId":"msk_impact_50k_2026","name":"MSK-IMPACT 50K Clinical Sequencing Cohort (MSK, Cancer Cell 2026)","sampleCount":54331}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+Perfect! Now let me present the findings:
+
+---
+
+## TERT Promoter Mutation Distribution Across Cancer Types
+
+I queried the **MSK-IMPACT 50K cohort** (54,331 samples), which contains the most comprehensive dataset of TERT promoter mutations. I treated this as a **promoter-mutation question**, not all-TERT-mutations — only mutations with `protein_change = "Promoter"` were counted.
+
+### Top 15 Cancer Types by TERT Promoter Mutation Frequency
+
+| Cancer Type | Promoter Mutations | Profiled Samples | Frequency |
+|---|---|---|---|
+| Oligodendroglioma, IDH-mutant, 1p/19q-Codeleted | 205 | 210 | **97.6%** |
+| Myxoid/Round-Cell Liposarcoma | 55 | 67 | **82.1%** |
+| Glioblastoma, IDH-Wildtype | 1,240 | 1,543 | **80.4%** |
+| Cutaneous Melanoma | 750 | 958 | **78.3%** |
+| Anaplastic Thyroid Cancer | 91 | 117 | **77.8%** |
+| Melanoma of Unknown Primary | 137 | 183 | **74.9%** |
+| Bladder Urothelial Carcinoma | 1,465 | 1,966 | **74.5%** |
+| Basal Cell Carcinoma | 37 | 50 | **74.0%** |
+| Cutaneous Squamous Cell Carcinoma | 85 | 138 | **61.6%** |
+| Melanoma (general) | 125 | 205 | **61.0%** |
+| Upper Tract Urothelial Carcinoma | 234 | 392 | **59.7%** |
+| Poorly Differentiated Thyroid Cancer | 112 | 188 | **59.6%** |
+| Papillary Thyroid Cancer | 235 | 394 | **59.6%** |
+| Oral Cavity Squamous Cell Carcinoma | 101 | 185 | **54.6%** |
+| Hepatocellular Carcinoma | 158 | 292 | **54.1%** |
+
+### Key Findings
+
+**Highest prevalence (≥75%):**
+- **Central nervous system tumors**: Oligodendrogliomas (97.6%) and glioblastomas (80.4%) show exceptionally high rates — TERT promoter mutations are a hallmark of these brain tumors
+- **Skin cancers**: Melanomas (61–78%), basal cell and squamous cell carcinomas (61–74%)
+- **Urinary tract**: Bladder and upper tract urothelial carcinomas (59.7–74.5%)
+- **Thyroid**: Papillary, poorly differentiated, and anaplastic forms (59.6–77.8%)
+
+**Moderate prevalence (30–50%):**
+- Head and neck squamous cell carcinoma (33.9%)
+- Solitary fibrous tumor (43.7%)
+- Hepatocellular carcinoma (54.1%)
+
+**Low prevalence (<15%):**
+- Adenocarcinomas (breast, lung, colorectal, pancreatic)
+- Renal cell carcinoma (8.3%)
+- Endometrial carcinoma (6.9%)
+
+### View the Data
+
+[View TERT mutations in MSK-IMPACT 50K](https://www.cbioportal.org/study/summary?id=msk_impact_50k_2026#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TERT%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_impact_50k_2026_mutations%22%5D%7D%5D%7D)
+
+Use the **CANCER_TYPE_DETAILED** filter on the StudyView to see the distributions by subtype, or click on any cancer type in the charts to drill down further.

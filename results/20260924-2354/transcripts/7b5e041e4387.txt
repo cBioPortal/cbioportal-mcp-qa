@@ -1,0 +1,1537 @@
+Q (sonnet): In the “Pan-cancer analysis of whole genomes” study what is the survival difference and the corresponding statistical significance between patients with mutations in both TP53 and KRAS versus patients with only a KRAS mutation?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ resolve_and_route
+{
+ "studyKeywords": [
+  "Pan-cancer",
+  "whole genomes"
+ ]
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"pancan_pcawg_2020","name":"Pan-cancer analysis of whole genomes (ICGC/TCGA, Nature 2020)","sampleCount":2922,"studyViewUrl":"https://www.cbioportal.org/study?id=pancan_pcawg_2020","metadata":{"clinicalAttributeIds":["AGE","ALCOHOL","ALCOHOL_HISTORY_INTENSITY","ANCESTRY_PRIMARY","CANCER_TYPE","CANCER_TYPE_DETAILED","CELLULARITY","FIRST THERAPY_RESPONSE","FIRST_THERAPY","GRADE","HISTOLOGY","HISTOLOGY_ABBREVIATION","HISTOLOGY_TIER1","HISTOLOGY_TIER2","HISTOLOGY_TIER3","HISTOLOGY_TIER4","ICD_10","ICGC_SAMPLE_ID","MUTATION_COUNT","ONCOTREE_CODE","ORGAN_SYSTEM","OS_MONTHS","OS_STATUS","PLOIDY","PROJECT_CODE","PURITY","PURITY_CONFUGURATION","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_TYPE","SEQUENCING_TYPE","SEX","STAGE","TBL_SCORE","TMB_NONSYNONYMOUS","TOBACCO_SMOKING_HISTORY_INDICATOR","TOBACCO_SMOKING_INTENSITY","TUMOR_SAMPLE_HISTOLOGY_CODE","WGD"],"molecularProfileIds":["pancan_pcawg_2020_cna","pancan_pcawg_2020_mirna","pancan_pcawg_2020_mirna_median_Zscores","pancan_pcawg_2020_mrna_seq_fpkm_capture","pancan_pcawg_2020_mrna_seq_fpkm_capture_all_sample_Zscores","pancan_pcawg_2020_mutations"],"genericAssayProfiles":["pancan_pcawg_2020_mutational_signatures_contribution_DBS","pancan_pcawg_2020_mutational_signatures_contribution_ID","pancan_pcawg_2020_mutational_signatures_contribution_SBS","pancan_pcawg_2020_mutational_signatures_counts_DBS","pancan_pcawg_2020_mutational_signatures_counts_ID","pancan_pcawg_2020_mutational_signatures_counts_SBS"],"heatmapProfileIds":["pancan_pcawg_2020_mirna_median_Zscores","pancan_pcawg_2020_mrna_seq_fpkm_capture_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","generic_assay_mutational_signature"]}}]}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH mut AS (
+  SELECT DISTINCT patient_unique_id,
+    hugo_gene_symbol
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+    AND variant_type = 'mutation'
+    AND hugo_gene_symbol IN ('TP53','KRAS')
+    AND off_panel = FALSE
+),
+patient_genes AS (
+  SELECT patient_unique_id,
+    maxIf(1, hugo_gene_symbol = 'TP53') AS has_tp53,
+    maxIf(1, hugo_gene_symbol = 'KRAS') AS has_kras
+  FROM mut
+  GROUP BY patient_unique_id
+),
+groups AS (
+  SELECT patient_unique_id,
+    CASE
+      WHEN has_tp53 = 1 AND has_kras = 1 THEN 'TP53+KRAS'
+      WHEN has_kras = 1 AND (has_tp53 IS NULL OR has_tp53 = 0) THEN 'KRAS_only'
+    END AS grp
+  FROM patient_genes
+  WHERE has_kras = 1
+)
+SELECT g.grp, g.patient_unique_id,
+  cd_os_months.attribute_value AS OS_MONTHS,
+  cd_os_status.attribute_value AS OS_STATUS
+FROM groups g
+LEFT JOIN clinical_data_derived cd_os_months
+  ON cd_os_months.patient_unique_id = g.patient_unique_id AND cd_os_months.attribute_name = 'OS_MONTHS'
+LEFT JOIN clinical_data_derived cd_os_status
+  ON cd_os_status.patient_unique_id = g.patient_unique_id AND cd_os_status.attribute_name = 'OS_STATUS'
+WHERE g.grp IS NOT NULL
+ORDER BY g.grp, g.patient_unique_id
+",
+ "max_rows": 500
+}
+
+◀ result
+{"rows":[{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO218180","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO220912","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO221543","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO221545","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO221547","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO23610","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO23648","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO23687","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO24467","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO24729","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO25985","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO26653","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO27067","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO32833","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO32875","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO32960","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO32972","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO33028","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO33184","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO33264","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO33480","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO33984","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO34264","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO34448","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO34600","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO34680","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO34817","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO35116","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO35118","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO35136","OS_STATUS":"0:LIVING"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO35186","OS_STATUS":"1:DECEASED"},{"grp":"KRAS_only","g.patient_unique_id":"pancan_pcawg_2020_DO351 … (22717 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT attribute_name, count(*) AS n
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+  AND attribute_name IN ('OS_MONTHS','OS_STATUS')
+GROUP BY attribute_name
+"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"rows":[{"attribute_name":"OS_STATUS","n":2658},{"attribute_name":"OS_MONTHS","n":2658}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT * FROM clinical_data_derived
+WHERE patient_unique_id = 'pancan_pcawg_2020_DO218180'
+  AND attribute_name IN ('OS_MONTHS','OS_STATUS')
+"
+}
+
+◀ result
+{"rows":[{"internal_id":391923,"patient_unique_id":"pancan_pcawg_2020_DO218180","attribute_name":"OS_MONTHS","cancer_study_identifier":"pancan_pcawg_2020","type":"patient"},{"internal_id":391923,"patient_unique_id":"pancan_pcawg_2020_DO218180","attribute_name":"OS_STATUS","attribute_value":"0:LIVING","cancer_study_identifier":"pancan_pcawg_2020","type":"patient"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH mut AS (
+  SELECT DISTINCT patient_unique_id, hugo_gene_symbol
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+    AND variant_type = 'mutation'
+    AND hugo_gene_symbol IN ('TP53','KRAS')
+    AND off_panel = FALSE
+),
+patient_genes AS (
+  SELECT patient_unique_id,
+    maxIf(1, hugo_gene_symbol = 'TP53') AS has_tp53,
+    maxIf(1, hugo_gene_symbol = 'KRAS') AS has_kras
+  FROM mut
+  GROUP BY patient_unique_id
+),
+groups AS (
+  SELECT patient_unique_id,
+    CASE WHEN has_tp53 = 1 AND has_kras = 1 THEN 'TP53+KRAS'
+         WHEN has_kras = 1 THEN 'KRAS_only' END AS grp
+  FROM patient_genes
+  WHERE has_kras = 1
+),
+os AS (
+  SELECT patient_unique_id,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name='OS_MONTHS') AS os_months,
+    maxIf(attribute_value, attribute_name='OS_STATUS') AS os_status
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+  GROUP BY patient_unique_id
+)
+SELECT g.grp,
+  count(*) AS n_patients,
+  countIf(os.os_status = '1:DECEASED') AS n_events,
+  countIf(os.os_status = '0:LIVING') AS n_censored,
+  countIf(os.os_months IS NOT NULL) AS n_with_os_months,
+  min(os.os_months) AS min_os_months,
+  max(os.os_months) AS max_os_months
+FROM groups g
+LEFT JOIN os ON os.patient_unique_id = g.patient_unique_id
+WHERE g.grp IS NOT NULL
+GROUP BY g.grp
+"
+}
+
+◀ result
+{"rows":[{"grp":"KRAS_only","n_patients":85,"n_events":41,"n_censored":44,"n_with_os_months":3,"min_os_months":0,"max_os_months":29.60526316},{"grp":"TP53+KRAS","n_patients":187,"n_events":122,"n_censored":65,"n_with_os_months":1,"min_os_months":33.51973684,"max_os_months":33.51973684}]}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "pancan_pcawg_2020"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "TP53+KRAS mutant",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "pancan_pcawg_2020_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "TP53"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "KRAS"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "KRAS-only mutant",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "pancan_pcawg_2020_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "KRAS"
+        }
+       ]
+      ]
+     }
+    ],
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "TP53",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "not mutated"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/filtered-samples/fetch","data":{"geneFilters":[{"molecularProfileIds":["pancan_pcawg_2020_mutations"],"geneQueries":[[{"hugoGeneSymbol":"KRAS"}]]}],"mutationDataFilters":[{"hugoGeneSymbol":"TP53","profileType":"mutations","categorization":"MUTATED","values":[[{"value":"not mutated"}]]}],"studyIds":["pancan_pcawg_2020"]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","content-type":"application/json","date":"Fri, 25 Sep 2026 00:30:37 GMT","elapsed-time":"206","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","connection":"close","transfer-encoding":"chunked"},"status":500,"text":"{\"message\":\"SQL exception. If you are a maintainer of this instance, see logs for details.\"}"}}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "pancan_pcawg_2020",
+ "geneSpecificQueries": [
+  {
+   "hugoGeneSymbol": "TP53",
+   "profileType": "mutations"
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"pancan_pcawg_2020","geneSpecificCounts":[{"hugoGeneSymbol":"TP53","profileType":"mutations","counts":[{"value":"Missense_Mutation","label":"Missense Mutation","count":599},{"value":"Splice_Region","label":"Splice Region","count":5},{"value":"Frame_Shift_Ins","label":"Frame Shift Ins","count":36},{"value":"In_Frame_Ins","label":"In Frame Ins","count":6},{"value":"Splice_Site","label":"Splice Site","count":69},{"value":"Frame_Shift_Del","label":"Frame Shift Del","count":87},{"value":"In_Frame_Del","label":"In Frame Del","count":19},{"value":"Nonsense_Mutation","label":"Nonsense Mutation","count":117}]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "pancan_pcawg_2020"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "TP53+KRAS mutant",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "pancan_pcawg_2020_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "TP53"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "KRAS"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "KRAS-only mutant",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "pancan_pcawg_2020_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "KRAS"
+        }
+       ]
+      ]
+     }
+    ],
+    "mutationDataFilters": [
+     {
+      "hugoGeneSymbol": "TP53",
+      "profileType": "mutations",
+      "categorization": "MUTATED",
+      "values": [
+       [
+        {
+         "value": "Not Mutated"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/filtered-samples/fetch","data":{"geneFilters":[{"molecularProfileIds":["pancan_pcawg_2020_mutations"],"geneQueries":[[{"hugoGeneSymbol":"KRAS"}]]}],"mutationDataFilters":[{"hugoGeneSymbol":"TP53","profileType":"mutations","categorization":"MUTATED","values":[[{"value":"Not Mutated"}]]}],"studyIds":["pancan_pcawg_2020"]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","content-type":"application/json","date":"Fri, 25 Sep 2026 00:30:45 GMT","elapsed-time":"19","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","connection":"close","transfer-encoding":"chunked"},"status":500,"text":"{\"message\":\"SQL exception. If you are a maintainer of this instance, see logs for details.\"}"}}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH mut AS (
+  SELECT DISTINCT sample_unique_id, sample_id, hugo_gene_symbol
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+    AND variant_type = 'mutation'
+    AND hugo_gene_symbol IN ('TP53','KRAS')
+    AND off_panel = FALSE
+),
+sample_genes AS (
+  SELECT sample_unique_id, sample_id,
+    maxIf(1, hugo_gene_symbol = 'TP53') AS has_tp53,
+    maxIf(1, hugo_gene_symbol = 'KRAS') AS has_kras
+  FROM mut
+  GROUP BY sample_unique_id, sample_id
+)
+SELECT
+  CASE WHEN has_tp53=1 AND has_kras=1 THEN 'TP53+KRAS' WHEN has_kras=1 THEN 'KRAS_only' END AS grp,
+  sample_id
+FROM sample_genes
+WHERE has_kras = 1
+ORDER BY grp, sample_id
+",
+ "max_rows": 500
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `sample_id` in scope  mut. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH mut AS (
+  SELECT DISTINCT sample_unique_id, hugo_gene_symbol
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'pancan_pcawg_2020'
+    AND variant_type = 'mutation'
+    AND hugo_gene_symbol IN ('TP53','KRAS')
+    AND off_panel = FALSE
+),
+sample_genes AS (
+  SELECT sample_unique_id,
+    maxIf(1, hugo_gene_symbol = 'TP53') AS has_tp53,
+    maxIf(1, hugo_gene_symbol = 'KRAS') AS has_kras
+  FROM mut
+  GROUP BY sample_unique_id
+)
+SELECT
+  CASE WHEN has_tp53=1 AND has_kras=1 THEN 'TP53+KRAS' WHEN has_kras=1 THEN 'KRAS_only' END AS grp,
+  replaceOne(sample_unique_id, 'pancan_pcawg_2020_', '') AS sample_id
+FROM sample_genes
+WHERE has_kras = 1
+ORDER BY grp, sample_id
+",
+ "max_rows": 500
+}
+
+◀ result
+{"rows":[{"grp":"KRAS_only","sample_id":"SP103866"},{"grp":"KRAS_only","sample_id":"SP106743"},{"grp":"KRAS_only","sample_id":"SP107030"},{"grp":"KRAS_only","sample_id":"SP107920"},{"grp":"KRAS_only","sample_id":"SP108017"},{"grp":"KRAS_only","sample_id":"SP109953"},{"grp":"KRAS_only","sample_id":"SP110789"},{"grp":"KRAS_only","sample_id":"SP110845"},{"grp":"KRAS_only","sample_id":"SP111080"},{"grp":"KRAS_only","sample_id":"SP114032"},{"grp":"KRAS_only","sample_id":"SP115070"},{"grp":"KRAS_only","sample_id":"SP116950"},{"grp":"KRAS_only","sample_id":"SP116985"},{"grp":"KRAS_only","sample_id":"SP117040"},{"grp":"KRAS_only","sample_id":"SP117215"},{"grp":"KRAS_only","sample_id":"SP117309"},{"grp":"KRAS_only","sample_id":"SP117376"},{"grp":"KRAS_only","sample_id":"SP117523"},{"grp":"KRAS_only","sample_id":"SP117660"},{"grp":"KRAS_only","sample_id":"SP117949"},{"grp":"KRAS_only","sample_id":"SP117974"},{"grp":"KRAS_only","sample_id":"SP124460"},{"grp":"KRAS_only","sample_id":"SP125689"},{"grp":"KRAS_only","sample_id":"SP125698"},{"grp":"KRAS_only","sample_id":"SP125706"},{"grp":"KRAS_only","sample_id":"SP125722"},{"grp":"KRAS_only","sample_id":"SP125724"},{"grp":"KRAS_only","sample_id":"SP125742"},{"grp":"KRAS_only","sample_id":"SP125745"},{"grp":"KRAS_only","sample_id":"SP125752"},{"grp":"KRAS_only","sample_id":"SP125753"},{"grp":"KRAS_only","sample_id":"SP125764"},{"grp":"KRAS_only","sample_id":"SP125766"},{"grp":"KRAS_only","sample_id":"SP125770"},{"grp":"KRAS_only","sample_id":"SP125771"},{"grp":"KRAS_only","sample_id":"SP125775"},{"grp":"KRAS_only","sample_id":"SP125776"},{"grp":"KRAS_only","sample_id":"SP125777"},{"grp":"KRAS_only","sample_id":"SP125778"},{"grp":"KRAS_only","sample_id":"SP125794"},{"grp":"KRAS_only","sample_id":"SP125795"},{"grp":"KRAS_only","sample_id":"SP125809"},{"grp":"KRAS_only","sample_id":"SP17016"},{"grp":"KRAS_only","sample_id":"SP17329"},{"grp":"KRAS_only","sample_id":"SP18121"},{"grp":"KRAS_only","sample_id":"SP18787"},{"grp":"KRAS_only","sample_id":"SP19295"},{"grp":"KRAS_only","sample_id":"SP19983"},{"grp":"KRAS_only","sample_id":"SP21400"},{"grp":"KRAS_only","sample_id":"SP50321"},{"grp":"KRAS_only","sample_id":"SP50406"},{"grp":"KRAS_only","sample_id":"SP50485"},{"grp":"KRAS_only","sample_id":"SP52232"},{"grp":"KRAS_only","sample_id":"SP52779"},{"grp":"KRAS_only","sample_id":"SP55509"},{"grp":"KRAS_only","sample_id":"SP56941"},{"grp":"KRAS_only","sample_id":"SP57818"},{"grp":"KRAS_only","sample_id":"SP69573"},{"grp":"KRAS_only","sample_id":"SP70046"},{"grp":"KRAS_only","sample_id":"SP70082"},{"grp":"KRAS_only","sample_id":"SP70266"},{"grp":"KRAS_only","sample_id":"SP70860"},{"grp":"KRAS_only","sample_id":"SP71132"},{"grp":"KRAS_only","sample_id":"SP71758"},{"grp":"KRAS_only","sample_id":"SP72262"},{"grp":"KRAS_only","sample_id":"SP73319"},{"grp":"KRAS_only","sample_id":"SP75322"},{"grp":"KRAS_only","sample_id":"SP75681"},{"grp":"KRAS_only","sample_id":"SP75977"},{"grp":"KRAS_only","sample_id":"SP76955"},{"grp":"K … (8636 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "pancan_pcawg_2020"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "TP53+KRAS mutant",
+   "studyViewFilter": {
+    "sampleIdentifiers": [
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP102113"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107770"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107781"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107784"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107786"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107874"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107915"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107945"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107952"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107956"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108020"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108033"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108049"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108059"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108065"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108068"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108088"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108123"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110736"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110770"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110798"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110816"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110822"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110824"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110849"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP111035"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP111069"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP116949"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP116962"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP116965"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP116968"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117001"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117017"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117037"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117158"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117164"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117165"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117201"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117216"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117261"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117290"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117291"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117323"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117332"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117340"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117351"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117412"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117440"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117441"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117463"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117476"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117522"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117568"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117643"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117648"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117650"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117653"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117656"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117661"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117690"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117722"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117745"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117760"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117878"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117908"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117911"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117972"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP118046"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP122725"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125685"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125686"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125693"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125694"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125695"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125696"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125699"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125703"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125704"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125705"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125710"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125711"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125712"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125713"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125715"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125717"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125721"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125725"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125726"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125730"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125731"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125733"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125737"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125741"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125744"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125749"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125755"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125757"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125758"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125760"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125761"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125762"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125763"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125768"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125769"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125772"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125780"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125781"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125783"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125784"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125785"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125786"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125791"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125793"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125802"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125804"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125805"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125807"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125811"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP16886"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP17294"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP18946"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP19670"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP21193"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP22031"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP54363"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP69565"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP69587"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP69705"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP69762"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP69812"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP69898"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70122"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70178"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70202"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70288"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70313"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70677"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70756"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70780"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70932"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70956"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71084"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71228"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71404"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71456"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71480"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71536"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71552"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71576"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71734"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71846"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71950"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71974"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP73263"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP74896"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76001"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76017"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76057"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76136"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76353"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76515"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76675"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76843"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76867"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76915"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP77131"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP77203"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP77866"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP77888"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP77930"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP77986"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP78013"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP78533"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP80271"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP80615"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP80754"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP81172"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP81440"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP81494"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP82087"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP84858"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP94540"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP96112"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP96114"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP96116"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP96120"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP96126"
+     }
+    ]
+   }
+  },
+  {
+   "name": "KRAS-only mutant",
+   "studyViewFilter": {
+    "sampleIdentifiers": [
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP103866"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP106743"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107030"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP107920"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP108017"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP109953"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110789"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP110845"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP111080"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP114032"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP115070"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP116950"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP116985"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117040"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117215"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117309"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117376"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117523"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117660"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117949"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP117974"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP124460"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125689"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125698"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125706"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125722"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125724"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125742"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125745"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125752"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125753"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125764"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125766"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125770"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125771"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125775"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125776"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125777"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125778"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125794"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125795"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP125809"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP17016"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP17329"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP18121"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP18787"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP19295"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP19983"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP21400"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP50321"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP50406"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP50485"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP52232"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP52779"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP55509"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP56941"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP57818"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP69573"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70046"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70082"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70266"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP70860"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71132"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP71758"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP72262"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP73319"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP75322"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP75681"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP75977"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP76955"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP77956"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP77972"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP78502"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP79383"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP79419"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP79971"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP80657"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP81840"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP82532"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP84392"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP84982"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP92268"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP92659"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP96122"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP99225"
+     },
+     {
+      "studyId": "pancan_pcawg_2020",
+      "sampleId": "SP99321"
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b01fe497aad53593c226","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b01fe497aad53593c226","data":{"description":"Group comparison (2 custom groups)","studies":["pancan_pcawg_2020"],"totalGroups":2,"groups":[{"name":"TP53+KRAS mutant","sampleCount":187},{"name":"KRAS-only mutant","sampleCount":86}],"studyViewUrl":"https://www.cbioportal.org/study?id=pancan_pcawg_2020","groupUrls":[{"groupName":"TP53+KRAS mutant","url":"https://www.cbioportal.org/study?id=pancan_pcawg_2020#filterJson=%7B%22sampleIdentifiers%22%3A%5B%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP102113%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107770%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107781%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107784%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107786%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107874%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107915%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107945%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107952%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP107956%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP108020%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP108033%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP108049%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP108059%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP108065%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP108068%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP108088%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP108123%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP110736%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP110770%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP110798%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP110816%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP110822%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP110824%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP110849%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP111035%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP111069%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleId%22%3A%22SP116949%22%7D%2C%7B%22studyId%22%3A%22pancan_pcawg_2020%22%2C%22sampleI … (20182 more chars)
+
+═ answer (success)
+Successfully created the group comparison.
+
+## Summary
+
+**ClickHouse cannot compute Kaplan-Meier curves or log-rank p-values**, so I did not fabricate a survival difference or significance value. Additionally, direct inspection of the study's `OS_MONTHS` clinical attribute showed it is populated for only a handful of patients in the derived table (3/85 KRAS-only, 1/187 TP53+KRAS) — the underlying cBioPortal survival plot may draw on more complete data internally, so the KM curve below is the authoritative source, not a manual recomputation from this thin sample.
+
+**Group definitions** (study: `pancan_pcawg_2020`, non-off-panel somatic mutations):
+
+| Group | N patients | Events (Deceased) | Censored (Living) |
+|---|---|---|---|
+| TP53 + KRAS both mutated | 187 | 122 (65%) | 65 |
+| KRAS mutated only (TP53 wild-type) | 86 | 41 (48%) | 44 |
+
+The TP53+KRAS group has a numerically higher raw death proportion, but this is **not** a survival estimate and ignores censoring/follow-up time — do not interpret it as such.
+
+**Run the actual Kaplan-Meier + log-rank test here:**
+
+[Survival Comparison: TP53+KRAS mutant vs. KRAS-only mutant](https://www.cbioportal.org/comparison/survival?comparisonId=6ab5b01fe497aad53593c226)
+
+Kaplan-Meier survival analysis comparing TP53+KRAS mutant (187) vs KRAS-only mutant (86). This page will render the KM curves, median OS (or "not reached"), and the log-rank p-value natively — the correct way to answer this question.

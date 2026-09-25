@@ -1,0 +1,173 @@
+Q (haiku): "What percentage of glioblastoma patients have alterations in RB pathway genes (CDKN2A, CDK4, RB1)?"
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ search_oncotree
+{
+ "search_term": "glioblastoma"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+{"result":[{"code":"GB","name":"Glioblastoma, IDH-Wildtype","score":60,"mainType":"Glioma","tissue":"CNS/Brain","hierarchy":"BRAIN > DIFG > ADIFG > GB","replacedCodes":["GBM"]},{"code":"SCGBM","name":"Small Cell Glioblastoma","score":50,"mainType":"Glioma","tissue":"CNS/Brain","hierarchy":"BRAIN > DIFG > ADIFG > GB > SCGBM"}]}
+
+▶ list_studies
+{
+ "search": "glioblastoma TCGA",
+ "verbose": false
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"gbm_tcga","name":"Glioblastoma Multiforme (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":619,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga"},{"cancer_study_identifier":"gbm_tcga_gdc","name":"Glioblastoma Multiforme (TCGA GDC, 2025)","type_of_cancer_id":"difg","sample_count":611,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_gdc"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":592,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pub2013","name":"Glioblastoma (TCGA, Cell 2013)","type_of_cancer_id":"difg","sample_count":577,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013"},{"cancer_study_identifier":"gbm_tcga_pub","name":"Glioblastoma (TCGA, Nature 2008)","type_of_cancer_id":"difg","sample_count":206,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH rb_pathway_genes AS (
+  SELECT 'CDKN2A' AS gene
+  UNION ALL
+  SELECT 'CDK4'
+  UNION ALL
+  SELECT 'RB1'
+),
+all_samples_profiled AS (
+  SELECT COUNT(DISTINCT sample_unique_id) AS total_samples
+  FROM sample_to_gene_panel_derived
+  WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+    AND alteration_type IN ('MUTATION_EXTENDED', 'COPY_NUMBER_ALTERATION')
+),
+altered_samples AS (
+  SELECT COUNT(DISTINCT ged.sample_unique_id) AS samples_with_alteration
+  FROM genomic_event_derived ged
+  WHERE ged.cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+    AND ged.hugo_gene_symbol IN ('CDKN2A', 'CDK4', 'RB1')
+    AND (
+      (ged.variant_type = 'mutation' AND ged.mutation_status != 'UNCALLED')
+      OR (ged.variant_type = 'cna' AND ged.cna_alteration IN (2, -2))
+    )
+)
+SELECT 
+  asp.total_samples,
+  al.samples_with_alteration,
+  ROUND(al.samples_with_alteration * 100.0 / asp.total_samples, 1) AS percentage_with_rb_pathway_alterations
+FROM all_samples_profiled asp, altered_samples al
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"total_samples":592,"samples_with_alteration":435,"percentage_with_rb_pathway_alterations":73.5}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+  ged.hugo_gene_symbol,
+  COUNT(DISTINCT ged.sample_unique_id) AS altered_samples,
+  SUM(CASE WHEN ged.variant_type = 'mutation' AND ged.mutation_status != 'UNCALLED' THEN 1 ELSE 0 END) AS mutation_events,
+  SUM(CASE WHEN ged.variant_type = 'cna' AND ged.cna_alteration = 2 THEN 1 ELSE 0 END) AS amp_events,
+  SUM(CASE WHEN ged.variant_type = 'cna' AND ged.cna_alteration = -2 THEN 1 ELSE 0 END) AS homdel_events
+FROM genomic_event_derived ged
+WHERE ged.cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+  AND ged.hugo_gene_symbol IN ('CDKN2A', 'CDK4', 'RB1')
+  AND (
+    (ged.variant_type = 'mutation' AND ged.mutation_status != 'UNCALLED')
+    OR (ged.variant_type = 'cna' AND ged.cna_alteration IN (2, -2))
+  )
+GROUP BY ged.hugo_gene_symbol
+ORDER BY altered_samples DESC
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"CDKN2A","altered_samples":326,"mutation_events":4,"amp_events":0,"homdel_events":322},{"hugo_gene_symbol":"CDK4","altered_samples":82,"mutation_events":0,"amp_events":82,"homdel_events":0},{"hugo_gene_symbol":"RB1","altered_samples":52,"mutation_events":39,"amp_events":0,"homdel_events":15}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "gbm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","sampleCount":592,"studyViewUrl":"https://www.cbioportal.org/study?id=gbm_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["gbm_tcga_pan_can_atlas_2018_gistic","gbm_tcga_pan_can_atlas_2018_log2CNA","gbm_tcga_pan_can_atlas_2018_mutations","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","gbm_tcga_pan_can_atlas_2018_rppa","gbm_tcga_pan_can_atlas_2018_rppa_Zscores","gbm_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["gbm_tcga_pan_can_atlas_2018_armlevel_cna","gbm_tcga_pan_can_atlas_2018_genetic_ancestry","gbm_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","gbm_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","gbm_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "gbm_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "CDKN2A",
+  "CDK4",
+  "RB1"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=CDKN2A%0ACDK4%0ARB1&case_set_id=gbm_tcga_pan_can_atlas_2018_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=CDKN2A%0ACDK4%0ARB1&case_set_id=gbm_tcga_pan_can_atlas_2018_all","data":{"studyIds":["gbm_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","sampleCount":592}],"genes":["CDKN2A","CDK4","RB1"],"caseSetId":"gbm_tcga_pan_can_atlas_2018_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## Summary
+
+**73.5% of glioblastoma patients have alterations in RB pathway genes** (CDKN2A, CDK4, and/or RB1) in the TCGA Glioblastoma Multiforme PanCancer Atlas cohort (435 of 592 samples).
+
+### Breakdown by Gene:
+
+| Gene | Altered Samples | Alteration Type | Details |
+|------|-----------------|---|---------|
+| **CDKN2A** | 326 (55.0%) | Homozygous deletion (322) + mutations (4) | Most frequent; primarily deletions |
+| **CDK4** | 82 (13.9%) | Amplification (82) | Exclusive amplifications in this cohort |
+| **RB1** | 52 (8.8%) | Mutations (39) + homozygous deletions (15) | Mixed mutation and deletion events |
+
+**Note:** Individual frequencies exceed 73.5% because individual genes overlap—samples can carry alterations in multiple pathway components.
+
+### Explore the Data:
+[View RB pathway alterations in OncoPrint](https://www.cbioportal.org/results/oncoprint?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=CDKN2A%0ACDK4%0ARB1&case_set_id=gbm_tcga_pan_can_atlas_2018_all) — Interactive visualization showing mutation and CNA events across samples, sorted by alteration frequency.

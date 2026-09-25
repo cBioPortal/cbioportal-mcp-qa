@@ -1,0 +1,293 @@
+Q (sonnet): "Are mutations in DNA repair pathway genes (BRCA1, BRCA2, ATM, CHEK2) enriched in specific cancer types across TCGA Pan-Cancer Atlas?"
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7083 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 'BRCA1' AS gene, * FROM gene_mutation_frequency_by_cancer_type(preference = 'pan_cancer_tcga', gene = 'BRCA1') ORDER BY frequency_pct DESC"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 'BRCA2' AS gene, * FROM gene_mutation_frequency_by_cancer_type(preference = 'pan_cancer_tcga', gene = 'BRCA2') ORDER BY frequency_pct DESC"
+}
+
+◀ result
+{"rows":[{"gene":"BRCA1","cancer_type":"Endometrial Cancer","altered_samples":47,"profiled_samples":574,"frequency_pct":8.2},{"gene":"BRCA1","cancer_type":"Melanoma","altered_samples":28,"profiled_samples":440,"frequency_pct":6.4},{"gene":"BRCA1","cancer_type":"Bladder Cancer","altered_samples":21,"profiled_samples":410,"frequency_pct":5.1},{"gene":"BRCA1","cancer_type":"Cervical Cancer","altered_samples":14,"profiled_samples":291,"frequency_pct":4.8},{"gene":"BRCA1","cancer_type":"Non-Small Cell Lung Cancer","altered_samples":41,"profiled_samples":1050,"frequency_pct":3.9},{"gene":"BRCA1","cancer_type":"Ovarian Epithelial Tumor","altered_samples":18,"profiled_samples":523,"frequency_pct":3.4},{"gene":"BRCA1","cancer_type":"Colorectal Cancer","altered_samples":16,"profiled_samples":534,"frequency_pct":3},{"gene":"BRCA1","cancer_type":"Esophagogastric Cancer","altered_samples":18,"profiled_samples":618,"frequency_pct":2.9},{"gene":"BRCA1","cancer_type":"Breast Cancer","altered_samples":27,"profiled_samples":1066,"frequency_pct":2.5},{"gene":"BRCA1","cancer_type":"Head and Neck Cancer","altered_samples":11,"profiled_samples":515,"frequency_pct":2.1},{"gene":"BRCA1","cancer_type":"Glioblastoma","altered_samples":6,"profiled_samples":397,"frequency_pct":1.5},{"gene":"BRCA1","cancer_type":"Pancreatic Cancer","altered_samples":2,"profiled_samples":179,"frequency_pct":1.1},{"gene":"BRCA1","cancer_type":"Hepatobiliary Cancer","altered_samples":4,"profiled_samples":366,"frequency_pct":1.1},{"gene":"BRCA1","cancer_type":"Renal Clear Cell Carcinoma","altered_samples":4,"profiled_samples":402,"frequency_pct":1},{"gene":"BRCA1","cancer_type":"Renal Non-Clear Cell Carcinoma","altered_samples":3,"profiled_samples":341,"frequency_pct":0.9},{"gene":"BRCA1","cancer_type":"Glioma","altered_samples":2,"profiled_samples":514,"frequency_pct":0.4},{"gene":"BRCA1","cancer_type":"Thyroid Cancer","altered_samples":1,"profiled_samples":490,"frequency_pct":0.2},{"gene":"BRCA1","cancer_type":"Prostate Cancer","altered_samples":1,"profiled_samples":494,"frequency_pct":0.2}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 'ATM' AS gene, * FROM gene_mutation_frequency_by_cancer_type(preference = 'pan_cancer_tcga', gene = 'ATM') ORDER BY frequency_pct DESC"
+}
+
+◀ result
+{"rows":[{"gene":"BRCA2","cancer_type":"Endometrial Cancer","altered_samples":83,"profiled_samples":574,"frequency_pct":14.5},{"gene":"BRCA2","cancer_type":"Melanoma","altered_samples":51,"profiled_samples":440,"frequency_pct":11.6},{"gene":"BRCA2","cancer_type":"Bladder Cancer","altered_samples":40,"profiled_samples":410,"frequency_pct":9.8},{"gene":"BRCA2","cancer_type":"Esophagogastric Cancer","altered_samples":45,"profiled_samples":618,"frequency_pct":7.3},{"gene":"BRCA2","cancer_type":"Colorectal Cancer","altered_samples":38,"profiled_samples":534,"frequency_pct":7.1},{"gene":"BRCA2","cancer_type":"Non-Small Cell Lung Cancer","altered_samples":60,"profiled_samples":1050,"frequency_pct":5.7},{"gene":"BRCA2","cancer_type":"Cervical Cancer","altered_samples":13,"profiled_samples":291,"frequency_pct":4.5},{"gene":"BRCA2","cancer_type":"Head and Neck Cancer","altered_samples":21,"profiled_samples":515,"frequency_pct":4.1},{"gene":"BRCA2","cancer_type":"Ovarian Epithelial Tumor","altered_samples":15,"profiled_samples":523,"frequency_pct":2.9},{"gene":"BRCA2","cancer_type":"Breast Cancer","altered_samples":29,"profiled_samples":1066,"frequency_pct":2.7},{"gene":"BRCA2","cancer_type":"Renal Non-Clear Cell Carcinoma","altered_samples":7,"profiled_samples":341,"frequency_pct":2.1},{"gene":"BRCA2","cancer_type":"Renal Clear Cell Carcinoma","altered_samples":8,"profiled_samples":402,"frequency_pct":2},{"gene":"BRCA2","cancer_type":"Hepatobiliary Cancer","altered_samples":7,"profiled_samples":366,"frequency_pct":1.9},{"gene":"BRCA2","cancer_type":"Thymic Epithelial Tumor","altered_samples":2,"profiled_samples":123,"frequency_pct":1.6},{"gene":"BRCA2","cancer_type":"Prostate Cancer","altered_samples":8,"profiled_samples":494,"frequency_pct":1.6},{"gene":"BRCA2","cancer_type":"Sarcoma","altered_samples":4,"profiled_samples":255,"frequency_pct":1.6},{"gene":"BRCA2","cancer_type":"Glioblastoma","altered_samples":6,"profiled_samples":397,"frequency_pct":1.5},{"gene":"BRCA2","cancer_type":"Glioma","altered_samples":7,"profiled_samples":514,"frequency_pct":1.4},{"gene":"BRCA2","cancer_type":"Ocular Melanoma","altered_samples":1,"profiled_samples":80,"frequency_pct":1.2},{"gene":"BRCA2","cancer_type":"Pancreatic Cancer","altered_samples":2,"profiled_samples":179,"frequency_pct":1.1},{"gene":"BRCA2","cancer_type":"Leukemia","altered_samples":2,"profiled_samples":200,"frequency_pct":1},{"gene":"BRCA2","cancer_type":"Pheochromocytoma","altered_samples":1,"profiled_samples":147,"frequency_pct":0.7},{"gene":"BRCA2","cancer_type":"Thyroid Cancer","altered_samples":2,"profiled_samples":490,"frequency_pct":0.4}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 'CHEK2' AS gene, * FROM gene_mutation_frequency_by_cancer_type(preference = 'pan_cancer_tcga', gene = 'CHEK2') ORDER BY frequency_pct DESC"
+}
+
+◀ result
+{"rows":[{"gene":"ATM","cancer_type":"Endometrial Cancer","altered_samples":101,"profiled_samples":574,"frequency_pct":17.6},{"gene":"ATM","cancer_type":"Bladder Cancer","altered_samples":55,"profiled_samples":410,"frequency_pct":13.4},{"gene":"ATM","cancer_type":"Colorectal Cancer","altered_samples":70,"profiled_samples":534,"frequency_pct":13.1},{"gene":"ATM","cancer_type":"Melanoma","altered_samples":42,"profiled_samples":440,"frequency_pct":9.5},{"gene":"ATM","cancer_type":"Esophagogastric Cancer","altered_samples":51,"profiled_samples":618,"frequency_pct":8.3},{"gene":"ATM","cancer_type":"Non-Small Cell Lung Cancer","altered_samples":76,"profiled_samples":1050,"frequency_pct":7.2},{"gene":"ATM","cancer_type":"Adrenocortical Carcinoma","altered_samples":5,"profiled_samples":91,"frequency_pct":5.5},{"gene":"ATM","cancer_type":"Pancreatic Cancer","altered_samples":8,"profiled_samples":179,"frequency_pct":4.5},{"gene":"ATM","cancer_type":"Prostate Cancer","altered_samples":20,"profiled_samples":494,"frequency_pct":4},{"gene":"ATM","cancer_type":"Cervical Cancer","altered_samples":11,"profiled_samples":291,"frequency_pct":3.8},{"gene":"ATM","cancer_type":"Hepatobiliary Cancer","altered_samples":13,"profiled_samples":366,"frequency_pct":3.6},{"gene":"ATM","cancer_type":"Head and Neck Cancer","altered_samples":17,"profiled_samples":515,"frequency_pct":3.3},{"gene":"ATM","cancer_type":"Renal Clear Cell Carcinoma","altered_samples":13,"profiled_samples":402,"frequency_pct":3.2},{"gene":"ATM","cancer_type":"Sarcoma","altered_samples":7,"profiled_samples":255,"frequency_pct":2.7},{"gene":"ATM","cancer_type":"Breast Cancer","altered_samples":25,"profiled_samples":1066,"frequency_pct":2.3},{"gene":"ATM","cancer_type":"Renal Non-Clear Cell Carcinoma","altered_samples":8,"profiled_samples":341,"frequency_pct":2.3},{"gene":"ATM","cancer_type":"Ovarian Epithelial Tumor","altered_samples":10,"profiled_samples":523,"frequency_pct":1.9},{"gene":"ATM","cancer_type":"Glioblastoma","altered_samples":7,"profiled_samples":397,"frequency_pct":1.8},{"gene":"ATM","cancer_type":"Thyroid Cancer","altered_samples":6,"profiled_samples":490,"frequency_pct":1.2},{"gene":"ATM","cancer_type":"Pleural Mesothelioma","altered_samples":1,"profiled_samples":86,"frequency_pct":1.2},{"gene":"ATM","cancer_type":"Non-Seminomatous Germ Cell Tumor","altered_samples":1,"profiled_samples":86,"frequency_pct":1.2},{"gene":"ATM","cancer_type":"Glioma","altered_samples":4,"profiled_samples":514,"frequency_pct":0.8},{"gene":"ATM","cancer_type":"Leukemia","altered_samples":1,"profiled_samples":200,"frequency_pct":0.5}]}
+
+◀ result
+{"rows":[{"gene":"CHEK2","cancer_type":"Endometrial Cancer","altered_samples":36,"profiled_samples":574,"frequency_pct":6.3},{"gene":"CHEK2","cancer_type":"Bladder Cancer","altered_samples":10,"profiled_samples":410,"frequency_pct":2.4},{"gene":"CHEK2","cancer_type":"Adrenocortical Carcinoma","altered_samples":2,"profiled_samples":91,"frequency_pct":2.2},{"gene":"CHEK2","cancer_type":"Colorectal Cancer","altered_samples":9,"profiled_samples":534,"frequency_pct":1.7},{"gene":"CHEK2","cancer_type":"Non-Small Cell Lung Cancer","altered_samples":17,"profiled_samples":1050,"frequency_pct":1.6},{"gene":"CHEK2","cancer_type":"Esophagogastric Cancer","altered_samples":9,"profiled_samples":618,"frequency_pct":1.5},{"gene":"CHEK2","cancer_type":"Cervical Cancer","altered_samples":4,"profiled_samples":291,"frequency_pct":1.4},{"gene":"CHEK2","cancer_type":"Melanoma","altered_samples":5,"profiled_samples":440,"frequency_pct":1.1},{"gene":"CHEK2","cancer_type":"Renal Non-Clear Cell Carcinoma","altered_samples":3,"profiled_samples":341,"frequency_pct":0.9},{"gene":"CHEK2","cancer_type":"Head and Neck Cancer","altered_samples":4,"profiled_samples":515,"frequency_pct":0.8},{"gene":"CHEK2","cancer_type":"Thymic Epithelial Tumor","altered_samples":1,"profiled_samples":123,"frequency_pct":0.8},{"gene":"CHEK2","cancer_type":"Hepatobiliary Cancer","altered_samples":3,"profiled_samples":366,"frequency_pct":0.8},{"gene":"CHEK2","cancer_type":"Ovarian Epithelial Tumor","altered_samples":4,"profiled_samples":523,"frequency_pct":0.8},{"gene":"CHEK2","cancer_type":"Breast Cancer","altered_samples":9,"profiled_samples":1066,"frequency_pct":0.8},{"gene":"CHEK2","cancer_type":"Thyroid Cancer","altered_samples":4,"profiled_samples":490,"frequency_pct":0.8},{"gene":"CHEK2","cancer_type":"Pancreatic Cancer","altered_samples":1,"profiled_samples":179,"frequency_pct":0.6},{"gene":"CHEK2","cancer_type":"Sarcoma","altered_samples":1,"profiled_samples":255,"frequency_pct":0.4},{"gene":"CHEK2","cancer_type":"Glioma","altered_samples":2,"profiled_samples":514,"frequency_pct":0.4},{"gene":"CHEK2","cancer_type":"Renal Clear Cell Carcinoma","altered_samples":1,"profiled_samples":402,"frequency_pct":0.2}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+Error: result (81,891 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-3woztzu0/bd9162f4-e2df-4116-ad77-dfe1aadc2d42/tool-results/mcp-navigator-resolve_and_route-1790296146480.txt.
+Format: Plain text
+- For targeted searches (find a string): use grep on the file directly.
+- For analysis or summarization that requires reading the full content: the file's lines are too long for Read's offset/limit. Slice by character range via Bash instead — e.g. python3 -c 'print(open("/home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-3woztzu0/bd9162f4-e2df-4116-ad77-dfe1aadc2d42/tool-results/mcp-navigator-resolve_and_route-1790296146480.txt").read()[A:B])' in ~80,000-char spans until you have read 100% of it.
+- If the Agent tool is available, do this inside a subagent so the full output stays out of your main context. Give it the instruction above verbatim, and be explicit about what it must return — e.g. "Slice /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-3woztzu0/bd9162f4-e2df-4116-ad77-dfe1aadc2d42/tool-results/mcp-navigator-resolve_and_route-1790296146480.txt in ~80,000-char spans via python (read()[A:B]) until you have read all 81,891 characters, then summarize and quote any key findings verbatim." A vague "summarize this" may lose detail.
+
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529,"studyViewUrl":"https://www.cbioportal.org/study?id=ucec_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["ucec_tcga_pan_can_atlas_2018_gistic","ucec_tcga_pan_can_atlas_2018_log2CNA","ucec_tcga_pan_can_atlas_2018_mutations","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","ucec_tcga_pan_can_atlas_2018_rppa","ucec_tcga_pan_can_atlas_2018_rppa_Zscores","ucec_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["ucec_tcga_pan_can_atlas_2018_armlevel_cna","ucec_tcga_pan_can_atlas_2018_genetic_ancestry","ucec_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","ucec_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ucec_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","ucec_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "BRCA1",
+  "BRCA2",
+  "ATM",
+  "CHEK2"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=BRCA1%0ABRCA2%0AATM%0ACHEK2&case_set_id=ucec_tcga_pan_can_atlas_2018_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=BRCA1%0ABRCA2%0AATM%0ACHEK2&case_set_id=ucec_tcga_pan_can_atlas_2018_all","data":{"studyIds":["ucec_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529}],"genes":["BRCA1","BRCA2","ATM","CHEK2"],"caseSetId":"ucec_tcga_pan_can_atlas_2018_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018","url":"https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018","data":{"studyIds":["ucec_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529}],"tab":"summary","hasFilters":false,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+Note: the full 32-study TCGA PanCancer Atlas cohort exceeded the tool's response size limit for a combined OncoPrint link, so I've generated links for **Endometrial Cancer (UCEC)** — the top-ranked cancer type for all four genes:
+
+- **[OncoPrint: BRCA1/BRCA2/ATM/CHEK2 in UCEC](https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=BRCA1%0ABRCA2%0AATM%0ACHEK2&case_set_id=ucec_tcga_pan_can_atlas_2018_all)** — Visual summary of alterations in queried genes across samples. (529 samples, Uterine Corpus Endometrial Carcinoma, TCGA PanCancer Atlas)
+- **[StudyView: UCEC Cohort Overview](https://www.cbioportal.org/study/summary?id=ucec_tcga_pan_can_atlas_2018)** — Overview of all study data displayed as interactive charts summarizing available clinical and genomic data.
+
+To explore the pan-cancer comparison interactively (all 32 TCGA studies, gene-by-gene, with statistical test support in the Comparison tab), browse directly at [cbioportal.org](https://www.cbioportal.org) and query BRCA1, BRCA2, ATM, CHEK2 with `case_set_id` = "Genome-wide Panel" studies pooled, or repeat this navigation for other high-signal types (Melanoma: `skcm_tcga_pan_can_atlas_2018`, Bladder: `blca_tcga_pan_can_atlas_2018`, Colorectal: `coadread_tcga_pan_can_atlas_2018`) if you'd like individual links generated.

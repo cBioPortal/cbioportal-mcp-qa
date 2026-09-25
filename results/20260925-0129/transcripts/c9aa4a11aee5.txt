@@ -1,0 +1,218 @@
+Q (sonnet): I receive a report with the PIK3CA p.*1069Wext*3 mutation. Can you provide details of it
+
+▶ read_guide
+{
+ "uri": "cbioportal://common-pitfalls"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Common Query Pitfalls Guide
+
+## Overview
+This guide highlights frequent mistakes when analyzing cBioPortal data and provides solutions to avoid them.
+
+## Critical Pitfalls
+
+### 1. 🚨 CRITICAL MUTATION FREQUENCY ERRORS
+
+#### ❌ WRONG: Using study-wide totals for gene frequencies
+```sql
+-- INCORRECT - This gives wrong frequencies!
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples,
+    (SELECT COUNT(DISTINCT sample_unique_id)
+     FROM genomic_event_derived
+     WHERE cancer_study_identifier = 'your_study_id') as total_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND cancer_study_identifier = 'your_study_id'
+GROUP BY hugo_gene_symbol;
+```
+**Problem**: Different genes have different profiling coverage - you can't use study-wide totals!
+
+#### ❌ WRONG: Not using gene-specific profiling denominators
+```sql
+-- INCORRECT - Missing gene-specific denominators
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+GROUP BY hugo_gene_symbol;
+-- Missing: WHERE ARE THE DENOMINATORS FOR EACH GENE?
+```
+
+#### ❌ WRONG: Skipping individual gene profiling queries
+**Problem**: Failing to run separate profiling queries for EACH gene in results.
+**Each gene has different coverage**: TP53 might be profiled in 25,040 samples, MUC16 in 23,000, etc.
+
+#### ✅ CORRECT: Complete gene-specific workflow
+```sql
+-- STEP 1: Get altered counts per gene
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id,
+    COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
+    COUNT(*) AS totalMutationEvents
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY entrez_gene_id, hugo_gene_symbol
+ORDER BY numberOfAlteredSamplesOnPanel DESC;
+
+-- STEP 2: FOR EACH GENE, run this profiling query:
+SELECT COUNT(DISTINCT stgp.sample_unique_id) AS numberOfProfiledSamples
+FROM sample_to_gene_panel_derived stgp
+JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+  AND g.hugo_gene_symbol = 'TP53'  -- Replace with each gene from Step 1
+  AND stgp.cancer_study_identifier = 'your_study_id';
+
+-- STEP 3: Calculate frequency = numberOfAlteredSamplesOnPanel / numberOfProfiledSamples * 100
+```
+
+#### 🚨 WORKFLOW REQUIREMENTS VIOLATIONS:
+- **Missing denominator columns**: Must show gene-specific profiled samples per row
+- **Wrong table format**: Should be | Gene | # Mutations | # Samples | Profiled Samples | Sample % |
+- **Not replacing gene symbols**: Must replace 'TP53' with actual gene for each query
+- **Using study totals**: Never use genomic_event_derived for total sample counts
+
+### 2. 🚨 OFF-PANEL MUTATION INCLUSION
+
+#### ❌ Wrong: Including off-panel mutations
+```sql
+-- INCORRECT - Includes mutations outside gene panels
+SELEC … (37891 more chars)
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (35166 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, hugo_gene_symbol, mutation_variant, mutation_type, mutation_status, COUNT(DISTINCT sample_unique_id) AS n_samples
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'PIK3CA'
+  AND variant_type = 'mutation'
+  AND (mutation_variant ILIKE '%1069%' OR mutation_variant ILIKE '%ext%')
+GROUP BY cancer_study_identifier, hugo_gene_symbol, mutation_variant, mutation_type, mutation_status
+ORDER BY n_samples DESC
+LIMIT 50",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_impact_50k_2026","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Ffs*5","mutation_type":"Frame_Shift_Ins","mutation_status":"SOMATIC","n_samples":3},{"cancer_study_identifier":"msk_impact_50k_2026","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","n_samples":3},{"cancer_study_identifier":"msk_impact_2017","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Ffs*5","mutation_type":"Frame_Shift_Ins","mutation_status":"NA","n_samples":3},{"cancer_study_identifier":"msk_met_2021","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","n_samples":2},{"cancer_study_identifier":"ccle_broad_2025","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","n_samples":2},{"cancer_study_identifier":"crc_msk_2026","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","n_samples":2},{"cancer_study_identifier":"msk_impact_50k_2026","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069*","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","n_samples":2},{"cancer_study_identifier":"breast_msk_2026","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069*","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","n_samples":2},{"cancer_study_identifier":"msk_met_2021","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Ffs*5","mutation_type":"Frame_Shift_Ins","mutation_status":"SOMATIC","n_samples":2},{"cancer_study_identifier":"cellline_ccle_broad","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","n_samples":2},{"cancer_study_identifier":"msk_chord_2024","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","n_samples":2},{"cancer_study_identifier":"ccle_genentech_2014","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","n_samples":2},{"cancer_study_identifier":"msk_chord_2024","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Ffs*5","mutation_type":"Frame_Shift_Ins","mutation_status":"SOMATIC","n_samples":2},{"cancer_study_identifier":"pancan_mimsi_msk_2024","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","n_samples":2},{"cancer_study_identifier":"ccle_broad_2019","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","n_samples":2},{"cancer_study_identifier":"msk_chord_2024","hugo_gene_symbol":"PIK3CA","mutation_variant":"*1069fs*","mutation_type":"Frame_Shift_Del","mutation_status":"SOMATIC","n_samples":1},{"cancer_study_identifier":"gbm_tcga_pub2013","hugo_gene_symbol":"PIK3CA","mutat … (4783 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, mutation_variant, mutation_type, mutation_status, off_panel, COUNT(DISTINCT sample_unique_id) AS n_samples
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'PIK3CA'
+  AND variant_type = 'mutation'
+  AND mutation_variant = '*1069Wext*4'
+GROUP BY cancer_study_identifier, mutation_variant, mutation_type, mutation_status, off_panel
+ORDER BY n_samples DESC",
+ "max_rows": 50
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_impact_50k_2026","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","off_panel":false,"n_samples":3},{"cancer_study_identifier":"msk_chord_2024","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","off_panel":false,"n_samples":2},{"cancer_study_identifier":"msk_met_2021","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","off_panel":false,"n_samples":2},{"cancer_study_identifier":"ccle_genentech_2014","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","off_panel":false,"n_samples":2},{"cancer_study_identifier":"cellline_ccle_broad","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","off_panel":false,"n_samples":2},{"cancer_study_identifier":"ccle_broad_2019","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","off_panel":false,"n_samples":2},{"cancer_study_identifier":"pancan_mimsi_msk_2024","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","off_panel":false,"n_samples":2},{"cancer_study_identifier":"ccle_broad_2025","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","off_panel":false,"n_samples":2},{"cancer_study_identifier":"crc_msk_2026","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"SOMATIC","off_panel":false,"n_samples":2},{"cancer_study_identifier":"cellline_nci60","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","off_panel":false,"n_samples":1},{"cancer_study_identifier":"coadread_dfci_2016","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","off_panel":false,"n_samples":1},{"cancer_study_identifier":"gbm_tcga_pub2013","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"Unknown","off_panel":false,"n_samples":1},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":".","off_panel":false,"n_samples":1},{"cancer_study_identifier":"gbm_tcga","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"Somatic","off_panel":false,"n_samples":1},{"cancer_study_identifier":"gbm_tcga_gdc","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"Somatic","off_panel":false,"n_samples":1},{"cancer_study_identifier":"brca_metabric","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","off_panel":false,"n_samples":1},{"cancer_study_identifier":"lgggbm_tcga_pub","mutation_variant":"*1069Wext*4","mutation_type":"Nonstop_Mutation","mutation_status":"NA","off_panel":false,"n_samples":1}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, mutation_variant, driver_filter, driver_filter_annotation, driver_tiers_filter, driver_tiers_filter_annotation
+FROM genomic_event_derived
+WHERE hugo_gene_symbol = 'PIK3CA'
+  AND variant_type = 'mutation'
+  AND mutation_variant = '*1069Wext*4'
+LIMIT 20",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"brca_metabric","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"ccle_broad_2019","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"ccle_broad_2019","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"ccle_broad_2025","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"ccle_broad_2025","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"gbm_tcga_gdc","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"gbm_tcga","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"msk_chord_2024","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"msk_chord_2024","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"pancan_mimsi_msk_2024","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"pancan_mimsi_msk_2024","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"coadread_dfci_2016","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"lgggbm_tcga_pub","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"msk_impact_50k_2026","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"msk_impact_50k_2026","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"msk_impact_50k_2026","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"gbm_tcga_pub2013","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"msk_met_2021","mutation_variant":"*1069Wext*4"},{"cancer_study_identifier":"msk_met_2021","mutation_variant":"*1069Wext*4"}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","metadata":{"clinicalAttributeIds":["ADRENAL_GLANDS","BONE","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_GROUP","CLINICAL_SUMMARY","CNS_BRAIN","CURRENT_AGE_DEID","DIAGNOSIS_DESCRIPTION","ETHNICITY","FRACTION_GENOME_ALTERED","GENDER","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","GLEASON_SAMPLE_LEVEL","HER2","HISTORY_OF_PDL1","HR","ICD_O_HISTOLOGY_DESCRIPTION","INTRA_ABDOMINAL","LIVER","LUNG","LYMPH_NODES","METASTATIC_SITE","MSI_COMMENT","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","NUM_ICDO_DX","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER","PATHOLOGICAL_GROUP","PDL1_POSITIVE","PLEURA","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","REPRODUCTIVE_ORGANS","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["msk_chord_2024_cna","msk_chord_2024_mutations","msk_chord_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "genes": [
+  "PIK3CA: X1069Wext*4"
+ ],
+ "tab": "mutations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/mutations?cancer_study_list=msk_chord_2024&gene_list=PIK3CA%3A+X1069Wext*4&case_set_id=msk_chord_2024_all","url":"https://www.cbioportal.org/results/mutations?cancer_study_list=msk_chord_2024&gene_list=PIK3CA%3A+X1069Wext*4&case_set_id=msk_chord_2024_all","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"genes":["PIK3CA"],"caseSetId":"msk_chord_2024_all","pageDescription":"Detailed mutation table with lollipop plot showing mutation positions, types, and frequencies for queried genes."}}
+
+═ answer (success)
+[View PIK3CA *1069Wext*4 mutations in MSK-CHORD (Mutations Tab)](https://www.cbioportal.org/results/mutations?cancer_study_list=msk_chord_2024&gene_list=PIK3CA%3A+X1069Wext*4&case_set_id=msk_chord_2024_all)
+
+This opens the MSK-CHORD cohort (25,040 samples) Mutations tab with a lollipop plot showing this variant's position and the 2 samples carrying it, alongside the full PIK3CA mutation spectrum for context. You can switch the study dropdown in the portal to view other cohorts (e.g., msk_impact_50k_2026, gbm_tcga_pan_can_atlas_2018) where it also recurs.
+
+**Bottom line:** This is a real, recurrent (though rare) PIK3CA stop-loss variant seen across ~15 cBioPortal cohorts, but I have no driver/oncogenicity annotation for it in this database, and I flagged a nomenclature discrepancy (`ext*3` in your report vs. `ext*4` here) that's worth verifying against your report's exact transcript. For functional/clinical interpretation, please consult OncoKB, ClinVar, or your lab's variant-interpretation pipeline — this is research data, not clinical guidance.
