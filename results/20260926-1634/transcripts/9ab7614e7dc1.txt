@@ -1,0 +1,177 @@
+Q (sonnet): What cancer types in MSK-IMPACT have mutations in TP53?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, sample_count FROM cancer_study WHERE lower(cancer_study_identifier) LIKE '%msk_impact%' ORDER BY sample_count DESC"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_impact_50k_2026","name":"MSK-IMPACT 50K Clinical Sequencing Cohort (MSK, Cancer Cell 2026)","sample_count":54331},{"cancer_study_identifier":"msk_impact_2017","name":"MSK-IMPACT Clinical Sequencing Cohort (MSK, Nat Med 2017)","sample_count":10945},{"cancer_study_identifier":"heme_msk_impact_2022","name":"MSK-IMPACT Heme Tumors (MSK, 2022)","sample_count":2383},{"cancer_study_identifier":"braf_msk_impact_2024","name":"BRAF Fusions - IMPACT Clinical Sequencing Cohort (MSK, Clin Cancer Res 2024)","sample_count":105}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT preference_name, COUNT(*) AS studies FROM cancer_study_query_preferences WHERE preference_name='large_genomic_cohort' GROUP BY preference_name"
+}
+
+◀ result
+{"rows":[{"preference_name":"large_genomic_cohort","studies":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'large_genomic_cohort'
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = 'CANCER_TYPE'
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.hugo_gene_symbol = 'TP53'
+      AND ged.off_panel = 0
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM mutation_panel_gene_coverage
+    WHERE hugo_gene_symbol = 'TP53'
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM mutation_wes_coverage
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples >= 50
+ORDER BY frequency_pct DESC
+",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[{"cancer_type":"Small Cell Lung Cancer","altered_samples":421,"profiled_samples":466,"frequency_pct":90.3},{"cancer_type":"Ovarian Cancer","altered_samples":1639,"profiled_samples":2140,"frequency_pct":76.6},{"cancer_type":"Colorectal Cancer","altered_samples":3884,"profiled_samples":5277,"frequency_pct":73.6},{"cancer_type":"Esophagogastric Cancer","altered_samples":1310,"profiled_samples":1834,"frequency_pct":71.4},{"cancer_type":"Pancreatic Cancer","altered_samples":1965,"profiled_samples":2851,"frequency_pct":68.9},{"cancer_type":"Vaginal Cancer","altered_samples":32,"profiled_samples":57,"frequency_pct":56.1},{"cancer_type":"Small Bowel Cancer","altered_samples":89,"profiled_samples":161,"frequency_pct":55.3},{"cancer_type":"Ampullary Cancer","altered_samples":73,"profiled_samples":134,"frequency_pct":54.5},{"cancer_type":"Non-Small Cell Lung Cancer","altered_samples":4242,"profiled_samples":7867,"frequency_pct":53.9},{"cancer_type":"Skin Cancer, Non-Melanoma","altered_samples":231,"profiled_samples":455,"frequency_pct":50.8},{"cancer_type":"Cancer of Unknown Primary","altered_samples":802,"profiled_samples":1581,"frequency_pct":50.7},{"cancer_type":"Head and Neck Cancer","altered_samples":328,"profiled_samples":657,"frequency_pct":49.9},{"cancer_type":"Bladder Cancer","altered_samples":1242,"profiled_samples":2526,"frequency_pct":49.2},{"cancer_type":"Endometrial Cancer","altered_samples":1125,"profiled_samples":2445,"frequency_pct":46},{"cancer_type":"Uterine Sarcoma","altered_samples":145,"profiled_samples":344,"frequency_pct":42.2},{"cancer_type":"Breast Cancer","altered_samples":2835,"profiled_samples":6807,"frequency_pct":41.6},{"cancer_type":"Glioma","altered_samples":849,"profiled_samples":2322,"frequency_pct":36.6},{"cancer_type":"Appendiceal Cancer","altered_samples":94,"profiled_samples":274,"frequency_pct":34.3},{"cancer_type":"Hepatobiliary Cancer","altered_samples":473,"profiled_samples":1431,"frequency_pct":33.1},{"cancer_type":"Prostate Cancer","altered_samples":947,"profiled_samples":3324,"frequency_pct":28.5},{"cancer_type":"Adrenocortical Carcinoma","altered_samples":24,"profiled_samples":88,"frequency_pct":27.3},{"cancer_type":"Salivary Gland Cancer","altered_samples":109,"profiled_samples":411,"frequency_pct":26.5},{"cancer_type":"Gastrointestinal Neuroendocrine Tumor","altered_samples":49,"profiled_samples":210,"frequency_pct":23.3},{"cancer_type":"Soft Tissue Sarcoma","altered_samples":496,"profiled_samples":2307,"frequency_pct":21.5},{"cancer_type":"Wilms Tumor","altered_samples":14,"profiled_samples":68,"frequency_pct":20.6},{"cancer_type":"Bone Cancer","altered_samples":119,"profiled_samples":590,"frequency_pct":20.2},{"cancer_type":"Melanoma","altered_samples":363,"profiled_samples":1831,"frequency_pct":19.8},{"cancer_type":"Thyroid Cancer","altered_samples":133,"profiled_samples":867,"frequency_pct":15.3},{"cancer_type":"Thymic Tumor","altered_samples":12,"profiled_samples":80,"frequency_pct":15},{"cancer … (1363 more chars)
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_impact_50k_2026"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_impact_50k_2026","name":"MSK-IMPACT 50K Clinical Sequencing Cohort (MSK, Cancer Cell 2026)","sampleCount":54331,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_impact_50k_2026","metadata":{"clinicalAttributeIds":["AGE_AT_DX","ANCESTRY_LABEL","CANCER_TYPE","CANCER_TYPE_DETAILED","DISEASE_STATUS","FACETS_PLOIDY","FACETS_PURITY","FACETS_QC","FACETS_SUITE_VERSION","FACETS_WGD","FRACTION_GENOME_ALTERED","GENE_PANEL","HLA-A1","HLA-A2","HLA-B1","HLA-B2","HLA-C1","HLA-C2","HLA_A1_LOH","HLA_A2_LOH","HLA_B1_LOH","HLA_B2_LOH","HLA_C1_LOH","HLA_C2_LOH","HLA_GENOTYPE_AVAILABLE","METASTATIC_SITE","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","N_OTHER_CANCER_TYPES","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PRIMARY_SITE","PURITY_ESTIMATE_FROM_MUTATIONS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SEX","SOMATIC_STATUS","TMB_SCORE","TUMOR_PURITY"],"molecularProfileIds":["msk_impact_50k_2026_gistic","msk_impact_50k_2026_mutations","msk_impact_50k_2026_structural_variants"],"genericAssayProfiles":["msk_impact_50k_2026_armlevel_cna","msk_impact_50k_2026_loh_hla","msk_impact_50k_2026_mutational_signatures_contribution_v2"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","generic_assay_armlevel_cna","generic_assay_loh_hla","generic_assay_mutational_signature"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "msk_impact_50k_2026"
+ ],
+ "genes": [
+  "TP53: MUT"
+ ],
+ "tab": "cancerTypesSummary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/cancerTypesSummary?cancer_study_list=msk_impact_50k_2026&gene_list=TP53%3A+MUT&case_set_id=msk_impact_50k_2026_all","url":"https://www.cbioportal.org/results/cancerTypesSummary?cancer_study_list=msk_impact_50k_2026&gene_list=TP53%3A+MUT&case_set_id=msk_impact_50k_2026_all","data":{"studyIds":["msk_impact_50k_2026"],"studies":[{"studyId":"msk_impact_50k_2026","name":"MSK-IMPACT 50K Clinical Sequencing Cohort (MSK, Cancer Cell 2026)","sampleCount":54331}],"genes":["TP53"],"caseSetId":"msk_impact_50k_2026_all","pageDescription":"Alteration frequencies for queried genes by cancer type."}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "msk_impact_50k_2026"
+ ],
+ "filterJson": {
+  "geneFilters": [
+   {
+    "molecularProfileIds": [
+     "msk_impact_50k_2026_mutations"
+    ],
+    "geneQueries": [
+     [
+      {
+       "hugoGeneSymbol": "TP53"
+      }
+     ]
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=msk_impact_50k_2026#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_impact_50k_2026_mutations%22%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=msk_impact_50k_2026#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_impact_50k_2026_mutations%22%5D%7D%5D%7D","data":{"studyIds":["msk_impact_50k_2026"],"studies":[{"studyId":"msk_impact_50k_2026","name":"MSK-IMPACT 50K Clinical Sequencing Cohort (MSK, Cancer Cell 2026)","sampleCount":54331}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+**Explore interactively:**
+- [TP53 mutation frequency by cancer type (Cancer Types Summary)](https://www.cbioportal.org/results/cancerTypesSummary?cancer_study_list=msk_impact_50k_2026&gene_list=TP53%3A+MUT&case_set_id=msk_impact_50k_2026_all) — the portal's own breakdown chart across all cancer types in this cohort.
+- [Cohort overview filtered to TP53-mutant samples](https://www.cbioportal.org/study/summary?id=msk_impact_50k_2026#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_impact_50k_2026_mutations%22%5D%7D%5D%7D) — clinical/demographic distribution of TP53-mutant cases.

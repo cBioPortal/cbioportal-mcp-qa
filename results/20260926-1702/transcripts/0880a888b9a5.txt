@@ -1,0 +1,151 @@
+Q (sonnet): <conversation_so_far>
+<user>
+TCGA PanCancer Atlas の乳がんで TP53 変異の頻度を教えてください。
+</user>
+
+<assistant>
+Breast Invasive Carcinoma (TCGA, PanCancer Atlas) では、TP53 変異はプロファイルされた 1,066 サンプル中 347 サンプル（32.6%）に見られます。
+</assistant>
+</conversation_so_far>
+
+Continue this conversation: reply to the user's new message.
+
+<user>
+変異だけでなく、ホモ接合性欠失（deep deletion）も含めて計算してください。
+</user>
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cs AS (
+    SELECT concat('brca_tcga_pan_can_atlas_2018_', s.stable_id) AS sid
+    FROM sample_list_list sll
+    JOIN sample_list sl ON sl.list_id = sll.list_id
+    JOIN sample s ON s.internal_id = sll.sample_id
+    WHERE sl.stable_id = 'brca_tcga_pan_can_atlas_2018_cnaseq'
+)
+SELECT (SELECT count() FROM cs) AS n,
+       uniqExact(sample_unique_id) AS altered,
+       round(altered * 100 / n, 1) AS pct
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'TP53'
+  AND ((variant_type = 'mutation' AND mutation_status != 'UNCALLED')
+       OR (variant_type = 'cna' AND cna_alteration = -2))
+  AND sample_unique_id IN (SELECT sid FROM cs)
+"
+}
+
+◀ result
+{"rows":[{"n":996,"altered":351,"pct":35.2}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cs AS (
+    SELECT concat('brca_tcga_pan_can_atlas_2018_', s.stable_id) AS sid
+    FROM sample_list_list sll
+    JOIN sample_list sl ON sl.list_id = sll.list_id
+    JOIN sample s ON s.internal_id = sll.sample_id
+    WHERE sl.stable_id = 'brca_tcga_pan_can_atlas_2018_cnaseq'
+)
+SELECT
+  countIf(variant_type = 'mutation' AND mutation_status != 'UNCALLED') AS mut_events,
+  uniqExactIf(sample_unique_id, variant_type = 'mutation' AND mutation_status != 'UNCALLED') AS mut_samples,
+  uniqExactIf(sample_unique_id, variant_type = 'cna' AND cna_alteration = -2) AS deldel_samples
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'TP53'
+  AND sample_unique_id IN (SELECT sid FROM cs)
+"
+}
+
+◀ result
+{"rows":[{"mut_events":350,"mut_samples":344,"deldel_samples":9}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["brca_tcga_pan_can_atlas_2018_gistic","brca_tcga_pan_can_atlas_2018_log2CNA","brca_tcga_pan_can_atlas_2018_mutations","brca_tcga_pan_can_atlas_2018_protein_quantification","brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa","brca_tcga_pan_can_atlas_2018_rppa_Zscores","brca_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["brca_tcga_pan_can_atlas_2018_armlevel_cna","brca_tcga_pan_can_atlas_2018_genetic_ancestry","brca_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","brca_tcga_pan_can_atlas_2018_methylation_hm450","brca_tcga_pan_can_atlas_2018_phosphoprotein_quantification"],"heatmapProfileIds":["brca_tcga_pan_can_atlas_2018_protein_quantification_zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","brca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","brca_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_anc … (83 more chars)
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "TP53: MUT HOMDEL"
+ ],
+ "tab": "oncoprint",
+ "caseSetId": "brca_tcga_pan_can_atlas_2018_cnaseq"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=TP53%3A+MUT+HOMDEL&case_set_id=brca_tcga_pan_can_atlas_2018_cnaseq","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=TP53%3A+MUT+HOMDEL&case_set_id=brca_tcga_pan_can_atlas_2018_cnaseq","data":{"studyIds":["brca_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084}],"genes":["TP53"],"caseSetId":"brca_tcga_pan_can_atlas_2018_cnaseq","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+Breast Invasive Carcinoma (TCGA, PanCancer Atlas) で、TP53 の**変異＋ホモ接合性欠失（deep deletion）**を合わせた頻度は以下の通りです（サンプル単位、変異とCNA両方がプロファイルされた 996 サンプルが分母）。
+
+| 区分 | サンプル数 | 頻度 |
+|---|---|---|
+| 変異のみ | 344 | 34.5% |
+| ホモ接合性欠失のみ | 9 | 0.9% |
+| **変異 または deep deletion（重複除去後）** | **351** | **35.2%** |
+
+- 分母は変異・CNAの両方がプロファイルされているサンプル集合（`_cnaseq` ケースセット）996サンプルを使用しています（前回回答の「変異のみプロファイルされた1,066サンプル」とは分母が異なる点にご注意ください）。
+- 深い欠失（deep deletion / HOMDEL）はごく少数（9サンプル）で、頻度上昇への寄与はわずかです。浅い欠失（shallow deletion/HETLOSS）は含めていません。
+
+[OncoPrint: TP53 変異＋Deep Deletion（BRCA TCGA PanCancer Atlas）](https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=TP53%3A+MUT+HOMDEL&case_set_id=brca_tcga_pan_can_atlas_2018_cnaseq)

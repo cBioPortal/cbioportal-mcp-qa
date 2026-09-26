@@ -1,0 +1,291 @@
+Q (sonnet): Can you analyze thyroid hormone gene expression by diagnosis in the Pediatric Brain Tumor Atlas (PBTA, Provisional) cohort?
+
+▶ list_studies
+{
+ "search": "Pediatric Brain Tumor Atlas"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+{"result":[]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ list_studies
+{
+ "search": "PBTA"
+}
+
+▶ list_studies
+{
+ "search": "pediatric brain"
+}
+
+◀ result
+{"result":[]}
+
+◀ result
+{"result":[{"cancer_study_identifier":"brain_cptac_2020","name":"Pediatric Brain Cancer (CPTAC/CHOP, Cell 2020)","type_of_cancer_id":"brain","sample_count":218,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brain_cptac_2020"}]}
+
+▶ list_studies
+{
+ "search": "Open Pediatric Brain"
+}
+
+◀ result
+{"result":[]}
+
+▶ list_studies
+{
+ "search": "brain tumor pediatric"
+}
+
+▶ list_studies
+{
+ "search": "provisional pediatric"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"brain_cptac_2020","name":"Pediatric Brain Cancer (CPTAC/CHOP, Cell 2020)","type_of_cancer_id":"brain","sample_count":218,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brain_cptac_2020"}]}
+
+◀ result
+{"result":[]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://study-resolution-guide"
+}
+
+◀ result
+# Study Resolution Guide
+
+Use this guide when the user names a study, cohort, portal, or data source that may not exist in the connected cBioPortal deployment.
+
+## Routing Triggers
+
+Read this guide when the user mentions:
+
+- PBTA, Pediatric Brain Tumor Atlas, pediatric cBioPortal, Kids First
+- GENIE, AACR GENIE, MSK private cohorts, institutional cohorts
+- "download study", "which study", "find cohort", "data from [portal]"
+- a named cohort that `list_studies(search=...)` does not find
+- HTAN, or an HTAN center (OHSU, MSK, Vanderbilt, ...)
+
+## Core Rules
+
+1. Resolve the requested study before substituting another study.
+2. If the requested study is not in this deployment, say so explicitly.
+3. Do not silently analyze a substitute cohort.
+4. If the user agrees to a substitute, keep a one-line scope caveat when reporting numbers.
+
+## Known External cBioPortal Instances
+
+These are not necessarily queryable from this MCP server, but they are useful redirects:
+
+| User wording | Likely external instance | Scope |
+|---|---|---|
+| PBTA, Pediatric Brain Tumor Atlas, pediatric brain tumors | https://pedcbioportal.kidsfirstdrc.org/ | Pediatric cancer studies, including pediatric brain tumor cohorts |
+| GENIE | https://genie.cbioportal.org/ | AACR GENIE data access, depending on release and permissions |
+| MSK private / institutional cohorts | private institutional cBioPortal deployments | Not queryable from public cBioPortal unless exported to the public database |
+
+## HTAN Studies
+
+HTAN study ids carry the atlas code (`hta9`, `hta8`, ...), and the names don't always name the center, so `list_studies(search="OHSU HTAN")` finds nothing. Search `list_studies(search="HTAN")` and match the center by atlas code:
+
+| Atlas code | Center | Study |
+|---|---|---|
+| `hta8` | MSK | `crc_hta8_htan_2024` |
+| `hta9` | OHSU | `brca_hta9_htan_2022` ("Breast Cancer (HTAN, 2022)") |
+| `hta11` | Vanderbilt | `crc_hta11_htan_2021` |
+
+For HTAN imaging (Minerva, MxIF, H&E), continue with the external-resources-guide.
+
+## Study Resolution Workflow
+
+1. Call `list_studies(search=...)` with the user's exact study/cohort phrase and close variants.
+2. If a cancer type is mentioned, call `search_oncotree(search_term)` before disease-level study discovery.
+3. If no matching study is found, check known external instances above before declaring the study absent.
+4. If proposing a substitute, describe why it is a substitute and how its scope differs.
+
+## Substitute-Cohort Answer Pattern
+
+> I cannot query PBTA from this cBioPortal deployment. PBTA is typically accessed through pediatric cBioPortal at https://pedcbioportal.kidsfirstdrc.org/. I can analyze `[substitute_study_id]` here, but its results should not be interpreted as PBTA results.
+
+When reporting numbers from a substitute:
+
+> Scope note: these counts are from `[substitute_study_id]` in this deployment, not from the requested PBTA cohort.
+
+## Do Not
+
+- Do not answer a PBTA question with `brain_cptac_2020` numbers without a scope wa … (169 more chars)
+
+═ answer (success)
+This confirms it: the Pediatric Brain Tumor Atlas (PBTA) is not available in this cBioPortal deployment's database.
+
+**PBTA is not queryable here.** The Pediatric Brain Tumor Atlas is hosted on a separate, pediatric-focused cBioPortal instance — **[Pediatric cBioPortal (Kids First DRC)](https://pedcbioportal.kidsfirstdrc.org/)** — not the public cBioPortal database I have direct query access to. I cannot pull gene expression values or clinical/diagnosis data for it from here.
+
+A couple of options:
+
+1. **Go directly to Pediatric cBioPortal** and search for "Pediatric Brain Tumor Atlas" or "OpenPBTA" there — it supports the same kind of expression-by-subgroup plots (via the Plots tab, grouping by diagnosis) that you're describing.
+2. **If you'd like, I can run an analogous analysis in this deployment** on a substitute cohort I *do* have access to — the closest match here is [Pediatric Brain Cancer (CPTAC/CHOP, Cell 2020)](https://www.cbioportal.org/study/summary?id=brain_cptac_2020) (218 samples). This is a different cohort, not PBTA, and results would not be interpretable as PBTA findings — but I can still look at thyroid hormone-related gene expression (e.g., THRA, THRB, DIO1/2/3, TSHR, SLC16A2) by tumor diagnosis in that study if that's useful as a stand-in.
+
+Would you like me to proceed with the CPTAC/CHOP pediatric brain cancer study as a substitute (with that scope caveat), or would you prefer to pursue PBTA directly on Pediatric cBioPortal yourself?

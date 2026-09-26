@@ -1,0 +1,219 @@
+Q (haiku): How does ERBB2 mRNA expression vary across different cancer types in TCGA Pan-Cancer Atlas studies?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH cohort AS (
+    SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga'
+),
+ct AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type
+    FROM clinical_data_derived
+    WHERE attribute_name = 'CANCER_TYPE' AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+)
+SELECT ct.cancer_type,
+       count() AS num_samples,
+       round(median(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS median_log2_rsem,
+       round(quantile(0.75)(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS q75_log2_rsem,
+       round(quantile(0.9)(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS p90_log2_rsem,
+       round(max(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS max_log2_rsem
+FROM genetic_alteration_derived g
+JOIN ct USING (sample_unique_id)
+WHERE g.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+  AND g.hugo_gene_symbol = 'ERBB2'
+  AND g.profile_type = 'rna_seq_v2_mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+GROUP BY ct.cancer_type
+ORDER BY p90_log2_rsem DESC",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_type":"Breast Cancer","num_samples":1082,"median_log2_rsem":12.78,"q75_log2_rsem":13.4,"p90_log2_rsem":14.75,"max_log2_rsem":18.54},{"cancer_type":"Bladder Cancer","num_samples":407,"median_log2_rsem":12.88,"q75_log2_rsem":13.57,"p90_log2_rsem":14.28,"max_log2_rsem":18.23},{"cancer_type":"Esophagogastric Cancer","num_samples":593,"median_log2_rsem":12.02,"q75_log2_rsem":12.61,"p90_log2_rsem":13.75,"max_log2_rsem":18.66},{"cancer_type":"Renal Non-Clear Cell Carcinoma","num_samples":348,"median_log2_rsem":12.63,"q75_log2_rsem":13.05,"p90_log2_rsem":13.38,"max_log2_rsem":14.61},{"cancer_type":"Endometrial Cancer","num_samples":584,"median_log2_rsem":12.24,"q75_log2_rsem":12.7,"p90_log2_rsem":13.36,"max_log2_rsem":18.45},{"cancer_type":"Thyroid Cancer","num_samples":498,"median_log2_rsem":12.71,"q75_log2_rsem":13.03,"p90_log2_rsem":13.28,"max_log2_rsem":13.91},{"cancer_type":"Non-Small Cell Lung Cancer","num_samples":994,"median_log2_rsem":11.96,"q75_log2_rsem":12.67,"p90_log2_rsem":13.23,"max_log2_rsem":18.09},{"cancer_type":"Cervical Cancer","num_samples":294,"median_log2_rsem":12.15,"q75_log2_rsem":12.57,"p90_log2_rsem":13.22,"max_log2_rsem":18.72},{"cancer_type":"Prostate Cancer","num_samples":493,"median_log2_rsem":12.43,"q75_log2_rsem":12.76,"p90_log2_rsem":13.03,"max_log2_rsem":16.76},{"cancer_type":"Pancreatic Cancer","num_samples":177,"median_log2_rsem":12.29,"q75_log2_rsem":12.63,"p90_log2_rsem":12.99,"max_log2_rsem":17.83},{"cancer_type":"Cholangiocarcinoma","num_samples":36,"median_log2_rsem":12.42,"q75_log2_rsem":12.72,"p90_log2_rsem":12.96,"max_log2_rsem":13.29},{"cancer_type":"Colorectal Cancer","num_samples":592,"median_log2_rsem":12.2,"q75_log2_rsem":12.57,"p90_log2_rsem":12.9,"max_log2_rsem":18.97},{"cancer_type":"Ovarian Epithelial Tumor","num_samples":300,"median_log2_rsem":11.98,"q75_log2_rsem":12.48,"p90_log2_rsem":12.8,"max_log2_rsem":18.1},{"cancer_type":"Non-Seminomatous Germ Cell Tumor","num_samples":86,"median_log2_rsem":11.57,"q75_log2_rsem":12.2,"p90_log2_rsem":12.63,"max_log2_rsem":13.58},{"cancer_type":"Head and Neck Cancer","num_samples":515,"median_log2_rsem":11.69,"q75_log2_rsem":12.11,"p90_log2_rsem":12.46,"max_log2_rsem":17.9},{"cancer_type":"Hepatobiliary Cancer","num_samples":366,"median_log2_rsem":11.12,"q75_log2_rsem":11.93,"p90_log2_rsem":12.42,"max_log2_rsem":14.17},{"cancer_type":"Pleural Mesothelioma","num_samples":87,"median_log2_rsem":11.4,"q75_log2_rsem":11.92,"p90_log2_rsem":12.34,"max_log2_rsem":12.85},{"cancer_type":"Renal Clear Cell Carcinoma","num_samples":510,"median_log2_rsem":11.32,"q75_log2_rsem":11.72,"p90_log2_rsem":12.12,"max_log2_rsem":13.09},{"cancer_type":"Ocular Melanoma","num_samples":80,"median_log2_rsem":10.73,"q75_log2_rsem":11.21,"p90_log2_rsem":11.76,"max_log2_rsem":12.49},{"cancer_type":"Sarcoma","num_samples":253,"median_log2_rsem":10.43,"q75_log2_rsem":10.92,"p90_log2_rsem":11.54,"max_log2_rsem":13.19},{"cancer_type":"Thymic Epithelial Tumor","num_samples":119," … (1358 more chars)
+
+▶ resolve_and_route
+{
+ "studyKeywords": [
+  "TCGA",
+  "pan",
+  "cancer"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 35 matching studies (top 5 with full metadata, rest with basic info). Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":35,"studiesWithMetadata":[{"studyId":"pancan_pcawg_2020","name":"Pan-cancer analysis of whole genomes (ICGC/TCGA, Nature 2020)","sampleCount":2922,"studyViewUrl":"https://www.cbioportal.org/study?id=pancan_pcawg_2020","metadata":{"clinicalAttributeIds":["AGE","ALCOHOL","ALCOHOL_HISTORY_INTENSITY","ANCESTRY_PRIMARY","CANCER_TYPE","CANCER_TYPE_DETAILED","CELLULARITY","FIRST THERAPY_RESPONSE","FIRST_THERAPY","GRADE","HISTOLOGY","HISTOLOGY_ABBREVIATION","HISTOLOGY_TIER1","HISTOLOGY_TIER2","HISTOLOGY_TIER3","HISTOLOGY_TIER4","ICD_10","ICGC_SAMPLE_ID","MUTATION_COUNT","ONCOTREE_CODE","ORGAN_SYSTEM","OS_MONTHS","OS_STATUS","PLOIDY","PROJECT_CODE","PURITY","PURITY_CONFUGURATION","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_TYPE","SEQUENCING_TYPE","SEX","STAGE","TBL_SCORE","TMB_NONSYNONYMOUS","TOBACCO_SMOKING_HISTORY_INDICATOR","TOBACCO_SMOKING_INTENSITY","TUMOR_SAMPLE_HISTOLOGY_CODE","WGD"],"molecularProfileIds":["pancan_pcawg_2020_cna","pancan_pcawg_2020_mirna","pancan_pcawg_2020_mirna_median_Zscores","pancan_pcawg_2020_mrna_seq_fpkm_capture","pancan_pcawg_2020_mrna_seq_fpkm_capture_all_sample_Zscores","pancan_pcawg_2020_mutations"],"genericAssayProfiles":["pancan_pcawg_2020_mutational_signatures_contribution_DBS","pancan_pcawg_2020_mutational_signatures_contribution_ID","pancan_pcawg_2020_mutational_signatures_contribution_SBS","pancan_pcawg_2020_mutational_signatures_counts_DBS","pancan_pcawg_2020_mutational_signatures_counts_ID","pancan_pcawg_2020_mutational_signatures_counts_SBS"],"heatmapProfileIds":["pancan_pcawg_2020_mirna_median_Zscores","pancan_pcawg_2020_mrna_seq_fpkm_capture_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","generic_assay_mutational_signature"]}},{"studyId":"nsclc_tcga_broad_2016","name":"Pan-Lung Cancer (TCGA, Nat Genet 2016)","sampleCount":1144,"studyViewUrl":"https://www.cbioportal.org/study?id=nsclc_tcga_broad_2016","metadata":{"clinicalAttributeIds":["AGE","AGE_AT_SURGERY","CANCER_TYPE","CANCER_TYPE_DETAILED","DAYS_TO_DEATH","DAYS_TO_LAST_FOLLOWUP","FRACTION_GENOME_ALTERED","HISTORY_NEOADJUVANT_TRTYN","HISTORY_OTHER_MALIGNANCY","MUTATION_COUNT","M_STAGE","N_STAGE","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","SAMPLE_COUNT","SEX","SMOKING_HISTORY","SMOKING_PACK_YEARS","SOMATIC_STATUS","STAGE","TMB_NONSYNONYMOUS","T_STAGE"],"molecularProfileIds":["nsclc_tcga_broad_2016_cna","nsclc_tcga_broad_2016_mutations","nsclc_tcga_broad_2016_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}},{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084,"studyVi … (20545 more chars)
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "acc_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "ERBB2"
+ ],
+ "tab": "oncoprint"
+}
+
+✗ error
+The operation timed out.
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "ERBB2"
+ ],
+ "tab": "plots",
+ "plotsHorzSelection": {
+  "selectedGeneOption": "ERBB2",
+  "dataType": "mRNA expression"
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/plots?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=ERBB2&case_set_id=brca_tcga_pan_can_atlas_2018_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%222064%22%2C%22dataType%22%3A%22mRNA+expression%22%7D","url":"https://www.cbioportal.org/results/plots?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=ERBB2&case_set_id=brca_tcga_pan_can_atlas_2018_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%222064%22%2C%22dataType%22%3A%22mRNA+expression%22%7D","data":{"studyIds":["brca_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084}],"genes":["ERBB2"],"caseSetId":"brca_tcga_pan_can_atlas_2018_all","pageDescription":"Scatter/box plots comparing any two data elements."}}
+
+═ answer (success)
+## ERBB2 mRNA Expression Across TCGA Pan-Cancer Atlas Cancer Types
+
+ERBB2 (HER2) mRNA expression shows substantial variation across TCGA Pan-Cancer Atlas cancer types, with epithelial cancers exhibiting higher overall expression than hematologic and CNS tumors. Here's the key distribution:
+
+### Top 10 by 90th Percentile (High-Expression Tail)
+
+| Cancer Type | N Samples | Median (log₂ RSEM) | 90th %ile (log₂ RSEM) | Max (log₂ RSEM) |
+|---|---|---|---|---|
+| **Breast Cancer** | 1,082 | 12.78 | 14.75 | 18.54 |
+| **Bladder Cancer** | 407 | 12.88 | 14.28 | 18.23 |
+| **Esophagogastric Cancer** | 593 | 12.02 | 13.75 | 18.66 |
+| **Renal Non-Clear Cell** | 348 | 12.63 | 13.38 | 14.61 |
+| **Endometrial Cancer** | 584 | 12.24 | 13.36 | 18.45 |
+| **Thyroid Cancer** | 498 | 12.71 | 13.28 | 13.91 |
+| **Lung Adenocarcinoma** | 994 | 11.96 | 13.23 | 18.09 |
+| **Cervical Cancer** | 294 | 12.15 | 13.22 | 18.72 |
+| **Prostate Cancer** | 493 | 12.43 | 13.03 | 16.76 |
+| **Pancreatic Cancer** | 177 | 12.29 | 12.99 | 17.83 |
+
+### Key Observations
+
+1. **Breast shows the highest 90th percentile:** At 14.75, breast cancer has the most abundant HER2-amplified tumors in the high-expression tail, consistent with HER2+ breast cancer biology (~15–20% of cases).
+
+2. **Bladder approaches breast in median:** Despite a lower 90th percentile, bladder cancer's median is slightly higher (12.88 vs 12.78), suggesting a baseline shift but fewer very-high expressers.
+
+3. **Expression drops sharply in CNS/lymphoid tumors:**
+   - Glioma: median 9.32, p90 10.37
+   - Leukemia: median 6.14, p90 7.34
+   - Mature B-Cell Lymphomas: median 7.87, p90 8.78
+
+4. **The high-expression subset is cancer-type-dependent:** Breast, bladder, esophagogastric, and endometrial cancers all show samples reaching log₂ RSEM ≥ 18, indicating HER2 gene amplification events. This is expected in adenocarcinomas.
+
+---
+
+### Visualization Links
+
+- **[Browse ERBB2 expression distribution in Breast Cancer](https://www.cbioportal.org/results/plots?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=ERBB2&case_set_id=brca_tcga_pan_can_atlas_2018_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%222064%22%2C%22dataType%22%3A%22mRNA+expression%22%7D)** — Open the Plots tab to see the full distribution and compare with other variables.
+
+To compare specific cancer types or view detailed mutation/amplification data alongside expression, visit the individual study pages from the list above and search for ERBB2 in ResultsView.

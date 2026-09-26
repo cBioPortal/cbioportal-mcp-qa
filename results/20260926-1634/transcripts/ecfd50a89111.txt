@@ -1,0 +1,276 @@
+Q (haiku): show me EGFR expression across cancer types
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH cohort AS (
+    SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga'
+),
+ct AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type
+    FROM clinical_data_derived
+    WHERE attribute_name = 'CANCER_TYPE' AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+)
+SELECT ct.cancer_type,
+       count() AS samples,
+       round(median(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS median_log2_rsem,
+       round(quantile(0.9)(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS p90_log2_rsem,
+       round(quantile(0.75)(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS q75_log2_rsem
+FROM genetic_alteration_derived g
+JOIN ct USING (sample_unique_id)
+WHERE g.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+  AND g.hugo_gene_symbol = 'EGFR'
+  AND g.profile_type = 'rna_seq_v2_mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+GROUP BY ct.cancer_type
+ORDER BY p90_log2_rsem DESC;",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_type":"Glioblastoma","samples":160,"median_log2_rsem":11.93,"p90_log2_rsem":15,"q75_log2_rsem":13.86},{"cancer_type":"Glioma","samples":514,"median_log2_rsem":11.24,"p90_log2_rsem":13.05,"q75_log2_rsem":11.96},{"cancer_type":"Head and Neck Cancer","samples":515,"median_log2_rsem":11.5,"p90_log2_rsem":12.98,"q75_log2_rsem":12.15},{"cancer_type":"Renal Clear Cell Carcinoma","samples":510,"median_log2_rsem":11.28,"p90_log2_rsem":12.54,"q75_log2_rsem":11.95},{"cancer_type":"Non-Small Cell Lung Cancer","samples":994,"median_log2_rsem":10.49,"p90_log2_rsem":12.05,"q75_log2_rsem":11.33},{"cancer_type":"Esophagogastric Cancer","samples":593,"median_log2_rsem":9.6,"p90_log2_rsem":11.7,"q75_log2_rsem":10.47},{"cancer_type":"Bladder Cancer","samples":407,"median_log2_rsem":9.27,"p90_log2_rsem":11.45,"q75_log2_rsem":10.42},{"cancer_type":"Pleural Mesothelioma","samples":87,"median_log2_rsem":9.75,"p90_log2_rsem":11.33,"q75_log2_rsem":10.65},{"cancer_type":"Cervical Cancer","samples":294,"median_log2_rsem":9.71,"p90_log2_rsem":11.32,"q75_log2_rsem":10.67},{"cancer_type":"Hepatobiliary Cancer","samples":366,"median_log2_rsem":9.67,"p90_log2_rsem":11.22,"q75_log2_rsem":10.52},{"cancer_type":"Renal Non-Clear Cell Carcinoma","samples":348,"median_log2_rsem":9.41,"p90_log2_rsem":11.03,"q75_log2_rsem":10.35},{"cancer_type":"Thyroid Cancer","samples":498,"median_log2_rsem":9.61,"p90_log2_rsem":10.96,"q75_log2_rsem":10.32},{"cancer_type":"Thymic Epithelial Tumor","samples":119,"median_log2_rsem":8.58,"p90_log2_rsem":10.93,"q75_log2_rsem":9.9},{"cancer_type":"Cholangiocarcinoma","samples":36,"median_log2_rsem":9.47,"p90_log2_rsem":10.76,"q75_log2_rsem":9.93},{"cancer_type":"Prostate Cancer","samples":493,"median_log2_rsem":9.5,"p90_log2_rsem":10.62,"q75_log2_rsem":10.12},{"cancer_type":"Sarcoma","samples":253,"median_log2_rsem":8.62,"p90_log2_rsem":10.54,"q75_log2_rsem":9.56},{"cancer_type":"Pancreatic Cancer","samples":177,"median_log2_rsem":9.36,"p90_log2_rsem":10.35,"q75_log2_rsem":9.91},{"cancer_type":"Colorectal Cancer","samples":592,"median_log2_rsem":9.05,"p90_log2_rsem":9.95,"q75_log2_rsem":9.57},{"cancer_type":"Breast Cancer","samples":1082,"median_log2_rsem":7.39,"p90_log2_rsem":9.76,"q75_log2_rsem":8.69},{"cancer_type":"Endometrial Cancer","samples":584,"median_log2_rsem":8.11,"p90_log2_rsem":9.62,"q75_log2_rsem":8.86},{"cancer_type":"Adrenocortical Carcinoma","samples":78,"median_log2_rsem":7.66,"p90_log2_rsem":9.59,"q75_log2_rsem":8.84},{"cancer_type":"Non-Seminomatous Germ Cell Tumor","samples":86,"median_log2_rsem":7.24,"p90_log2_rsem":9.54,"q75_log2_rsem":8.41},{"cancer_type":"Ovarian Epithelial Tumor","samples":300,"median_log2_rsem":7.76,"p90_log2_rsem":9.02,"q75_log2_rsem":8.54},{"cancer_type":"Melanoma","samples":443,"median_log2_rsem":4.85,"p90_log2_rsem":7.96,"q75_log2_rsem":6.64},{"cancer_type":"Pheochromocytoma","samples":147,"median_log2_rsem":4.9,"p90_log2_rsem":7.82,"q75_log2_rsem":6.35},{"cancer_type":"Seminoma","samples": … (545 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier
+FROM cancer_study_query_preferences
+WHERE preference_name = 'pan_cancer_tcga'
+ORDER BY cancer_study_identifier;",
+ "max_rows": 100
+}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "laml_tcga",
+  "acc_tcga",
+  "blca_tcga",
+  "brca_tcga",
+  "cesc_tcga",
+  "chol_tcga",
+  "coad_tcga",
+  "dlbc_tcga",
+  "esca_tcga",
+  "gbm_tcga",
+  "hnsc_tcga",
+  "kich_tcga",
+  "kirc_tcga",
+  "kirp_tcga",
+  "lgg_tcga",
+  "lihc_tcga",
+  "luad_tcga",
+  "lusc_tcga",
+  "meso_tcga",
+  "ov_tcga",
+  "paad_tcga",
+  "pcpg_tcga",
+  "prad_tcga",
+  "read_tcga",
+  "sarc_tcga",
+  "skcm_tcga",
+  "som_tcga",
+  "stad_tcga",
+  "tgct_tcga",
+  "thca_tcga",
+  "thym_tcga",
+  "ucec_tcga",
+  "ucs_tcga",
+  "um_tcga"
+ ]
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"acc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"chol_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"dlbc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"esca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"hnsc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kich_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kirp_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"laml_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lihc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"meso_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"pcpg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"sarc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"stad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"tgct_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"thca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"thym_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucs_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"uvm_tcga_pan_can_atlas_2018"}]}
+
+◀ result
+{"success":false,"error":"Invalid study ID(s): coad_tcga, read_tcga, som_tcga, um_tcga","details":{"invalidIds":["coad_tcga","read_tcga","som_tcga","um_tcga"],"providedIds":["laml_tcga","acc_tcga","blca_tcga","brca_tcga","cesc_tcga","chol_tcga","coad_tcga","dlbc_tcga","esca_tcga","gbm_tcga","hnsc_tcga","kich_tcga","kirc_tcga","kirp_tcga","lgg_tcga","lihc_tcga","luad_tcga","lusc_tcga","meso_tcga","ov_tcga","paad_tcga","pcpg_tcga","prad_tcga","read_tcga","sarc_tcga","skcm_tcga","som_tcga","stad_tcga","tgct_tcga","thca_tcga","thym_tcga","ucec_tcga","ucs_tcga","um_tcga"]}}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "laml_tcga_pan_can_atlas_2018",
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+Error: result (81,891 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-5mhnjm0m/b236cbdd-7d0b-4bf1-8f69-1ad9c3febc1d/tool-results/mcp-navigator-resolve_and_route-1790442039265.txt.
+Format: Plain text
+- For targeted searches (find a string): use grep on the file directly.
+- For analysis or summarization that requires reading the full content: the file's lines are too long for Read's offset/limit. Slice by character range via Bash instead — e.g. python3 -c 'print(open("/home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-5mhnjm0m/b236cbdd-7d0b-4bf1-8f69-1ad9c3febc1d/tool-results/mcp-navigator-resolve_and_route-1790442039265.txt").read()[A:B])' in ~80,000-char spans until you have read 100% of it.
+- If the Agent tool is available, do this inside a subagent so the full output stays out of your main context. Give it the instruction above verbatim, and be explicit about what it must return — e.g. "Slice /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-5mhnjm0m/b236cbdd-7d0b-4bf1-8f69-1ad9c3febc1d/tool-results/mcp-navigator-resolve_and_route-1790442039265.txt in ~80,000-char spans via python (read()[A:B]) until you have read all 81,891 characters, then summarize and quote any key findings verbatim." A vague "summarize this" may lose detail.
+
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "laml_tcga_pan_can_atlas_2018",
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "EGFR"
+ ],
+ "tab": "plots",
+ "plotsVertSelection": {
+  "selectedGeneOption": "EGFR",
+  "dataType": "MRNA_EXPRESSION"
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/plots?cancer_study_list=laml_tcga_pan_can_atlas_2018%2Cacc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tcga_pan_can_atlas_2018%2Cprad_tcga_pan_can_atlas_2018%2Csarc_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018%2Cstad_tcga_pan_can_atlas_2018%2Ctgct_tcga_pan_can_atlas_2018%2Cthca_tcga_pan_can_atlas_2018%2Cthym_tcga_pan_can_atlas_2018%2Cucec_tcga_pan_can_atlas_2018%2Cucs_tcga_pan_can_atlas_2018%2Cuvm_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=all&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%7D","url":"https://www.cbioportal.org/results/plots?cancer_study_list=laml_tcga_pan_can_atlas_2018%2Cacc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tcga_pan_can_atlas_2018%2Cprad_tcga_pan_can_atlas_2018%2Csarc_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018%2Cstad_tcga_pan_can_atlas_2018%2Ctgct_tcga_pan_can_atlas_2018%2Cthca_tcga_pan_can_atlas_2018%2Cthym_tcga_pan_can_atlas_2018%2Cucec_tcga_pan_can_atlas_2018%2Cucs_tcga_pan_can_atlas_2018%2Cuvm_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=all&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%7D","data":{"studyIds":["laml_tcga_pan_can_atlas_2018","acc_tcga_pan_can_atlas_2018","blca_tcga_pan_can_atlas_2018","brca_tcga_pan_can_atlas_2018","cesc_tcga_pan_can_atlas_2018","chol_tcga_pan_can_atlas_2018","coadread_tcga_pan_can_atlas_2018","dlbc_tcga_pan_can_atlas_2018","esca_tcga_pan_can_atlas_2018","gbm_tcga_pan_can_atlas_2018","hnsc_tcga_pan_can_atlas_2018","kich_tcga_pan_can_atlas_2018","kirc_tcga_pan_can_atlas_2018","kirp_tcga_pan_can_atlas_2018","lgg_tcga_pan_can_atlas_2018","lihc_tcga_pan_can_atlas_2018","luad_tcga_pan_can_atlas_2018","lusc_tcga_pan_can_atlas_2018","meso … (4355 more chars)
+
+═ answer (success)
+## EGFR Expression Across Cancer Types
+
+Here are EGFR mRNA expression levels (log₂ RSEM-normalized, TCGA PanCancer Atlas, n=10,155 samples):
+
+| Cancer Type | Samples | Median (log₂) | 75th % | 90th % |
+|---|---|---|---|---|
+| **Glioblastoma** | 160 | 11.93 | 13.86 | **15.00** |
+| **Glioma** | 514 | 11.24 | 11.96 | 13.05 |
+| **Head and Neck Cancer** | 515 | 11.50 | 12.15 | 12.98 |
+| **Renal Clear Cell Carcinoma** | 510 | 11.28 | 11.95 | 12.54 |
+| **Non-Small Cell Lung Cancer** | 994 | 10.49 | 11.33 | 12.05 |
+| **Esophagogastric Cancer** | 593 | 9.60 | 10.47 | 11.70 |
+| **Bladder Cancer** | 407 | 9.27 | 10.42 | 11.45 |
+| **Melanoma** | 443 | 4.85 | 6.64 | 7.96 |
+| **Leukemia** | 173 | −0.10 | 1.26 | 2.67 |
+
+**Key findings:**
+- **Highest EGFR**: Glioblastoma (median 11.93) and lower-grade glioma (11.24) consistently express EGFR at the top. The 90th percentile in GBM reaches 15.00, reflecting EGFR-amplified subsets.
+- **Moderate-high EGFR**: Head and neck squamous, renal clear cell, and lung cancers (10.5–11.5 median), clinically expected given EGFR-driven tumors in these tissues.
+- **Low EGFR**: Melanoma and leukemia show minimal EGFR expression (4.85 and −0.10 log₂), consistent with lineage-specific biology.
+
+[View the full distribution and compare cancer types interactively](https://www.cbioportal.org/results/plots?cancer_study_list=laml_tcga_pan_can_atlas_2018%2Cacc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tcga_pan_can_atlas_2018%2Cprad_tcga_pan_can_atlas_2018%2Csarc_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018%2Cstad_tcga_pan_can_atlas_2018%2Ctgct_tcga_pan_can_atlas_2018%2Cthca_tcga_pan_can_atlas_2018%2Cthym_tcga_pan_can_atlas_2018%2Cucec_tcga_pan_can_atlas_2018%2Cucs_tcga_pan_can_atlas_2018%2Cuvm_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=all&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%7D) — use the box-plot view to see distributions across cancer types, or filter by cancer type to drill down.

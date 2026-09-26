@@ -1,0 +1,135 @@
+Q (haiku): Help me rank TCGA cancer studies based on median CD3 expression
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cohort AS (
+    SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga'
+),
+ct AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type, cancer_study_identifier
+    FROM clinical_data_derived
+    WHERE attribute_name = 'CANCER_TYPE' AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+)
+SELECT ct.cancer_type,
+       ct.cancer_study_identifier,
+       count() AS samples,
+       round(median(toFloat64OrNull(g.alteration_value)), 2) AS median_cd3_expression,
+       round(quantile(0.25)(toFloat64OrNull(g.alteration_value)), 2) AS q1_cd3_expression,
+       round(quantile(0.75)(toFloat64OrNull(g.alteration_value)), 2) AS q3_cd3_expression
+FROM genetic_alteration_derived g
+JOIN ct USING (sample_unique_id)
+WHERE g.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+  AND g.hugo_gene_symbol = 'CD3E'
+  AND g.profile_type = 'rna_seq_v2_mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+GROUP BY ct.cancer_type, ct.cancer_study_identifier
+ORDER BY median_cd3_expression DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_type":"Thymic Epithelial Tumor","ct.cancer_study_identifier":"thym_tcga_pan_can_atlas_2018","samples":119,"median_cd3_expression":8500.2,"q1_cd3_expression":2417.22,"q3_cd3_expression":19964.15},{"cancer_type":"Mature B-Cell Neoplasms","ct.cancer_study_identifier":"dlbc_tcga_pan_can_atlas_2018","samples":48,"median_cd3_expression":1734.14,"q1_cd3_expression":600.77,"q3_cd3_expression":2955.57},{"cancer_type":"Seminoma","ct.cancer_study_identifier":"tgct_tcga_pan_can_atlas_2018","samples":63,"median_cd3_expression":954.16,"q1_cd3_expression":539.39,"q3_cd3_expression":1660.8},{"cancer_type":"Renal Clear Cell Carcinoma","ct.cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018","samples":510,"median_cd3_expression":419.11,"q1_cd3_expression":249.56,"q3_cd3_expression":821.85},{"cancer_type":"Non-Small Cell Lung Cancer","ct.cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","samples":510,"median_cd3_expression":382.38,"q1_cd3_expression":199.46,"q3_cd3_expression":650.91},{"cancer_type":"Esophagogastric Cancer","ct.cancer_study_identifier":"stad_tcga_pan_can_atlas_2018","samples":412,"median_cd3_expression":316.98,"q1_cd3_expression":150.69,"q3_cd3_expression":561.33},{"cancer_type":"Non-Seminomatous Germ Cell Tumor","ct.cancer_study_identifier":"tgct_tcga_pan_can_atlas_2018","samples":86,"median_cd3_expression":296.4,"q1_cd3_expression":126.82,"q3_cd3_expression":517.68},{"cancer_type":"Cervical Cancer","ct.cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018","samples":294,"median_cd3_expression":271.18,"q1_cd3_expression":137.21,"q3_cd3_expression":551.79},{"cancer_type":"Leukemia","ct.cancer_study_identifier":"laml_tcga_pan_can_atlas_2018","samples":173,"median_cd3_expression":263.64,"q1_cd3_expression":132.21,"q3_cd3_expression":527.29},{"cancer_type":"Non-Small Cell Lung Cancer","ct.cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","samples":484,"median_cd3_expression":259,"q1_cd3_expression":122.68,"q3_cd3_expression":493.68},{"cancer_type":"Pancreatic Cancer","ct.cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","samples":177,"median_cd3_expression":258.9,"q1_cd3_expression":111.51,"q3_cd3_expression":498.07},{"cancer_type":"Melanoma","ct.cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018","samples":443,"median_cd3_expression":256.82,"q1_cd3_expression":64.01,"q3_cd3_expression":791.45},{"cancer_type":"Pleural Mesothelioma","ct.cancer_study_identifier":"meso_tcga_pan_can_atlas_2018","samples":87,"median_cd3_expression":254.92,"q1_cd3_expression":123.62,"q3_cd3_expression":428.32},{"cancer_type":"Head and Neck Cancer","ct.cancer_study_identifier":"hnsc_tcga_pan_can_atlas_2018","samples":515,"median_cd3_expression":250.1,"q1_cd3_expression":118.35,"q3_cd3_expression":510.34},{"cancer_type":"Breast Cancer","ct.cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","samples":1082,"median_cd3_expression":192.82,"q1_cd3_expression":82.33,"q3_cd3_expression":427.99},{"cancer_type":"Cholangiocarcinoma","ct. … (3643 more chars)
+
+═ answer (success)
+Perfect! Here's the ranking of **TCGA cancer studies by median CD3 expression** (CD3E gene, RSEM-normalized RNA-Seq):
+
+## Top 10 TCGA Studies (Highest Median CD3)
+
+| Rank | Cancer Type | Study ID | Samples | Median CD3 | Q1–Q3 |
+|---|---|---|---|---|---|
+| 1 | Thymic Epithelial Tumor | `thym_tcga_pan_can_atlas_2018` | 119 | **8,500.2** | 2,417–19,964 |
+| 2 | Mature B-Cell Neoplasms (DLBCL) | `dlbc_tcga_pan_can_atlas_2018` | 48 | **1,734.1** | 601–2,956 |
+| 3 | Seminoma | `tgct_tcga_pan_can_atlas_2018` | 63 | **954.2** | 539–1,661 |
+| 4 | Renal Clear Cell Carcinoma | `kirc_tcga_pan_can_atlas_2018` | 510 | **419.1** | 250–822 |
+| 5 | Non-Small Cell Lung Cancer (NSCLC) | `luad_tcga_pan_can_atlas_2018` | 510 | **382.4** | 199–651 |
+| 6 | Esophagogastric Cancer | `stad_tcga_pan_can_atlas_2018` | 412 | **317.0** | 151–561 |
+| 7 | Non-Seminomatous Germ Cell Tumor | `tgct_tcga_pan_can_atlas_2018` | 86 | **296.4** | 127–518 |
+| 8 | Cervical Cancer | `cesc_tcga_pan_can_atlas_2018` | 294 | **271.2** | 137–552 |
+| 9 | Acute Myeloid Leukemia | `laml_tcga_pan_can_atlas_2018` | 173 | **263.6** | 132–527 |
+| 10 | Non-Small Cell Lung Cancer (Squamous) | `lusc_tcga_pan_can_atlas_2018` | 484 | **259.0** | 123–494 |
+
+## Lowest CD3 Expression
+- **Glioma (LGG):** `lgg_tcga_pan_can_atlas_2018` — 514 samples, median **6.9** (Q1–Q3: 2.8–19.8)
+- **Adrenocortical Carcinoma:** `acc_tcga_pan_can_atlas_2018` — 78 samples, median **14.9**
+- **Ocular Melanoma:** `uvm_tcga_pan_can_atlas_2018` — 80 samples, median **25.5**
+
+## Key Observations
+- **Thymic tumors and hematologic malignancies** dominate the top, reflecting their inherent T-cell composition (CD3 marks T lymphocytes).
+- **Gliomas** have minimal CD3, consistent with the immune-excluded microenvironment of brain tumors.
+- **Solid tumors** (carcinomas, sarcomas) cluster in the middle range (100–400 RSEM units).
+
+All data come from **TCGA PanCancer Atlas** studies using raw RSEM-normalized RNA-Seq (not Z-scores), making values comparable across cancer types.

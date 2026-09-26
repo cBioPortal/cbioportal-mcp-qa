@@ -1,0 +1,541 @@
+Q (haiku): How does overall survival compare between prostate cancer patients where TMPRSS2 is acting as the upstream donor to an ERG fusion event and patients without this fusion?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+▶ search_oncotree
+{
+ "search_term": "prostate cancer"
+}
+
+◀ result
+{"result":[{"code":"BCCP","name":"Basal Cell Carcinoma of Prostate","score":65,"mainType":"Prostate Cancer","tissue":"Prostate","hierarchy":"PROSTATE > BCCP"},{"code":"PRAD","name":"Prostate Adenocarcinoma","score":65,"mainType":"Prostate Cancer","tissue":"Prostate","hierarchy":"PROSTATE > PRAD"},{"code":"PRNE","name":"Prostate Neuroendocrine Carcinoma","score":65,"mainType":"Prostate Cancer","tissue":"Prostate","hierarchy":"PROSTATE > PRNE"},{"code":"PROSTATE","name":"Prostate","score":65,"mainType":"Prostate Cancer","tissue":"Prostate","hierarchy":"PROSTATE"},{"code":"PRSC","name":"Prostate Squamous Cell Carcinoma","score":65,"mainType":"Prostate Cancer","tissue":"Prostate","hierarchy":"PROSTATE > PRSC"},{"code":"PRSCC","name":"Prostate Small Cell Carcinoma","score":65,"mainType":"Prostate Cancer","tissue":"Prostate","hierarchy":"PROSTATE > PRSCC"}]}
+
+▶ list_studies
+{
+ "search": "prostate",
+ "limit": 20,
+ "verbose": true
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","description":"MSK-MET (Memorial Sloan Kettering - Metastatic Events and Tropisms) is a pan-cancer cohort of tumor genomic and clinical outcome data from 25,000 patients. The dataset identifies associations between tumor genomic alterations and patterns of metastatic dissemination across 50 tumor types; showing that chromosomal instability is strongly correlated with metastatic burden in some tumor types, like prostate and lung adenocarcinomas and HR+/HER2+ breast ductal carcinoma, but not in others, such as colorectal MSS, pancreatic adenocarcinoma and high-grade serous ovarian cancer. The study also identifies somatic alterations associated with increased metastatic burden and routes of metastatic spread. Our data offers a resource for the investigation of the biologic basis for metastatic spread and highlights the role of chromosomal instability in cancer progression. This data is available under the <a href=\"https://creativecommons.org/licenses/by-nc-nd/4.0/deed.en\">Creative Commons BY-NC-ND 4.0 license</a>.","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"prostate_msk_2024","name":"Prostate Cancer (MSK, Clin Cancer Res 2024)","description":"Targeted sequencing of 2,257 prostate cancer patient samples and their matched normals via MSK-IMPACT platform. This data is available under the <a href=\"https://creativecommons.org/licenses/by-nc-nd/4.0/deed.en\">Creative Commons BY-NC-ND 4.0 license</a>.","type_of_cancer_id":"prostate","sample_count":2260,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prostate_msk_2024"},{"cancer_study_identifier":"prad_msk_stopsack_2021","name":"Race Differences in Prostate Cancer (MSK, 2021)","description":"Targeted sequencing of 2,069 prostate cancers from different races via MSK-IMPACT.","type_of_cancer_id":"prad","sample_count":2069,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_msk_stopsack_2021"},{"cancer_study_identifier":"prad_cdk12_mskcc_2020","name":"Prostate Adenocarcinoma (MSK, Eur Urol 2020)","description":"Targeted sequencing of 1465 prostate adenocarcinoma tumor/normal pairs via MSK-IMPACT.","type_of_cancer_id":"prad","sample_count":1465,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_cdk12_mskcc_2020"},{"cancer_study_identifier":"prad_pik3r1_msk_2021","name":"Prostate Adenocarcinoma (MSK, Clin Cancer Res. 2022)","description":"Targeted sequencing of 1417 Prostate Adenocarcinoma tumor/normal sample pairs via MSK-IMPACT to analyze the significance of PIK3R1 alterations.","type_of_cancer_id":"prad","sample_count":1417,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=prad_pik3r1_msk_2021"},{"cancer_study_identifier":"prad_p1000","name":"Prostate Adenocarcinoma (MSK/DFCI, Nature Genetics 2018)","description": … (6239 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    cancer_study_identifier,
+    name,
+    sample_count,
+    structural_variant_sample_count,
+    mutation_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id IN ('prad', 'prostate')
+  AND structural_variant_sample_count > 0
+ORDER BY structural_variant_sample_count DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"prostate_msk_2024","name":"Prostate Cancer (MSK, Clin Cancer Res 2024)","sample_count":2260,"structural_variant_sample_count":1004,"mutation_sample_count":2260},{"cancer_study_identifier":"prad_msk_stopsack_2021","name":"Race Differences in Prostate Cancer (MSK, 2021)","sample_count":2069,"structural_variant_sample_count":921,"mutation_sample_count":2069},{"cancer_study_identifier":"prad_pik3r1_msk_2021","name":"Prostate Adenocarcinoma (MSK, Clin Cancer Res. 2022)","sample_count":1417,"structural_variant_sample_count":697,"mutation_sample_count":1417},{"cancer_study_identifier":"prad_cdk12_mskcc_2020","name":"Prostate Adenocarcinoma (MSK, Eur Urol 2020)","sample_count":1465,"structural_variant_sample_count":626,"mutation_sample_count":1465},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018","name":"Prostate Adenocarcinoma (TCGA, PanCancer Atlas)","sample_count":494,"structural_variant_sample_count":431,"mutation_sample_count":494},{"cancer_study_identifier":"prad_p1000","name":"Prostate Adenocarcinoma (MSK/DFCI, Nature Genetics 2018)","sample_count":1013,"structural_variant_sample_count":378,"mutation_sample_count":1013},{"cancer_study_identifier":"prad_mskcc_2017","name":"Prostate Cancer (MSK, JCO Precis Oncol 2017)","sample_count":504,"structural_variant_sample_count":201,"mutation_sample_count":504},{"cancer_study_identifier":"prad_tcga_pub","name":"Prostate Adenocarcinoma (TCGA, Cell 2015)","sample_count":333,"structural_variant_sample_count":198,"mutation_sample_count":333},{"cancer_study_identifier":"prad_mcspc_mskcc_2020","name":"Metastatic castration-sensitive prostate cancer (MSK, Clin Cancer Res 2020)","sample_count":424,"structural_variant_sample_count":192,"mutation_sample_count":424},{"cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sample_count":444,"structural_variant_sample_count":178,"mutation_sample_count":444},{"cancer_study_identifier":"prad_su2c_2015","name":"Metastatic Prostate Cancer (SU2C/PCF Dream Team, Cell 2015)","sample_count":150,"structural_variant_sample_count":105,"mutation_sample_count":150},{"cancer_study_identifier":"prad_msk_2025","name":"Prostate Adenocarcinoma (MSK, 2025)","sample_count":120,"structural_variant_sample_count":50,"mutation_sample_count":120},{"cancer_study_identifier":"prad_eururol_2017","name":"Prostate Adenocarcinoma (SMMU, Eur Urol 2017)","sample_count":65,"structural_variant_sample_count":49,"mutation_sample_count":65},{"cancer_study_identifier":"prad_mich","name":"Metastatic Prostate Adenocarcinoma (MCTP, Nature 2012)","sample_count":121,"structural_variant_sample_count":33,"mutation_sample_count":61},{"cancer_study_identifier":"prad_broad_2013","name":"Prostate Adenocarcinoma (Broad/Cornell, Cell 2013)","sample_count":82,"structural_variant_sample_count":28,"mutation_sample_count":57},{"cancer_study_identifier":"prad_msk_mdanderson_2023","name":"Prostate Cancer MDA PCa PDX ( … (669 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check for TMPRSS2-ERG fusion events in the main MSK prostate studies
+-- Look for fusions where TMPRSS2 is the 5' partner and ERG is the 3' partner
+SELECT DISTINCT
+    cancer_study_identifier,
+    COUNT(DISTINCT sample_unique_id) as samples_with_fusion,
+    COUNT(DISTINCT patient_unique_id) as patients_with_fusion
+FROM genomic_event_derived
+WHERE cancer_study_identifier IN ('prostate_msk_2024', 'prad_msk_stopsack_2021', 'prad_pik3r1_msk_2021', 'prad_cdk12_mskcc_2020', 'prad_p1000')
+  AND variant_type = 'fusion'
+  AND (
+    (site_1_hugo_gene_symbol = 'TMPRSS2' AND site_2_hugo_gene_symbol = 'ERG')
+    OR (site_1_hugo_gene_symbol = 'ERG' AND site_2_hugo_gene_symbol = 'TMPRSS2')
+  )
+GROUP BY cancer_study_identifier
+ORDER BY patients_with_fusion DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `site_1_hugo_gene_symbol` in scope SELECT DISTINCT cancer_study_identifier, COUNTDistinct(sample_unique_id) AS samples_with_fusion, COUNTDistinct(patient_unique_id) AS patients_with_fusion FROM genomic_event_derived WHERE (cancer_study_identifier IN ('prostate_msk_2024', 'prad_msk_stopsack_2021', 'prad_pik3r1_msk_2021', 'prad_cdk12_mskcc_2020', 'prad_p1000')) AND (variant_type = 'fusion') AND (((site_1_hugo_gene_symbol = 'TMPRSS2') AND (site_2_hugo_gene_symbol = 'ERG')) OR ((site_1_hugo_gene_symbol = 'ERG') AND (site_2_hugo_gene_symbol = 'TMPRSS2'))) GROUP BY cancer_study_identifier ORDER BY patients_with_fusion DESC. Maybe you meant: ['hugo_gene_symbol']. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check structure of sv_event_info for fusion events
+SELECT DISTINCT 
+    sv_event_info,
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as samples
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'prostate_msk_2024'
+  AND variant_type = 'structural_variant'
+  AND hugo_gene_symbol IN ('TMPRSS2', 'ERG')
+GROUP BY sv_event_info, hugo_gene_symbol
+ORDER BY samples DESC
+LIMIT 20
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"sv_event_info":"Protein Fusion: out of frame  {TMPRSS2:ERG}","hugo_gene_symbol":"ERG","samples":222},{"sv_event_info":"Protein Fusion: out of frame  {TMPRSS2:ERG}","hugo_gene_symbol":"TMPRSS2","samples":193},{"sv_event_info":"Protein Fusion: in frame  {TMPRSS2:ERG}","hugo_gene_symbol":"ERG","samples":84},{"sv_event_info":"Protein fusion: out of frame (TMPRSS2-ERG)","hugo_gene_symbol":"ERG","samples":78},{"sv_event_info":"Protein Fusion: in frame  {TMPRSS2:ERG}","hugo_gene_symbol":"TMPRSS2","samples":69},{"sv_event_info":"TMPRSS2-intragenic","hugo_gene_symbol":"TMPRSS2","samples":61},{"sv_event_info":"Protein fusion: in frame (TMPRSS2-ERG)","hugo_gene_symbol":"ERG","samples":52},{"sv_event_info":"TMPRSS2-ERG Fusion - Archer","hugo_gene_symbol":"TMPRSS2","samples":30},{"sv_event_info":"TMPRSS2-ERG Fusion - Archer","hugo_gene_symbol":"ERG","samples":30},{"sv_event_info":"Antisense Fusion","hugo_gene_symbol":"TMPRSS2","samples":22},{"sv_event_info":"Protein fusion: out of frame (TMPRSS2-ERG)","hugo_gene_symbol":"TMPRSS2","samples":19},{"sv_event_info":"TMPRSS2-ERG Fusion","hugo_gene_symbol":"TMPRSS2","samples":17},{"sv_event_info":"TMPRSS2-ERG Fusion","hugo_gene_symbol":"ERG","samples":17},{"sv_event_info":"Protein fusion: in frame (TMPRSS2-ERG)","hugo_gene_symbol":"TMPRSS2","samples":16},{"sv_event_info":"Transcript Fusion {TMPRSS2:ERG}","hugo_gene_symbol":"ERG","samples":16},{"sv_event_info":"Transcript Fusion {TMPRSS2:ERG}","hugo_gene_symbol":"TMPRSS2","samples":15},{"sv_event_info":"Transcript fusion (TMPRSS2-ERG)","hugo_gene_symbol":"ERG","samples":8},{"sv_event_info":"TMPRSS2-ERG fusion","hugo_gene_symbol":"ERG","samples":8},{"sv_event_info":"Deletion of 1 exon : out of frame","hugo_gene_symbol":"TMPRSS2","samples":8},{"sv_event_info":"TMPRSS2-ERG fusion","hugo_gene_symbol":"TMPRSS2","samples":7}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get TMPRSS2-ERG fusion patients in prostate_msk_2024
+WITH tmprss2_erg_fusion AS (
+  SELECT DISTINCT patient_unique_id
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'prostate_msk_2024'
+    AND variant_type = 'structural_variant'
+    AND hugo_gene_symbol IN ('TMPRSS2', 'ERG')
+    AND sv_event_info LIKE '%TMPRSS2%ERG%'
+    -- Exclude clearly non-fusion events
+    AND sv_event_info NOT LIKE '%intragenic%'
+    AND sv_event_info NOT LIKE '%Antisense%'
+    AND sv_event_info NOT LIKE '%Deletion%'
+)
+-- Get OS data for all prostate cancer patients
+SELECT 
+  'TMPRSS2-ERG fusion' AS fusion_status,
+  COUNT(DISTINCT patient_unique_id) AS n_patients,
+  COUNTIF(os_status = '1:DECEASED') AS n_events,
+  COUNTIF(os_status = '0:LIVING') AS n_censored,
+  MIN(os_months) AS min_followup_months,
+  MAX(os_months) AS max_followup_months,
+  ROUND(AVG(os_months), 1) AS mean_followup_months
+FROM (
+  SELECT DISTINCT
+    cd.patient_unique_id,
+    MAX(CASE WHEN cd.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(cd.attribute_value) END) AS os_months,
+    MAX(CASE WHEN cd.attribute_name = 'OS_STATUS' THEN cd.attribute_value END) AS os_status
+  FROM clinical_data_derived cd
+  WHERE cd.cancer_study_identifier = 'prostate_msk_2024'
+    AND cd.attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+    AND cd.patient_unique_id IN (SELECT patient_unique_id FROM tmprss2_erg_fusion)
+  GROUP BY cd.patient_unique_id
+)
+WHERE os_months IS NOT NULL AND os_status != ''
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 46\n Code: 46. DB::Exception: Function with name `COUNTIF` does not exist. In scope WITH tmprss2_erg_fusion AS (SELECT DISTINCT patient_unique_id FROM genomic_event_derived WHERE (cancer_study_identifier = 'prostate_msk_2024') AND (variant_type = 'structural_variant') AND (hugo_gene_symbol IN ('TMPRSS2', 'ERG')) AND (sv_event_info LIKE '%TMPRSS2%ERG%') AND (sv_event_info NOT LIKE '%intragenic%') AND (sv_event_info NOT LIKE '%Antisense%') AND (sv_event_info NOT LIKE '%Deletion%')) SELECT 'TMPRSS2-ERG fusion' AS fusion_status, COUNTDistinct(patient_unique_id) AS n_patients, COUNTIF(os_status = '1:DECEASED') AS n_events, COUNTIF(os_status = '0:LIVING') AS n_censored, MIN(os_months) AS min_followup_months, MAX(os_months) AS max_followup_months, ROUND(AVG(os_months), 1) AS mean_followup_months FROM (SELECT DISTINCT cd.patient_unique_id, MAX(multiIf(cd.attribute_name = 'OS_MONTHS', toFloat64OrNull(cd.attribute_value), NULL)) AS os_months, MAX(multiIf(cd.attribute_name = 'OS_STATUS', cd.attribute_value, NULL)) AS os_status FROM clinical_data_derived AS cd WHERE (cd.cancer_study_identifier = 'prostate_msk_2024') AND (cd.attribute_name IN ('OS_MONTHS', 'OS_STATUS')) AND (cd.patient_unique_id IN (SELECT patient_unique_id FROM tmprss2_erg_fusion)) GROUP BY cd.patient_unique_id) WHERE (os_months IS NOT NULL) AND (os_status != ''). Maybe you meant: ['count']. (UNKNOWN_FUNCTION) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get TMPRSS2-ERG fusion patients in prostate_msk_2024
+WITH tmprss2_erg_fusion AS (
+  SELECT DISTINCT patient_unique_id
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'prostate_msk_2024'
+    AND variant_type = 'structural_variant'
+    AND hugo_gene_symbol IN ('TMPRSS2', 'ERG')
+    AND sv_event_info LIKE '%TMPRSS2%ERG%'
+    AND sv_event_info NOT LIKE '%intragenic%'
+    AND sv_event_info NOT LIKE '%Antisense%'
+    AND sv_event_info NOT LIKE '%Deletion%'
+),
+os_data AS (
+  SELECT DISTINCT
+    cd.patient_unique_id,
+    MAX(CASE WHEN cd.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(cd.attribute_value) END) AS os_months,
+    MAX(CASE WHEN cd.attribute_name = 'OS_STATUS' THEN cd.attribute_value END) AS os_status
+  FROM clinical_data_derived cd
+  WHERE cd.cancer_study_identifier = 'prostate_msk_2024'
+    AND cd.attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+  GROUP BY cd.patient_unique_id
+)
+SELECT 
+  'TMPRSS2-ERG fusion' AS fusion_status,
+  COUNT(DISTINCT os.patient_unique_id) AS n_patients,
+  countIf(os.os_status = '1:DECEASED') AS n_events,
+  countIf(os.os_status = '0:LIVING') AS n_censored,
+  MIN(os.os_months) AS min_followup_months,
+  MAX(os.os_months) AS max_followup_months,
+  ROUND(AVG(os.os_months), 1) AS mean_followup_months
+FROM os_data os
+WHERE os.patient_unique_id IN (SELECT patient_unique_id FROM tmprss2_erg_fusion)
+  AND os.os_months IS NOT NULL 
+  AND os.os_status != ''
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"fusion_status":"TMPRSS2-ERG fusion","n_patients":508,"n_events":213,"n_censored":295,"min_followup_months":0.32876352,"max_followup_months":110.3001611,"mean_followup_months":42.4}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get all prostate patients, stratified by fusion status
+WITH tmprss2_erg_fusion AS (
+  SELECT DISTINCT patient_unique_id
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'prostate_msk_2024'
+    AND variant_type = 'structural_variant'
+    AND hugo_gene_symbol IN ('TMPRSS2', 'ERG')
+    AND sv_event_info LIKE '%TMPRSS2%ERG%'
+    AND sv_event_info NOT LIKE '%intragenic%'
+    AND sv_event_info NOT LIKE '%Antisense%'
+    AND sv_event_info NOT LIKE '%Deletion%'
+),
+os_data AS (
+  SELECT DISTINCT
+    cd.patient_unique_id,
+    MAX(CASE WHEN cd.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(cd.attribute_value) END) AS os_months,
+    MAX(CASE WHEN cd.attribute_name = 'OS_STATUS' THEN cd.attribute_value END) AS os_status
+  FROM clinical_data_derived cd
+  WHERE cd.cancer_study_identifier = 'prostate_msk_2024'
+    AND cd.attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+  GROUP BY cd.patient_unique_id
+)
+SELECT 
+  CASE 
+    WHEN os.patient_unique_id IN (SELECT patient_unique_id FROM tmprss2_erg_fusion) 
+      THEN 'TMPRSS2-ERG fusion' 
+    ELSE 'No TMPRSS2-ERG fusion' 
+  END AS fusion_status,
+  COUNT(DISTINCT os.patient_unique_id) AS n_patients,
+  countIf(os.os_status = '1:DECEASED') AS n_events,
+  countIf(os.os_status = '0:LIVING') AS n_censored,
+  MIN(os.os_months) AS min_followup_months,
+  MAX(os.os_months) AS max_followup_months,
+  ROUND(AVG(os.os_months), 1) AS mean_followup_months,
+  ROUND(SQRT(VAR_SAMP(os.os_months)), 1) AS std_dev_followup
+FROM os_data os
+WHERE os.os_months IS NOT NULL 
+  AND os.os_status != ''
+GROUP BY fusion_status
+ORDER BY fusion_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"fusion_status":"TMPRSS2-ERG fusion","n_patients":508,"n_events":213,"n_censored":295,"min_followup_months":0.32876352,"max_followup_months":110.3001611,"mean_followup_months":42.4,"std_dev_followup":26.8},{"fusion_status":"No TMPRSS2-ERG fusion","n_patients":1693,"n_events":703,"n_censored":990,"min_followup_months":0,"max_followup_months":115.98777,"mean_followup_months":43.4,"std_dev_followup":27.9}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "prostate_msk_2024"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"prostate_msk_2024","name":"Prostate Cancer (MSK, Clin Cancer Res 2024)","sampleCount":2260,"studyViewUrl":"https://www.cbioportal.org/study?id=prostate_msk_2024","metadata":{"clinicalAttributeIds":["CANCER_TYPE","CANCER_TYPE_DETAILED","CURRENT_AGE","ETHNICITY","FRACTION_GENOME_ALTERED","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PFS_MONTHS","PFS_STATUS","RACE","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["prostate_msk_2024_cna","prostate_msk_2024_mutations","prostate_msk_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "prostate_msk_2024"
+ ],
+ "groups": [
+  {
+   "name": "TMPRSS2-ERG Fusion Present",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "prostate_msk_2024_structural_variants"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "TMPRSS2"
+        },
+        {
+         "hugoGeneSymbol": "ERG"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "TMPRSS2-ERG Fusion Absent",
+   "isUnselected": true
+  }
+ ],
+ "tab": "survival"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ab81cb5c2115c492d885164","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ab81cb5c2115c492d885164","data":{"description":"Group comparison (2 custom groups)","studies":["prostate_msk_2024"],"totalGroups":2,"groups":[{"name":"TMPRSS2-ERG Fusion Present","sampleCount":678},{"name":"TMPRSS2-ERG Fusion Absent","sampleCount":1582}],"studyViewUrl":"https://www.cbioportal.org/study?id=prostate_msk_2024","groupUrls":[{"groupName":"TMPRSS2-ERG Fusion Present","url":"https://www.cbioportal.org/study?id=prostate_msk_2024#filterJson=%7B%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22prostate_msk_2024_structural_variants%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22TMPRSS2%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22ERG%22%7D%5D%5D%7D%5D%7D"}],"pageDescription":"Kaplan-Meier survival analysis comparing TMPRSS2-ERG Fusion Present (678) vs TMPRSS2-ERG Fusion Absent (1582)."}}
+
+═ answer (success)
+Perfect! Now let me provide a comprehensive answer with the data and visualization links:
+
+---
+
+## Overall Survival Comparison: TMPRSS2-ERG Fusion vs Wild-Type
+
+Based on the **Prostate Cancer (MSK, Clin Cancer Res 2024)** cohort with 2,260 samples, here is the survival summary:
+
+### Study Population Summary
+
+| Group | N Patients | Deaths (Events) | Censored (Living) | Follow-up (months) |
+|-------|:---:|:---:|:---:|---|
+| **TMPRSS2-ERG Fusion** | 508 | 213 (41.9%) | 295 | 0.3–110.3 |
+| **No TMPRSS2-ERG Fusion** | 1,693 | 703 (41.5%) | 990 | 0–116.0 |
+
+### Key Observations
+
+1. **Event Rate**: Patients with TMPRSS2-ERG fusion have a comparable event rate (41.9% deaths) to those without the fusion (41.5%), suggesting similar mortality in this cohort.
+
+2. **Follow-up**: Both groups have comparable mean follow-up durations (~42–43 months), so the event rates are not simply due to different observation periods.
+
+3. **Median OS**: **Cannot report from raw data alone.** The number of events in each group is substantial enough that Kaplan-Meier analysis may show a reached median in one or both groups — however, this requires proper survival regression that accounts for censoring.
+
+### Statistical Analysis Required
+
+To answer whether overall survival **differs significantly** between these groups, you must run **Kaplan-Meier estimation + log-rank test**, which I cannot compute. This accounts for censoring (the 295 and 990 living patients whose events are yet to occur).
+
+### Visualize & Analyze
+
+Use this link to view the Kaplan-Meier curves and log-rank p-value:
+
+**[View Survival Comparison: TMPRSS2-ERG Fusion vs Wild-Type](https://www.cbioportal.org/comparison/survival?comparisonId=6ab81cb5c2115c492d885164)**
+
+This opens the cBioPortal Group Comparison **Survival** tab with:
+- Kaplan-Meier curves for both groups  
+- Log-rank p-value and event counts  
+- Median OS (if reached) for each group  
+- Interactive plot to explore specific time points
+
+You can also export the underlying data and run survival analysis in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`) for additional modeling (Cox regression, hazard ratios).
+
+### Study Notes
+
+- The TMPRSS2-ERG fusion is one of the most common recurrent alterations in prostate cancer (~40% of adenocarcinomas).
+- This MSK cohort includes ~678 samples with detected TMPRSS2-ERG fusions (by structural variant calling), representing a well-characterized fusion population.
+- Fusion detection is based on MSK-IMPACT sequencing; the presence/absence reflects both true biology and assay sensitivity for structural variants.

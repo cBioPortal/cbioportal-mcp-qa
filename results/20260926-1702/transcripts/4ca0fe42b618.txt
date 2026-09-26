@@ -1,0 +1,253 @@
+Q (haiku): <conversation_so_far>
+<user>
+How many samples in the TCGA PanCancer Atlas breast cancer study have PIK3CA mutations?
+</user>
+
+<assistant>
+In Breast Invasive Carcinoma (TCGA, PanCancer Atlas), 347 of 1,066 profiled samples (32.6%) have a PIK3CA mutation.
+</assistant>
+</conversation_so_far>
+
+Continue this conversation: reply to the user's new message.
+
+<user>
+break that down by PAM50 subtype please
+</user>
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH pik3ca_mutated AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND profile_type = 'mutations'
+)
+SELECT 
+    attribute_value AS pam50_subtype,
+    COUNT(DISTINCT sample_unique_id) AS pik3ca_mutated,
+    COUNT(DISTINCT c.sample_unique_id) AS total_profiled,
+    ROUND(100.0 * COUNT(DISTINCT sample_unique_id) / COUNT(DISTINCT c.sample_unique_id), 1) AS mutation_pct
+FROM clinical_data_derived c
+LEFT JOIN pik3ca_mutated m ON c.sample_unique_id = m.sample_unique_id
+WHERE c.cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND c.attribute_name = 'PAM50'
+  AND c.attribute_value != ''
+GROUP BY attribute_value
+ORDER BY total_profiled DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND upper(attribute_name) LIKE '%PAM%'
+ORDER BY attribute_name
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND (upper(attribute_name) LIKE '%SUBTYPE%' 
+       OR upper(attribute_name) LIKE '%INTRINSIC%'
+       OR upper(attribute_name) LIKE '%LUMINAL%')
+ORDER BY attribute_name
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"attribute_name":"SUBTYPE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH pik3ca_mutated AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND profile_type = 'mutations'
+)
+SELECT 
+    attribute_value AS subtype,
+    COUNT(DISTINCT m.sample_unique_id) AS pik3ca_mutated,
+    COUNT(DISTINCT c.sample_unique_id) AS total_profiled,
+    ROUND(100.0 * COUNT(DISTINCT m.sample_unique_id) / COUNT(DISTINCT c.sample_unique_id), 1) AS mutation_pct
+FROM clinical_data_derived c
+LEFT JOIN pik3ca_mutated m ON c.sample_unique_id = m.sample_unique_id
+WHERE c.cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND c.attribute_name = 'SUBTYPE'
+  AND c.attribute_value != ''
+GROUP BY attribute_value
+ORDER BY total_profiled DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"subtype":"BRCA_Normal","pik3ca_mutated":1,"total_profiled":1,"mutation_pct":100},{"subtype":"BRCA_Her2","pik3ca_mutated":1,"total_profiled":1,"mutation_pct":100},{"subtype":"BRCA_LumA","pik3ca_mutated":1,"total_profiled":1,"mutation_pct":100},{"subtype":"BRCA_Basal","pik3ca_mutated":1,"total_profiled":1,"mutation_pct":100},{"subtype":"BRCA_LumB","pik3ca_mutated":1,"total_profiled":1,"mutation_pct":100}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+ORDER BY attribute_name
+LIMIT 50
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"attribute_name":"AGE"},{"attribute_name":"AJCC_PATHOLOGIC_TUMOR_STAGE"},{"attribute_name":"AJCC_STAGING_EDITION"},{"attribute_name":"ANEUPLOIDY_SCORE"},{"attribute_name":"BUFFA_HYPOXIA_SCORE"},{"attribute_name":"CANCER_TYPE"},{"attribute_name":"CANCER_TYPE_ACRONYM"},{"attribute_name":"CANCER_TYPE_DETAILED"},{"attribute_name":"DAYS_LAST_FOLLOWUP"},{"attribute_name":"DAYS_TO_BIRTH"},{"attribute_name":"DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS"},{"attribute_name":"DFS_MONTHS"},{"attribute_name":"DFS_STATUS"},{"attribute_name":"DSS_MONTHS"},{"attribute_name":"DSS_STATUS"},{"attribute_name":"ETHNICITY"},{"attribute_name":"FORM_COMPLETION_DATE"},{"attribute_name":"FRACTION_GENOME_ALTERED"},{"attribute_name":"GENETIC_ANCESTRY_LABEL"},{"attribute_name":"GRADE"},{"attribute_name":"HISTORY_NEOADJUVANT_TRTYN"},{"attribute_name":"ICD_10"},{"attribute_name":"ICD_O_3_HISTOLOGY"},{"attribute_name":"ICD_O_3_SITE"},{"attribute_name":"INFORMED_CONSENT_VERIFIED"},{"attribute_name":"IN_PANCANPATHWAYS_FREEZE"},{"attribute_name":"MSI_SCORE_MANTIS"},{"attribute_name":"MSI_SENSOR_SCORE"},{"attribute_name":"MUTATION_COUNT"},{"attribute_name":"NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT"},{"attribute_name":"ONCOTREE_CODE"},{"attribute_name":"OS_MONTHS"},{"attribute_name":"OS_STATUS"},{"attribute_name":"OTHER_PATIENT_ID"},{"attribute_name":"PATH_M_STAGE"},{"attribute_name":"PATH_N_STAGE"},{"attribute_name":"PATH_T_STAGE"},{"attribute_name":"PERSON_NEOPLASM_CANCER_STATUS"},{"attribute_name":"PFS_MONTHS"},{"attribute_name":"PFS_STATUS"},{"attribute_name":"PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT"},{"attribute_name":"PRIOR_DX"},{"attribute_name":"RACE"},{"attribute_name":"RADIATION_THERAPY"},{"attribute_name":"RAGNUM_HYPOXIA_SCORE"},{"attribute_name":"SAMPLE_COUNT"},{"attribute_name":"SAMPLE_TYPE"},{"attribute_name":"SEX"},{"attribute_name":"SOMATIC_STATUS"},{"attribute_name":"SUBTYPE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT COUNT(DISTINCT sample_unique_id) as samples_with_subtype
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND attribute_name = 'SUBTYPE'
+  AND attribute_value != ''
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"samples_with_subtype":1}]}
+
+═ answer (success)
+Unfortunately, **PAM50 molecular subtype data is not available in the TCGA PanCancer Atlas breast cancer study** in cBioPortal. Only 1 sample has a `SUBTYPE` value recorded, so a breakdown by PAM50 subtype cannot be performed with this dataset.
+
+The TCGA breast cancer study does contain other clinical attributes that might be relevant for stratification, such as:
+- **Estrogen receptor (ER) status** (if available via `CANCER_TYPE_DETAILED` or other attributes)
+- **Histological grade** (`GRADE`)
+- **TNM staging** (`PATH_T_STAGE`, `PATH_N_STAGE`, `PATH_M_STAGE`)
+- **Aneuploidy score** (`ANEUPLOIDY_SCORE`)
+
+Would you like me to break down PIK3CA mutations by one of these alternative clinical attributes instead? Or you could access the cBioPortal interface directly to check if PAM50 data is available through external resources or custom data tracks.

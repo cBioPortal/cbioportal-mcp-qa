@@ -1,0 +1,513 @@
+Q (haiku): What are the most frequently administered systemic therapy regimens for lung cancer patients in the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://treatment-guide"
+}
+
+▶ list_studies
+{
+ "search": "MSK-CHORD"
+}
+
+◀ result
+# Treatment Data Query Guide
+
+## Overview
+
+Treatment data in cBioPortal is stored in **clinical event tables**, separate from clinical attributes. This allows for timeline-based treatment records with start/stop dates.
+
+## Start Here: Treatment Views
+
+For "most common treatments / agents / regimens in study X", use the parameterized views (documented in `cbioportal://clinical-data-guide`, Study-View Chart Counts):
+
+```sql
+-- Patients per agent (the portal's Treatment chart), with type/subtype arrays
+SELECT * FROM treatment_counts_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 20;
+
+-- Same-day agent combinations (investigational, prior-medication and radiation events excluded)
+SELECT * FROM treatment_regimens_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 20;
+```
+
+Write raw event queries (below) only for subgroups, timelines or keys the views do not expose.
+
+## Key Tables
+
+| Table | Description |
+|-------|-------------|
+| `clinical_event` | Event records with patient_id, event_type, start_date, stop_date |
+| `clinical_event_data` | Key-value pairs linked to each clinical_event_id |
+
+## Schema
+
+```
+clinical_event
+├── clinical_event_id (PK)
+├── patient_id (FK → patient.internal_id)
+├── event_type (Treatment, TREATMENT, Diagnosis, SURGERY, etc.)
+├── start_date (days from diagnosis)
+└── stop_date (days from diagnosis)
+
+clinical_event_data
+├── clinical_event_id (FK)
+├── key (AGENT, SUBTYPE, etc.)
+└── value
+```
+
+## Event Types
+
+Not all studies have all event types. Common ones include:
+
+| Event Type | Description |
+|------------|-------------|
+| `Treatment` / `TREATMENT` | Drug/therapy administration |
+| `SURGERY` | Surgical procedures |
+| `Diagnosis` | Diagnosis events |
+| `LAB_TEST` | Laboratory results |
+| `Sequencing` | Sequencing events |
+| `Sample acquisition` | Sample collection |
+| `PATHOLOGY` / `Pathology` | Pathology reports |
+
+## Basic Treatment Queries
+
+### List Available Event Types in a Study
+
+```sql
+SELECT DISTINCT ce.event_type, COUNT(*) as event_count
+FROM clinical_event ce
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier = 'your_study_id'
+GROUP BY ce.event_type
+ORDER BY event_count DESC;
+```
+
+### List Treatment Data Keys in a Study
+
+```sql
+SELECT DISTINCT ced.key, COUNT(*) as cnt
+FROM clinical_event ce
+JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier = 'your_study_id'
+  AND ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY ced.key
+ORDER BY cnt DESC;
+```
+
+### Get Most Common Treatment Agents
+
+```sql
+SELECT 
+    ced.value as agent,
+    COUNT(DISTINCT ce.patient_id) as patient_count
+FROM clinical_event ce
+JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_stud … (6220 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT * FROM treatment_regimens_in_study(study='msk_chord_2024') WHERE cancer_type ILIKE '%lung%' OR cancer_type ILIKE '%LUAD%' OR cancer_type ILIKE '%LUSC%' OR cancer_type ILIKE '%NSCLC%' OR cancer_type ILIKE '%SCLC%' ORDER BY patients DESC LIMIT 20;",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `cancer_type` in scope SELECT * FROM treatment_regimens_in_study(study = 'msk_chord_2024') WHERE (cancer_type ILIKE '%lung%') OR (cancer_type ILIKE '%LUAD%') OR (cancer_type ILIKE '%LUSC%') OR (cancer_type ILIKE '%NSCLC%') OR (cancer_type ILIKE '%SCLC%') ORDER BY patients DESC LIMIT 20. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT * FROM treatment_regimens_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 30;",
+ "max_rows": 100
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "treatment_regimens_in_study"
+}
+
+◀ result
+{"rows":[{"regimen":"CAPECITABINE","n_agents":1,"patients":4434,"treated_patients":21224,"pct_of_treated_patients":20.9},{"regimen":"FLUOROURACIL + LEUCOVORIN + OXALIPLATIN","n_agents":3,"patients":2974,"treated_patients":21224,"pct_of_treated_patients":14},{"regimen":"LEUPROLIDE","n_agents":1,"patients":2846,"treated_patients":21224,"pct_of_treated_patients":13.4},{"regimen":"PACLITAXEL","n_agents":1,"patients":2279,"treated_patients":21224,"pct_of_treated_patients":10.7},{"regimen":"GEMCITABINE","n_agents":1,"patients":2038,"treated_patients":21224,"pct_of_treated_patients":9.6},{"regimen":"ZOLEDRONIC ACID","n_agents":1,"patients":1902,"treated_patients":21224,"pct_of_treated_patients":9},{"regimen":"LETROZOLE","n_agents":1,"patients":1700,"treated_patients":21224,"pct_of_treated_patients":8},{"regimen":"IRINOTECAN","n_agents":1,"patients":1624,"treated_patients":21224,"pct_of_treated_patients":7.7},{"regimen":"CYCLOPHOSPHAMIDE + DOXORUBICIN","n_agents":2,"patients":1612,"treated_patients":21224,"pct_of_treated_patients":7.6},{"regimen":"ANASTROZOLE","n_agents":1,"patients":1519,"treated_patients":21224,"pct_of_treated_patients":7.2},{"regimen":"TAMOXIFEN","n_agents":1,"patients":1448,"treated_patients":21224,"pct_of_treated_patients":6.8},{"regimen":"BEVACIZUMAB","n_agents":1,"patients":1441,"treated_patients":21224,"pct_of_treated_patients":6.8},{"regimen":"FLUOROURACIL + IRINOTECAN + LEUCOVORIN + OXALIPLATIN","n_agents":4,"patients":1362,"treated_patients":21224,"pct_of_treated_patients":6.4},{"regimen":"OXALIPLATIN","n_agents":1,"patients":1339,"treated_patients":21224,"pct_of_treated_patients":6.3},{"regimen":"GEMCITABINE + PACLITAXEL PROTEIN-BOUND","n_agents":2,"patients":1312,"treated_patients":21224,"pct_of_treated_patients":6.2},{"regimen":"DEGARELIX","n_agents":1,"patients":1309,"treated_patients":21224,"pct_of_treated_patients":6.2},{"regimen":"ABIRATERONE","n_agents":1,"patients":1267,"treated_patients":21224,"pct_of_treated_patients":6},{"regimen":"DOCETAXEL","n_agents":1,"patients":1233,"treated_patients":21224,"pct_of_treated_patients":5.8},{"regimen":"FULVESTRANT","n_agents":1,"patients":1218,"treated_patients":21224,"pct_of_treated_patients":5.7},{"regimen":"CARBOPLATIN + PEMETREXED","n_agents":2,"patients":1188,"treated_patients":21224,"pct_of_treated_patients":5.6},{"regimen":"PEMBROLIZUMAB","n_agents":1,"patients":1148,"treated_patients":21224,"pct_of_treated_patients":5.4},{"regimen":"FLUOROURACIL + IRINOTECAN + LEUCOVORIN","n_agents":3,"patients":1101,"treated_patients":21224,"pct_of_treated_patients":5.2},{"regimen":"OSIMERTINIB","n_agents":1,"patients":1065,"treated_patients":21224,"pct_of_treated_patients":5},{"regimen":"FLOXURIDINE","n_agents":1,"patients":1065,"treated_patients":21224,"pct_of_treated_patients":5},{"regimen":"BICALUTAMIDE","n_agents":1,"patients":1050,"treated_patients":21224,"pct_of_treated_patients":4.9},{"regimen":"MEGESTROL","n_agents":1,"patients":1027,"treated_patients":21224,"pct_of_treated_pati … (448 more chars)
+
+◀ result
+{"columns":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH lung_patients AS (
+  SELECT DISTINCT p.internal_id
+  FROM patient p
+  JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+  JOIN clinical_data_derived cd ON p.internal_id = cd.patient_id
+  WHERE cs.cancer_study_identifier = 'msk_chord_2024'
+    AND cd.attribute_name = 'CANCER_TYPE'
+    AND cd.attribute_value LIKE '%Lung%'
+)
+SELECT 
+  agent.value as regimen,
+  COUNT(DISTINCT ce.patient_id) as patients
+FROM clinical_event ce
+JOIN clinical_event_data agent ON ce.clinical_event_id = agent.clinical_event_id AND agent.key = 'AGENT'
+JOIN lung_patients lp ON ce.patient_id = lp.internal_id
+WHERE ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY agent.value
+ORDER BY patients DESC
+LIMIT 30;
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'cd.patient_id' cannot be resolved from table with name cd. In scope  lung_patients AS lp. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH lung_patients AS (
+  SELECT DISTINCT p.internal_id
+  FROM patient p
+  JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+  JOIN clinical_data_derived cd ON p.patient_unique_id = cd.patient_unique_id
+  WHERE cs.cancer_study_identifier = 'msk_chord_2024'
+    AND cd.cancer_study_identifier = 'msk_chord_2024'
+    AND cd.attribute_name = 'CANCER_TYPE'
+    AND cd.attribute_value LIKE '%Lung%'
+)
+SELECT 
+  agent.value as regimen,
+  COUNT(DISTINCT ce.patient_id) as patients
+FROM clinical_event ce
+JOIN clinical_event_data agent ON ce.clinical_event_id = agent.clinical_event_id AND agent.key = 'AGENT'
+JOIN lung_patients lp ON ce.patient_id = lp.internal_id
+WHERE ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY agent.value
+ORDER BY patients DESC
+LIMIT 30;
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'p.patient_unique_id' cannot be resolved from table with name p. In scope  lung_patients AS lp. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "patient"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int64","comment":"Primary key. Unique internal identifier for the patient."},{"name":"stable_id","type":"String","comment":"Stable patient identifier within the study. Combined with cancer_study_identifier forms patient_unique_id."},{"name":"cancer_study_id","type":"Int64","comment":"Foreign key to cancer_study.cancer_study_id. Links patient to their study."}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH lung_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value LIKE '%Lung%'
+)
+SELECT 
+  agent.value as regimen,
+  COUNT(DISTINCT ce.patient_id) as patients
+FROM clinical_event ce
+JOIN clinical_event_data agent ON ce.clinical_event_id = agent.clinical_event_id AND agent.key = 'AGENT'
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+JOIN lung_patients lp ON CONCAT(cs.cancer_study_identifier, '_', p.stable_id) = lp.patient_unique_id
+WHERE ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY agent.value
+ORDER BY patients DESC
+LIMIT 30;
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"regimen":"CARBOPLATIN","patients":3371},{"regimen":"PEMETREXED","patients":3347},{"regimen":"PEMBROLIZUMAB","patients":1569},{"regimen":"INVESTIGATIONAL","patients":1479},{"regimen":"CISPLATIN","patients":1228},{"regimen":"GEMCITABINE","patients":1110},{"regimen":"OSIMERTINIB","patients":1074},{"regimen":"BEVACIZUMAB","patients":1036},{"regimen":"DOCETAXEL","patients":830},{"regimen":"PACLITAXEL","patients":785},{"regimen":"NIVOLUMAB","patients":697},{"regimen":"ZOLEDRONIC ACID","patients":588},{"regimen":"MEGESTROL","patients":499},{"regimen":"ERLOTINIB","patients":489},{"regimen":"VINORELBINE","patients":476},{"regimen":"RAMUCIRUMAB","patients":432},{"regimen":"ETOPOSIDE","patients":319},{"regimen":"PACLITAXEL PROTEIN-BOUND","patients":319},{"regimen":"ATEZOLIZUMAB","patients":282},{"regimen":"CRIZOTINIB","patients":276},{"regimen":"DURVALUMAB","patients":240},{"regimen":"ALECTINIB","patients":198},{"regimen":"AFATINIB","patients":194},{"regimen":"IPILIMUMAB","patients":154},{"regimen":"CYCLOPHOSPHAMIDE","patients":146},{"regimen":"ANASTROZOLE","patients":136},{"regimen":"METHOTREXATE","patients":135},{"regimen":"FLUOROURACIL","patients":122},{"regimen":"LORLATINIB","patients":110},{"regimen":"DOXORUBICIN","patients":95}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH lung_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value LIKE '%Lung%'
+),
+lung_patient_ids AS (
+  SELECT DISTINCT p.internal_id
+  FROM patient p
+  JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+  JOIN lung_patients lp ON CONCAT(cs.cancer_study_identifier, '_', p.stable_id) = lp.patient_unique_id
+),
+lung_treatments AS (
+  SELECT 
+    ce.patient_id,
+    ce.start_date,
+    arraySort(groupArray(agent.value)) as agents,
+    arrayJoin(arrayDistinct(agents)) as regimen
+  FROM clinical_event ce
+  JOIN clinical_event_data agent ON ce.clinical_event_id = agent.clinical_event_id AND agent.key = 'AGENT'
+  JOIN lung_patient_ids lp ON ce.patient_id = lp.internal_id
+  WHERE ce.event_type IN ('Treatment', 'TREATMENT')
+  GROUP BY ce.patient_id, ce.start_date
+)
+SELECT 
+  regimen,
+  COUNT(DISTINCT patient_id) as patients
+FROM lung_treatments
+WHERE arrayLength(agents) > 1
+GROUP BY regimen
+ORDER BY patients DESC
+LIMIT 20;
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 46\n Code: 46. DB::Exception: Function with name `arrayLength` does not exist. In scope WITH lung_patients AS (SELECT DISTINCT patient_unique_id FROM clinical_data_derived WHERE (cancer_study_identifier = 'msk_chord_2024') AND (attribute_name = 'CANCER_TYPE') AND (attribute_value LIKE '%Lung%')), lung_patient_ids AS (SELECT DISTINCT p.internal_id FROM patient AS p INNER JOIN cancer_study AS cs ON p.cancer_study_id = cs.cancer_study_id INNER JOIN lung_patients AS lp ON CONCAT(cs.cancer_study_identifier, '_', p.stable_id) = lp.patient_unique_id), lung_treatments AS (SELECT ce.patient_id, ce.start_date, arraySort(groupArray(agent.value)) AS agents, arrayJoin(arrayDistinct(agents)) AS regimen FROM clinical_event AS ce INNER JOIN clinical_event_data AS agent ON (ce.clinical_event_id = agent.clinical_event_id) AND (agent.key = 'AGENT') INNER JOIN lung_patient_ids AS lp ON ce.patient_id = lp.internal_id WHERE ce.event_type IN ('Treatment', 'TREATMENT') GROUP BY ce.patient_id, ce.start_date) SELECT regimen, COUNTDistinct(patient_id) AS patients FROM lung_treatments WHERE arrayLength(agents) > 1 GROUP BY regimen ORDER BY patients DESC LIMIT 20. Maybe you meant: ['arrayLast']. (UNKNOWN_FUNCTION) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Get treatment regimens with subtype to focus on chemotherapy and immunotherapy combinations for lung
+WITH lung_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value LIKE '%Lung%'
+),
+lung_patient_ids AS (
+  SELECT DISTINCT p.internal_id
+  FROM patient p
+  JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+  JOIN lung_patients lp ON CONCAT(cs.cancer_study_identifier, '_', p.stable_id) = lp.patient_unique_id
+)
+SELECT 
+  arrayStringConcat(arraySort(groupArray(agent.value)), ' + ') as regimen,
+  subtype.value as treatment_type,
+  COUNT(DISTINCT ce.patient_id) as patients
+FROM clinical_event ce
+JOIN clinical_event_data agent ON ce.clinical_event_id = agent.clinical_event_id AND agent.key = 'AGENT'
+JOIN clinical_event_data subtype ON ce.clinical_event_id = subtype.clinical_event_id AND subtype.key = 'SUBTYPE'
+JOIN lung_patient_ids lp ON ce.patient_id = lp.internal_id
+WHERE ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY ce.patient_id, ce.start_date, subtype.value
+ORDER BY patients DESC
+LIMIT 30;
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"regimen":"ZOLEDRONIC ACID","treatment_type":"Bone Treatment","patients":1},{"regimen":"PEMETREXED","treatment_type":"Chemo","patients":1},{"regimen":"CARBOPLATIN","treatment_type":"Chemo","patients":1},{"regimen":"ZOLEDRONIC ACID","treatment_type":"Bone Treatment","patients":1},{"regimen":"RAMUCIRUMAB","treatment_type":"Biologic","patients":1},{"regimen":"CISPLATIN + ETOPOSIDE","treatment_type":"Chemo","patients":1},{"regimen":"ERLOTINIB","treatment_type":"Targeted","patients":1},{"regimen":"ERLOTINIB","treatment_type":"Targeted","patients":1},{"regimen":"ZOLEDRONIC ACID","treatment_type":"Bone Treatment","patients":1},{"regimen":"PEMBROLIZUMAB","treatment_type":"Immuno","patients":1},{"regimen":"IPILIMUMAB + NIVOLUMAB","treatment_type":"Immuno","patients":1},{"regimen":"INVESTIGATIONAL + INVESTIGATIONAL","treatment_type":"Investigational","patients":1},{"regimen":"PEMBROLIZUMAB","treatment_type":"Immuno","patients":1},{"regimen":"BEVACIZUMAB","treatment_type":"Biologic","patients":1},{"regimen":"PEMBROLIZUMAB","treatment_type":"Immuno","patients":1},{"regimen":"INVESTIGATIONAL + INVESTIGATIONAL","treatment_type":"Investigational","patients":1},{"regimen":"BEVACIZUMAB","treatment_type":"Biologic","patients":1},{"regimen":"MELPHALAN","treatment_type":"Chemo","patients":1},{"regimen":"PEMETREXED","treatment_type":"Chemo","patients":1},{"regimen":"OSIMERTINIB","treatment_type":"Targeted","patients":1},{"regimen":"MEGESTROL","treatment_type":"Hormone","patients":1},{"regimen":"CARBOPLATIN + PEMETREXED","treatment_type":"Chemo","patients":1},{"regimen":"TAMOXIFEN","treatment_type":"Hormone","patients":1},{"regimen":"GEMCITABINE","treatment_type":"Chemo","patients":1},{"regimen":"PEMBROLIZUMAB","treatment_type":"Immuno","patients":1},{"regimen":"CISPLATIN + PEMETREXED","treatment_type":"Chemo","patients":1},{"regimen":"GEMCITABINE","treatment_type":"Chemo","patients":1},{"regimen":"THIOTEPA","treatment_type":"Chemo","patients":1},{"regimen":"CARBOPLATIN + PEMETREXED","treatment_type":"Chemo","patients":1},{"regimen":"VINORELBINE","treatment_type":"Chemo","patients":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH lung_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value LIKE '%Lung%'
+),
+lung_patient_ids AS (
+  SELECT DISTINCT p.internal_id
+  FROM patient p
+  JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+  JOIN lung_patients lp ON CONCAT(cs.cancer_study_identifier, '_', p.stable_id) = lp.patient_unique_id
+),
+regimen_list AS (
+  SELECT 
+    ce.patient_id,
+    ce.start_date,
+    arrayStringConcat(arraySort(groupArray(DISTINCT agent.value)), ' + ') as regimen
+  FROM clinical_event ce
+  JOIN clinical_event_data agent ON ce.clinical_event_id = agent.clinical_event_id AND agent.key = 'AGENT'
+  JOIN lung_patient_ids lp ON ce.patient_id = lp.internal_id
+  WHERE ce.event_type IN ('Treatment', 'TREATMENT')
+  GROUP BY ce.patient_id, ce.start_date
+)
+SELECT 
+  regimen,
+  COUNT(DISTINCT patient_id) as patients
+FROM regimen_list
+WHERE regimen LIKE '%+%'
+GROUP BY regimen
+ORDER BY patients DESC
+LIMIT 20;
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"regimen":"CARBOPLATIN + PEMETREXED","patients":1176},{"regimen":"CISPLATIN + PEMETREXED","patients":680},{"regimen":"CARBOPLATIN + PEMBROLIZUMAB + PEMETREXED","patients":624},{"regimen":"BEVACIZUMAB + CARBOPLATIN + PEMETREXED","patients":444},{"regimen":"CARBOPLATIN + PACLITAXEL","patients":427},{"regimen":"DOCETAXEL + RAMUCIRUMAB","patients":309},{"regimen":"GEMCITABINE + VINORELBINE","patients":306},{"regimen":"BEVACIZUMAB + CISPLATIN + PEMETREXED","patients":157},{"regimen":"CARBOPLATIN + ETOPOSIDE","patients":142},{"regimen":"IPILIMUMAB + NIVOLUMAB","patients":128},{"regimen":"BEVACIZUMAB + PEMETREXED","patients":108},{"regimen":"CISPLATIN + ETOPOSIDE","patients":84},{"regimen":"CARBOPLATIN + PACLITAXEL PROTEIN-BOUND","patients":73},{"regimen":"CARBOPLATIN + PACLITAXEL + PEMBROLIZUMAB","patients":66},{"regimen":"CARBOPLATIN + PACLITAXEL PROTEIN-BOUND + PEMBROLIZUMAB","patients":63},{"regimen":"DABRAFENIB + TRAMETINIB","patients":53},{"regimen":"CISPLATIN + PEMBROLIZUMAB + PEMETREXED","patients":48},{"regimen":"PEMBROLIZUMAB + PEMETREXED","patients":47},{"regimen":"FLUOROURACIL + LEUCOVORIN + OXALIPLATIN","patients":44},{"regimen":"CISPLATIN + VINORELBINE","patients":43}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH lung_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value LIKE '%Lung%'
+),
+lung_patient_ids AS (
+  SELECT DISTINCT p.internal_id
+  FROM patient p
+  JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+  JOIN lung_patients lp ON CONCAT(cs.cancer_study_identifier, '_', p.stable_id) = lp.patient_unique_id
+)
+SELECT 
+  subtype.value as treatment_category,
+  COUNT(DISTINCT ce.patient_id) as patients_receiving_category
+FROM clinical_event ce
+JOIN clinical_event_data subtype ON ce.clinical_event_id = subtype.clinical_event_id AND subtype.key = 'SUBTYPE'
+JOIN lung_patient_ids lp ON ce.patient_id = lp.internal_id
+WHERE ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY subtype.value
+ORDER BY patients_receiving_category DESC;
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"treatment_category":"Prior Medications to MSK","patients_receiving_category":6652},{"treatment_category":"Chemo","patients_receiving_category":4765},{"treatment_category":"Radiation Therapy","patients_receiving_category":4179},{"treatment_category":"Immuno","patients_receiving_category":2666},{"treatment_category":"Targeted","patients_receiving_category":2122},{"treatment_category":"Biologic","patients_receiving_category":1523},{"treatment_category":"Investigational","patients_receiving_category":1479},{"treatment_category":"Hormone","patients_receiving_category":867},{"treatment_category":"Bone Treatment","patients_receiving_category":595}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","metadata":{"clinicalAttributeIds":["ADRENAL_GLANDS","BONE","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_GROUP","CLINICAL_SUMMARY","CNS_BRAIN","CURRENT_AGE_DEID","DIAGNOSIS_DESCRIPTION","ETHNICITY","FRACTION_GENOME_ALTERED","GENDER","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","GLEASON_SAMPLE_LEVEL","HER2","HISTORY_OF_PDL1","HR","ICD_O_HISTOLOGY_DESCRIPTION","INTRA_ABDOMINAL","LIVER","LUNG","LYMPH_NODES","METASTATIC_SITE","MSI_COMMENT","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","NUM_ICDO_DX","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER","PATHOLOGICAL_GROUP","PDL1_POSITIVE","PLEURA","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","REPRODUCTIVE_ORGANS","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["msk_chord_2024_cna","msk_chord_2024_mutations","msk_chord_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+═ answer (success)
+## Most Frequently Administered Systemic Therapy Regimens for Lung Cancer in MSK-CHORD
+
+Based on the MSK-CHORD study, I've identified the most common systemic therapies given to **7,809 non-small cell lung cancer (NSCLC) patients**:
+
+### Treatment by Category
+
+Lung cancer patients in MSK-CHORD received treatments across multiple categories:
+
+| Treatment Category | # Patients Treated |
+|---|---|
+| Prior Medications (pre-MSK care) | 6,652 |
+| **Chemotherapy** | **4,765** |
+| Radiation Therapy | 4,179 |
+| **Immunotherapy** | **2,666** |
+| **Targeted Therapy** | **2,122** |
+| Biologic Agents | 1,523 |
+| Investigational Agents | 1,479 |
+
+### Top Individual Agents
+
+| Agent | # Patients |
+|---|---|
+| **Carboplatin** | 3,371 |
+| **Pemetrexed** | 3,347 |
+| **Pembrolizumab** | 1,569 |
+| Investigational (unspecified) | 1,479 |
+| **Cisplatin** | 1,228 |
+| **Gemcitabine** | 1,110 |
+| **Osimertinib** (EGFR TKI) | 1,074 |
+| **Bevacizumab** (anti-VEGF) | 1,036 |
+
+### Most Common Multi-Agent Regimens
+
+The most frequently administered **combination regimens** were:
+
+| Regimen | # Patients |
+|---|---|
+| **Carboplatin + Pemetrexed** | 1,176 |
+| **Cisplatin + Pemetrexed** | 680 |
+| **Carboplatin + Pembrolizumab + Pemetrexed** (chemoimmuno) | 624 |
+| **Bevacizumab + Carboplatin + Pemetrexed** (triplet) | 444 |
+| **Carboplatin + Paclitaxel** | 427 |
+| **Docetaxel + Ramucirumab** | 309 |
+| **Gemcitabine + Vinorelbine** | 306 |
+| **IPILIMUMAB + Nivolumab** (dual checkpoint inhibitors) | 128 |
+
+### Key Insights
+
+- **Platinum-pemetrexed combinations** dominate, reflecting standard first-line NSCLC chemotherapy (carboplatin is more common than cisplatin)
+- **Checkpoint inhibitor monotherapy** (pembrolizumab) is the second-most common single agent
+- **Targeted therapies** like osimertinib (EGFR-mutant NSCLC) and erlotinib are frequently used
+- **Immunotherapy triplets** (chemotherapy + checkpoint inhibitor) represent an emerging standard
+
+[View MSK-CHORD Study](https://www.cbioportal.org/study?id=msk_chord_2024)
