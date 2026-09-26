@@ -12,7 +12,7 @@ from tqdm import tqdm
 from .agent import AgentClient
 from .claude_code import ClaudeCodeClient
 from .dataset import Question
-from .grade import Judge, StudyValidator, cbio_links
+from .grade import Judge, StudyValidator, cbio_links, tool_log
 from .render import render_links
 from .traces import Langfuse
 
@@ -142,7 +142,9 @@ def grade_answers(run: Run, judge: Judge) -> None:
     ]
     for rec in tqdm(pending, desc="grading", unit="ans"):
         q = Question.from_dict(rec["question"])
-        rec["grade"] = judge.grade(q, rec["reply"]["answer"], studies, run.data.get("renders", {})).to_dict()
+        rec["grade"] = judge.grade(
+            q, rec["reply"]["answer"], studies, run.data.get("renders", {}), tool_log(rec, run.dir)
+        ).to_dict()
         run.save()
 
 

@@ -397,3 +397,27 @@ def test_history_is_quoted_ahead_of_the_new_message():
     )
     assert prompt.index("EGFR?") < prompt.index("12%") < prompt.index("And KRAS?")
     assert "<assistant>\n12%\n</assistant>" in prompt
+
+
+def test_parse_stream_records_tool_inputs_and_results():
+    stream = _events(
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "mcp__cbioportal-database__clickhouse_run_select_query",
+                        "input": {"query": "SELECT 1"},
+                    }
+                ],
+            },
+        },
+        _tool_result("t1", False, json.dumps({"result": '{"rows":[{"n":548}]}'})),
+        {"type": "result", "subtype": "success", "result": "548"},
+    )
+    call = parse_stream(stream, started=0, latency_s=1).trace["tool_calls"][0]
+    assert call["input"] == '{"query": "SELECT 1"}'
+    assert call["result"] == '{"rows":[{"n":548}]}'

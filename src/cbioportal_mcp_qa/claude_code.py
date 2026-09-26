@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .agent import AgentReply
 from .config import MODELS
-from .traces import ToolCall, TraceStats
+from .traces import ToolCall, TraceStats, excerpt
 
 # Deliberately unlike the database connector's "claude_ai_cBioPortal_MCP": with two cBioPortal-looking tool
 # prefixes the model mixes them up and calls navigator tools under the connector's name.
@@ -204,6 +204,21 @@ def connector_needs_signin(lines: list[str], connector: str) -> bool:
 USAGE_LIMIT = re.compile(r"hit your \w+ limit|usage limit reached", re.IGNORECASE)
 
 
+def tool_result_text(content) -> str:
+    """A tool_result block's text, unwrapping the MCP `{"result": "..."}` envelope."""
+    if isinstance(content, list):
+        text = "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
+    else:
+        text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    try:
+        wrapped = json.loads(text)
+        if isinstance(wrapped, dict) and isinstance(wrapped.get("result"), str):
+            return wrapped["result"]
+    except ValueError:
+        pass
+    return text
+
+
 def format_transcript(lines: list[str]) -> str:
     """A readable transcript: every tool call with its arguments and (truncated) result, then the answer."""
     out: list[str] = []
@@ -219,17 +234,7 @@ def format_transcript(lines: list[str]) -> str:
                 args = json.dumps(block.get("input"), indent=1, ensure_ascii=False)
                 out.append(f"▶ {short_tool_name(block['name'])}\n{args.replace(chr(92) + 'n', chr(10))}\n")
             elif block.get("type") == "tool_result":
-                content = block.get("content")
-                if isinstance(content, list):
-                    text = "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
-                else:
-                    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-                try:
-                    wrapped = json.loads(text)
-                    if isinstance(wrapped, dict) and isinstance(wrapped.get("result"), str):
-                        text = wrapped["result"]
-                except ValueError:
-                    pass
+                text = tool_result_text(block.get("content"))
                 label = "✗ error" if block.get("is_error") else "◀ result"
                 more = f" … ({len(text) - RESULT_CHARS} more chars)" if len(text) > RESULT_CHARS else ""
                 out.append(f"{label}\n{text[:RESULT_CHARS]}{more}\n")
@@ -252,18 +257,21 @@ def parse_stream(lines: list[str], started: float, latency_s: float) -> AgentRep
                 models.add(message["model"])
             for block in message.get("content") or []:
                 if block.get("type") == "tool_use":
-                    calls[block["id"]] = ToolCall(short_tool_name(block["name"]), True)
+                    calls[block["id"]] = ToolCall(
+                        short_tool_name(block["name"]),
+                        True,
+                        input=excerpt(json.dumps(block.get("input"), ensure_ascii=False)),
+                    )
         elif event.get("type") == "user":
             for block in message.get("content") or []:
-                if (
-                    block.get("type") == "tool_result"
-                    and block.get("is_error")
-                    and block["tool_use_id"] in calls
-                ):
+                if block.get("type") != "tool_result" or block.get("tool_use_id") not in calls:
+                    continue
+                call = calls[block["tool_use_id"]]
+                call.result = excerpt(tool_result_text(block.get("content")))
+                if block.get("is_error"):
                     content = block.get("content")
-                    text = content if isinstance(content, str) else json.dumps(content)
-                    calls[block["tool_use_id"]].ok = False
-                    calls[block["tool_use_id"]].error = text[:500]
+                    call.ok = False
+                    call.error = (content if isinstance(content, str) else json.dumps(content))[:500]
     result = next((e for e in events if e.get("type") == "result"), None)
     trace = TraceStats("", "", len(message_ids), list(calls.values()), sorted(models))
     if result is None or result.get("is_error"):
