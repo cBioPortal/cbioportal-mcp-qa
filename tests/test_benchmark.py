@@ -284,9 +284,9 @@ def test_index_shows_runner_and_flags_changed_setup(tmp_path, monkeypatch):
     assert report_mod.run_setup(runs["20260101-0000"])["runner"] == "LibreChat"
     html = report_mod.write_index().read_text()
     newest, middle, oldest = (html.index(r) for r in sorted(runs, reverse=True))
-    assert 'class="changed"><span class="muted">prompt' in html[newest:middle]
-    assert 'class="changed"><strong>Claude Code' in html[middle:oldest]
-    assert 'class="changed"><strong>Claude Code' not in html[newest:middle]
+    assert 'was: aaa"><span class="muted">prompt' in html[newest:middle]
+    assert 'was: LibreChat"><strong>Claude Code' in html[middle:oldest]
+    assert "was: LibreChat" not in html[newest:middle]
 
 
 def test_multiturn_history_loads_and_is_validated(tmp_path):
@@ -382,6 +382,7 @@ def test_index_has_one_table_per_question_set(tmp_path, monkeypatch):
     assert "20260102-0000" in html[multiturn:]
     # The multi-turn run's different prompt doesn't count as a change for the main set.
     assert 'class="changed"' not in html[main:multiturn]
+    assert 'class="chg"' in html  # the legend
 
 
 def test_test_sets_page_lists_the_questions():
