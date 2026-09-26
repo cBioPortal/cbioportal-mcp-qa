@@ -1,0 +1,259 @@
+Q (haiku): What are the top 5 most frequently copy number altered genes in the Osteosarcoma study from TARGET?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "TARGET osteosarcoma"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"os_target_gdc","name":"Osteosarcoma (TARGET GDC, 2025)","type_of_cancer_id":"os","sample_count":159,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=os_target_gdc"}]}
+
+▶ get_study_guide
+{
+ "study_id": "os_target_gdc"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "top_cna_genes_in_study"
+}
+
+◀ result
+# Osteosarcoma (TARGET GDC, 2025)
+
+**Study ID:** `os_target_gdc`
+
+## Overview
+Pediatric osteosarcoma study from the TARGET (Therapeutically Applicable Research to Generate Effective Treatments) initiative. Whole exome sequencing data.
+
+## Gene Panel
+- **WES** (Whole Exome Sequencing): all coding genes profiled
+- **143 of the 160 samples are profiled for mutations.** Use 143 as the mutation-frequency denominator (`sample_to_gene_panel_derived`, `alteration_type = 'MUTATION_EXTENDED'`), not the study's sample count — e.g. TP53 is mutated in 32/143 = 22.4%.
+
+## Patients vs Samples
+383 patients have clinical data, but only 153 of them have a sample (159 samples). Patient-level questions (age, sex, survival) use all patients with a value; genomic questions use the 143 mutation-profiled samples.
+
+## Clinical Attributes - Semantic Guide
+
+### Patient Demographics
+| Attribute | Description | Notes |
+|-----------|-------------|-------|
+| `AGE` | Age at diagnosis, **floored at 18** | Every patient younger than 18 is recorded as 18 (241 of 293). **Don't use it for age statistics** — use `DAYS_TO_BIRTH` |
+| `DAYS_TO_BIRTH` | Days from birth to diagnosis, negative | Age at diagnosis in years = `-DAYS_TO_BIRTH / 365.25`. 293 patients have a value; 90 are empty |
+| `SEX` | Patient sex | Male 172, Female 133, 78 empty |
+| `RACE`, `ETHNICITY` | Race, ethnicity | |
+
+### Disease Characteristics
+| Attribute | Description | Notes |
+|-----------|-------------|-------|
+| `CANCER_TYPE_DETAILED` | Cancer type | Osteosarcoma for every sample |
+| `PRIMARY_SITE_PATIENT` | Primary site | "Appendicular Skeleton" for every patient with a value — no finer location (femur, tibia) |
+
+No histological subtype, tumor necrosis / chemotherapy response, or event-free survival attributes exist in this study.
+
+### Clinical Outcomes
+| Attribute | Description | Notes |
+|-----------|-------------|-------|
+| `OS_MONTHS` | Overall survival in months | Time from diagnosis |
+| `OS_STATUS` | Overall survival status | 0:LIVING 171, 1:DECEASED 105, 107 empty |
+
+## Age at Diagnosis
+
+Compute age from `DAYS_TO_BIRTH`, not `AGE`. A median from `AGE` comes out as 18 because every child is recorded as 18; the real median is about 15 years.
+
+```sql
+SELECT
+    count() AS patients,
+    round(median(-toFloat64OrNull(attribute_value) / 365.25), 1) AS median_age_years,
+    round(min(-toFloat64OrNull(attribute_value) / 365.25), 1) AS min_age_years,
+    round(max(-toFloat64OrNull(attribute_value) / 365.25), 1) AS max_age_years
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'os_target_gdc'
+  AND attribute_name = 'DAYS_TO_BIRTH'
+  AND toFloat64OrNull(attribute_value) IS NOT NULL;
+-- 293 patients, median 15.2, range 3.6-87.1
+```
+
+When reporting, say the age comes from `DAYS_TO_BIRTH` and that `AGE` is floored at 18.
+
+## Notes & Caveats
+- This is a pediatric cancer cohort; age distribution is younger than adult studies
+- WES coverage means no gene panel filtering needed for frequency calculations
+- Part  … (66 more chars)
+
+◀ result
+{"columns":[]}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "top_cna_genes_in_study"
+}
+
+◀ result
+{"columns":[]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    hugo_gene_symbol,
+    countDistinct(sample_unique_id) AS altered_samples,
+    count() AS cna_events
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'os_target_gdc'
+  AND variant_type = 'cna'
+GROUP BY hugo_gene_symbol
+ORDER BY altered_samples DESC
+LIMIT 5;
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"LINC00901","altered_samples":32,"cna_events":32},{"hugo_gene_symbol":"RN7SL442P","altered_samples":31,"cna_events":31},{"hugo_gene_symbol":"RNA5SP436","altered_samples":30,"cna_events":30},{"hugo_gene_symbol":"FLII","altered_samples":30,"cna_events":30},{"hugo_gene_symbol":"TRPS1-AS1","altered_samples":30,"cna_events":30}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    COUNT(DISTINCT sample_unique_id) AS cna_profiled_samples
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'os_target_gdc'
+  AND variant_type = 'cna';
+",
+ "max_rows": 5
+}
+
+◀ result
+{"rows":[{"cna_profiled_samples":81}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "os_target_gdc"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"os_target_gdc","name":"Osteosarcoma (TARGET GDC, 2025)","sampleCount":159,"studyViewUrl":"https://www.cbioportal.org/study?id=os_target_gdc","metadata":{"clinicalAttributeIds":["AGE","CANCER_TYPE","CANCER_TYPE_DETAILED","DAYS_TO_BIRTH","DAYS_TO_DEATH","DISEASE_TYPE","ETHNICITY","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PRIMARY_DIAGNOSIS","PRIMARY_SITE_PATIENT","PROJECT_ID","RACE","SAMPLE_COUNT","SEX","SPECIMEN_TYPE","TMB_NONSYNONYMOUS","VITAL_STATUS"],"molecularProfileIds":["os_target_gdc_cna","os_target_gdc_mrna_seq_fpkm","os_target_gdc_mrna_seq_fpkm_Zscores","os_target_gdc_mrna_seq_read_counts_Zscores","os_target_gdc_mrna_seq_tpm","os_target_gdc_mrna_seq_tpm_Zscores","os_target_gdc_mutations","os_target_gdc_rna_seq_mrna"],"heatmapProfileIds":["os_target_gdc_mrna_seq_fpkm_Zscores","os_target_gdc_mrna_seq_read_counts_Zscores","os_target_gdc_mrna_seq_tpm_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "os_target_gdc"
+ ],
+ "genes": [
+  "LINC00901",
+  "RN7SL442P",
+  "RNA5SP436",
+  "FLII",
+  "TRPS1-AS1"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=os_target_gdc&gene_list=LINC00901%0ARN7SL442P%0ARNA5SP436%0AFLII%0ATRPS1-AS1&case_set_id=os_target_gdc_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=os_target_gdc&gene_list=LINC00901%0ARN7SL442P%0ARNA5SP436%0AFLII%0ATRPS1-AS1&case_set_id=os_target_gdc_all","data":{"studyIds":["os_target_gdc"],"studies":[{"studyId":"os_target_gdc","name":"Osteosarcoma (TARGET GDC, 2025)","sampleCount":159}],"genes":["LINC00901","RN7SL442P","RNA5SP436","FLII","TRPS1-AS1"],"caseSetId":"os_target_gdc_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## Top 5 Most Frequently Copy Number Altered Genes in Osteosarcoma (TARGET)
+
+Based on copy number alterations (amplifications and deep deletions) in the **Osteosarcoma (TARGET GDC, 2025)** study (81 CNA-profiled samples):
+
+| Rank | Gene | Altered Samples | Frequency |
+|------|------|-----------------|-----------|
+| 1 | LINC00901 | 32/81 | 39.5% |
+| 2 | RN7SL442P | 31/81 | 38.3% |
+| 3 | RNA5SP436 | 30/81 | 37.0% |
+| 4 | FLII | 30/81 | 37.0% |
+| 5 | TRPS1-AS1 | 30/81 | 37.0% |
+
+**Note:** The top genes are primarily non-coding RNAs (long intergenic non-coding RNA and small nucleolar RNAs). FLII is the only protein-coding gene in the top 5, which may be of greater functional interest for osteosarcoma biology.
+
+### View the Data
+[View copy number alterations in OncoPrint](https://www.cbioportal.org/results/oncoprint?cancer_study_list=os_target_gdc&gene_list=LINC00901%0ARN7SL442P%0ARNA5SP436%0AFLII%0ATRPS1-AS1&case_set_id=os_target_gdc_all)

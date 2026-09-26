@@ -1,0 +1,244 @@
+Q (haiku): Can you identify a mutations that are highly specific to a single cancer type?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Find mutations that are highly cancer-type specific
+-- Look for mutations that appear in one cancer type but are rare/absent in others
+WITH cancer_types AS (
+    SELECT DISTINCT cancer_type
+    FROM (
+        SELECT cd.attribute_value AS cancer_type
+        FROM clinical_data_derived cd
+        JOIN cancer_study_query_preferences csp ON cd.cancer_study_identifier = csp.cancer_study_identifier
+        WHERE csp.preference_name = 'pan_cancer_tcga'
+          AND cd.attribute_name = 'CANCER_TYPE'
+        ORDER BY cancer_type
+    )
+),
+mutation_by_cancer AS (
+    SELECT 
+        ged.hugo_gene_symbol,
+        ged.mutation_variant,
+        cd.attribute_value AS cancer_type,
+        COUNT(DISTINCT ged.sample_unique_id) AS samples_with_mutation
+    FROM genomic_event_derived ged
+    JOIN cancer_study_query_preferences csp ON ged.cancer_study_identifier = csp.cancer_study_identifier
+    JOIN clinical_data_derived cd ON ged.sample_unique_id = cd.sample_unique_id 
+        AND ged.cancer_study_identifier = cd.cancer_study_identifier
+    WHERE csp.preference_name = 'pan_cancer_tcga'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND cd.attribute_name = 'CANCER_TYPE'
+      AND ged.off_panel = 0
+    GROUP BY ged.hugo_gene_symbol, ged.mutation_variant, cd.attribute_value
+),
+mutation_totals AS (
+    SELECT 
+        hugo_gene_symbol,
+        mutation_variant,
+        SUM(samples_with_mutation) AS total_samples_with_mutation,
+        COUNT(DISTINCT cancer_type) AS num_cancer_types_with_mutation
+    FROM mutation_by_cancer
+    GROUP BY hugo_gene_symbol, mutation_variant
+),
+mutation_with_max AS (
+    SELECT 
+        mbc.hugo_gene_symbol,
+        mbc.mutation_variant,
+        mbc.cancer_type,
+        mbc.samples_with_mutation,
+        mt.total_samples_with_mutation,
+        mt.num_cancer_types_with_mutation,
+        MAX(mbc.samples_with_mutation) OVER (PARTITION BY mbc.hugo_gene_symbol, mbc.mutation_variant) AS max_samples_in_any_type
+    FROM mutation_by_cancer mbc
+    JOIN mutation_totals mt ON mbc.hugo_gene_symbol = mt.hugo_gene_symbol 
+        AND mbc.mutation_variant = mt.mutation_variant
+)
+SELECT 
+    hugo_gene_symbol,
+    mutation_variant,
+    cancer_type,
+    samples_with_mutation,
+    total_samples_with_mutation,
+    num_cancer_types_with_mutation,
+    ROUND(samples_with_mutation * 100.0 / NULLIF(total_samples_with_mutation, 0), 1) AS percent_of_total_mutation,
+    CASE 
+        WHEN samples_with_mutation = max_samples_in_any_type THEN 'PRIMARY'
+        ELSE 'secondary'
+    END AS prevalence_rank
+FROM mutation_with_max
+WHERE samples_with_mutation >= 5  -- At least 5 samples with this mutation
+  AND num_cancer_types_with_mutation = 1  -- Only in one cancer type
+  AND total_samples_with_mutation >= 10  -- Sufficient overall prevalence
+ORDER BY samples_with_mutation DESC
+LIMIT 50
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"NPM1","mutation_variant":"W288Cfs*12","cancer_type":"Leukemia","samples_with_mutation":51,"total_samples_with_mutation":51,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"BRAF","mutation_variant":"V600K","cancer_type":"Melanoma","samples_with_mutation":35,"total_samples_with_mutation":35,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"EGFR","mutation_variant":"L858R","cancer_type":"Non-Small Cell Lung Cancer","samples_with_mutation":23,"total_samples_with_mutation":23,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"EGFR","mutation_variant":"E746_A750del","cancer_type":"Non-Small Cell Lung Cancer","samples_with_mutation":17,"total_samples_with_mutation":17,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"APC","mutation_variant":"R216*","cancer_type":"Colorectal Cancer","samples_with_mutation":14,"total_samples_with_mutation":14,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"GATA3","mutation_variant":"P408Afs*99","cancer_type":"Breast Cancer","samples_with_mutation":13,"total_samples_with_mutation":13,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"KLHDC7A","mutation_variant":"E635K","cancer_type":"Melanoma","samples_with_mutation":12,"total_samples_with_mutation":12,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"OR11H1","mutation_variant":"G79E","cancer_type":"Melanoma","samples_with_mutation":11,"total_samples_with_mutation":11,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"OR4M2","mutation_variant":"S268F","cancer_type":"Melanoma","samples_with_mutation":11,"total_samples_with_mutation":11,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"PPP6C","mutation_variant":"R264C","cancer_type":"Melanoma","samples_with_mutation":11,"total_samples_with_mutation":11,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"APC","mutation_variant":"Q1378*","cancer_type":"Colorectal Cancer","samples_with_mutation":11,"total_samples_with_mutation":11,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"CNOT9","mutation_variant":"P131L","cancer_type":"Melanoma","samples_with_mutation":11,"total_samples_with_mutation":11,"num_cancer_types_with_mutation":1,"percent_of_total_mutation":100,"prevalence_rank":"PRIMARY"},{"hugo_gene_symbol":"FLT3","mutation_variant":"D835Y","cancer_type":"Leukemia","samples_ … (1828 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Identify high-frequency cancer-type-specific mutations
+-- Focus on mutations with strong cancer-type specificity (high prevalence in one type, absent in others)
+WITH cancer_mutation_freq AS (
+    SELECT 
+        ged.hugo_gene_symbol,
+        ged.mutation_variant,
+        cd.attribute_value AS cancer_type,
+        COUNT(DISTINCT ged.sample_unique_id) AS mutated_samples,
+        COUNT(DISTINCT CASE WHEN ged.off_panel = 0 THEN ged.sample_unique_id END) AS mutated_samples_on_panel
+    FROM genomic_event_derived ged
+    JOIN cancer_study_query_preferences csp ON ged.cancer_study_identifier = csp.cancer_study_identifier
+    JOIN clinical_data_derived cd ON ged.sample_unique_id = cd.sample_unique_id 
+        AND ged.cancer_study_identifier = cd.cancer_study_identifier
+    WHERE csp.preference_name = 'pan_cancer_tcga'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND cd.attribute_name = 'CANCER_TYPE'
+    GROUP BY ged.hugo_gene_symbol, ged.mutation_variant, cd.attribute_value
+),
+cancer_type_coverage AS (
+    SELECT 
+        cd.attribute_value AS cancer_type,
+        COUNT(DISTINCT ged.sample_unique_id) AS total_profiled_samples
+    FROM genomic_event_derived ged
+    JOIN cancer_study_query_preferences csp ON ged.cancer_study_identifier = csp.cancer_study_identifier
+    JOIN clinical_data_derived cd ON ged.sample_unique_id = cd.sample_unique_id 
+        AND ged.cancer_study_identifier = cd.cancer_study_identifier
+    WHERE csp.preference_name = 'pan_cancer_tcga'
+      AND ged.variant_type = 'mutation'
+      AND cd.attribute_name = 'CANCER_TYPE'
+    GROUP BY cd.attribute_value
+),
+mutation_specificity AS (
+    SELECT 
+        cmf.hugo_gene_symbol,
+        cmf.mutation_variant,
+        cmf.cancer_type,
+        cmf.mutated_samples_on_panel,
+        ctc.total_profiled_samples,
+        ROUND(cmf.mutated_samples_on_panel * 100.0 / NULLIF(ctc.total_profiled_samples, 0), 2) AS frequency_in_cancer_type,
+        COUNT(DISTINCT cmf.cancer_type) OVER (PARTITION BY cmf.hugo_gene_symbol, cmf.mutation_variant) AS num_cancer_types,
+        ROW_NUMBER() OVER (PARTITION BY cmf.hugo_gene_symbol, cmf.mutation_variant ORDER BY cmf.mutated_samples_on_panel DESC) AS rank_in_mutation
+    FROM cancer_mutation_freq cmf
+    JOIN cancer_type_coverage ctc ON cmf.cancer_type = ctc.cancer_type
+)
+SELECT 
+    hugo_gene_symbol,
+    mutation_variant,
+    cancer_type,
+    mutated_samples_on_panel AS samples_with_mutation,
+    total_profiled_samples,
+    frequency_in_cancer_type,
+    num_cancer_types,
+    rank_in_mutation
+FROM mutation_specificity
+WHERE num_cancer_types = 1  -- Specific to one cancer type
+  AND mutated_samples_on_panel >= 5  -- At least 5 samples
+  AND frequency_in_cancer_type >= 2.0  -- At least 2% frequency in that cancer type
+  AND rank_in_mutation = 1  -- Most common instance of this mutation
+ORDER BY frequency_in_cancer_type DESC
+LIMIT 30
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"NPM1","mutation_variant":"W288Cfs*12","cancer_type":"Leukemia","samples_with_mutation":51,"total_profiled_samples":199,"frequency_in_cancer_type":25.63,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"IGHV2-70","mutation_variant":"G52E","cancer_type":"Mature B-Cell Neoplasms","samples_with_mutation":5,"total_profiled_samples":37,"frequency_in_cancer_type":13.51,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"GNAQ","mutation_variant":"Q209L","cancer_type":"Ocular Melanoma","samples_with_mutation":10,"total_profiled_samples":80,"frequency_in_cancer_type":12.5,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"BRAF","mutation_variant":"V600K","cancer_type":"Melanoma","samples_with_mutation":35,"total_profiled_samples":440,"frequency_in_cancer_type":7.95,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"FLT3","mutation_variant":"D835Y","cancer_type":"Leukemia","samples_with_mutation":11,"total_profiled_samples":199,"frequency_in_cancer_type":5.53,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"BPIFC","mutation_variant":"X219_splice","cancer_type":"Leukemia","samples_with_mutation":10,"total_profiled_samples":199,"frequency_in_cancer_type":5.03,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"KLHDC7A","mutation_variant":"E635K","cancer_type":"Melanoma","samples_with_mutation":12,"total_profiled_samples":440,"frequency_in_cancer_type":2.73,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"APC","mutation_variant":"R216*","cancer_type":"Colorectal Cancer","samples_with_mutation":14,"total_profiled_samples":528,"frequency_in_cancer_type":2.65,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"FLT3","mutation_variant":"F594_D600dup","cancer_type":"Leukemia","samples_with_mutation":5,"total_profiled_samples":199,"frequency_in_cancer_type":2.51,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"SLIT2","mutation_variant":"X830_splice","cancer_type":"Leukemia","samples_with_mutation":5,"total_profiled_samples":199,"frequency_in_cancer_type":2.51,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"SLC27A5","mutation_variant":"T554I","cancer_type":"Melanoma","samples_with_mutation":11,"total_profiled_samples":440,"frequency_in_cancer_type":2.5,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"OR11H1","mutation_variant":"G79E","cancer_type":"Melanoma","samples_with_mutation":11,"total_profiled_samples":440,"frequency_in_cancer_type":2.5,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"OR4M2","mutation_variant":"S268F","cancer_type":"Melanoma","samples_with_mutation":11,"total_profiled_samples":440,"frequency_in_cancer_type":2.5,"num_cancer_types":1,"rank_in_mutation":1},{"hugo_gene_symbol":"CNOT9","mutation_variant":"P131L","cancer_type":"Melanoma","samples_with_mutation":11,"total_profiled_samples":440,"frequency_in_cancer_type":2.5,"num_cancer_types":1,"rank_in_mut … (2576 more chars)
+
+═ answer (success)
+Perfect! I've identified several mutations that are highly specific to individual cancer types. Here are the key findings:
+
+## Cancer-Type-Specific Mutations
+
+Based on the TCGA Pan-Cancer Atlas data, I've identified mutations that are **highly specific to a single cancer type** — present in that cancer type but essentially absent from all others:
+
+### **Top Cancer-Type-Specific Mutations**
+
+| Mutation | Gene | Cancer Type | Frequency | Samples |
+|----------|------|-------------|-----------|---------|
+| **W288Cfs*12** | **NPM1** | Leukemia | 25.6% | 51/199 |
+| **Q209L** | **GNAQ** | Ocular Melanoma | 12.5% | 10/80 |
+| **V600K** | **BRAF** | Melanoma | 8.0% | 35/440 |
+| **D835Y** | **FLT3** | Leukemia | 5.5% | 11/199 |
+| **X219_splice** | **BPIFC** | Leukemia | 5.0% | 10/199 |
+| **E635K** | **KLHDC7A** | Melanoma | 2.7% | 12/440 |
+| **R216*** | **APC** | Colorectal Cancer | 2.7% | 14/528 |
+| **L858R** | **EGFR** | Non-Small Cell Lung Cancer | 2.2% | 23/1030 |
+| **Q555*** | **KDM6A** | Bladder Cancer | 2.2% | 9/409 |
+| **N238S** | **ERCC2** | Bladder Cancer | 2.2% | 9/409 |
+
+### **Key Findings**
+
+**Most striking cancer-type-specific mutations:**
+
+1. **NPM1 W288Cfs*12 in Leukemia** — Found in 51 samples (25.6% of leukemia cases) and **absent from all other cancer types**. This is a hallmark of acute myeloid leukemia (AML).
+
+2. **GNAQ Q209L in Ocular Melanoma** — Present in 10/80 ocular melanoma samples (12.5%) and specific to this cancer type. GNAQ mutations are characteristic of ocular/uveal melanoma.
+
+3. **BRAF V600K in Melanoma** — 35 melanoma samples (8.0%) carry this specific BRAF V600K mutation, which is nearly exclusive to skin melanoma in this cohort.
+
+4. **FLT3 D835Y in Leukemia** — An internal tandem duplication-like mutation found only in leukemia (5.5%), a known poor prognostic marker in AML.
+
+5. **EGFR L858R in Lung Cancer** — The classic activating EGFR mutation found in 23/1,030 non-small cell lung cancer samples (2.2%), and not observed in other cancer types—particularly associated with adenocarcinoma.
+
+These mutations represent **lineage-specific genetic events** that can serve as biomarkers for cancer type classification and are often associated with specific pathogenic pathways unique to each cancer type.

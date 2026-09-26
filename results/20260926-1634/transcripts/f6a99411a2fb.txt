@@ -1,0 +1,277 @@
+Q (sonnet): Which genes are enriched for mutations between NSCLC vs squamous cell carcinoma?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ list_studies
+{
+ "search": "TCGA lung adenocarcinoma pan_can_atlas"
+}
+
+▶ list_studies
+{
+ "search": "TCGA lung squamous pan_can_atlas"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"luad","sample_count":566,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018"}]}
+
+◀ result
+{"result":[{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","name":"Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"lusc","sample_count":487,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT cancer_study_identifier, COUNT(DISTINCT sample_unique_id) AS profiled_samples
+FROM genomic_event_derived
+WHERE cancer_study_identifier IN ('luad_tcga_pan_can_atlas_2018','lusc_tcga_pan_can_atlas_2018')
+  AND profile_type = 'mutations'
+GROUP BY cancer_study_identifier
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `profile_type` in scope SELECT cancer_study_identifier, COUNTDistinct(sample_unique_id) AS profiled_samples FROM genomic_event_derived WHERE (cancer_study_identifier IN ('luad_tcga_pan_can_atlas_2018', 'lusc_tcga_pan_can_atlas_2018')) AND (profile_type = 'mutations') GROUP BY cancer_study_identifier. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT cancer_study_identifier, genetic_profile_stable_id, COUNT(DISTINCT sample_unique_id) AS n
+FROM genomic_event_derived
+WHERE cancer_study_identifier IN ('luad_tcga_pan_can_atlas_2018','lusc_tcga_pan_can_atlas_2018')
+  AND variant_type = 'mutation'
+GROUP BY cancer_study_identifier, genetic_profile_stable_id
+"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","genetic_profile_stable_id":"luad_tcga_pan_can_atlas_2018_mutations","n":561},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","genetic_profile_stable_id":"lusc_tcga_pan_can_atlas_2018_mutations","n":469}]}
+
+▶ clickhouse_run_select_query
+{
+ "__unparsedToolInput": {
+  "raw": "{\"max_rows\": 60\">
+<parameter name=\"query\">
+WITH gene_counts AS (
+  SELECT
+    hugo_gene_symbol,
+    cancer_study_identifier,
+    COUNT(DISTINCT sample_unique_id) AS altered
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier IN ('luad_tcga_pan_can_atlas_2018','lusc_tcga_pan_can_atlas_2018')
+    AND variant_type = 'mutation'
+    AND mutation_status != 'UNCALLED'
+    AND off_panel = 0
+  GROUP BY hugo_gene_symbol, cancer_study_identifier
+)
+SELECT
+  hugo_gene_symbol,
+  sumIf(altered, cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018') AS luad_altered,
+  sumIf(altered, cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018') AS lusc_altered
+FROM gene_counts
+GROUP BY hugo_gene_symbol
+ORDER BY (luad_altered + lusc_altered) DESC
+LIMIT 30
+}",
+  "len": 757
+ }
+}
+
+✗ error
+<tool_use_error>InputValidationError: mcp__claude_ai_cBioPortal_MCP__clickhouse_run_select_query was called with input that could not be parsed as JSON.
+You sent (first 200 of 757 bytes): {"max_rows": 60">
+<parameter name="query">
+WITH gene_counts AS (
+  SELECT
+    hugo_gene_symbol,
+    cancer_study_identifier,
+    COUNT(DISTINCT sample_unique_id) AS altered
+  FROM genomic_event_derive
+Common causes: unescaped backslashes in file paths (use / or \\), unescaped control characters, or truncated output. Retry with valid JSON.</tool_use_error>
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH gene_counts AS (
+  SELECT
+    hugo_gene_symbol,
+    cancer_study_identifier,
+    COUNT(DISTINCT sample_unique_id) AS altered
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier IN ('luad_tcga_pan_can_atlas_2018','lusc_tcga_pan_can_atlas_2018')
+    AND variant_type = 'mutation'
+    AND mutation_status != 'UNCALLED'
+    AND off_panel = 0
+  GROUP BY hugo_gene_symbol, cancer_study_identifier
+)
+SELECT
+  hugo_gene_symbol,
+  sumIf(altered, cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018') AS luad_altered,
+  sumIf(altered, cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018') AS lusc_altered
+FROM gene_counts
+GROUP BY hugo_gene_symbol
+ORDER BY (luad_altered + lusc_altered) DESC
+LIMIT 30",
+ "max_rows": 30
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"TP53","luad_altered":295,"lusc_altered":404},{"hugo_gene_symbol":"TTN","luad_altered":272,"lusc_altered":345},{"hugo_gene_symbol":"CSMD3","luad_altered":226,"lusc_altered":209},{"hugo_gene_symbol":"MUC16","luad_altered":242,"lusc_altered":188},{"hugo_gene_symbol":"RYR2","luad_altered":217,"lusc_altered":192},{"hugo_gene_symbol":"LRP1B","luad_altered":201,"lusc_altered":171},{"hugo_gene_symbol":"USH2A","luad_altered":177,"lusc_altered":160},{"hugo_gene_symbol":"ZFHX4","luad_altered":185,"lusc_altered":143},{"hugo_gene_symbol":"SPTA1","luad_altered":148,"lusc_altered":97},{"hugo_gene_symbol":"XIRP2","luad_altered":150,"lusc_altered":93},{"hugo_gene_symbol":"SYNE1","luad_altered":81,"lusc_altered":151},{"hugo_gene_symbol":"FLG","luad_altered":145,"lusc_altered":84},{"hugo_gene_symbol":"NAV3","luad_altered":123,"lusc_altered":104},{"hugo_gene_symbol":"PCDH15","luad_altered":118,"lusc_altered":93},{"hugo_gene_symbol":"CSMD1","luad_altered":125,"lusc_altered":82},{"hugo_gene_symbol":"RYR3","luad_altered":106,"lusc_altered":99},{"hugo_gene_symbol":"FAM135B","luad_altered":86,"lusc_altered":118},{"hugo_gene_symbol":"COL11A1","luad_altered":120,"lusc_altered":84},{"hugo_gene_symbol":"FAT3","luad_altered":121,"lusc_altered":82},{"hugo_gene_symbol":"PCLO","luad_altered":109,"lusc_altered":88},{"hugo_gene_symbol":"PAPPA2","luad_altered":101,"lusc_altered":89},{"hugo_gene_symbol":"MUC17","luad_altered":111,"lusc_altered":78},{"hugo_gene_symbol":"CDH10","luad_altered":92,"lusc_altered":97},{"hugo_gene_symbol":"ZNF536","luad_altered":117,"lusc_altered":64},{"hugo_gene_symbol":"ADAMTS12","luad_altered":99,"lusc_altered":81},{"hugo_gene_symbol":"RYR1","luad_altered":95,"lusc_altered":83},{"hugo_gene_symbol":"APOB","luad_altered":104,"lusc_altered":73},{"hugo_gene_symbol":"SI","luad_altered":93,"lusc_altered":84},{"hugo_gene_symbol":"ANK2","luad_altered":111,"lusc_altered":65},{"hugo_gene_symbol":"DNAH9","luad_altered":99,"lusc_altered":77}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH gene_counts AS (
+  SELECT
+    hugo_gene_symbol,
+    cancer_study_identifier,
+    COUNT(DISTINCT sample_unique_id) AS altered
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier IN ('luad_tcga_pan_can_atlas_2018','lusc_tcga_pan_can_atlas_2018')
+    AND variant_type = 'mutation'
+    AND mutation_status != 'UNCALLED'
+    AND off_panel = 0
+    AND hugo_gene_symbol IN ('TP53','KRAS','EGFR','STK11','KEAP1','NFE2L2','PIK3CA','PTEN','CDKN2A','SOX2','NOTCH1','FAT1','ARID1A','RB1','BRAF','MET','SMARCA4','ATM')
+  GROUP BY hugo_gene_symbol, cancer_study_identifier
+)
+SELECT
+  hugo_gene_symbol,
+  sumIf(altered, cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018') AS luad_altered,
+  561 - sumIf(altered, cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018') AS luad_unaltered,
+  sumIf(altered, cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018') AS lusc_altered,
+  469 - sumIf(altered, cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018') AS lusc_unaltered
+FROM gene_counts
+GROUP BY hugo_gene_symbol
+ORDER BY hugo_gene_symbol",
+ "max_rows": 30
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"ARID1A","luad_altered":35,"luad_unaltered":526,"lusc_altered":32,"lusc_unaltered":437},{"hugo_gene_symbol":"ATM","luad_altered":47,"luad_unaltered":514,"lusc_altered":29,"lusc_unaltered":440},{"hugo_gene_symbol":"BRAF","luad_altered":41,"luad_unaltered":520,"lusc_altered":15,"lusc_unaltered":454},{"hugo_gene_symbol":"CDKN2A","luad_altered":25,"luad_unaltered":536,"lusc_altered":73,"lusc_unaltered":396},{"hugo_gene_symbol":"EGFR","luad_altered":70,"luad_unaltered":491,"lusc_altered":14,"lusc_unaltered":455},{"hugo_gene_symbol":"FAT1","luad_altered":60,"luad_unaltered":501,"lusc_altered":68,"lusc_unaltered":401},{"hugo_gene_symbol":"KEAP1","luad_altered":102,"luad_unaltered":459,"lusc_altered":49,"lusc_unaltered":420},{"hugo_gene_symbol":"KRAS","luad_altered":168,"luad_unaltered":393,"lusc_altered":7,"lusc_unaltered":462},{"hugo_gene_symbol":"MET","luad_altered":21,"luad_unaltered":540,"lusc_altered":8,"lusc_unaltered":461},{"hugo_gene_symbol":"NFE2L2","luad_altered":18,"luad_unaltered":543,"lusc_altered":72,"lusc_unaltered":397},{"hugo_gene_symbol":"NOTCH1","luad_altered":25,"luad_unaltered":536,"lusc_altered":38,"lusc_unaltered":431},{"hugo_gene_symbol":"PIK3CA","luad_altered":28,"luad_unaltered":533,"lusc_altered":53,"lusc_unaltered":416},{"hugo_gene_symbol":"PTEN","luad_altered":10,"luad_unaltered":551,"lusc_altered":51,"lusc_unaltered":418},{"hugo_gene_symbol":"RB1","luad_altered":34,"luad_unaltered":527,"lusc_altered":31,"lusc_unaltered":438},{"hugo_gene_symbol":"SMARCA4","luad_altered":46,"luad_unaltered":515,"lusc_altered":17,"lusc_unaltered":452},{"hugo_gene_symbol":"SOX2","luad_altered":1,"luad_unaltered":560,"lusc_altered":3,"lusc_unaltered":466},{"hugo_gene_symbol":"STK11","luad_altered":75,"luad_unaltered":486,"lusc_altered":5,"lusc_unaltered":464},{"hugo_gene_symbol":"TP53","luad_altered":295,"luad_unaltered":266,"lusc_altered":404,"lusc_unaltered":65}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 2 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":2,"studiesWithMetadata":[{"studyId":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":566,"studyViewUrl":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["luad_tcga_pan_can_atlas_2018_gistic","luad_tcga_pan_can_atlas_2018_log2CNA","luad_tcga_pan_can_atlas_2018_mutations","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","luad_tcga_pan_can_atlas_2018_rppa","luad_tcga_pan_can_atlas_2018_rppa_Zscores","luad_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["luad_tcga_pan_can_atlas_2018_armlevel_cna","luad_tcga_pan_can_atlas_2018_genetic_ancestry","luad_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","luad_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","luad_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}},{"studyId":"lusc_tcga_pan_can_atlas_2018","name":"Lung Squamous Cell … (2585 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "LUAD",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "CANCER_TYPE_ACRONYM",
+      "values": [
+       {
+        "value": "LUAD"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "LUSC",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "CANCER_TYPE_ACRONYM",
+      "values": [
+       {
+        "value": "LUSC"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "alterations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/alterations?comparisonId=6a8d24e6e497aad535936dc4","url":"https://www.cbioportal.org/comparison/alterations?comparisonId=6a8d24e6e497aad535936dc4","data":{"description":"Group comparison (2 custom groups)","studies":["luad_tcga_pan_can_atlas_2018","lusc_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"LUAD","sampleCount":566},{"name":"LUSC","sampleCount":487}],"studyViewUrl":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"LUAD","url":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE_ACRONYM%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LUAD%22%7D%5D%7D%5D%7D"},{"groupName":"LUSC","url":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE_ACRONYM%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LUSC%22%7D%5D%7D%5D%7D"}],"pageDescription":"Comparison of genomic alteration rates across LUAD (566) vs LUSC (487)."}}
+
+═ answer (success)
+## Interpretation used
+
+Since squamous cell carcinoma of the lung (LUSC) is itself an NSCLC subtype, "NSCLC vs. squamous cell carcinoma" was treated as the two major NSCLC histologies compared head-to-head: **Lung Adenocarcinoma (LUAD)** vs. **Lung Squamous Cell Carcinoma (LUSC)**, using the TCGA PanCancer Atlas cohorts (the field's reference comparison for this contrast).
+
+- **LUAD**: 566 samples, 561 mutation-profiled
+- **LUSC**: 487 samples, 469 mutation-profiled
+
+## What the data shows (counts only — no test run)
+
+I can't compute a p-value or formally declare "enrichment" here — that requires Fisher's exact test per gene (with multiple-testing correction across the genome), which ClickHouse doesn't run. What I can give you is the mutated-sample counts and frequencies for canonical lung-cancer driver genes, which is where the LUAD/LUSC difference is most biologically interpretable (rather than the raw top-mutated-gene list, which is dominated by very large genes like TTN, MUC16, CSMD3 that scale with tumor mutation burden in both histologies and aren't drivers):
+
+| Gene | LUAD altered/profiled (%) | LUSC altered/profiled (%) | Direction |
+|---|---|---|---|
+| KRAS | 168/561 (29.9%) | 7/469 (1.5%) | LUAD-skewed |
+| STK11 | 75/561 (13.4%) | 5/469 (1.1%) | LUAD-skewed |
+| EGFR | 70/561 (12.5%) | 14/469 (3.0%) | LUAD-skewed |
+| KEAP1 | 102/561 (18.2%) | 49/469 (10.4%) | LUAD-skewed |
+| BRAF | 41/561 (7.3%) | 15/469 (3.2%) | LUAD-skewed |
+| SMARCA4 | 46/561 (8.2%) | 17/469 (3.6%) | LUAD-skewed |
+| TP53 | 295/561 (52.6%) | 404/469 (86.1%) | LUSC-skewed |
+| PTEN | 10/561 (1.8%) | 51/469 (10.9%) | LUSC-skewed |
+| NFE2L2 | 18/561 (3.2%) | 72/469 (15.4%) | LUSC-skewed |
+| CDKN2A | 25/561 (4.5%) | 73/469 (15.6%) | LUSC-skewed |
+| PIK3CA | 28/561 (5.0%) | 53/469 (11.3%) | LUSC-skewed |
+| NOTCH1 | 25/561 (4.5%) | 38/469 (8.1%) | LUSC-skewed |
+| FAT1 | 60/561 (10.7%) | 68/469 (14.5%) | roughly similar |
+| ARID1A | 35/561 (6.2%) | 32/469 (6.8%) | roughly similar |
+| RB1 | 34/561 (6.1%) | 31/469 (6.6%) | roughly similar |
+
+These directional gaps (e.g., KRAS 30% vs 1.5%, TP53 53% vs 86%) are large enough that formal Fisher's exact tests would very likely confirm significant enrichment in each direction, but that determination should come from the test itself, not from counts alone. To get the exact odds ratios and q-values (with FDR correction across all genes), use cBioPortal's built-in comparison:
+
+[Group Comparison: LUAD vs. LUSC — Alterations tab](https://www.cbioportal.org/comparison/alterations?comparisonId=6a8d24e6e497aad535936dc4)
+
+This runs Fisher's exact test (and Benjamini-Hochberg-adjusted q-values) on every gene automatically and will give you the ranked, statistically-supported enrichment list, plus visualizations (lollipop/oncoprint) for genes of interest.
+
+If you instead meant a different comparison — e.g., all-NSCLC-combined vs. LUSC-alone, or a specific non-TCGA cohort — let me know and I'll rerun this.

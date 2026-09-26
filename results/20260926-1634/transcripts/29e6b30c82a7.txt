@@ -1,0 +1,182 @@
+Q (sonnet): Which cancer types show the highest frequency of BRAF V600E mutations across all TCGA Pan-Cancer Atlas studies?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = 'CANCER_TYPE'
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.hugo_gene_symbol = 'BRAF'
+      AND ged.mutation_variant = 'V600E'
+      AND ged.off_panel = 0
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM mutation_panel_gene_coverage
+    WHERE hugo_gene_symbol = 'BRAF'
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM mutation_wes_coverage
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 2) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples >= 50
+ORDER BY frequency_pct DESC;
+"
+}
+
+◀ result
+{"rows":[{"cancer_type":"Thyroid Cancer","altered_samples":284,"profiled_samples":490,"frequency_pct":57.96},{"cancer_type":"Melanoma","altered_samples":158,"profiled_samples":440,"frequency_pct":35.91},{"cancer_type":"Colorectal Cancer","altered_samples":48,"profiled_samples":534,"frequency_pct":8.99},{"cancer_type":"Glioblastoma","altered_samples":5,"profiled_samples":397,"frequency_pct":1.26},{"cancer_type":"Non-Small Cell Lung Cancer","altered_samples":9,"profiled_samples":1050,"frequency_pct":0.86},{"cancer_type":"Renal Non-Clear Cell Carcinoma","altered_samples":2,"profiled_samples":341,"frequency_pct":0.59},{"cancer_type":"Bladder Cancer","altered_samples":1,"profiled_samples":410,"frequency_pct":0.24},{"cancer_type":"Head and Neck Cancer","altered_samples":1,"profiled_samples":515,"frequency_pct":0.19},{"cancer_type":"Glioma","altered_samples":1,"profiled_samples":514,"frequency_pct":0.19}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "thyroid_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":false,"error":"Invalid study ID(s): thyroid_tcga_pan_can_atlas_2018","details":{"invalidIds":["thyroid_tcga_pan_can_atlas_2018"],"providedIds":["thyroid_tcga_pan_can_atlas_2018","skcm_tcga_pan_can_atlas_2018"]}}
+
+▶ resolve_and_route
+{
+ "studyKeywords": [
+  "thyroid",
+  "TCGA",
+  "pan_can_atlas"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"thca_tcga_pan_can_atlas_2018","name":"Thyroid Carcinoma (TCGA, PanCancer Atlas)","sampleCount":500,"studyViewUrl":"https://www.cbioportal.org/study?id=thca_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["thca_tcga_pan_can_atlas_2018_gistic","thca_tcga_pan_can_atlas_2018_log2CNA","thca_tcga_pan_can_atlas_2018_mutations","thca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","thca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","thca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","thca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","thca_tcga_pan_can_atlas_2018_rppa","thca_tcga_pan_can_atlas_2018_rppa_Zscores","thca_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["thca_tcga_pan_can_atlas_2018_armlevel_cna","thca_tcga_pan_can_atlas_2018_genetic_ancestry","thca_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","thca_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["thca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","thca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","thca_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","thca_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "skcm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"skcm_tcga_pan_can_atlas_2018","name":"Skin Cutaneous Melanoma (TCGA, PanCancer Atlas)","sampleCount":448,"studyViewUrl":"https://www.cbioportal.org/study?id=skcm_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["skcm_tcga_pan_can_atlas_2018_gistic","skcm_tcga_pan_can_atlas_2018_log2CNA","skcm_tcga_pan_can_atlas_2018_mutations","skcm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","skcm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","skcm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","skcm_tcga_pan_can_atlas_2018_rppa","skcm_tcga_pan_can_atlas_2018_rppa_Zscores","skcm_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["skcm_tcga_pan_can_atlas_2018_armlevel_cna","skcm_tcga_pan_can_atlas_2018_genetic_ancestry","skcm_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","skcm_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["skcm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","skcm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","skcm_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "thca_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "BRAF: MUT = V600E"
+ ],
+ "tab": "mutations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/mutations?cancer_study_list=thca_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018&gene_list=BRAF%3A+MUT+%3D+V600E&case_set_id=all","url":"https://www.cbioportal.org/results/mutations?cancer_study_list=thca_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018&gene_list=BRAF%3A+MUT+%3D+V600E&case_set_id=all","data":{"studyIds":["thca_tcga_pan_can_atlas_2018","skcm_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"thca_tcga_pan_can_atlas_2018","name":"Thyroid Carcinoma (TCGA, PanCancer Atlas)","sampleCount":500},{"studyId":"skcm_tcga_pan_can_atlas_2018","name":"Skin Cutaneous Melanoma (TCGA, PanCancer Atlas)","sampleCount":448}],"genes":["BRAF"],"caseSetId":"all","pageDescription":"Detailed mutation table with lollipop plot showing mutation positions, types, and frequencies for queried genes."}}
+
+═ answer (success)
+## BRAF V600E mutation frequency across TCGA Pan-Cancer Atlas studies
+
+Using the 32-study TCGA PanCancer Atlas cohort (patients/samples grouped by `CANCER_TYPE`, gene-specific profiled denominators, cancer types with ≥50 BRAF-profiled samples shown):
+
+| Cancer type | BRAF V600E samples | Profiled samples | Frequency |
+|---|---|---|---|
+| **Thyroid Cancer** | 284 | 490 | **58.0%** |
+| **Melanoma** (skin cutaneous) | 158 | 440 | **35.9%** |
+| Colorectal Cancer | 48 | 534 | 9.0% |
+| Glioblastoma | 5 | 397 | 1.3% |
+| Non-Small Cell Lung Cancer | 9 | 1,050 | 0.9% |
+| Renal Non-Clear Cell Carcinoma | 2 | 341 | 0.6% |
+| Bladder Cancer | 1 | 410 | 0.2% |
+| Head and Neck Cancer | 1 | 515 | 0.2% |
+| Glioma | 1 | 514 | 0.2% |
+
+**Thyroid Cancer** (papillary thyroid carcinoma, driven largely by classical BRAF V600E biology) and **Melanoma** are by far the most enriched, together accounting for the large majority of V600E events in this cohort. Colorectal cancer shows a modest ~9% rate — consistent with the known subset of BRAF-mutant, often MSI-high/serrated-pathway colorectal tumors. All other cancer types show V600E in well under 2% of profiled samples.
+
+Note: frequencies use sample-level counts with the gene-specific profiled denominator (samples actually assayed for BRAF), not the total study size.
+
+**Explore further:**
+- [BRAF V600E mutation details — Thyroid Carcinoma & Melanoma (TCGA PanCancer Atlas)](https://www.cbioportal.org/results/mutations?cancer_study_list=thca_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018&gene_list=BRAF%3A+MUT+%3D+V600E&case_set_id=all) — lollipop plot and per-study mutation table.
+- [Thyroid Carcinoma cohort overview](https://www.cbioportal.org/study?id=thca_tcga_pan_can_atlas_2018)
+- [Melanoma cohort overview](https://www.cbioportal.org/study?id=skcm_tcga_pan_can_atlas_2018)
+
+To see all 32 studies together in one OncoPrint (rather than just the top two), let me know and I can widen the results-view query to the full pan-cancer cohort.

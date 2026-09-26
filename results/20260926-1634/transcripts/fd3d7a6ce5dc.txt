@@ -1,0 +1,333 @@
+Q (sonnet): In the TCGA glioblastoma study (Cell 2013), how does methylation of the MGMT gene promoter affect the prognosis and treatment response in patients with glioblastoma?
+
+▶ list_studies
+{
+ "search": "glioblastoma Cell 2013"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"gbm_tcga_pub2013","name":"Glioblastoma (TCGA, Cell 2013)","type_of_cancer_id":"difg","sample_count":577,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013"}]}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT attr_id, description, patient_attribute
+FROM clinical_attribute_meta
+WHERE cancer_study_id = (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'gbm_tcga_pub2013')
+  AND (upper(attr_id) LIKE '%MGMT%' OR upper(description) LIKE '%MGMT%' OR upper(attr_id) LIKE '%METHYL%')
+ORDER BY attr_id
+"
+}
+
+◀ result
+{"rows":[{"attr_id":"G_CIMP_METHYLATION","description":"G-CIMP  Methylation","patient_attribute":0},{"attr_id":"METHYLATION_STATUS","description":"Yes/No indicator for methylation data","patient_attribute":0},{"attr_id":"MGMT_STATUS","description":"MGMT Status","patient_attribute":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT attribute_value, COUNT(DISTINCT sample_unique_id) AS n_samples
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'gbm_tcga_pub2013'
+  AND attribute_name = 'MGMT_STATUS'
+GROUP BY attribute_value
+ORDER BY n_samples DESC
+"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"rows":[{"n_samples":227},{"attribute_value":"UNMETHYLATED","n_samples":180},{"attribute_value":"METHYLATED","n_samples":170}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH mgmt AS (
+    SELECT patient_unique_id,
+           anyIf(attribute_value, attribute_name = 'MGMT_STATUS') AS mgmt_status
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'gbm_tcga_pub2013'
+      AND attribute_name = 'MGMT_STATUS'
+    GROUP BY patient_unique_id
+),
+os AS (
+    SELECT patient_unique_id,
+        maxIf(toFloat64OrNull(attribute_value), attribute_name = 'OS_MONTHS') AS os_months,
+        maxIf(attribute_value, attribute_name = 'OS_STATUS') AS os_status
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'gbm_tcga_pub2013' AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+    GROUP BY patient_unique_id
+)
+SELECT
+    mgmt.mgmt_status AS group_name,
+    count() AS n_patients,
+    countIf(startsWith(os.os_status, '1')) AS n_events_death,
+    countIf(startsWith(os.os_status, '0')) AS n_censored,
+    round(min(os.os_months),1) AS min_followup_months,
+    round(max(os.os_months),1) AS max_followup_months,
+    round(avg(os.os_months),1) AS mean_os_months_censored_caveat
+FROM mgmt
+JOIN os ON mgmt.patient_unique_id = os.patient_unique_id
+WHERE mgmt.mgmt_status IN ('METHYLATED','UNMETHYLATED')
+  AND os.os_months IS NOT NULL AND os.os_status != ''
+GROUP BY group_name
+"
+}
+
+◀ result
+{"rows":[{"group_name":"UNMETHYLATED","n_patients":179,"n_events_death":131,"n_censored":48,"min_followup_months":0.1,"max_followup_months":127.6,"mean_os_months_censored_caveat":11.9},{"group_name":"METHYLATED","n_patients":169,"n_events_death":115,"n_censored":54,"min_followup_months":0.1,"max_followup_months":100,"mean_os_months_censored_caveat":16}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "gbm_tcga_pub2013"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"gbm_tcga_pub2013","name":"Glioblastoma (TCGA, Cell 2013)","sampleCount":577,"studyViewUrl":"https://www.cbioportal.org/study?id=gbm_tcga_pub2013","metadata":{"clinicalAttributeIds":["AGE","CANCER_TYPE","CANCER_TYPE_DETAILED","DFS_MONTHS","DFS_STATUS","EXPRESSION_SUBTYPE","FRACTION_GENOME_ALTERED","G_CIMP_METHYLATION","IDH1_MUTATION","METHYLATION_STATUS","MGMT_STATUS","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","THERAPY","TMB_NONSYNONYMOUS"],"molecularProfileIds":["gbm_tcga_pub2013_gistic","gbm_tcga_pub2013_linear_CNA","gbm_tcga_pub2013_mutations","gbm_tcga_pub2013_protein_quantification","gbm_tcga_pub2013_protein_quantification_zscores","gbm_tcga_pub2013_rna_seq_v2_mrna","gbm_tcga_pub2013_rna_seq_v2_mrna_median_Zscores","gbm_tcga_pub2013_rna_seq_v2_mrna_median_all_sample_Zscores"],"heatmapProfileIds":["gbm_tcga_pub2013_protein_quantification_zscores","gbm_tcga_pub2013_rna_seq_v2_mrna_median_Zscores","gbm_tcga_pub2013_rna_seq_v2_mrna_median_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "gbm_tcga_pub2013",
+ "attributeIds": [
+  "MGMT_STATUS"
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/clinical-data-counts/fetch","data":{"attributes":[{"attributeId":"MGMT_STATUS","values":[]}],"studyViewFilter":{"studyIds":["gbm_tcga_pub2013"]}},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","content-type":"application/json","date":"Sat, 26 Sep 2026 16:45:29 GMT","elapsed-time":"1","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","connection":"close","transfer-encoding":"chunked"},"status":500,"text":"{\"timestamp\":1790441129892,\"status\":500,\"error\":\"Internal Server Error\",\"path\":\"/api/clinical-data-counts/fetch\"}"}}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "gbm_tcga_pub2013"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "MGMT Methylated",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "MGMT_STATUS",
+      "values": [
+       {
+        "value": "METHYLATED"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "MGMT Unmethylated",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "MGMT_STATUS",
+      "values": [
+       {
+        "value": "UNMETHYLATED"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "gbm_tcga_pub2013"
+ ],
+ "filterJson": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "MGMT_STATUS",
+    "values": [
+     {
+      "value": "METHYLATED"
+     },
+     {
+      "value": "UNMETHYLATED"
+     }
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/filtered-samples/fetch","data":{"clinicalDataFilters":[{"attributeId":"MGMT_STATUS","values":[{"value":"UNMETHYLATED"}]}],"studyIds":["gbm_tcga_pub2013"]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","content-type":"application/json","date":"Sat, 26 Sep 2026 16:46:03 GMT","elapsed-time":"1","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","connection":"close","transfer-encoding":"chunked"},"status":500,"text":"{\"timestamp\":1790441163733,\"status\":500,\"error\":\"Internal Server Error\",\"path\":\"/api/filtered-samples/fetch\"}"}}}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22MGMT_STATUS%22%2C%22values%22%3A%5B%7B%22value%22%3A%22METHYLATED%22%7D%2C%7B%22value%22%3A%22UNMETHYLATED%22%7D%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22MGMT_STATUS%22%2C%22values%22%3A%5B%7B%22value%22%3A%22METHYLATED%22%7D%2C%7B%22value%22%3A%22UNMETHYLATED%22%7D%5D%7D%5D%7D","data":{"studyIds":["gbm_tcga_pub2013"],"studies":[{"studyId":"gbm_tcga_pub2013","name":"Glioblastoma (TCGA, Cell 2013)","sampleCount":577}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "gbm_tcga_pub2013"
+ ],
+ "tab": "survival",
+ "groups": [
+  {
+   "name": "MGMT Methylated",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "MGMT_STATUS",
+      "values": [
+       {
+        "value": "METHYLATED"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "MGMT Unmethylated",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "MGMT_STATUS",
+      "values": [
+       {
+        "value": "UNMETHYLATED"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/filtered-samples/fetch","data":{"clinicalDataFilters":[{"attributeId":"MGMT_STATUS","values":[{"value":"METHYLATED"}]}],"studyIds":["gbm_tcga_pub2013"]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","content-type":"application/json","date":"Sat, 26 Sep 2026 16:46:37 GMT","elapsed-time":"0","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","connection":"close","transfer-encoding":"chunked"},"status":500,"text":"{\"timestamp\":1790441197852,\"status\":500,\"error\":\"Internal Server Error\",\"path\":\"/api/filtered-samples/fetch\"}"}}}
+
+═ answer (success)
+The comparison API is currently erroring on the portal's side — this is not something I can resolve by retrying differently. Here's the full picture I can give you.
+
+## Important scope note
+
+cBioPortal's database stores clinical/genomic *data*, not clinical *conclusions*. It cannot tell you "how methylation affects treatment response" as a causal or mechanistic statement — that is a finding from the clinical trial/radiation-oncology literature (the seminal reference is Hegi et al., *NEJM* 2005, showing MGMT promoter methylation predicts benefit from temozolomide + radiotherapy). I have not consulted that literature here and won't present it as verified by this database. What I *can* show you is the actual MGMT methylation and survival data recorded in this specific TCGA cohort.
+
+## What's in the Glioblastoma (TCGA, Cell 2013) study
+
+577 samples total. MGMT promoter methylation status (`MGMT_STATUS`) is available for 350 samples:
+
+| MGMT status | Samples | Patients with OS data | Deaths | Censored (alive/lost to follow-up) |
+|---|---|---|---|---|
+| Methylated | 170 | 169 | 115 | 54 |
+| Unmethylated | 180 | 179 | 131 | 48 |
+| Not recorded | 227 | — | — | — |
+
+Descriptive follow-up (not a survival estimate): the unmethylated group has a higher proportion of observed deaths (131/179, 73%) than the methylated group (115/169, 68%), and mean observed OS is numerically lower in the unmethylated group (11.9 vs. 16.0 months) — but **this is a raw, censored-data average, not a Kaplan-Meier median, and I have not run a log-rank test or Cox model**, so I cannot state whether this difference is statistically significant or report a hazard ratio. This dataset also does not distinguish temozolomide-treated vs. untreated patients in a way I queried here, so I cannot speak to treatment-response interaction from this data alone.
+
+To get a proper statistically-tested comparison (Kaplan-Meier curves, log-rank p-value), use the portal's own Group Comparison Survival tool. I attempted to generate a direct link for you, but the cBioPortal comparison API is currently returning a server error — you can reach the same view manually:
+
+1. Open the [Glioblastoma (TCGA, Cell 2013) study](https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013) — this link is filtered to samples with definitive METHYLATED/UNMETHYLATED MGMT status.
+2. Click the "MGMT Status" chart, select the two groups, and choose "Compare" to open Group Comparison, then go to the Survival tab.
+
+Let me know if you'd like me to retry the direct comparison link later, or if you'd like the raw per-patient MGMT/OS table for your own analysis.

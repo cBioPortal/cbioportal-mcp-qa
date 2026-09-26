@@ -1,0 +1,196 @@
+Q (sonnet): What are the top 5 most common primary diagnosis sites in the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_value AS primary_site,
+       COUNT(DISTINCT patient_unique_id) AS patient_count
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'msk_chord_2024'
+  AND attribute_name = 'PRIMARY_SITE'
+GROUP BY attribute_value
+ORDER BY patient_count DESC
+LIMIT 10"
+}
+
+◀ result
+{"rows":[{"primary_site":"Lung","patient_count":7773},{"primary_site":"Breast","patient_count":5358},{"primary_site":"Prostate","patient_count":3208},{"primary_site":"Pancreas","patient_count":3104},{"primary_site":"Colon","patient_count":2516},{"primary_site":"Rectum","patient_count":1261},{"primary_site":"Sigmoid Colon","patient_count":501},{"primary_site":"Ascending Colon","patient_count":293},{"primary_site":"Cecum","patient_count":265},{"primary_site":"Rectosigmoid Colon","patient_count":258}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","metadata":{"clinicalAttributeIds":["ADRENAL_GLANDS","BONE","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_GROUP","CLINICAL_SUMMARY","CNS_BRAIN","CURRENT_AGE_DEID","DIAGNOSIS_DESCRIPTION","ETHNICITY","FRACTION_GENOME_ALTERED","GENDER","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","GLEASON_SAMPLE_LEVEL","HER2","HISTORY_OF_PDL1","HR","ICD_O_HISTOLOGY_DESCRIPTION","INTRA_ABDOMINAL","LIVER","LUNG","LYMPH_NODES","METASTATIC_SITE","MSI_COMMENT","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","NUM_ICDO_DX","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER","PATHOLOGICAL_GROUP","PDL1_POSITIVE","PLEURA","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","REPRODUCTIVE_ORGANS","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["msk_chord_2024_cna","msk_chord_2024_mutations","msk_chord_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "tab": "summary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=msk_chord_2024","url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"tab":"summary","hasFilters":false,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+In the [MSK-CHORD (MSK, Nature 2024)](https://www.cbioportal.org/study/summary?id=msk_chord_2024) study (24,950 patients), the top 5 primary diagnosis sites (`PRIMARY_SITE` attribute, counted by patient) are:
+
+| Rank | Primary Site | Patients | % of study |
+|------|-------------|----------|-----------|
+| 1 | Lung | 7,773 | 31.2% |
+| 2 | Breast | 5,358 | 21.5% |
+| 3 | Prostate | 3,208 | 12.9% |
+| 4 | Pancreas | 3,104 | 12.4% |
+| 5 | Colon | 2,516 | 10.1% |
+
+Note that `PRIMARY_SITE` is a more granular anatomical field than the study's broader `CANCER_TYPE` classification (e.g., colorectal cancer is split into Colon, Rectum, Sigmoid Colon, etc. as separate sites), which is why Colon (rather than combined "Colorectal") appears here as the #5 site.
+
+You can explore the full breakdown, including the remaining sites, directly on the [MSK-CHORD Study View](https://www.cbioportal.org/study/summary?id=msk_chord_2024) (look for the "Primary Site" chart, or add it via the Charts menu if not shown by default).

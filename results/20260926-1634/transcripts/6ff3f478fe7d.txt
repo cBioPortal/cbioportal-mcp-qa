@@ -1,0 +1,286 @@
+Q (haiku): How many unique patients have both primary and metastatic samples in the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+▶ list_studies
+{
+ "search": "MSK-CHORD"
+}
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH sample_types AS (
+  SELECT DISTINCT
+    patient_unique_id,
+    attribute_value AS sample_type
+  FROM clinical_data_derived
+  WHERE
+    cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'SAMPLE_TYPE'
+    AND attribute_value IN ('Primary', 'Metastasis')
+)
+SELECT
+  COUNT(DISTINCT patient_unique_id) AS patients_with_both_types,
+  COUNT(DISTINCT CASE WHEN sample_type = 'Primary' THEN patient_unique_id END) AS patients_with_primary,
+  COUNT(DISTINCT CASE WHEN sample_type = 'Metastasis' THEN patient_unique_id END) AS patients_with_metastasis
+FROM sample_types
+GROUP BY 
+  CASE 
+    WHEN patient_unique_id IN (
+      SELECT patient_unique_id 
+      FROM sample_types 
+      WHERE sample_type = 'Primary'
+    )
+    AND patient_unique_id IN (
+      SELECT patient_unique_id 
+      FROM sample_types 
+      WHERE sample_type = 'Metastasis'
+    )
+    THEN 'has_both'
+  END
+HAVING 
+  CASE 
+    WHEN patient_unique_id IN (
+      SELECT patient_unique_id 
+      FROM sample_types 
+      WHERE sample_type = 'Primary'
+    )
+    AND patient_unique_id IN (
+      SELECT patient_unique_id 
+      FROM sample_types 
+      WHERE sample_type = 'Metastasis'
+    )
+    THEN 'has_both'
+  END = 'has_both'
+"
+}
+
+◀ result
+{"rows":[{"patients_with_both_types":26,"patients_with_primary":26,"patients_with_metastasis":26}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH patients_by_type AS (
+  SELECT
+    patient_unique_id,
+    attribute_value AS sample_type
+  FROM clinical_data_derived
+  WHERE
+    cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'SAMPLE_TYPE'
+    AND attribute_value IN ('Primary', 'Metastasis')
+),
+patient_type_counts AS (
+  SELECT
+    patient_unique_id,
+    COUNT(DISTINCT sample_type) AS type_count,
+    arraySort(arrayUniq(groupArray(sample_type))) AS types_present
+  FROM patients_by_type
+  GROUP BY patient_unique_id
+)
+SELECT
+  COUNT(*) AS unique_patients_with_both_primary_and_metastatic,
+  SUM(CASE WHEN type_count = 2 THEN 1 ELSE 0 END) AS patients_with_both,
+  SUM(CASE WHEN type_count = 1 THEN 1 ELSE 0 END) AS patients_with_one_type_only
+FROM patient_type_counts
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 43\n Code: 43. DB::Exception: The 1st and only argument for function arraySort must be array. Found UInt32 instead: In scope  patient_type_counts. (ILLEGAL_TYPE_OF_ARGUMENT) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH patients_by_type AS (
+  SELECT
+    patient_unique_id,
+    attribute_value AS sample_type
+  FROM clinical_data_derived
+  WHERE
+    cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'SAMPLE_TYPE'
+    AND attribute_value IN ('Primary', 'Metastasis')
+),
+patients_with_primary AS (
+  SELECT DISTINCT patient_unique_id
+  FROM patients_by_type
+  WHERE sample_type = 'Primary'
+),
+patients_with_metastasis AS (
+  SELECT DISTINCT patient_unique_id
+  FROM patients_by_type
+  WHERE sample_type = 'Metastasis'
+)
+SELECT
+  COUNT(*) AS unique_patients_with_both_primary_and_metastatic
+FROM patients_with_primary
+INTERSECT
+SELECT COUNT(*)
+FROM patients_with_metastasis
+INTERSECT
+SELECT DISTINCT patient_unique_id
+FROM patients_by_type
+WHERE patient_unique_id IN (SELECT patient_unique_id FROM patients_with_primary)
+AND patient_unique_id IN (SELECT patient_unique_id FROM patients_with_metastasis)
+"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 386\n Code: 386. DB::Exception: There is no supertype for types UInt64, String because some of them are String/FixedString/Enum and some of them are not. (NO_COMMON_TYPE) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+  COUNT(DISTINCT patient_unique_id) AS unique_patients_with_both
+FROM (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE
+    cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'SAMPLE_TYPE'
+    AND attribute_value = 'Primary'
+) primary_patients
+INNER JOIN (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE
+    cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'SAMPLE_TYPE'
+    AND attribute_value = 'Metastasis'
+) metastasis_patients
+ON primary_patients.patient_unique_id = metastasis_patients.patient_unique_id
+"
+}
+
+◀ result
+{"rows":[{"unique_patients_with_both":26}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT
+  attribute_value AS sample_type,
+  COUNT(DISTINCT sample_unique_id) AS sample_count,
+  COUNT(DISTINCT patient_unique_id) AS patient_count
+FROM clinical_data_derived
+WHERE
+  cancer_study_identifier = 'msk_chord_2024'
+  AND attribute_name = 'SAMPLE_TYPE'
+GROUP BY attribute_value
+ORDER BY sample_count DESC
+"
+}
+
+◀ result
+{"rows":[{"sample_type":"Primary","sample_count":15928,"patient_count":15872},{"sample_type":"Metastasis","sample_count":8878,"patient_count":8872},{"sample_type":"Unknown","sample_count":136,"patient_count":136},{"sample_type":"Local Recurrence","sample_count":98,"patient_count":98}]}
+
+═ answer (success)
+## Answer
+
+In the **MSK-CHORD Study**, **26 unique patients** have both primary and metastatic samples.
+
+### Context
+The MSK-CHORD study includes 25,040 total samples across:
+- **15,928 primary tumor samples** from 15,872 patients
+- **8,878 metastatic samples** from 8,872 patients  
+- **136 unknown type** samples
+- **98 local recurrence** samples
+
+These 26 patients with paired primary-metastatic samples represent approximately 0.16% of the cohort but are valuable for studying tumor evolution and clonal relationships between primary and metastatic disease.
+
+[View MSK-CHORD Study](https://www.cbioportal.org/study/summary?id=msk_chord_2024)

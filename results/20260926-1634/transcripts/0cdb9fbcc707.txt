@@ -1,0 +1,688 @@
+Q (sonnet): what are the most common events in her2- breast cancer?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ list_studies
+{
+ "search": "breast"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"breast_msk_2026","name":"CCNE1 Amplifications in Breast Cancer (MSK, 2026)","type_of_cancer_id":"breast","sample_count":6318,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2026"},{"cancer_study_identifier":"breast_msk_2025","name":"Breast Cancer (MSK, Nat Genet 2025)","type_of_cancer_id":"brca","sample_count":3879,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2025"},{"cancer_study_identifier":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","type_of_cancer_id":"brca","sample_count":2509,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_metabric"},{"cancer_study_identifier":"breast_msk_2018","name":"Breast Cancer (MSK, Cancer Cell 2018)","type_of_cancer_id":"breast","sample_count":1918,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_msk_2018"},{"cancer_study_identifier":"breast_ink4_msk_2021","name":"Metastatic Breast Cancer (MSK, Cancer Discovery 2022)","type_of_cancer_id":"breast","sample_count":1365,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=breast_ink4_msk_2021"},{"cancer_study_identifier":"brca_tcga","name":"Breast Invasive Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"brca","sample_count":1108,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga"},{"cancer_study_identifier":"brca_tcga_gdc","name":"Invasive Breast Carcinoma (TCGA GDC, 2025)","type_of_cancer_id":"brca","sample_count":1102,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_gdc"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"brca","sample_count":1084,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"brca_tcga_pub","name":"Breast Invasive Carcinoma (TCGA, Nature 2012)","type_of_cancer_id":"brca","sample_count":825,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pub"},{"cancer_study_identifier":"brca_tcga_pub2015","name":"Breast Invasive Carcinoma (TCGA, Cell 2015)","type_of_cancer_id":"brca","sample_count":818,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pub2015"},{"cancer_study_identifier":"brca_msk_2025","name":"Breast Carcinoma (MSK, NPJ Precis Oncol 2025)","type_of_cancer_id":"brca","sample_count":527,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_msk_2025"},{"cancer_study_identifier":"brca_mbcproject_2022","name":"The Metastatic Breast Cancer Project (Provisional, December 2021)","type_of_cancer_id":"brca","sample_count":379,"has_gu … (1846 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT attribute_name, attribute_value, count() AS n
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND upper(attribute_name) LIKE '%HER2%'
+GROUP BY attribute_name, attribute_value
+ORDER BY attribute_name, n DESC"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+ORDER BY attribute_name",
+ "max_rows": 300
+}
+
+◀ result
+{"rows":[{"attribute_name":"AGE"},{"attribute_name":"AJCC_PATHOLOGIC_TUMOR_STAGE"},{"attribute_name":"AJCC_STAGING_EDITION"},{"attribute_name":"ANEUPLOIDY_SCORE"},{"attribute_name":"BUFFA_HYPOXIA_SCORE"},{"attribute_name":"CANCER_TYPE"},{"attribute_name":"CANCER_TYPE_ACRONYM"},{"attribute_name":"CANCER_TYPE_DETAILED"},{"attribute_name":"DAYS_LAST_FOLLOWUP"},{"attribute_name":"DAYS_TO_BIRTH"},{"attribute_name":"DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS"},{"attribute_name":"DFS_MONTHS"},{"attribute_name":"DFS_STATUS"},{"attribute_name":"DSS_MONTHS"},{"attribute_name":"DSS_STATUS"},{"attribute_name":"ETHNICITY"},{"attribute_name":"FORM_COMPLETION_DATE"},{"attribute_name":"FRACTION_GENOME_ALTERED"},{"attribute_name":"GENETIC_ANCESTRY_LABEL"},{"attribute_name":"GRADE"},{"attribute_name":"HISTORY_NEOADJUVANT_TRTYN"},{"attribute_name":"ICD_10"},{"attribute_name":"ICD_O_3_HISTOLOGY"},{"attribute_name":"ICD_O_3_SITE"},{"attribute_name":"INFORMED_CONSENT_VERIFIED"},{"attribute_name":"IN_PANCANPATHWAYS_FREEZE"},{"attribute_name":"MSI_SCORE_MANTIS"},{"attribute_name":"MSI_SENSOR_SCORE"},{"attribute_name":"MUTATION_COUNT"},{"attribute_name":"NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT"},{"attribute_name":"ONCOTREE_CODE"},{"attribute_name":"OS_MONTHS"},{"attribute_name":"OS_STATUS"},{"attribute_name":"OTHER_PATIENT_ID"},{"attribute_name":"PATH_M_STAGE"},{"attribute_name":"PATH_N_STAGE"},{"attribute_name":"PATH_T_STAGE"},{"attribute_name":"PERSON_NEOPLASM_CANCER_STATUS"},{"attribute_name":"PFS_MONTHS"},{"attribute_name":"PFS_STATUS"},{"attribute_name":"PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT"},{"attribute_name":"PRIOR_DX"},{"attribute_name":"RACE"},{"attribute_name":"RADIATION_THERAPY"},{"attribute_name":"RAGNUM_HYPOXIA_SCORE"},{"attribute_name":"SAMPLE_COUNT"},{"attribute_name":"SAMPLE_TYPE"},{"attribute_name":"SEX"},{"attribute_name":"SOMATIC_STATUS"},{"attribute_name":"SUBTYPE"},{"attribute_name":"TBL_SCORE"},{"attribute_name":"TISSUE_PROSPECTIVE_COLLECTION_INDICATOR"},{"attribute_name":"TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR"},{"attribute_name":"TISSUE_SOURCE_SITE"},{"attribute_name":"TISSUE_SOURCE_SITE_CODE"},{"attribute_name":"TMB_NONSYNONYMOUS"},{"attribute_name":"TUMOR_TISSUE_SITE"},{"attribute_name":"TUMOR_TYPE"},{"attribute_name":"WEIGHT"},{"attribute_name":"WINTER_HYPOXIA_SCORE"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_value, count() AS n
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018' AND attribute_name = 'SUBTYPE'
+GROUP BY attribute_value ORDER BY n DESC"
+}
+
+◀ result
+{"rows":[{"attribute_value":"BRCA_LumA","n":499},{"attribute_value":"BRCA_LumB","n":197},{"attribute_value":"BRCA_Basal","n":171},{"n":103},{"attribute_value":"BRCA_Her2","n":78},{"attribute_value":"BRCA_Normal","n":36}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT cancer_study_identifier, attribute_name
+FROM clinical_data_derived
+WHERE cancer_study_identifier IN ('brca_metabric','brca_tcga','brca_tcga_gdc','brca_tcga_pub','brca_tcga_pub2015','breast_msk_2018','breast_msk_2025')
+  AND (upper(attribute_name) LIKE '%HER2%' OR upper(attribute_name) LIKE '%ERBB2%')
+ORDER BY cancer_study_identifier, attribute_name"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"brca_metabric","attribute_name":"HER2_SNP6"},{"cancer_study_identifier":"brca_metabric","attribute_name":"HER2_STATUS"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_AND_CENT17_CELLS_COUNT"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_AND_CENT17_SCALE_OTHER"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_CENT17_COUNTED_CELLS_COUNT"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_CENT17_RATIO"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_COPY_NUMBER"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_FISH_METHOD"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_FISH_STATUS"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_IHC_PERCENT_POSITIVE"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_IHC_SCORE"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_POSITIVITY_METHOD_TEXT"},{"cancer_study_identifier":"brca_tcga","attribute_name":"HER2_POSITIVITY_SCALE_OTHER"},{"cancer_study_identifier":"brca_tcga","attribute_name":"IHC_HER2"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_CENT17_HER2_OTHER_SCALE"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_CENT_17_HER2_RATIO"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_HER2_FISH_DEFINE_METHOD"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_HER2_FISH_STATUS"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_HER2_POSITIVITY_IHC_SCORE"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_HER2_POSITIVITY_METHOD"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_HER2_POSITIVITY_OTHER_SCALE"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_HER2_SIGNAL_NUMBER"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_HER2_STATUS"},{"cancer_study_identifier":"brca_tcga","attribute_name":"NTE_HER2_STATUS_IHC_POSITIVE"},{"cancer_study_identifier":"brca_tcga_pub","attribute_name":"HER2_STATUS"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_AND_CENT17_CELLS_COUNT"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_AND_CENT17_SCALE_OTHER"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_CENT17_RATIO"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_COPY_NUMBER"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_FISH_METHOD"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_FISH_STATUS"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_IHC_PERCENT_POSITIVE"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_IHC_SCORE"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_POSITIVITY_METHOD_TEXT"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_name":"HER2_POSITIVITY_SCALE_OTHER"},{"cancer_study_identifier":"brca_tcga_pub2015","attribute_ … (1395 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_value, count(DISTINCT sample_unique_id) AS n
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_metabric' AND attribute_name = 'HER2_STATUS'
+GROUP BY attribute_value ORDER BY n DESC"
+}
+
+▶ get_study_guide
+{
+ "study_id": "brca_metabric"
+}
+
+◀ result
+{"rows":[{"attribute_value":"Negative","n":1733},{"n":529},{"attribute_value":"Positive","n":247}]}
+
+◀ result
+# Study Guide: Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)
+
+**Study ID:** `brca_metabric`
+**Cancer Type:** brca
+**Description:** Targeted sequencing of 2509 primary breast tumors with 548 matched normals.
+
+## Cohort Statistics
+- **Patients:** 2,509
+- **Samples:** 2,510
+
+## Available Data Types
+
+- **COPY_NUMBER_ALTERATION**: Putative copy-number alterations from DNAcopy.
+- **MUTATION_EXTENDED**: Mutations
+- **METHYLATION**: Promoter methylation (RRBS)
+- **MRNA_EXPRESSION**: mRNA expression (Illumina HT-12 v3 microarray)
+- **MRNA_EXPRESSION**: mRNA expression z-scores relative to all samples (log microarray)
+
+## Gene Panels
+
+- **METABRIC_173**: 2,433 samples
+- **WES** (Whole Exome): 2,173 samples — all genes profiled
+
+## Available Clinical Attributes
+
+| Attribute | Samples with Data |
+|-----------|------------------|
+| CANCER_TYPE_DETAILED | 2,509 |
+| HER2_STATUS | 2,509 |
+| TUMOR_STAGE | 2,509 |
+| PR_STATUS | 2,509 |
+| GRADE | 2,509 |
+| ER_STATUS | 2,509 |
+| TMB_NONSYNONYMOUS | 2,509 |
+| ONCOTREE_CODE | 2,509 |
+| SAMPLE_TYPE | 2,509 |
+| TUMOR_SIZE | 2,509 |
+| MUTATION_COUNT | 2,509 |
+| CANCER_TYPE | 2,509 |
+| BREAST_SURGERY | 1 |
+| ER_IHC | 1 |
+| RFS_STATUS | 1 |
+| INFERRED_MENOPAUSAL_STATE | 1 |
+| COHORT | 1 |
+| CHEMOTHERAPY | 1 |
+| OS_MONTHS | 1 |
+| LYMPH_NODES_EXAMINED_POSITIVE | 1 |
+
+## Top Mutated Genes
+
+| Gene | Altered Samples |
+|------|----------------|
+| PIK3CA | 975 |
+| TP53 | 864 |
+| MUC16 | 409 |
+| AHNAK2 | 395 |
+| SYNE1 | 294 |
+| KMT2C | 280 |
+| GATA3 | 269 |
+| CDH1 | 236 |
+| MAP3K1 | 236 |
+| DNAH11 | 226 |
+
+## Sample Types
+
+- **Primary**: 2,509 samples
+
+## Query Tips for brca_metabric
+
+```sql
+-- Get all samples in this study
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_metabric';
+
+-- Get mutations for a specific gene
+SELECT sample_unique_id, hugo_gene_symbol, mutation_variant, mutation_type
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+    AND hugo_gene_symbol = 'TP53'
+    AND variant_type = 'mutation';
+
+-- Get clinical data for specific attributes
+SELECT sample_unique_id, attribute_name, attribute_value
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'OS_MONTHS');
+```
+
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH her2neg AS (
+    SELECT DISTINCT sample_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND attribute_name = 'HER2_STATUS' AND attribute_value = 'Negative'
+),
+altered AS (
+    SELECT hugo_gene_symbol,
+           COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS altered_samples,
+           COUNT(*) AS total_events
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND sample_unique_id IN (SELECT sample_unique_id FROM her2neg)
+    GROUP BY hugo_gene_symbol
+),
+profiled AS (
+    SELECT g.hugo_gene_symbol, COUNT(DISTINCT stgp.sample_unique_id) AS profiled_samples
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+    WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+      AND stgp.cancer_study_identifier = 'brca_metabric'
+      AND stgp.sample_unique_id IN (SELECT sample_unique_id FROM her2neg)
+    GROUP BY g.hugo_gene_symbol
+    UNION ALL
+    SELECT altered.hugo_gene_symbol, (SELECT COUNT(DISTINCT sample_unique_id) FROM sample_to_gene_panel_derived
+        WHERE cancer_study_identifier='brca_metabric' AND gene_panel_id='WES' AND sample_unique_id IN (SELECT sample_unique_id FROM her2neg)) AS profiled_samples
+    FROM (SELECT DISTINCT hugo_gene_symbol FROM altered) altered
+)
+SELECT a.hugo_gene_symbol,
+       a.altered_samples,
+       sum(p.profiled_samples) AS profiled_samples,
+       round(a.altered_samples * 100.0 / sum(p.profiled_samples), 1) AS frequency_pct,
+       a.total_events
+FROM altered a
+JOIN profiled p ON a.hugo_gene_symbol = p.hugo_gene_symbol
+GROUP BY a.hugo_gene_symbol, a.altered_samples, a.total_events
+ORDER BY a.altered_samples DESC
+LIMIT 15
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"PIK3CA","altered_samples":717,"profiled_samples":3401,"frequency_pct":21.1,"total_events":839},{"hugo_gene_symbol":"TP53","altered_samples":498,"profiled_samples":3401,"frequency_pct":14.6,"total_events":516},{"hugo_gene_symbol":"MUC16","altered_samples":271,"profiled_samples":3401,"frequency_pct":8,"total_events":339},{"hugo_gene_symbol":"AHNAK2","altered_samples":262,"profiled_samples":3401,"frequency_pct":7.7,"total_events":356},{"hugo_gene_symbol":"GATA3","altered_samples":219,"profiled_samples":3401,"frequency_pct":6.4,"total_events":227},{"hugo_gene_symbol":"KMT2C","altered_samples":210,"profiled_samples":3401,"frequency_pct":6.2,"total_events":240},{"hugo_gene_symbol":"SYNE1","altered_samples":200,"profiled_samples":3401,"frequency_pct":5.9,"total_events":233},{"hugo_gene_symbol":"MAP3K1","altered_samples":191,"profiled_samples":3401,"frequency_pct":5.6,"total_events":273},{"hugo_gene_symbol":"CDH1","altered_samples":160,"profiled_samples":3401,"frequency_pct":4.7,"total_events":166},{"hugo_gene_symbol":"AHNAK","altered_samples":153,"profiled_samples":3401,"frequency_pct":4.5,"total_events":173},{"hugo_gene_symbol":"DNAH11","altered_samples":145,"profiled_samples":3401,"frequency_pct":4.3,"total_events":154},{"hugo_gene_symbol":"DNAH2","altered_samples":134,"profiled_samples":3401,"frequency_pct":3.9,"total_events":147},{"hugo_gene_symbol":"KMT2D","altered_samples":124,"profiled_samples":3401,"frequency_pct":3.6,"total_events":133},{"hugo_gene_symbol":"USH2A","altered_samples":119,"profiled_samples":3401,"frequency_pct":3.5,"total_events":122},{"hugo_gene_symbol":"DNAH5","altered_samples":117,"profiled_samples":3401,"frequency_pct":3.4,"total_events":130}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH her2neg AS (
+    SELECT DISTINCT sample_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND attribute_name = 'HER2_STATUS' AND attribute_value = 'Negative'
+)
+SELECT hugo_gene_symbol,
+       cna_alteration,
+       COUNT(DISTINCT sample_unique_id) AS altered_samples
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+  AND variant_type = 'cna'
+  AND cna_alteration IN (2, -2)
+  AND sample_unique_id IN (SELECT sample_unique_id FROM her2neg)
+GROUP BY hugo_gene_symbol, cna_alteration
+ORDER BY altered_samples DESC
+LIMIT 15
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"TRPS1","cna_alteration":2,"altered_samples":436},{"hugo_gene_symbol":"MIR205HG","cna_alteration":2,"altered_samples":430},{"hugo_gene_symbol":"SIPA1L2","cna_alteration":2,"altered_samples":426},{"hugo_gene_symbol":"PLEKHA6","cna_alteration":2,"altered_samples":426},{"hugo_gene_symbol":"MDM4","cna_alteration":2,"altered_samples":425},{"hugo_gene_symbol":"LRRN2","cna_alteration":2,"altered_samples":425},{"hugo_gene_symbol":"CAMK1G","cna_alteration":2,"altered_samples":423},{"hugo_gene_symbol":"PLXNA2","cna_alteration":2,"altered_samples":423},{"hugo_gene_symbol":"PPP1R15B","cna_alteration":2,"altered_samples":423},{"hugo_gene_symbol":"LEMD1-AS1","cna_alteration":2,"altered_samples":423},{"hugo_gene_symbol":"PIK3C2B","cna_alteration":2,"altered_samples":422},{"hugo_gene_symbol":"KLHDC8A","cna_alteration":2,"altered_samples":422},{"hugo_gene_symbol":"ESRRG","cna_alteration":2,"altered_samples":422},{"hugo_gene_symbol":"CDK18","cna_alteration":2,"altered_samples":422},{"hugo_gene_symbol":"LEMD1","cna_alteration":2,"altered_samples":422}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH her2neg AS (
+    SELECT DISTINCT sample_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND attribute_name = 'HER2_STATUS' AND attribute_value = 'Negative'
+),
+altered AS (
+    SELECT hugo_gene_symbol,
+           COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS altered_samples,
+           COUNT(*) AS total_events
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND sample_unique_id IN (SELECT sample_unique_id FROM her2neg)
+    GROUP BY hugo_gene_symbol
+),
+profiled_per_gene AS (
+    SELECT g.hugo_gene_symbol AS hugo_gene_symbol, stgp.sample_unique_id AS sample_unique_id
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+    WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+      AND stgp.cancer_study_identifier = 'brca_metabric'
+      AND stgp.sample_unique_id IN (SELECT sample_unique_id FROM her2neg)
+    UNION DISTINCT
+    SELECT alt.hugo_gene_symbol AS hugo_gene_symbol, stgp2.sample_unique_id AS sample_unique_id
+    FROM (SELECT DISTINCT hugo_gene_symbol FROM altered) alt
+    CROSS JOIN (
+        SELECT sample_unique_id FROM sample_to_gene_panel_derived
+        WHERE cancer_study_identifier = 'brca_metabric' AND gene_panel_id = 'WES'
+          AND sample_unique_id IN (SELECT sample_unique_id FROM her2neg)
+    ) stgp2
+),
+profiled AS (
+    SELECT hugo_gene_symbol, COUNT(DISTINCT sample_unique_id) AS profiled_samples
+    FROM profiled_per_gene
+    GROUP BY hugo_gene_symbol
+)
+SELECT a.hugo_gene_symbol,
+       a.altered_samples,
+       p.profiled_samples,
+       round(a.altered_samples * 100.0 / p.profiled_samples, 1) AS frequency_pct,
+       a.total_events
+FROM altered a
+JOIN profiled p USING (hugo_gene_symbol)
+ORDER BY a.altered_samples DESC
+LIMIT 15
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"PIK3CA","altered_samples":717,"profiled_samples":1733,"frequency_pct":41.4,"total_events":839},{"hugo_gene_symbol":"TP53","altered_samples":498,"profiled_samples":1733,"frequency_pct":28.7,"total_events":516},{"hugo_gene_symbol":"MUC16","altered_samples":271,"profiled_samples":1733,"frequency_pct":15.6,"total_events":339},{"hugo_gene_symbol":"AHNAK2","altered_samples":262,"profiled_samples":1733,"frequency_pct":15.1,"total_events":356},{"hugo_gene_symbol":"GATA3","altered_samples":219,"profiled_samples":1733,"frequency_pct":12.6,"total_events":227},{"hugo_gene_symbol":"KMT2C","altered_samples":210,"profiled_samples":1733,"frequency_pct":12.1,"total_events":240},{"hugo_gene_symbol":"SYNE1","altered_samples":200,"profiled_samples":1733,"frequency_pct":11.5,"total_events":233},{"hugo_gene_symbol":"MAP3K1","altered_samples":191,"profiled_samples":1733,"frequency_pct":11,"total_events":273},{"hugo_gene_symbol":"CDH1","altered_samples":160,"profiled_samples":1733,"frequency_pct":9.2,"total_events":166},{"hugo_gene_symbol":"AHNAK","altered_samples":153,"profiled_samples":1733,"frequency_pct":8.8,"total_events":173},{"hugo_gene_symbol":"DNAH11","altered_samples":145,"profiled_samples":1733,"frequency_pct":8.4,"total_events":154},{"hugo_gene_symbol":"DNAH2","altered_samples":134,"profiled_samples":1733,"frequency_pct":7.7,"total_events":147},{"hugo_gene_symbol":"KMT2D","altered_samples":124,"profiled_samples":1733,"frequency_pct":7.2,"total_events":133},{"hugo_gene_symbol":"USH2A","altered_samples":119,"profiled_samples":1733,"frequency_pct":6.9,"total_events":122},{"hugo_gene_symbol":"DNAH5","altered_samples":117,"profiled_samples":1733,"frequency_pct":6.8,"total_events":130}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH her2neg AS (
+    SELECT DISTINCT sample_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND attribute_name = 'HER2_STATUS' AND attribute_value = 'Negative'
+),
+profiled_cna AS (
+    SELECT COUNT(DISTINCT sample_unique_id) AS n
+    FROM sample_to_gene_panel_derived
+    WHERE cancer_study_identifier = 'brca_metabric'
+      AND alteration_type = 'COPY_NUMBER_ALTERATION'
+      AND sample_unique_id IN (SELECT sample_unique_id FROM her2neg)
+)
+SELECT hugo_gene_symbol,
+       cna_alteration,
+       COUNT(DISTINCT sample_unique_id) AS altered_samples,
+       (SELECT n FROM profiled_cna) AS profiled_samples,
+       round(COUNT(DISTINCT sample_unique_id) * 100.0 / (SELECT n FROM profiled_cna), 1) AS frequency_pct
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+  AND variant_type = 'cna'
+  AND cna_alteration IN (2, -2)
+  AND sample_unique_id IN (SELECT sample_unique_id FROM her2neg)
+  AND hugo_gene_symbol IN ('ERBB2','MYC','CCND1','FGFR1','ZNF703','PIK3CA','MDM4','CDKN2A','RB1','PTEN','MTAP','MCL1','GATA3','BRCA1','BRCA2')
+GROUP BY hugo_gene_symbol, cna_alteration
+ORDER BY altered_samples DESC
+"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"MDM4","cna_alteration":2,"altered_samples":425,"profiled_samples":1733,"frequency_pct":24.5},{"hugo_gene_symbol":"MYC","cna_alteration":2,"altered_samples":410,"profiled_samples":1733,"frequency_pct":23.7},{"hugo_gene_symbol":"MCL1","cna_alteration":2,"altered_samples":332,"profiled_samples":1733,"frequency_pct":19.2},{"hugo_gene_symbol":"CCND1","cna_alteration":2,"altered_samples":288,"profiled_samples":1733,"frequency_pct":16.6},{"hugo_gene_symbol":"ZNF703","cna_alteration":2,"altered_samples":253,"profiled_samples":1733,"frequency_pct":14.6},{"hugo_gene_symbol":"FGFR1","cna_alteration":2,"altered_samples":233,"profiled_samples":1733,"frequency_pct":13.4},{"hugo_gene_symbol":"PIK3CA","cna_alteration":2,"altered_samples":75,"profiled_samples":1733,"frequency_pct":4.3},{"hugo_gene_symbol":"GATA3","cna_alteration":2,"altered_samples":70,"profiled_samples":1733,"frequency_pct":4},{"hugo_gene_symbol":"ERBB2","cna_alteration":2,"altered_samples":63,"profiled_samples":1733,"frequency_pct":3.6},{"hugo_gene_symbol":"CDKN2A","cna_alteration":-2,"altered_samples":41,"profiled_samples":1733,"frequency_pct":2.4},{"hugo_gene_symbol":"PTEN","cna_alteration":-2,"altered_samples":40,"profiled_samples":1733,"frequency_pct":2.3},{"hugo_gene_symbol":"MTAP","cna_alteration":-2,"altered_samples":39,"profiled_samples":1733,"frequency_pct":2.3},{"hugo_gene_symbol":"CDKN2A","cna_alteration":2,"altered_samples":25,"profiled_samples":1733,"frequency_pct":1.4},{"hugo_gene_symbol":"MTAP","cna_alteration":2,"altered_samples":25,"profiled_samples":1733,"frequency_pct":1.4},{"hugo_gene_symbol":"BRCA1","cna_alteration":2,"altered_samples":16,"profiled_samples":1733,"frequency_pct":0.9},{"hugo_gene_symbol":"RB1","cna_alteration":-2,"altered_samples":12,"profiled_samples":1733,"frequency_pct":0.7},{"hugo_gene_symbol":"BRCA2","cna_alteration":2,"altered_samples":11,"profiled_samples":1733,"frequency_pct":0.6},{"hugo_gene_symbol":"PTEN","cna_alteration":2,"altered_samples":10,"profiled_samples":1733,"frequency_pct":0.6},{"hugo_gene_symbol":"BRCA2","cna_alteration":-2,"altered_samples":10,"profiled_samples":1733,"frequency_pct":0.6},{"hugo_gene_symbol":"RB1","cna_alteration":2,"altered_samples":9,"profiled_samples":1733,"frequency_pct":0.5},{"hugo_gene_symbol":"FGFR1","cna_alteration":-2,"altered_samples":3,"profiled_samples":1733,"frequency_pct":0.2},{"hugo_gene_symbol":"GATA3","cna_alteration":-2,"altered_samples":2,"profiled_samples":1733,"frequency_pct":0.1},{"hugo_gene_symbol":"ZNF703","cna_alteration":-2,"altered_samples":2,"profiled_samples":1733,"frequency_pct":0.1},{"hugo_gene_symbol":"BRCA1","cna_alteration":-2,"altered_samples":1,"profiled_samples":1733,"frequency_pct":0.1}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_metabric"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_metabric","metadata":{"clinicalAttributeIds":["AGE_AT_DIAGNOSIS","BREAST_SURGERY","CANCER_TYPE","CANCER_TYPE_DETAILED","CELLULARITY","CHEMOTHERAPY","CLAUDIN_SUBTYPE","COHORT","ER_IHC","ER_STATUS","GRADE","HER2_SNP6","HER2_STATUS","HISTOLOGICAL_SUBTYPE","HORMONE_THERAPY","INFERRED_MENOPAUSAL_STATE","INTCLUST","LATERALITY","LYMPH_NODES_EXAMINED_POSITIVE","MUTATION_COUNT","NPI","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PR_STATUS","RADIO_THERAPY","RFS_MONTHS","RFS_STATUS","SAMPLE_COUNT","SAMPLE_TYPE","SEX","THREEGENE","TMB_NONSYNONYMOUS","TUMOR_SIZE","TUMOR_STAGE","VITAL_STATUS"],"molecularProfileIds":["brca_metabric_cna","brca_metabric_methylation_promoters_rrbs","brca_metabric_mrna","brca_metabric_mrna_median_all_sample_Zscores","brca_metabric_mutations"],"heatmapProfileIds":["brca_metabric_methylation_promoters_rrbs","brca_metabric_mrna_median_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","dna_methylation"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "brca_metabric",
+ "attributeIds": [
+  "HER2_STATUS"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"brca_metabric","attributes":[{"attributeId":"HER2_STATUS","displayName":"HER2 Status","description":"HER2 Status","datatype":"STRING","values":["NA","Negative","Positive"]}]}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "brca_metabric"
+ ],
+ "filterJson": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "HER2_STATUS",
+    "values": [
+     {
+      "value": "Negative"
+     }
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=brca_metabric#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22HER2_STATUS%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Negative%22%7D%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=brca_metabric#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22HER2_STATUS%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Negative%22%7D%5D%7D%5D%7D","data":{"studyIds":["brca_metabric"],"studies":[{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_metabric"
+ ],
+ "genes": [
+  "PIK3CA",
+  "TP53",
+  "MUC16",
+  "AHNAK2",
+  "GATA3",
+  "KMT2C",
+  "SYNE1",
+  "MAP3K1",
+  "CDH1",
+  "MDM4",
+  "MYC",
+  "MCL1",
+  "CCND1",
+  "ZNF703",
+  "FGFR1"
+ ],
+ "tab": "oncoprint",
+ "studyViewFilter": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "HER2_STATUS",
+    "values": [
+     {
+      "value": "Negative"
+     }
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?session_id=6ab7f7eac2115c492d885150","url":"https://www.cbioportal.org/results/oncoprint?session_id=6ab7f7eac2115c492d885150","data":{"studyIds":["brca_metabric"],"studies":[{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509}],"genes":["PIK3CA","TP53","MUC16","AHNAK2","GATA3","KMT2C","SYNE1","MAP3K1","CDH1","MDM4","MYC","MCL1","CCND1","ZNF703","FGFR1"],"filteredSampleCount":1733,"caseSetId":"-1","sessionId":"6ab7f7eac2115c492d885150","studyViewUrl":"https://www.cbioportal.org/study?id=brca_metabric#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22HER2_STATUS%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Negative%22%7D%5D%7D%5D%7D","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## HER2-Negative Breast Cancer — Most Common Genomic Events
+
+**Cohort:** [Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)](https://www.cbioportal.org/study/summary?id=brca_metabric), filtered to **HER2-negative** by IHC/FISH status (`HER2_STATUS = Negative`): **1,733 of 2,509 samples** (patient-level = sample-level here, 1 sample/patient). This cohort was chosen because it has an explicit, direct HER2 clinical status field — I did not infer HER2 status from molecular subtype.
+
+### Most frequently mutated genes (% of 1,733 HER2-negative samples profiled for mutations)
+
+| Gene | Altered samples | Frequency |
+|---|---|---|
+| **PIK3CA** | 717 | 41.4% |
+| **TP53** | 498 | 28.7% |
+| MUC16 | 271 | 15.6% |
+| AHNAK2 | 262 | 15.1% |
+| GATA3 | 219 | 12.6% |
+| KMT2C | 210 | 12.1% |
+| SYNE1 | 200 | 11.5% |
+| MAP3K1 | 191 | 11.0% |
+| CDH1 | 160 | 9.2% |
+
+PIK3CA and TP53 dominate, consistent with the fact that this HER2-negative group is enriched for luminal (ER+) and basal-like tumors — MUC16, AHNAK2, and SYNE1 are large genes frequently hit by passenger mutations and should be interpreted cautiously.
+
+### Most frequent copy-number amplifications/deep deletions (same 1,733-sample denominator)
+
+| Gene | Event | Frequency |
+|---|---|---|
+| MDM4 | AMP | 24.5% |
+| MYC | AMP | 23.7% |
+| MCL1 | AMP | 19.2% |
+| CCND1 | AMP | 16.6% |
+| ZNF703 | AMP | 14.6% |
+| FGFR1 | AMP | 13.4% |
+| ERBB2 (HER2) | AMP | 3.6% |
+| PTEN | HOMDEL | 2.3% |
+
+MYC (8q24), CCND1 (11q13) and FGFR1 (8p11) amplifications are the classic recurrent CNAs in HER2-negative disease. Note that **3.6% still show ERBB2 copy-number amplification** despite negative clinical HER2 status — a known IHC/FISH-vs-copy-number discordance, not a query error.
+
+Neither mutation nor CNA frequency here reflects annotated "driver" status — METABRIC does not carry OncoKB/driver-filter annotations in this database; use the OQL `MUT_DRIVER` modifier in the portal if you want oncogenicity-filtered counts.
+
+[**View HER2-negative cohort overview**](https://www.cbioportal.org/study/summary?id=brca_metabric#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22HER2_STATUS%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Negative%22%7D%5D%7D%5D%7D)
+
+[**View OncoPrint of top altered genes in HER2-negative samples**](https://www.cbioportal.org/results/oncoprint?session_id=6ab7f7eac2115c492d885150)

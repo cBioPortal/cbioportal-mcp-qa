@@ -1,0 +1,212 @@
+Q (haiku): Which cancer type has the highest average tumor mutational burden across all studies?
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    ccd.cancer_study_identifier AS study,
+    ccd.type_of_cancer_id AS cancer_type_id,
+    COUNT(DISTINCT ccd.sample_unique_id) AS samples_with_tmb,
+    ROUND(AVG(toFloat64OrNull(ccd.attribute_value)), 2) AS avg_tmb,
+    ROUND(quantile(0.5)(toFloat64OrNull(ccd.attribute_value)), 2) AS median_tmb
+FROM clinical_data_derived ccd
+WHERE ccd.attribute_name = 'TMB_NONSYNONYMOUS'
+  AND ccd.cancer_study_identifier IN (
+    SELECT cancer_study_identifier 
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+  )
+  AND toFloat64OrNull(ccd.attribute_value) IS NOT NULL
+GROUP BY cancer_study_identifier, type_of_cancer_id
+ORDER BY avg_tmb DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'ccd.type_of_cancer_id' cannot be resolved from table with name ccd. In scope SELECT ccd.cancer_study_identifier AS study, ccd.type_of_cancer_id AS cancer_type_id, COUNTDistinct(ccd.sample_unique_id) AS samples_with_tmb, ROUND(AVG(toFloat64OrNull(ccd.attribute_value)), 2) AS avg_tmb, ROUND(quantile(0.5)(toFloat64OrNull(ccd.attribute_value)), 2) AS median_tmb FROM clinical_data_derived AS ccd WHERE (ccd.attribute_name = 'TMB_NONSYNONYMOUS') AND (ccd.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')) AND (toFloat64OrNull(ccd.attribute_value) IS NOT NULL) GROUP BY cancer_study_identifier, type_of_cancer_id ORDER BY avg_tmb DESC. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    cs.type_of_cancer_id AS cancer_type_id,
+    COUNT(DISTINCT ccd.sample_unique_id) AS samples_with_tmb,
+    ROUND(AVG(toFloat64OrNull(ccd.attribute_value)), 2) AS avg_tmb,
+    ROUND(quantile(0.5)(toFloat64OrNull(ccd.attribute_value)), 2) AS median_tmb
+FROM clinical_data_derived ccd
+JOIN cancer_study cs ON ccd.cancer_study_identifier = cs.cancer_study_identifier
+WHERE ccd.attribute_name = 'TMB_NONSYNONYMOUS'
+  AND ccd.cancer_study_identifier IN (
+    SELECT cancer_study_identifier 
+    FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+  )
+  AND toFloat64OrNull(ccd.attribute_value) IS NOT NULL
+GROUP BY cs.type_of_cancer_id
+ORDER BY avg_tmb DESC
+",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"cancer_type_id":"ucec","samples_with_tmb":517,"avg_tmb":35.66,"median_tmb":2.57},{"cancer_type_id":"skcm","samples_with_tmb":440,"avg_tmb":25.91,"median_tmb":14.88},{"cancer_type_id":"coadread","samples_with_tmb":534,"avg_tmb":13.64,"median_tmb":3.5},{"cancer_type_id":"stad","samples_with_tmb":436,"avg_tmb":12.69,"median_tmb":3.9},{"cancer_type_id":"luad","samples_with_tmb":566,"avg_tmb":10.02,"median_tmb":6.68},{"cancer_type_id":"lusc","samples_with_tmb":484,"avg_tmb":9.43,"median_tmb":7.67},{"cancer_type_id":"blca","samples_with_tmb":410,"avg_tmb":8.44,"median_tmb":5.77},{"cancer_type_id":"cesc","samples_with_tmb":291,"avg_tmb":6.48,"median_tmb":2.83},{"cancer_type_id":"hnsc","samples_with_tmb":515,"avg_tmb":5.41,"median_tmb":3.53},{"cancer_type_id":"esca","samples_with_tmb":182,"avg_tmb":4.87,"median_tmb":3.53},{"cancer_type_id":"ucs","samples_with_tmb":57,"avg_tmb":4.28,"median_tmb":1.57},{"cancer_type_id":"dlbclnos","samples_with_tmb":41,"avg_tmb":3.96,"median_tmb":3.6},{"cancer_type_id":"paad","samples_with_tmb":179,"avg_tmb":3.89,"median_tmb":1.17},{"cancer_type_id":"hcc","samples_with_tmb":366,"avg_tmb":3.52,"median_tmb":2.83},{"cancer_type_id":"acc","samples_with_tmb":91,"avg_tmb":2.78,"median_tmb":0.9},{"cancer_type_id":"brca","samples_with_tmb":1066,"avg_tmb":2.73,"median_tmb":1.3},{"cancer_type_id":"prcc","samples_with_tmb":276,"avg_tmb":2.73,"median_tmb":2.23},{"cancer_type_id":"difg","samples_with_tmb":911,"avg_tmb":2.69,"median_tmb":1.23},{"cancer_type_id":"chol","samples_with_tmb":36,"avg_tmb":2.32,"median_tmb":1.45},{"cancer_type_id":"hgsoc","samples_with_tmb":523,"avg_tmb":2.31,"median_tmb":1.87},{"cancer_type_id":"ccrcc","samples_with_tmb":402,"avg_tmb":1.77,"median_tmb":1.67},{"cancer_type_id":"prad","samples_with_tmb":494,"avg_tmb":1.56,"median_tmb":0.9},{"cancer_type_id":"soft_tissue","samples_with_tmb":433,"avg_tmb":1.5,"median_tmb":0.7},{"cancer_type_id":"aml","samples_with_tmb":200,"avg_tmb":1.28,"median_tmb":0.53},{"cancer_type_id":"chrcc","samples_with_tmb":65,"avg_tmb":1.09,"median_tmb":0.67},{"cancer_type_id":"plmeso","samples_with_tmb":86,"avg_tmb":0.98,"median_tmb":0.88},{"cancer_type_id":"thym","samples_with_tmb":123,"avg_tmb":0.74,"median_tmb":0.47},{"cancer_type_id":"um","samples_with_tmb":80,"avg_tmb":0.56,"median_tmb":0.4},{"cancer_type_id":"thpa","samples_with_tmb":490,"avg_tmb":0.54,"median_tmb":0.33},{"cancer_type_id":"testis","samples_with_tmb":149,"avg_tmb":0.49,"median_tmb":0.4}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT DISTINCT
+    type_of_cancer_id,
+    name AS cancer_type_name
+FROM cancer_type
+WHERE type_of_cancer_id IN ('ucec', 'skcm', 'coadread', 'stad', 'luad', 'lusc')
+ORDER BY type_of_cancer_id
+",
+ "max_rows": 20
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 60\n Code: 60. DB::Exception: Unknown table expression identifier 'cancer_type' in scope SELECT DISTINCT type_of_cancer_id, name AS cancer_type_name FROM cancer_type WHERE type_of_cancer_id IN ('ucec', 'skcm', 'coadread', 'stad', 'luad', 'lusc') ORDER BY type_of_cancer_id ASC. (UNKNOWN_TABLE) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+SELECT 
+    type_of_cancer_id,
+    name AS cancer_type_name
+FROM type_of_cancer
+WHERE type_of_cancer_id IN ('ucec', 'skcm', 'coadread', 'stad', 'luad', 'lusc')
+ORDER BY type_of_cancer_id
+",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"type_of_cancer_id":"coadread","cancer_type_name":"Colorectal Adenocarcinoma"},{"type_of_cancer_id":"luad","cancer_type_name":"Lung Adenocarcinoma"},{"type_of_cancer_id":"lusc","cancer_type_name":"Lung Squamous Cell Carcinoma"},{"type_of_cancer_id":"skcm","cancer_type_name":"Cutaneous Melanoma"},{"type_of_cancer_id":"stad","cancer_type_name":"Stomach Adenocarcinoma"},{"type_of_cancer_id":"ucec","cancer_type_name":"Endometrial Carcinoma"}]}
+
+═ answer (success)
+Perfect! Now I have all the data I need to answer the question.
+
+## Results
+
+**Endometrial Carcinoma (UCEC)** has the highest average tumor mutational burden (TMB) across all TCGA studies, with **35.66 mutations/Mb** (mean) based on 517 samples.
+
+Here's the breakdown of the top 6 cancer types by average TMB:
+
+| Cancer Type | Samples with TMB | Mean TMB | Median TMB |
+|---|---|---|---|
+| **Endometrial Carcinoma** | 517 | **35.66** | 2.57 |
+| Cutaneous Melanoma | 440 | 25.91 | 14.88 |
+| Colorectal Adenocarcinoma | 534 | 13.64 | 3.5 |
+| Stomach Adenocarcinoma | 436 | 12.69 | 3.9 |
+| Lung Adenocarcinoma | 566 | 10.02 | 6.68 |
+| Lung Squamous Cell Carcinoma | 484 | 9.43 | 7.67 |
+
+**Important note:** The mean and median TMB rankings differ substantially. While Endometrial Carcinoma has the highest *mean* TMB (35.66), Cutaneous Melanoma has the higher *median* TMB (14.88 vs 2.57), suggesting that Endometrial Carcinoma's high mean is driven by a subset of hypermutated samples. This is typical of endometrial cancer, which frequently harbors mismatch repair deficiency.
+
+These data come from the TCGA PanCancer Atlas—the most consistently processed and comparable multi-cancer cohort in cBioPortal.

@@ -1,0 +1,293 @@
+Q (sonnet): In the TCGA PanCancer Atlas ovarian cancer study, do samples with TP53 truncating mutations have significantly lower TP53 mRNA expression compared to wild-type samples?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ list_studies
+{
+ "search": "ovarian pan_can_atlas"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"hgsoc","sample_count":585,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=ov_tcga_pan_can_atlas_2018"}]}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT mutation_type FROM genomic_event_derived WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018' AND hugo_gene_symbol = 'TP53' AND variant_type = 'mutation'"
+}
+
+◀ result
+{"rows":[{"mutation_type":"Nonsense_Mutation"},{"mutation_type":"Missense_Mutation"},{"mutation_type":"Frame_Shift_Del"},{"mutation_type":"Splice_Site"},{"mutation_type":"In_Frame_Del"},{"mutation_type":"Frame_Shift_Ins"},{"mutation_type":"Splice_Region"},{"mutation_type":"In_Frame_Ins"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type FROM genetic_alteration_derived WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018' ORDER BY profile_type"
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"log2CNA"},{"profile_type":"protein_quantification"},{"profile_type":"protein_quantification_zscores"},{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rppa"},{"profile_type":"rppa_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+WITH profiled_mut AS (
+    SELECT DISTINCT sample_unique_id
+    FROM sample_to_gene_panel_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND alteration_type = 'MUTATION_EXTENDED'
+),
+trunc_samples AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'TP53'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+      AND mutation_type IN ('Nonsense_Mutation','Frame_Shift_Del','Frame_Shift_Ins','Splice_Site')
+),
+any_tp53_mut_samples AS (
+    SELECT DISTINCT sample_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'TP53'
+      AND variant_type = 'mutation'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+expr AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'TP53'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+SELECT
+  'Truncating_mutant' AS grp,
+  count() AS n,
+  round(avg(log2(v+1)),3) AS mean_log2,
+  round(quantile(0.5)(log2(v+1)),3) AS median_log2,
+  round(stddevPop(log2(v+1)),3) AS sd_log2
+FROM expr
+WHERE sample_unique_id IN (SELECT sample_unique_id FROM trunc_samples)
+  AND sample_unique_id IN (SELECT sample_unique_id FROM profiled_mut)
+
+UNION ALL
+
+SELECT
+  'Wild_type' AS grp,
+  count() AS n,
+  round(avg(log2(v+1)),3) AS mean_log2,
+  round(quantile(0.5)(log2(v+1)),3) AS median_log2,
+  round(stddevPop(log2(v+1)),3) AS sd_log2
+FROM expr
+WHERE sample_unique_id IN (SELECT sample_unique_id FROM profiled_mut)
+  AND sample_unique_id NOT IN (SELECT sample_unique_id FROM any_tp53_mut_samples)
+"
+}
+
+◀ result
+{"rows":[{"grp":"Wild_type","n":98,"mean_log2":10.768,"median_log2":11.34,"sd_log2":1.341},{"grp":"Truncating_mutant","n":77,"mean_log2":9.298,"median_log2":9.097,"sd_log2":0.922}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT * FROM gene_mutation_frequency_in_study(study = 'ov_tcga_pan_can_atlas_2018', gene = 'TP53')"
+}
+
+◀ result
+{"rows":[{"cancer_type":"Ovarian Epithelial Tumor","altered_samples":373,"profiled_samples":523,"frequency_pct":71.3}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "ov_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":585,"studyViewUrl":"https://www.cbioportal.org/study?id=ov_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["ov_tcga_pan_can_atlas_2018_gistic","ov_tcga_pan_can_atlas_2018_log2CNA","ov_tcga_pan_can_atlas_2018_mutations","ov_tcga_pan_can_atlas_2018_protein_quantification","ov_tcga_pan_can_atlas_2018_protein_quantification_zscores","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ov_tcga_pan_can_atlas_2018_rppa","ov_tcga_pan_can_atlas_2018_rppa_Zscores","ov_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["ov_tcga_pan_can_atlas_2018_armlevel_cna","ov_tcga_pan_can_atlas_2018_genetic_ancestry","ov_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","ov_tcga_pan_can_atlas_2018_methylation_hm450","ov_tcga_pan_can_atlas_2018_phosphoprotein_quantification"],"heatmapProfileIds":["ov_tcga_pan_can_atlas_2018_protein_quantification_zscores","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ov_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation","generic_assay_phosphosite_quantification"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "ov_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "TP53: MUT = TRUNC"
+ ],
+ "tab": "comparison/mrna",
+ "profileFilter": "mutations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/comparison/mrna?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=TP53%3A+MUT+%3D+TRUNC&case_set_id=ov_tcga_pan_can_atlas_2018_all&profileFilter=mutations","url":"https://www.cbioportal.org/results/comparison/mrna?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=TP53%3A+MUT+%3D+TRUNC&case_set_id=ov_tcga_pan_can_atlas_2018_all&profileFilter=mutations","data":{"studyIds":["ov_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":585}],"genes":["TP53"],"caseSetId":"ov_tcga_pan_can_atlas_2018_all","pageDescription":"mRNA expression for all genes compared across groups defined by query genes."}}
+
+═ answer (success)
+## TP53 truncating mutations vs. TP53 mRNA expression — Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)
+
+**Cohort context:** TP53 is mutated in 373/523 profiled samples (71.3%) in this cohort — one of the highest mutation rates in TCGA, as expected for high-grade serous ovarian cancer.
+
+**Groups compared** (sample-level, `rna_seq_v2_mrna` RSEM values, log2(x+1)-transformed per the guide's convention for RNA-seq data):
+
+| Group | N samples | Mean log2(RSEM+1) | Median log2(RSEM+1) | SD |
+|---|---|---|---|---|
+| TP53 truncating mutant (Nonsense, Frameshift Ins/Del, Splice Site) | 77 | 9.298 | 9.097 | 0.922 |
+| TP53 wild-type (profiled, no mutation of any kind) | 98 | 10.768 | 11.34 | 1.341 |
+
+Truncating-mutant samples show visibly lower TP53 transcript levels on average (mean log2 expression ~1.5 units lower, roughly consistent with nonsense-mediated decay of transcripts bearing premature stop codons or frameshift-introduced stops).
+
+**On significance:** I can't compute a p-value here — ClickHouse doesn't run statistical tests. Per the standard test-selection rules, this is a 2-group continuous-expression comparison, so the appropriate test is a **Student's t-test on log2-transformed values** (or Mann-Whitney U if you prefer a non-parametric check given the skew evident in the wide SD/median gap for the wild-type group). Given group sizes (77 vs. 98) and the apparent mean/median separation, this comparison is very likely to reach significance, but I won't state a p-value without the test actually being run — you can get one instantly in the linked Group Comparison view below, or via `scipy.stats.ttest_ind` / `mannwhitneyu` in Python.
+
+**Run the test / see the distributions:**
+[TP53 truncating-mutant vs. rest — mRNA comparison](https://www.cbioportal.org/results/comparison/mrna?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=TP53%3A+MUT+%3D+TRUNC&case_set_id=ov_tcga_pan_can_atlas_2018_all&profileFilter=mutations)
+
+This opens cBioPortal's Comparison → mRNA tab with the OQL `TP53: MUT = TRUNC`, showing box plots and the built-in significance test (t-test/Mann-Whitney, with q-value) for Altered (truncating) vs Unaltered groups.

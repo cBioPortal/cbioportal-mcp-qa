@@ -1,0 +1,752 @@
+Q (haiku): Do patients with PIK3CA mutations have different overall survival outcomes compared to PIK3CA wild-type patients in breast cancer from the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ list_studies
+{
+ "search": "MSK-CHORD breast",
+ "verbose": true
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[]}
+
+▶ list_studies
+{
+ "search": "CHORD",
+ "verbose": true
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","description":"Targeted sequencing of 25040 tumors from 24950 patients and their matched normals via MSK-IMPACT, along with clinical annotations, some of which are derived from natural language processing (denoted NLP). This data is available under the <a href=\"https://creativecommons.org/licenses/by-nc-nd/4.0/deed.en\">Creative Commons BY-NC-ND 4.0 license</a>. For commercial use, please contact <a href=\"mailto: datarequests@mskcc.org\">datarequests@mskcc.org</a>","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Breast cancer patients from MSK-CHORD: PIK3CA mutation status vs OS
+SELECT
+  CASE WHEN hugo_gene_symbol = 'PIK3CA' AND variant_type = 'mutation' 
+       AND mutation_status NOT IN ('GERMLINE', '') 
+    THEN 'PIK3CA mutant'
+    ELSE 'PIK3CA wild-type'
+  END AS pik3ca_status,
+  COUNT(DISTINCT p.patient_unique_id) AS n_patients,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_events,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_censored,
+  MIN(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS min_os_months,
+  MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS max_os_months
+FROM patient p
+LEFT JOIN sample s ON p.patient_unique_id = s.patient_unique_id
+LEFT JOIN genomic_event_derived g ON s.sample_unique_id = g.sample_unique_id
+LEFT JOIN clinical_data_derived c ON p.patient_unique_id = c.patient_unique_id
+WHERE p.cancer_study_identifier = 'msk_chord_2024'
+  AND c.cancer_study_identifier = 'msk_chord_2024'
+  AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+  AND (SELECT attribute_value FROM clinical_data_derived 
+       WHERE patient_unique_id = p.patient_unique_id 
+       AND cancer_study_identifier = 'msk_chord_2024'
+       AND attribute_name = 'CANCER_TYPE') = 'Breast Cancer'
+GROUP BY pik3ca_status
+ORDER BY pik3ca_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'p.patient_unique_id' cannot be resolved from table with name p. In scope SELECT multiIf((hugo_gene_symbol = 'PIK3CA') AND (variant_type = 'mutation') AND (mutation_status NOT IN ('GERMLINE', '')), 'PIK3CA mutant', 'PIK3CA wild-type') AS pik3ca_status, COUNTDistinct(p.patient_unique_id) AS n_patients, SUM(multiIf((c.attribute_name = 'OS_STATUS') AND (c.attribute_value = '1:DECEASED'), 1, 0)) AS n_events, SUM(multiIf((c.attribute_name = 'OS_STATUS') AND (c.attribute_value = '0:LIVING'), 1, 0)) AS n_censored, MIN(multiIf(c.attribute_name = 'OS_MONTHS', toFloat64OrNull(c.attribute_value), NULL)) AS min_os_months, MAX(multiIf(c.attribute_name = 'OS_MONTHS', toFloat64OrNull(c.attribute_value), NULL)) AS max_os_months FROM patient AS p LEFT JOIN sample AS s ON p.patient_unique_id = s.patient_unique_id LEFT JOIN genomic_event_derived AS g ON s.sample_unique_id = g.sample_unique_id LEFT JOIN clinical_data_derived AS c ON p.patient_unique_id = c.patient_unique_id WHERE (p.cancer_study_identifier = 'msk_chord_2024') AND (c.cancer_study_identifier = 'msk_chord_2024') AND (c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')) AND ((SELECT attribute_value FROM clinical_data_derived WHERE (patient_unique_id = p.patient_unique_id) AND (cancer_study_identifier = 'msk_chord_2024') AND (attribute_name = 'CANCER_TYPE')) = 'Breast Cancer') GROUP BY pik3ca_status ORDER BY pik3ca_status DESC. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "patient"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int64","comment":"Primary key. Unique internal identifier for the patient."},{"name":"stable_id","type":"String","comment":"Stable patient identifier within the study. Combined with cancer_study_identifier forms patient_unique_id."},{"name":"cancer_study_id","type":"Int64","comment":"Foreign key to cancer_study.cancer_study_id. Links patient to their study."}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Step 1: Get breast cancer patients with PIK3CA mutation status
+WITH breast_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value = 'Breast Cancer'
+),
+pik3ca_status AS (
+  SELECT DISTINCT 
+    patient_unique_id,
+    CASE WHEN hugo_gene_symbol = 'PIK3CA' AND variant_type = 'mutation' 
+         AND mutation_status NOT IN ('GERMLINE', 'UNCALLED', '')
+      THEN 'mutant'
+      ELSE 'wild-type'
+    END AS status
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND hugo_gene_symbol = 'PIK3CA'
+),
+pik3ca_any AS (
+  SELECT patient_unique_id, 
+    CASE WHEN COUNT(*) > 0 THEN 'mutant' ELSE 'wild-type' END AS pik3ca_status
+  FROM pik3ca_status
+  WHERE status = 'mutant'
+  GROUP BY patient_unique_id
+)
+-- Step 2: Get OS status and months for each group
+SELECT
+  CASE WHEN p.patient_unique_id IS NOT NULL THEN 'PIK3CA mutant'
+       ELSE 'PIK3CA wild-type'
+  END AS pik3ca_status,
+  COUNT(DISTINCT b.patient_unique_id) AS n_patients,
+  SUM(CASE WHEN c_os.attribute_name = 'OS_STATUS' AND c_os.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_events,
+  SUM(CASE WHEN c_os.attribute_name = 'OS_STATUS' AND c_os.attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_censored,
+  MIN(CASE WHEN c_os.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c_os.attribute_value) END) AS min_os_months,
+  MAX(CASE WHEN c_os.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c_os.attribute_value) END) AS max_os_months,
+  CAST(quantile(0.5)(toFloat64OrNull(c_os.attribute_value)) AS Float64) AS median_os_months
+FROM breast_patients b
+LEFT JOIN pik3ca_any p ON b.patient_unique_id = p.patient_unique_id
+LEFT JOIN clinical_data_derived c_os ON b.patient_unique_id = c_os.patient_unique_id
+WHERE c_os.cancer_study_identifier = 'msk_chord_2024'
+  AND c_os.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+GROUP BY (p.patient_unique_id IS NOT NULL)
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"pik3ca_status":"PIK3CA mutant","n_patients":5368,"n_events":1990,"n_censored":3378,"min_os_months":0.032876676,"max_os_months":118.4546647,"median_os_months":36.29585063}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Breast cancer patients from MSK-CHORD with OS data
+-- Get all breast cancer patients first, then check for PIK3CA mutations
+WITH breast_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value = 'Breast Cancer'
+),
+pik3ca_mutants AS (
+  SELECT DISTINCT patient_unique_id
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND hugo_gene_symbol = 'PIK3CA'
+    AND variant_type = 'mutation'
+    AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+    AND off_panel = FALSE
+)
+SELECT
+  CASE WHEN m.patient_unique_id IS NOT NULL THEN 'PIK3CA mutant' ELSE 'PIK3CA wild-type' END AS pik3ca_status,
+  COUNT(DISTINCT b.patient_unique_id) AS n_patients,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_living,
+  CAST(quantile(0.5)(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS Float64) AS median_os_months_raw,
+  MIN(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS min_os_months,
+  MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS max_os_months
+FROM breast_patients b
+LEFT JOIN pik3ca_mutants m ON b.patient_unique_id = m.patient_unique_id
+LEFT JOIN clinical_data_derived c ON b.patient_unique_id = c.patient_unique_id
+WHERE c.cancer_study_identifier = 'msk_chord_2024'
+  AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+GROUP BY (m.patient_unique_id IS NOT NULL)
+ORDER BY pik3ca_status
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"pik3ca_status":"PIK3CA mutant","n_patients":5368,"n_deceased":1990,"n_living":3378,"median_os_months_raw":36.29585063,"min_os_months":0.032876676,"max_os_months":118.4546647}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check for PIK3CA mutations in breast cancer
+SELECT
+  COUNT(DISTINCT patient_unique_id) AS breast_patients,
+  COUNT(DISTINCT CASE WHEN hugo_gene_symbol = 'PIK3CA' AND variant_type = 'mutation' 
+                     AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+                     AND off_panel = FALSE THEN patient_unique_id END) AS pik3ca_mutant_patients
+FROM genomic_event_derived g
+WHERE cancer_study_identifier = 'msk_chord_2024'
+  AND patient_unique_id IN (
+    SELECT DISTINCT patient_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+      AND attribute_name = 'CANCER_TYPE'
+      AND attribute_value = 'Breast Cancer'
+  )
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"breast_patients":5237,"pik3ca_mutant_patients":1908}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Breast cancer PIK3CA mutation status and OS outcomes - corrected query
+WITH breast_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value = 'Breast Cancer'
+),
+pik3ca_mutants AS (
+  SELECT DISTINCT patient_unique_id
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND hugo_gene_symbol = 'PIK3CA'
+    AND variant_type = 'mutation'
+    AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+    AND off_panel = FALSE
+)
+SELECT
+  CASE WHEN m.patient_unique_id IS NOT NULL THEN 'PIK3CA mutant' ELSE 'PIK3CA wild-type' END AS pik3ca_status,
+  COUNT(DISTINCT b.patient_unique_id) AS n_patients,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased_events,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_censored_living,
+  MIN(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS min_followup_months,
+  MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS max_followup_months
+FROM breast_patients b
+LEFT JOIN pik3ca_mutants m ON b.patient_unique_id = m.patient_unique_id
+LEFT JOIN clinical_data_derived c ON b.patient_unique_id = c.patient_unique_id
+WHERE c.cancer_study_identifier = 'msk_chord_2024'
+  AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+GROUP BY (m.patient_unique_id IS NOT NULL)
+ORDER BY pik3ca_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"pik3ca_status":"PIK3CA mutant","n_patients":5368,"n_deceased_events":1990,"n_censored_living":3378,"min_followup_months":0.032876676,"max_followup_months":118.4546647}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Simple version: count separately
+SELECT
+  'Breast Cancer (MSK-CHORD)' AS cohort,
+  'All patients with OS data' AS group_desc,
+  (SELECT COUNT(DISTINCT patient_unique_id)
+   FROM clinical_data_derived
+   WHERE cancer_study_identifier = 'msk_chord_2024'
+     AND attribute_name = 'CANCER_TYPE'
+     AND attribute_value = 'Breast Cancer') AS total_breast_patients,
+  (SELECT COUNT(DISTINCT patient_unique_id)
+   FROM genomic_event_derived
+   WHERE cancer_study_identifier = 'msk_chord_2024'
+     AND hugo_gene_symbol = 'PIK3CA'
+     AND variant_type = 'mutation'
+     AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+     AND off_panel = FALSE
+     AND patient_unique_id IN (
+       SELECT DISTINCT patient_unique_id
+       FROM clinical_data_derived
+       WHERE cancer_study_identifier = 'msk_chord_2024'
+         AND attribute_name = 'CANCER_TYPE'
+         AND attribute_value = 'Breast Cancer'
+     )) AS pik3ca_mutant_patients,
+  (SELECT COUNT(DISTINCT patient_unique_id)
+   FROM clinical_data_derived
+   WHERE cancer_study_identifier = 'msk_chord_2024'
+     AND attribute_name = 'CANCER_TYPE'
+     AND attribute_value = 'Breast Cancer'
+     AND patient_unique_id NOT IN (
+       SELECT DISTINCT patient_unique_id
+       FROM genomic_event_derived
+       WHERE cancer_study_identifier = 'msk_chord_2024'
+         AND hugo_gene_symbol = 'PIK3CA'
+         AND variant_type = 'mutation'
+         AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+         AND off_panel = FALSE
+     )) AS pik3ca_wildtype_patients
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cohort":"Breast Cancer (MSK-CHORD)","group_desc":"All patients with OS data","total_breast_patients":5368,"pik3ca_mutant_patients":1908,"pik3ca_wildtype_patients":3460}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- OS outcomes by PIK3CA mutation status
+WITH pik3ca_mutants AS (
+  SELECT DISTINCT patient_unique_id
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND hugo_gene_symbol = 'PIK3CA'
+    AND variant_type = 'mutation'
+    AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+    AND off_panel = FALSE
+),
+breast_cancer_os AS (
+  SELECT 
+    c.patient_unique_id,
+    CASE WHEN m.patient_unique_id IS NOT NULL THEN 'PIK3CA mutant' ELSE 'PIK3CA wild-type' END AS pik3ca_status,
+    MAX(CASE WHEN c.attribute_name = 'OS_STATUS' THEN c.attribute_value END) AS os_status,
+    MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END) AS os_months
+  FROM clinical_data_derived c
+  LEFT JOIN pik3ca_mutants m ON c.patient_unique_id = m.patient_unique_id
+  WHERE c.cancer_study_identifier = 'msk_chord_2024'
+    AND c.patient_unique_id IN (
+      SELECT DISTINCT patient_unique_id
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024'
+        AND attribute_name = 'CANCER_TYPE'
+        AND attribute_value = 'Breast Cancer'
+    )
+    AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+  GROUP BY c.patient_unique_id, pik3ca_status
+)
+SELECT
+  pik3ca_status,
+  COUNT(DISTINCT patient_unique_id) AS n_patients,
+  SUM(CASE WHEN os_status = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN os_status = '0:LIVING' THEN 1 ELSE 0 END) AS n_living,
+  SUM(CASE WHEN os_status IS NULL THEN 1 ELSE 0 END) AS n_missing_os_status,
+  ROUND(100.0 * SUM(CASE WHEN os_status = '1:DECEASED' THEN 1 ELSE 0 END) / COUNT(DISTINCT patient_unique_id), 1) AS pct_deceased,
+  ROUND(MIN(os_months), 2) AS min_os_months,
+  ROUND(MAX(os_months), 2) AS max_os_months,
+  ROUND(AVG(os_months), 2) AS mean_os_months
+FROM breast_cancer_os
+GROUP BY pik3ca_status
+ORDER BY pik3ca_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"pik3ca_status":"PIK3CA mutant","n_patients":5368,"n_deceased":1990,"n_living":3378,"n_missing_os_status":0,"pct_deceased":37.1,"min_os_months":0.03,"max_os_months":118.45,"mean_os_months":40.11}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- PIK3CA mutant breast cancer patients with OS data
+WITH pik3ca_mutants AS (
+  SELECT DISTINCT patient_unique_id
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND hugo_gene_symbol = 'PIK3CA'
+    AND variant_type = 'mutation'
+    AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+    AND off_panel = FALSE
+),
+breast_cancer_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value = 'Breast Cancer'
+)
+SELECT
+  'PIK3CA mutant' AS pik3ca_status,
+  COUNT(DISTINCT b.patient_unique_id) AS n_patients,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_living,
+  ROUND(100.0 * SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) / COUNT(DISTINCT b.patient_unique_id), 1) AS pct_deceased,
+  ROUND(MIN(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS min_os_months,
+  ROUND(MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS max_os_months,
+  ROUND(AVG(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS mean_os_months
+FROM breast_cancer_patients b
+INNER JOIN pik3ca_mutants m ON b.patient_unique_id = m.patient_unique_id
+LEFT JOIN clinical_data_derived c ON b.patient_unique_id = c.patient_unique_id
+WHERE c.cancer_study_identifier = 'msk_chord_2024'
+  AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+
+UNION ALL
+
+SELECT
+  'PIK3CA wild-type' AS pik3ca_status,
+  COUNT(DISTINCT b.patient_unique_id) AS n_patients,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_living,
+  ROUND(100.0 * SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) / COUNT(DISTINCT b.patient_unique_id), 1) AS pct_deceased,
+  ROUND(MIN(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS min_os_months,
+  ROUND(MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS max_os_months,
+  ROUND(AVG(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS mean_os_months
+FROM breast_cancer_patients b
+WHERE b.patient_unique_id NOT IN (SELECT patient_unique_id FROM pik3ca_mutants)
+  AND EXISTS (
+    SELECT 1 FROM clinical_data_derived c
+    WHERE c.patient_unique_id = b.patient_unique_id
+      AND c.cancer_study_identifier = 'msk_chord_2024'
+      AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+  )
+  AND b.patient_unique_id IN (
+    SELECT patient_unique_id FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+      AND attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+  )
+  AND EXISTS (
+    SELECT 1 FROM clinical_data_derived c2
+    WHERE c2.patient_unique_id = b.patient_unique_id
+      AND c2.cancer_study_identifier = 'msk_chord_2024'
+      AND c2.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+  )
+LEFT JOIN clinical_data_derived c ON b.patient_unique_id = c.patient_unique_id
+  AND c.cancer_study_identifier = 'msk_chord_2024'
+  AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+
+ORDER BY pik3ca_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 62\n Code: 62. DB::Exception: Syntax error: failed at position 3384 (LEFT) (line 63, col 1): LEFT JOIN clinical_data_derived c ON b.patient_unique_id = c.patient_unique_id\n  AND c.cancer_study_identifier = 'msk_chord_2024'\n  AND c.attribute_name IN ('OS_S... Expected one of: OR, AND, IS NOT DISTINCT FROM, IS DISTINCT FROM, IS NULL, IS NOT NULL, BETWEEN, NOT BETWEEN, LIKE, ILIKE, NOT LIKE, NOT ILIKE, REGEXP, IN, NOT IN, GLOBAL IN, GLOBAL NOT IN, MOD, DIV, alias, AS, GROUP BY, WITH, HAVING, WINDOW, QUALIFY, ORDER BY, LIMIT, OFFSET, FETCH, SETTINGS, UNION, EXCEPT, INTERSECT. (SYNTAX_ERROR) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- PIK3CA status and OS outcomes in breast cancer
+WITH pik3ca_mutants AS (
+  SELECT DISTINCT patient_unique_id
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND hugo_gene_symbol = 'PIK3CA'
+    AND variant_type = 'mutation'
+    AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+    AND off_panel = FALSE
+),
+breast_cancer_patients AS (
+  SELECT DISTINCT patient_unique_id
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name = 'CANCER_TYPE'
+    AND attribute_value = 'Breast Cancer'
+),
+mutant_os_data AS (
+  SELECT
+    'PIK3CA mutant' AS pik3ca_status,
+    b.patient_unique_id,
+    c.attribute_name,
+    c.attribute_value
+  FROM breast_cancer_patients b
+  INNER JOIN pik3ca_mutants m ON b.patient_unique_id = m.patient_unique_id
+  LEFT JOIN clinical_data_derived c ON b.patient_unique_id = c.patient_unique_id
+    AND c.cancer_study_identifier = 'msk_chord_2024'
+    AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+),
+wildtype_os_data AS (
+  SELECT
+    'PIK3CA wild-type' AS pik3ca_status,
+    b.patient_unique_id,
+    c.attribute_name,
+    c.attribute_value
+  FROM breast_cancer_patients b
+  LEFT JOIN clinical_data_derived c ON b.patient_unique_id = c.patient_unique_id
+    AND c.cancer_study_identifier = 'msk_chord_2024'
+    AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+  WHERE b.patient_unique_id NOT IN (SELECT patient_unique_id FROM pik3ca_mutants)
+)
+SELECT
+  pik3ca_status,
+  COUNT(DISTINCT patient_unique_id) AS n_patients,
+  SUM(CASE WHEN attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_living,
+  ROUND(100.0 * SUM(CASE WHEN attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) / COUNT(DISTINCT patient_unique_id), 1) AS pct_deceased,
+  ROUND(MIN(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END), 2) AS min_os_months,
+  ROUND(MAX(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END), 2) AS max_os_months,
+  ROUND(AVG(CASE WHEN attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(attribute_value) END), 2) AS mean_os_months
+FROM (SELECT * FROM mutant_os_data UNION ALL SELECT * FROM wildtype_os_data)
+GROUP BY pik3ca_status
+ORDER BY pik3ca_status DESC
+",
+ "max_rows": 100
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression or function identifier `patient_unique_id` in scope WITH pik3ca_mutants AS (SELECT DISTINCT patient_unique_id FROM genomic_event_derived WHERE (cancer_study_identifier = 'msk_chord_2024') AND (hugo_gene_symbol = 'PIK3CA') AND (variant_type = 'mutation') AND (mutation_status NOT IN ('GERMLINE', 'UNCALLED')) AND (off_panel = false)), breast_cancer_patients AS (SELECT DISTINCT patient_unique_id FROM clinical_data_derived WHERE (cancer_study_identifier = 'msk_chord_2024') AND (attribute_name = 'CANCER_TYPE') AND (attribute_value = 'Breast Cancer')), mutant_os_data AS (SELECT 'PIK3CA mutant' AS pik3ca_status, b.patient_unique_id, c.attribute_name, c.attribute_value FROM breast_cancer_patients AS b INNER JOIN pik3ca_mutants AS m ON b.patient_unique_id = m.patient_unique_id LEFT JOIN clinical_data_derived AS c ON (b.patient_unique_id = c.patient_unique_id) AND (c.cancer_study_identifier = 'msk_chord_2024') AND (c.attribute_name IN ('OS_STATUS', 'OS_MONTHS'))), wildtype_os_data AS (SELECT 'PIK3CA wild-type' AS pik3ca_status, b.patient_unique_id, c.attribute_name, c.attribute_value FROM breast_cancer_patients AS b LEFT JOIN clinical_data_derived AS c ON (b.patient_unique_id = c.patient_unique_id) AND (c.cancer_study_identifier = 'msk_chord_2024') AND (c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')) WHERE b.patient_unique_id NOT IN (SELECT patient_unique_id FROM pik3ca_mutants)) SELECT pik3ca_status, COUNTDistinct(patient_unique_id) AS n_patients, SUM(multiIf(attribute_value = '1:DECEASED', 1, 0)) AS n_deceased, SUM(multiIf(attribute_value = '0:LIVING', 1, 0)) AS n_living, ROUND((100. * SUM(multiIf(attribute_value = '1:DECEASED', 1, 0))) / COUNTDistinct(patient_unique_id), 1) AS pct_deceased, ROUND(MIN(multiIf(attribute_name = 'OS_MONTHS', toFloat64OrNull(attribute_value), NULL)), 2) AS min_os_months, ROUND(MAX(multiIf(attribute_name = 'OS_MONTHS', toFloat64OrNull(attribute_value), NULL)), 2) AS max_os_months, ROUND(AVG(multiIf(attribute_name = 'OS_MONTHS', toFloat64OrNull(attribute_value), NULL)), 2) AS mean_os_months FROM (SELECT * FROM mutant_os_data UNION ALL SELECT * FROM wildtype_os_data) GROUP BY pik3ca_status ORDER BY pik3ca_status DESC. (UNKNOWN_IDENTIFIER) (version 26.4.1.2359 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Simple two-part query for PIK3CA mutant vs wild-type
+-- Part 1: PIK3CA mutants
+SELECT
+  'PIK3CA mutant' AS pik3ca_status,
+  COUNT(DISTINCT c.patient_unique_id) AS n_patients,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_living,
+  ROUND(100.0 * SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) / COUNT(DISTINCT c.patient_unique_id), 1) AS pct_deceased,
+  ROUND(MIN(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS min_os_months,
+  ROUND(MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS max_os_months,
+  ROUND(AVG(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS mean_os_months
+FROM clinical_data_derived c
+WHERE c.cancer_study_identifier = 'msk_chord_2024'
+  AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+  AND c.patient_unique_id IN (
+    SELECT DISTINCT cd.patient_unique_id
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'msk_chord_2024'
+      AND cd.attribute_name = 'CANCER_TYPE'
+      AND cd.attribute_value = 'Breast Cancer'
+  )
+  AND c.patient_unique_id IN (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND variant_type = 'mutation'
+      AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+      AND off_panel = FALSE
+  )
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"pik3ca_status":"PIK3CA mutant","n_patients":1908,"n_deceased":718,"n_living":1190,"pct_deceased":37.6,"min_os_months":0.03,"max_os_months":113.13,"mean_os_months":40.87}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- PIK3CA wild-type breast cancer patients
+SELECT
+  'PIK3CA wild-type' AS pik3ca_status,
+  COUNT(DISTINCT c.patient_unique_id) AS n_patients,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) AS n_deceased,
+  SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '0:LIVING' THEN 1 ELSE 0 END) AS n_living,
+  ROUND(100.0 * SUM(CASE WHEN c.attribute_name = 'OS_STATUS' AND c.attribute_value = '1:DECEASED' THEN 1 ELSE 0 END) / COUNT(DISTINCT c.patient_unique_id), 1) AS pct_deceased,
+  ROUND(MIN(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS min_os_months,
+  ROUND(MAX(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS max_os_months,
+  ROUND(AVG(CASE WHEN c.attribute_name = 'OS_MONTHS' THEN toFloat64OrNull(c.attribute_value) END), 2) AS mean_os_months
+FROM clinical_data_derived c
+WHERE c.cancer_study_identifier = 'msk_chord_2024'
+  AND c.attribute_name IN ('OS_STATUS', 'OS_MONTHS')
+  AND c.patient_unique_id IN (
+    SELECT DISTINCT cd.patient_unique_id
+    FROM clinical_data_derived cd
+    WHERE cd.cancer_study_identifier = 'msk_chord_2024'
+      AND cd.attribute_name = 'CANCER_TYPE'
+      AND cd.attribute_value = 'Breast Cancer'
+  )
+  AND c.patient_unique_id NOT IN (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND variant_type = 'mutation'
+      AND mutation_status NOT IN ('GERMLINE', 'UNCALLED')
+      AND off_panel = FALSE
+  )
+",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"pik3ca_status":"PIK3CA wild-type","n_patients":3460,"n_deceased":1272,"n_living":2188,"pct_deceased":36.8,"min_os_months":0.03,"max_os_months":118.45,"mean_os_months":39.68}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","metadata":{"clinicalAttributeIds":["ADRENAL_GLANDS","BONE","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_GROUP","CLINICAL_SUMMARY","CNS_BRAIN","CURRENT_AGE_DEID","DIAGNOSIS_DESCRIPTION","ETHNICITY","FRACTION_GENOME_ALTERED","GENDER","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","GLEASON_SAMPLE_LEVEL","HER2","HISTORY_OF_PDL1","HR","ICD_O_HISTOLOGY_DESCRIPTION","INTRA_ABDOMINAL","LIVER","LUNG","LYMPH_NODES","METASTATIC_SITE","MSI_COMMENT","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","NUM_ICDO_DX","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER","PATHOLOGICAL_GROUP","PDL1_POSITIVE","PLEURA","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","REPRODUCTIVE_ORGANS","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["msk_chord_2024_cna","msk_chord_2024_mutations","msk_chord_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "groups": [
+  {
+   "name": "PIK3CA mutant",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "msk_chord_2024_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "PIK3CA wild-type",
+   "isUnselected": true
+  }
+ ],
+ "studyViewFilter": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Breast Cancer"
+     }
+    ]
+   }
+  ]
+ },
+ "tab": "survival"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ab7f4bfc2115c492d885144","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ab7f4bfc2115c492d885144","data":{"description":"Group comparison (2 custom groups)","studies":["msk_chord_2024"],"totalGroups":2,"groups":[{"name":"PIK3CA mutant","sampleCount":1908},{"name":"PIK3CA wild-type","sampleCount":3460}],"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%7D","groupUrls":[{"groupName":"PIK3CA mutant","url":"https://www.cbioportal.org/study?id=msk_chord_2024#filterJson=%7B%22studyIds%22%3A%5B%22msk_chord_2024%22%5D%2C%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%2C%22geneFilters%22%3A%5B%7B%22molecularProfileIds%22%3A%5B%22msk_chord_2024_mutations%22%5D%2C%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%5D%5D%7D%5D%7D"}],"pageDescription":"Kaplan-Meier survival analysis comparing PIK3CA mutant (1908) vs PIK3CA wild-type (3460)."}}
+
+═ answer (success)
+Perfect! Now I have all the data and a direct comparison link. Let me compile the findings:
+
+---
+
+## Summary
+
+Based on analysis of the **MSK-CHORD Study (MSK, Nature 2024)** breast cancer cohort, here are the overall survival outcomes comparing PIK3CA-mutant vs wild-type patients:
+
+### Patient Counts
+- **PIK3CA mutant:** 1,908 breast cancer patients
+- **PIK3CA wild-type:** 3,460 breast cancer patients
+- **Total breast cancer cohort:** 5,368 patients
+
+### Overall Survival Status
+
+| Group | N Patients | Deceased (Events) | Living (Censored) | Event Rate |
+|-------|-----------|------------------|------------------|-----------|
+| PIK3CA mutant | 1,908 | 718 | 1,190 | 37.6% |
+| PIK3CA wild-type | 3,460 | 1,272 | 2,188 | 36.8% |
+
+### Follow-up Duration
+Both groups have similar follow-up ranges:
+- **PIK3CA mutant:** 0.03–113.13 months (mean: 40.87 months)
+- **PIK3CA wild-type:** 0.03–118.45 months (mean: 39.68 months)
+
+---
+
+## Key Finding
+
+**The raw event rates are very similar:** PIK3CA mutants show 37.6% mortality vs 36.8% in wild-type patients. **However, raw percentages ignore censoring** — patients still alive have not yet experienced the event, and a naive comparison would be misleading.
+
+⚠️ **For a proper survival comparison, use Kaplan-Meier analysis**, which accounts for censoring and provides:
+- **Median overall survival** per group (may be "not reached" if <50% have events)
+- **Log-rank test p-value** to assess statistical significance
+- **Hazard ratio** (requires Cox regression)
+
+---
+
+## View Survival Analysis
+
+**[Open Kaplan-Meier Comparison: PIK3CA mutant vs wild-type](https://www.cbioportal.org/comparison/survival?comparisonId=6ab7f4bfc2115c492d885144)**
+
+This link opens cBioPortal's Group Comparison **Survival** tab, where you can:
+- View the Kaplan-Meier curves side-by-side
+- See the log-rank p-value
+- Access per-group survival statistics (events, censored, at-risk over time)
+- Export the KM table for downstream analysis
+
+Alternatively, run Kaplan-Meier in **R** (`survival::survfit`) or **Python** (`lifelines.KaplanMeierFitter`) using the event/censored counts above.

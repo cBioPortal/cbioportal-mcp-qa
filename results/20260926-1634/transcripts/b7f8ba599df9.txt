@@ -1,0 +1,205 @@
+Q (haiku): "Are mutations in CDKN2A, CDK4, and RB1 mutually exclusive in glioblastoma patients?"
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ search_oncotree
+{
+ "search_term": "glioblastoma"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"code":"GB","name":"Glioblastoma, IDH-Wildtype","score":60,"mainType":"Glioma","tissue":"CNS/Brain","hierarchy":"BRAIN > DIFG > ADIFG > GB","replacedCodes":["GBM"]},{"code":"SCGBM","name":"Small Cell Glioblastoma","score":50,"mainType":"Glioma","tissue":"CNS/Brain","hierarchy":"BRAIN > DIFG > ADIFG > GB > SCGBM"}]}
+
+▶ list_studies
+{
+ "search": "glioblastoma",
+ "limit": 20
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"gbm_tcga","name":"Glioblastoma Multiforme (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":619,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga"},{"cancer_study_identifier":"gbm_tcga_gdc","name":"Glioblastoma Multiforme (TCGA GDC, 2025)","type_of_cancer_id":"difg","sample_count":611,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_gdc"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":592,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pub2013","name":"Glioblastoma (TCGA, Cell 2013)","type_of_cancer_id":"difg","sample_count":577,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013"},{"cancer_study_identifier":"gbm_tcga_pub","name":"Glioblastoma (TCGA, Nature 2008)","type_of_cancer_id":"difg","sample_count":206,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub"},{"cancer_study_identifier":"gbm_cptac_2021","name":"Glioblastoma (CPTAC, Cell 2021)","type_of_cancer_id":"difg","sample_count":99,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_cptac_2021"},{"cancer_study_identifier":"gbm_columbia_2019","name":"Glioblastoma (Columbia, Nat Med. 2019)","type_of_cancer_id":"difg","sample_count":42,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_columbia_2019"},{"cancer_study_identifier":"gbm_iatlas_prins_2019","name":"Glioblastoma (Randomized Clinical Trial, Nat Med. 2019) - iAtlas Harmonized","type_of_cancer_id":"adifg","sample_count":30,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_iatlas_prins_2019"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Mutual exclusivity analysis: CDKN2A, CDK4, RB1 in GBM (TCGA PanCancer Atlas)
+-- Step 1: Identify all samples profiled for mutations in this study
+SELECT
+  'gbm_tcga_pan_can_atlas_2018' AS study,
+  COUNT(DISTINCT sample_unique_id) AS total_samples_profiled,
+  SUM(CASE WHEN cdkn2a_mutated = 1 THEN 1 ELSE 0 END) AS cdkn2a_mut,
+  SUM(CASE WHEN cdk4_mutated = 1 THEN 1 ELSE 0 END) AS cdk4_mut,
+  SUM(CASE WHEN rb1_mutated = 1 THEN 1 ELSE 0 END) AS rb1_mut,
+  SUM(CASE WHEN cdkn2a_mutated = 1 AND cdk4_mutated = 1 THEN 1 ELSE 0 END) AS cdkn2a_and_cdk4,
+  SUM(CASE WHEN cdkn2a_mutated = 1 AND rb1_mutated = 1 THEN 1 ELSE 0 END) AS cdkn2a_and_rb1,
+  SUM(CASE WHEN cdk4_mutated = 1 AND rb1_mutated = 1 THEN 1 ELSE 0 END) AS cdk4_and_rb1,
+  SUM(CASE WHEN cdkn2a_mutated = 1 AND cdk4_mutated = 1 AND rb1_mutated = 1 THEN 1 ELSE 0 END) AS all_three_mutated
+FROM (
+  SELECT DISTINCT
+    sample_unique_id,
+    MAX(CASE WHEN hugo_gene_symbol = 'CDKN2A' AND variant_type = 'mutation' 
+             AND upper(mutation_status) != 'GERMLINE' AND off_panel = FALSE THEN 1 ELSE 0 END) AS cdkn2a_mutated,
+    MAX(CASE WHEN hugo_gene_symbol = 'CDK4' AND variant_type = 'mutation' 
+             AND upper(mutation_status) != 'GERMLINE' AND off_panel = FALSE THEN 1 ELSE 0 END) AS cdk4_mutated,
+    MAX(CASE WHEN hugo_gene_symbol = 'RB1' AND variant_type = 'mutation' 
+             AND upper(mutation_status) != 'GERMLINE' AND off_panel = FALSE THEN 1 ELSE 0 END) AS rb1_mutated
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+    AND hugo_gene_symbol IN ('CDKN2A', 'CDK4', 'RB1')
+  GROUP BY sample_unique_id
+)
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"study":"gbm_tcga_pan_can_atlas_2018","total_samples_profiled":437,"cdkn2a_mut":4,"cdk4_mut":0,"rb1_mut":38,"cdkn2a_and_cdk4":0,"cdkn2a_and_rb1":1,"cdk4_and_rb1":0,"all_three_mutated":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Pairwise contingency tables for mutual exclusivity (TCGA GBM PanCancer Atlas)
+
+-- CDKN2A vs RB1
+SELECT
+  'CDKN2A vs RB1' AS comparison,
+  SUM(CASE WHEN cdkn2a_mutated = 1 AND rb1_mutated = 1 THEN 1 ELSE 0 END) AS both_mutated,
+  SUM(CASE WHEN cdkn2a_mutated = 1 AND rb1_mutated = 0 THEN 1 ELSE 0 END) AS cdkn2a_only,
+  SUM(CASE WHEN cdkn2a_mutated = 0 AND rb1_mutated = 1 THEN 1 ELSE 0 END) AS rb1_only,
+  SUM(CASE WHEN cdkn2a_mutated = 0 AND rb1_mutated = 0 THEN 1 ELSE 0 END) AS neither
+FROM (
+  SELECT DISTINCT
+    sample_unique_id,
+    MAX(CASE WHEN hugo_gene_symbol = 'CDKN2A' AND variant_type = 'mutation' 
+             AND upper(mutation_status) != 'GERMLINE' AND off_panel = FALSE THEN 1 ELSE 0 END) AS cdkn2a_mutated,
+    MAX(CASE WHEN hugo_gene_symbol = 'RB1' AND variant_type = 'mutation' 
+             AND upper(mutation_status) != 'GERMLINE' AND off_panel = FALSE THEN 1 ELSE 0 END) AS rb1_mutated
+  FROM genomic_event_derived
+  WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+    AND hugo_gene_symbol IN ('CDKN2A', 'RB1')
+  GROUP BY sample_unique_id
+)
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"comparison":"CDKN2A vs RB1","both_mutated":1,"cdkn2a_only":3,"rb1_only":37,"neither":328}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "
+-- Check CDK4 mutation profile specifically
+SELECT
+  hugo_gene_symbol,
+  COUNT(DISTINCT sample_unique_id) AS samples_with_mutation,
+  COUNT(*) AS total_mutation_events
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'gbm_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol IN ('CDKN2A', 'CDK4', 'RB1')
+  AND variant_type = 'mutation'
+  AND upper(mutation_status) != 'GERMLINE'
+  AND off_panel = FALSE
+GROUP BY hugo_gene_symbol
+ORDER BY hugo_gene_symbol
+",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"CDKN2A","samples_with_mutation":4,"total_mutation_events":4},{"hugo_gene_symbol":"RB1","samples_with_mutation":38,"total_mutation_events":39}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "gbm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","sampleCount":592,"studyViewUrl":"https://www.cbioportal.org/study?id=gbm_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["gbm_tcga_pan_can_atlas_2018_gistic","gbm_tcga_pan_can_atlas_2018_log2CNA","gbm_tcga_pan_can_atlas_2018_mutations","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","gbm_tcga_pan_can_atlas_2018_rppa","gbm_tcga_pan_can_atlas_2018_rppa_Zscores","gbm_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["gbm_tcga_pan_can_atlas_2018_armlevel_cna","gbm_tcga_pan_can_atlas_2018_genetic_ancestry","gbm_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","gbm_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","gbm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","gbm_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "gbm_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "CDKN2A",
+  "CDK4",
+  "RB1"
+ ],
+ "tab": "mutualExclusivity"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/mutualExclusivity?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=CDKN2A%0ACDK4%0ARB1&case_set_id=gbm_tcga_pan_can_atlas_2018_all","url":"https://www.cbioportal.org/results/mutualExclusivity?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=CDKN2A%0ACDK4%0ARB1&case_set_id=gbm_tcga_pan_can_atlas_2018_all","data":{"studyIds":["gbm_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","sampleCount":592}],"genes":["CDKN2A","CDK4","RB1"],"caseSetId":"gbm_tcga_pan_can_atlas_2018_all","pageDescription":"Co-occurrence and mutual exclusivity statistics for all queried gene pairs."}}
+
+═ answer (success)
+## Summary
+
+Based on my analysis of the **Glioblastoma Multiforme (TCGA, PanCancer Atlas)** cohort (n=592 samples, 437 mutation-profiled), here is what I found:
+
+### Mutation Frequencies
+- **CDKN2A**: 4 samples mutated (0.9% of profiled)
+- **CDK4**: 0 samples mutated (0% of profiled)
+- **RB1**: 38 samples mutated (8.7% of profiled)
+
+### Co-occurrence Pattern
+- **CDKN2A + RB1**: Only **1 sample** had mutations in both genes
+- **CDKN2A + CDK4**: 0 co-occurrences (CDK4 has no mutations in this cohort)
+- **CDK4 + RB1**: 0 co-occurrences
+- **All three**: 0 samples
+
+### 2×2 Contingency Table (CDKN2A vs RB1)
+
+| | RB1 mutated | RB1 wildtype | Total |
+|---|---|---|---|
+| **CDKN2A mutated** | 1 | 3 | 4 |
+| **CDKN2A wildtype** | 37 | 328 | 365 |
+| **Total** | 38 | 331 | 437 |
+
+---
+
+## Answer: **Not Clearly Mutually Exclusive**
+
+While the contingency table shows only **1 co-occurrence** out of 4 CDKN2A-mutated and 38 RB1-mutated samples (small overlap by count), **mutual exclusivity requires a formal Fisher's exact test**, which I cannot compute. The pattern is suggestive but not statistically confirmed.
+
+**Key limitations:**
+- **CDK4 has zero mutations** in this cohort, so no exclusivity can be assessed with CDK4
+- **CDKN2A is very rare** (4 samples), limiting statistical power for a test
+- A single co-occurrence does not prove mutual exclusivity — the test must show a significant odds ratio < 1
+
+### Next Steps
+[**View the Mutual Exclusivity analysis in cBioPortal**](https://www.cbioportal.org/results/mutualExclusivity?cancer_study_list=gbm_tcga_pan_can_atlas_2018&gene_list=CDKN2A%0ACDK4%0ARB1&case_set_id=gbm_tcga_pan_can_atlas_2018_all) — this page will compute Fisher's exact p-values and odds ratios for each pair and display the statistical results automatically.
+
+For a definitive answer, run Fisher's exact test in **R** (`fisher.test(matrix(c(1, 3, 37, 328), nrow=2))`) or **Python** (`scipy.stats.fisher_exact([[1, 3], [37, 328]])`).
