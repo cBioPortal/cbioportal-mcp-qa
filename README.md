@@ -19,7 +19,9 @@ For every question × model (× repeat):
 - **Grade**, pass/fail: an LLM judge (default Sonnet 4.6 on Bedrock, deliberately not one of the models under
   test) checks the answer against the reference answer, expected links and the `notes` rubric, using the
   criterion for the question's track (below). It also records whether the answer *declined*, so the report
-  can separate precision (right when it answers) from coverage (how often it answers).
+  can separate precision (right when it answers) from coverage (how often it answers). The judge also sees the
+  answer's tool calls (inputs and truncated results; guide text left out), so statistics the agent actually
+  computed aren't marked as invented. Older claude-code runs are graded from their transcripts.
 - **Objective checks**: when the reference is a single number, whether the answer contains it (exact for
   counts, within rounding for decimals/percentages) — shown where it disagrees with the judge; and whether
   every study id in the answer's cBioPortal links exists (a hallucination signal).

@@ -343,8 +343,11 @@ def test_judge_sees_the_conversation():
     judge = Judge.__new__(Judge)
     judge.model, judge.client = "m", type("C", (), {"messages": Messages()})()
     with pytest.raises(RuntimeError):
-        judge.grade(q, "29.7%", StudyValidator.__new__(StudyValidator))
+        judge.grade(
+            q, "29.7%", StudyValidator.__new__(StudyValidator), tool_log="1. clickhouse_run_select_query"
+        )
     assert "<conversation_so_far>" in prompts[0] and "EGFR in LUAD?" in prompts[0]
+    assert "<tool_calls>1. clickhouse_run_select_query</tool_calls>" in prompts[0]
 
 
 def test_index_has_one_table_per_question_set(tmp_path, monkeypatch):
@@ -396,3 +399,55 @@ def test_test_sets_page_lists_the_questions():
     )
     assert html.count('<details class="q"') == info["n_questions"]
     assert "Conversation so far" in html
+
+
+def test_tool_calls_pair_langfuse_args_with_results():
+    obs = {
+        "input": {
+            "messages": [
+                {"kwargs": {"tool_calls": [{"id": "c1", "name": "q", "args": {"query": "SELECT 1"}}]}},
+            ]
+        },
+        "output": {
+            "messages": [
+                {
+                    "id": ["langchain_core", "messages", "ToolMessage"],
+                    "kwargs": {
+                        "name": "clickhouse_run_select_query_mcp_cbioportal-database",
+                        "tool_call_id": "c1",
+                        "content": '{"rows":[{"n":548}]}',
+                    },
+                }
+            ]
+        },
+    }
+    (call,) = _tool_calls(obs)
+    assert call.input == '{"query": "SELECT 1"}' and call.result == '{"rows":[{"n":548}]}'
+
+
+def test_tool_log_for_the_judge(tmp_path):
+    from cbioportal_mcp_qa.grade import tool_log
+
+    rec = {
+        "trace": {
+            "tool_calls": [
+                {"name": "read_guide", "ok": True, "input": '{"uri": "g"}', "result": "# Guide text"},
+                {"name": "clickhouse_run_select_query", "ok": True, "input": "SELECT 1", "result": "548"},
+                {"name": "navigate_to_study_view", "ok": False, "error": "bad input", "input": "{}"},
+            ]
+        }
+    }
+    log = tool_log(rec)
+    assert "SELECT 1" in log and "548" in log and "bad input" in log
+    assert "Guide text" not in log
+    # Older claude-code records: only names, so the transcript file is used.
+    (tmp_path / "transcripts").mkdir()
+    (tmp_path / "transcripts" / "a.txt").write_text(
+        "Q (haiku): q\n\n▶ read_guide\n{}\n\n◀ result\n# Guide text\n\n"
+        '▶ clickhouse_run_select_query\nSELECT 2\n\n◀ result\n{"rows": 7}\n\n═ answer (success)\n7'
+    )
+    old = {"trace": {"url": "transcripts/a.txt", "tool_calls": [{"name": "read_guide", "ok": True}]}}
+    log = tool_log(old, tmp_path)
+    assert "SELECT 2" in log and '{"rows": 7}' in log
+    assert "Guide text" not in log and "═ answer" not in log
+    assert tool_log({"trace": {}}, tmp_path) == ""

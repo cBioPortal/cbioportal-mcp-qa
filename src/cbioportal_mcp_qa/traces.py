@@ -15,6 +15,15 @@ class ToolCall:
     name: str
     ok: bool
     error: str | None = None
+    input: str | None = None  # arguments, truncated
+    result: str | None = None  # result excerpt, truncated
+
+
+TOOL_EXCERPT_CHARS = 1500
+
+
+def excerpt(text: str, limit: int = TOOL_EXCERPT_CHARS) -> str:
+    return text if len(text) <= limit else f"{text[:limit]} … ({len(text) - limit} more chars)"
 
 
 @dataclass
@@ -103,6 +112,11 @@ class Langfuse:
 
 
 def _tool_calls(obs: dict) -> list[ToolCall]:
+    args = {
+        call.get("id"): call.get("args")
+        for msg in (obs.get("input") or {}).get("messages") or []
+        for call in (msg.get("kwargs") or {}).get("tool_calls") or []
+    }
     calls = []
     for msg in (obs.get("output") or {}).get("messages") or []:
         if (msg.get("id") or [None])[-1] != "ToolMessage":
@@ -111,7 +125,14 @@ def _tool_calls(obs: dict) -> list[ToolCall]:
         content = kwargs.get("content")
         text = content if isinstance(content, str) else json.dumps(content)
         failed = kwargs.get("status") == "error"
+        call_args = args.get(kwargs.get("tool_call_id"))
         calls.append(
-            ToolCall(short_tool_name(kwargs.get("name") or "?"), not failed, text[:500] if failed else None)
+            ToolCall(
+                short_tool_name(kwargs.get("name") or "?"),
+                not failed,
+                text[:500] if failed else None,
+                excerpt(json.dumps(call_args, ensure_ascii=False)) if call_args is not None else None,
+                excerpt(text),
+            )
         )
     return calls

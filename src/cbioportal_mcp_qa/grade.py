@@ -3,6 +3,7 @@
 import json
 import re
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -13,11 +14,11 @@ from .dataset import Question, extract_urls
 JUDGE_SCHEMA = {
     "type": "object",
     "properties": {
+        "rationale": {"type": "string"},
         "passed": {"type": "boolean"},
         "declined": {"type": "boolean"},
-        "rationale": {"type": "string"},
     },
-    "required": ["passed", "declined", "rationale"],
+    "required": ["rationale", "passed", "declined"],
     "additionalProperties": False,
 }
 
@@ -36,7 +37,9 @@ It must also satisfy every "must" / "must not" requirement in the notes. Judge a
 
 Also report `declined`: true when the answer refuses or says the data isn't available instead of answering (whether or not that is the right call).
 
-Keep the rationale to 1-3 sentences.
+Write the rationale first, then decide: `passed` must agree with it. Keep the rationale to 1-3 sentences.
+
+The tool calls below are what the assistant ran to produce the answer, with their inputs and (truncated) results. A number or statistic that a tool result supports, or that follows from one by simple arithmetic, was computed, not invented. Treat a statistic as invented only when no tool call could have produced it; results are truncated, so give the benefit of the doubt when the supporting rows may be in the cut-off part. The tool calls are evidence for the answer's claims only; grade the answer the user sees.
 
 When the answer contains cBioPortal links, judge them from the decoded form below, using these conventions:
 - study view `filterJson` → `geneFilters[].geneQueries` is a list of lists: the OUTER list is AND, each INNER list is OR. `[[IDH1],[TP53]]` means IDH1 AND TP53; `[[IDH1, TP53]]` means IDH1 OR TP53.
@@ -50,8 +53,48 @@ When the answer contains cBioPortal links, judge them from the decoded form belo
 <reference_answer>{expected_answer}</reference_answer>
 <expected_links>{expected_links}</expected_links>
 <notes>{notes}</notes>
+<tool_calls>{tool_log}</tool_calls>
 <answer>{answer}</answer>
 <decoded_answer_links>{decoded_links}</decoded_answer_links>"""
+
+TOOL_LOG_CHARS = 40000
+# Their results are documentation, not evidence for the answer's claims.
+GUIDE_TOOLS = {"read_guide", "list_guides", "get_study_guide", "list_study_guides", "get_general_guide"}
+
+
+def tool_log(rec: dict, run_dir: Path | None = None) -> str:
+    """The answer's tool calls with their inputs and result excerpts, for the judge.
+
+    Older claude-code runs recorded only tool names; their transcript file has the rest."""
+    calls = (rec.get("trace") or {}).get("tool_calls") or []
+    if calls and any(c.get("input") is not None or c.get("result") is not None for c in calls):
+        parts = []
+        for i, c in enumerate(calls, 1):
+            part = f"{i}. {c['name']} ({'ok' if c.get('ok', True) else 'error'})"
+            if c.get("input"):
+                part += f"\n   input: {c['input']}"
+            result = c.get("error") if not c.get("ok", True) else c.get("result")
+            if result and c["name"] not in GUIDE_TOOLS:
+                part += f"\n   result: {result}"
+            parts.append(part)
+        text = "\n".join(parts)
+    else:
+        url = (rec.get("trace") or {}).get("url") or ""
+        path = run_dir / url if run_dir and url and not url.startswith("http") else None
+        if path is None or not path.is_file():
+            return ""
+        chunks = re.split(r"(?m)^(?=▶ )", path.read_text().split("═ answer")[0])
+        text = "\n".join(
+            c.split("◀ result")[0].rstrip() if c[2:].split("\n", 1)[0].strip() in GUIDE_TOOLS else c.rstrip()
+            for c in chunks
+            if c.startswith("▶ ")
+        )
+    if len(text) <= TOOL_LOG_CHARS:
+        return text
+    # The last calls usually produce the numbers the answer reports, so keep more of the end.
+    head, tail = TOOL_LOG_CHARS // 4, TOOL_LOG_CHARS - TOOL_LOG_CHARS // 4
+    return f"{text[:head]}\n… ({len(text) - TOOL_LOG_CHARS} chars omitted) …\n{text[-tail:]}"
+
 
 NUMBER_RE = re.compile(r"-?\d[\d,]*\.?\d*")
 BARE_NUMBER_RE = re.compile(r"^~?\s*-?\d[\d,]*\.?\d*\s*%?$")
@@ -170,7 +213,12 @@ class Judge:
         self.client = AnthropicBedrock(aws_region=aws_region, aws_profile=aws_profile)
 
     def grade(
-        self, q: Question, answer: str, studies: StudyValidator, renders: dict[str, dict] | None = None
+        self,
+        q: Question,
+        answer: str,
+        studies: StudyValidator,
+        renders: dict[str, dict] | None = None,
+        tool_log: str = "",
     ) -> Grade:
         links = cbio_links(answer)
         base = dict(
@@ -198,6 +246,7 @@ class Judge:
             expected_links="\n".join(q.expected_links) or "(none)",
             notes=q.notes or "(none)",
             answer=answer,
+            tool_log=tool_log or "(not recorded)",
             decoded_links="\n\n".join(
                 f"{url}\n{describe_link(url)}{rendered_text((renders or {}).get(url))}" for url in links
             )
