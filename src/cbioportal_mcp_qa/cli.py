@@ -5,8 +5,10 @@ from pathlib import Path
 import click
 
 from .agent import AgentClient
-from .agent_prompt import fetch_agent_prompt, prompt_fingerprint
+from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
 from .claude_code import ClaudeCodeClient, find_connector
+from .compare import compare as compare_runs
+from .compare import write_compare
 from .config import MODELS, TARGETS, load_settings
 from .dataset import DEFAULT_QUESTIONS, load_questions, parse_selection
 from .grade import Judge
@@ -22,14 +24,18 @@ from .run import (
 from .traces import Langfuse
 from .versions import collect as collect_versions
 
-MODEL_CHOICES = [k for k in MODELS if k in TARGETS["beta"].specs]
+MODEL_CHOICES = [k for k in MODELS if any(k in t.specs for t in TARGETS.values())]
 
 
-def _models(value: str) -> list[str]:
-    models = [m.strip() for m in value.split(",") if m.strip()]
-    unknown = [m for m in models if m not in MODEL_CHOICES]
+def _models(value: str | None, target: str, runner: str = "agents-api") -> list[str]:
+    """The models to ask, checked against what the target offers (default: all of them)."""
+    offered = list(TARGETS[target].specs)
+    models = [m.strip() for m in value.split(",") if m.strip()] if value else offered
+    unknown = [m for m in models if m not in offered]
     if unknown:
-        raise click.BadParameter(f"unknown model(s) {unknown}; choose from {MODEL_CHOICES}")
+        raise click.BadParameter(f"target {target} has no model(s) {unknown}; choose from {offered}")
+    if runner == "claude-code" and (no_cc := [m for m in models if not MODELS[m].claude_code_id]):
+        raise click.BadParameter(f"the claude-code runner can't run {no_cc}: they aren't a single model")
     return models
 
 
@@ -101,11 +107,12 @@ def cli() -> None:
 @cli.command()
 @click.argument("question")
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
-@click.option("--model", type=click.Choice(MODEL_CHOICES), default="haiku", show_default=True)
+@click.option("--model", type=click.Choice(MODEL_CHOICES), default=None, help="Default: the target's first.")
 @runner_option
-def ask(question: str, target: str, model: str, runner: str) -> None:
+def ask(question: str, target: str, model: str | None, runner: str) -> None:
     """Ask the deployed agent a single question."""
     settings = load_settings()
+    model = _models(model, target, runner)[0]
 
     async def go():
         client = _client(settings, target, runner)
@@ -127,7 +134,12 @@ def ask(question: str, target: str, model: str, runner: str) -> None:
 
 @cli.command()
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
-@click.option("--models", "models_arg", default="haiku,sonnet", show_default=True, help="Comma-separated.")
+@click.option(
+    "--models",
+    "models_arg",
+    default=None,
+    help="Comma-separated. Default: every model the target offers (beta: haiku,sonnet; beta-router: router).",
+)
 @click.option("--questions", "selection", default=None, help='Question ids, e.g. "1-10,15". Default: all.')
 @click.option(
     "--questions-file",
@@ -160,6 +172,8 @@ def run(
         bench = Run.load(resume)
         target = bench.data["target"]
         runner = bench.data.get("runner", "agents-api")
+    else:
+        models = _models(models_arg, target, runner)
     agent = None
     if runner == "claude-code" or not resume:
         try:
@@ -183,13 +197,24 @@ def run(
             }
         else:
             prompt_info["error"] = agent_error
-        extra = {"agent_prompt": prompt_info, "versions": collect_versions(settings, runner, target)}
+        root = TARGETS[target].agent_id
+        extra = {
+            "agent_prompt": prompt_info,
+            "target_config": {"url": TARGETS[target].url, "agent_id": root, "specs": TARGETS[target].specs},
+            # The target agent and every agent it hands off to (the router's specialists).
+            "agents": describe_agents(
+                root,
+                settings.kube_context,
+                lambda agent_id, ctx: (
+                    agent if agent and agent_id == root else fetch_agent_prompt(agent_id, ctx)
+                ),
+            ),
+            "versions": collect_versions(settings, runner, target),
+        }
         if runner == "claude-code":
             extra["database_mcp"] = _database_connector(settings) or settings.database_mcp_url
             extra["navigator_mcp"] = settings.navigator_mcp_url
-        bench = Run.create(
-            target, _models(models_arg), repeats, settings.judge_model, str(questions_file), runner, extra
-        )
+        bench = Run.create(target, models, repeats, settings.judge_model, str(questions_file), runner, extra)
         if agent:
             # A record of the prompt this run tested (the benchmark itself always reads the live agent).
             (bench.dir / "agent-prompt.md").write_text(agent["instructions"])
@@ -275,3 +300,27 @@ def grade(run_id: str, regrade: bool, refresh_questions: bool) -> None:
 def report(run_id: str | None) -> None:
     """Re-render a run's report (or just the results index when no run id is given)."""
     click.echo(write_report(Run.load(run_id)) if run_id else write_index())
+
+
+@cli.command()
+@click.argument("run_a")
+@click.argument("run_b")
+@click.option("--model-a", default=None, help="Model of RUN_A to compare (needed when it ran several).")
+@click.option("--model-b", default=None, help="Model of RUN_B to compare (needed when it ran several).")
+@click.option(
+    "--out",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Output directory. Default: results/compare/<A>-<model>_vs_<B>-<model>/.",
+)
+def compare(run_a: str, run_b: str, model_a: str | None, model_b: str | None, out: Path | None) -> None:
+    """Compare RUN_B against the baseline RUN_A per question and in aggregate (repeats pooled).
+
+    Writes compare.html, compare.md and compare.json, and prints the markdown."""
+    try:
+        result = compare_runs(Run.load(run_a), Run.load(run_b), model_a, model_b)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    html = write_compare(result, out)
+    click.echo((html.parent / "compare.md").read_text())
+    click.echo(f"Report: {html}")

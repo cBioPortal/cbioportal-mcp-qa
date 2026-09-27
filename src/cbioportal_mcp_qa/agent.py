@@ -42,12 +42,10 @@ class AgentClient:
         await self.http.aclose()
 
     async def ask(self, question: str, model: str, history: tuple[dict, ...] = ()) -> AgentReply:
-        body = {
-            "model": self.target.agent_id,
-            "spec": self.target.specs[model],
-            "messages": [*history, {"role": "user", "content": question}],
-            "stream": False,
-        }
+        body = {"model": self.target.agent_id}
+        if spec := self.target.specs[model]:
+            body["spec"] = spec
+        body |= {"messages": [*history, {"role": "user", "content": question}], "stream": False}
         started = time.time()
         for attempt in range(self.retries + 1):
             reply = await self._post(body, started)

@@ -76,6 +76,36 @@ uv run cbioportal-mcp-qa grade 20260923-1800 --refresh-questions
 uv run cbioportal-mcp-qa report 20260923-1800
 ```
 
+### Targets
+
+| `--target` | Agent | `--models` | Request |
+|---|---|---|---|
+| `beta` | unified beta agent `agent_OHVSJI9Gd6gwsDnFSL-Xl` | `haiku`, `sonnet` | with the `cBioPortalChatBeta` / `cBioPortalChatBetaSonnet` spec |
+| `beta-router` | handoff router `agent_cbiobeta_router` | `router` | no spec: the router and its specialists run their own models |
+| `beta-unified` | unified beta agent | `unified` | no spec: the agent's own model |
+| `prod` | prod agent `agent_9ZXhcwLIsROBQX0u4JS5F` | `haiku`, `sonnet` | with the prod specs |
+
+Once beta's `cBioPortalChatBeta` spec points at the router, `--target beta` returns 400 (the spec no longer
+selects a model for the unified agent) and `beta-unified` is the single-agent baseline. `router` and `unified`
+stand for whatever models the agents call, so their answers are priced per LLM call from the Langfuse trace.
+Each trace records every LLM call (model, agent, start/end, tokens, cost), the handoffs (`lc_transfer_to_*`),
+the agent that answered (`routed_to`), and tool rounds; `summary.json` has the routing distribution, p90
+latency, LLM calls and tool rounds per answer. `run.json` records the target agent and every agent it hands
+off to (prompt hash, model, last update) and the LibreChat and MCP image tags, where kubectl can read them.
+
+### Comparing runs
+
+```bash
+# B against baseline A, per question and per category, repeats pooled (A's model must be named if it ran several)
+uv run cbioportal-mcp-qa compare 20260923-1919 20260927-1200 --model-a haiku
+```
+
+Writes `results/compare/<A>-<model>_vs_<B>-<model>/compare.{html,md,json}`: pass rate, precision, coverage,
+median/p90 latency, share of answers under 10s, LLM calls, tool rounds, handoffs and cost; the same by
+category and track; and every question with its outcome per repeat, pass variance and latency spread,
+regressions first. Only questions both runs asked are compared. Runs recorded before per-call traces show
+"–" for tool rounds and routing.
+
 Output goes to `results/<run-id>/`: `run.json` (every answer, trace and grade), `report.html`, and
 `summary.json`, plus `results/index.html` listing all runs. Commit the run directory to publish it.
 
