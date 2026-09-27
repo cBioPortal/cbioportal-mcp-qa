@@ -7,8 +7,8 @@ import click
 from .agent import AgentClient
 from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
 from .claude_code import ClaudeCodeClient, find_connector
+from .compare import ASKED_FIELDS, write_compare
 from .compare import compare as compare_runs
-from .compare import write_compare
 from .config import MODELS, TARGETS, load_settings
 from .dataset import DEFAULT_QUESTIONS, load_questions, parse_selection
 from .grade import Judge
@@ -290,10 +290,13 @@ def grade(run_id: str, regrade: bool, refresh_questions: bool) -> None:
     if refresh_questions:
         current = {q.id: asdict(q) for q in load_questions(Path(bench.data["questions_file"]))}
         for rec in bench.records.values():
+            # The answer was to the text and history asked at the time; keep them so `compare` still sees it.
+            rec.setdefault("asked", {k: rec["question"].get(k) for k in ASKED_FIELDS})
             rec["question"] = current.get(rec["question"]["id"], rec["question"])
     if regrade or refresh_questions:
         for rec in bench.records.values():
             rec.pop("grade", None)
+        bench.save()
     grade_answers(bench, _judge(load_settings()))
     click.echo(f"Report: {write_report(bench)}")
 

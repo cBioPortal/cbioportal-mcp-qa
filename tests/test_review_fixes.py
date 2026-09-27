@@ -19,6 +19,7 @@ from cbioportal_mcp_qa import run as run_mod
 from cbioportal_mcp_qa.agent import AgentClient
 from cbioportal_mcp_qa.compare import compare, to_markdown, write_compare
 from cbioportal_mcp_qa.config import TARGETS
+from cbioportal_mcp_qa.dataset import Question
 from cbioportal_mcp_qa.redact import describe_error, redact
 from cbioportal_mcp_qa.report import quantile, summarize, write_report
 from cbioportal_mcp_qa.run import Run, record_key
@@ -232,6 +233,26 @@ def test_compare_refuses_changed_question_definitions(results_dir, overrides, fi
     assert {q["id"]: q["mismatch"] for q in result["questions"]} == {1: [], 2: [field], 3: []}
     assert any("different definitions" in w for w in result["warnings"])
     assert "⚠ changed: " + field in to_markdown(result)
+
+
+def test_refreshed_questions_still_compare_the_text_that_was_asked(results_dir, monkeypatch):
+    # A run asked an older wording, then was regraded against the current questions file.
+    a = _run("A", "haiku", 1, [_rec(1, "haiku", 1, question="Old wording?"), _rec(2, "haiku", 1)])
+    current = [Question.from_dict(_question(q)) for q in (1, 2)]
+    monkeypatch.setattr(cli_mod, "load_questions", lambda path: current)
+    monkeypatch.setattr(cli_mod, "grade_answers", lambda bench, judge: None)
+    monkeypatch.setattr(cli_mod, "_judge", lambda settings: None)
+    result = CliRunner().invoke(cli_mod.cli, ["grade", str(a.dir), "--refresh-questions"])
+    assert result.exit_code == 0, result.output
+    refreshed = Run.load(str(a.dir))
+    rec = refreshed.records[record_key(1, "haiku", 1)]
+    assert rec["question"]["question"] == "Question 1?" and rec["asked"]["question"] == "Old wording?"
+    b = _run("B", "router", 1, [_rec(1, "router", 1), _rec(2, "router", 1)])
+    with pytest.raises(ValueError, match=r"Q1 \(question\)"):
+        compare(refreshed, b, "haiku")
+    # Refreshing again keeps the original wording, not the refreshed one.
+    CliRunner().invoke(cli_mod.cli, ["grade", str(a.dir), "--refresh-questions"])
+    assert Run.load(str(a.dir)).records[record_key(1, "haiku", 1)]["asked"]["question"] == "Old wording?"
 
 
 def test_equivalent_empty_fields_are_not_a_mismatch(results_dir):

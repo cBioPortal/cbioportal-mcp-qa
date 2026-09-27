@@ -48,6 +48,9 @@ from .run import RESULTS_DIR, Run
 MISSING_ICON = "?"
 # What makes two runs' answers to a question comparable: it was asked and graded against the same thing.
 DEFINITION_FIELDS = ("question", "history", "expected_answer", "expected_links", "notes", "track")
+# What the agent was actually asked. `grade --refresh-questions` keeps these in the record's `asked` before
+# replacing its question, since the answer was to that text.
+ASKED_FIELDS = ("question", "history")
 
 
 class IncompatibleRuns(ValueError):
@@ -298,8 +301,9 @@ def _norm(value):
     return list(value) if isinstance(value, tuple) else value
 
 
-def definition(question: dict) -> str:
-    """The fields that decide how a question is asked and graded, as a comparable string."""
+def definition(rec: dict) -> str:
+    """The fields that decide how a record's question was asked and graded, as a comparable string."""
+    question = rec["question"] | (rec.get("asked") or {})
     fields = {f: _norm(question.get(f)) for f in DEFINITION_FIELDS}
     fields["track"] = fields["track"] or "data"
     return json.dumps(fields, sort_keys=True, ensure_ascii=False)
@@ -307,7 +311,7 @@ def definition(question: dict) -> str:
 
 def definition_mismatch(recs_a: list[dict], recs_b: list[dict]) -> list[str]:
     """Which definition fields differ for one question, between runs or between one run's repeats."""
-    defs = {side: {definition(r["question"]) for r in recs} for side, recs in (("A", recs_a), ("B", recs_b))}
+    defs = {side: {definition(r) for r in recs} for side, recs in (("A", recs_a), ("B", recs_b))}
     out = [f"differs between {side}'s repeats" for side, d in defs.items() if len(d) > 1]
     a, b = (json.loads(sorted(defs[s])[0]) for s in ("A", "B"))
     out += [f for f in DEFINITION_FIELDS if a[f] != b[f]]
