@@ -58,8 +58,12 @@ class TraceStats:
     models: list[str] = field(default_factory=list)
     generations: list[Generation] = field(default_factory=list)
     tool_rounds: int = 0  # tool_batch executions, excluding handoff-only batches
-    handoffs: int = 0
-    routed_to: str | None = None  # the agent that wrote the answer
+    handoffs: int = 0  # successful handoffs only
+    failed_handoffs: int = 0  # transfers whose tool result had error status
+    # One entry per transfer the agents attempted: {"to", "status": ok | error | unconfirmed, "error"}.
+    handoff_evidence: list[dict] = field(default_factory=list)
+    # The agent that made the last LLM call, i.e. wrote the answer; UNKNOWN when that call's agent wasn't recorded.
+    routed_to: str | None = None
 
     @property
     def tool_errors(self) -> list[ToolCall]:
@@ -132,27 +136,57 @@ class Langfuse:
         )
 
 
+UNKNOWN = "unknown"
+
+
 def trace_stats(trace_id: str, url: str, observations) -> TraceStats:
     stats = TraceStats(trace_id, url)
-    transfers: list[str] = []
+    results: list[ToolCall] = []  # transfer tool results, in order
     for obs in sorted(observations, key=lambda o: o.get("startTime") or ""):
         if obs["type"] == "GENERATION":
             stats.generations.append(generation(obs))
         elif obs["type"] == "TOOL" and obs.get("name") == "tool_batch":
             calls = _tool_calls(obs)
-            batch_transfers = [c.name for c in calls if c.name.startswith(TRANSFER_PREFIX)]
-            transfers += batch_transfers
+            transfers = [c for c in calls if c.name.startswith(TRANSFER_PREFIX)]
+            results += transfers
             stats.tool_calls.extend(c for c in calls if not c.name.startswith(TRANSFER_PREFIX))
-            stats.tool_rounds += len(batch_transfers) < len(calls) or not calls
+            stats.tool_rounds += len(transfers) < len(calls) or not calls
     stats.llm_calls = len(stats.generations)
     stats.models = sorted({g.model for g in stats.generations if g.model})
-    # A handoff shows up as the router's tool call; count it from there too in case its batch wasn't traced.
-    called = [t for g in stats.generations for t in g.tool_calls if t.startswith(TRANSFER_PREFIX)]
-    transfers = transfers if len(transfers) >= len(called) else called
-    stats.handoffs = len(transfers)
-    last_agent = next((g.agent for g in reversed(stats.generations) if g.agent), None)
-    stats.routed_to = transfers[-1].removeprefix(TRANSFER_PREFIX) if transfers else last_agent
+    stats.handoff_evidence = _handoff_evidence(stats.generations, results)
+    stats.handoffs = sum(e["status"] == "ok" for e in stats.handoff_evidence)
+    stats.failed_handoffs = sum(e["status"] == "error" for e in stats.handoff_evidence)
+    # Only the final call's own agent counts: a transfer's destination or an earlier agent may not have answered.
+    last = stats.generations[-1] if stats.generations else None
+    stats.routed_to = (last.agent if last else None) or UNKNOWN
     return stats
+
+
+def _handoff_evidence(generations: list[Generation], results: list[ToolCall]) -> list[dict]:
+    """What happened to each transfer: its tool result's status when traced; otherwise `ok` if the destination
+    agent made a later LLM call, else `unconfirmed` (neither counts as failed nor as a handoff)."""
+    evidence = [
+        {
+            "to": r.name.removeprefix(TRANSFER_PREFIX),
+            "status": "ok" if r.ok else "error",
+            "error": r.error,
+        }
+        for r in results
+    ]
+    unmatched: dict[str, int] = {}
+    for r in results:
+        unmatched[r.name] = unmatched.get(r.name, 0) - 1
+    for i, g in enumerate(generations):
+        for name in g.tool_calls:
+            if not name.startswith(TRANSFER_PREFIX):
+                continue
+            unmatched[name] = unmatched.get(name, 0) + 1
+            if unmatched[name] <= 0:
+                continue  # its result was traced
+            to = name.removeprefix(TRANSFER_PREFIX)
+            reached = any(later.agent == to for later in generations[i + 1 :])
+            evidence.append({"to": to, "status": "ok" if reached else "unconfirmed", "error": None})
+    return evidence
 
 
 CACHE_READ_KEYS = ("input_cache_read", "cache_read_input_tokens", "cache_read")

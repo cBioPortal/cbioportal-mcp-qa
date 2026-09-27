@@ -76,6 +76,10 @@ def pct(n: int, d: int) -> float | None:
 
 
 def quantile(values: list[float], q: float) -> float | None:
+    """Upper nearest-rank quantile: the sorted value at index floor(q·n), clamped to the last one.
+
+    For p90 that is the maximum when n <= 10 (n=10 -> 10th value; n=11 -> 10th; n=20 -> 19th), so with few
+    answers it errs high rather than interpolating. None for no values."""
     if not values:
         return None
     values = sorted(values)
@@ -131,6 +135,7 @@ class ModelStats:
     llm_calls: list[int] = field(default_factory=list)
     tool_rounds: list[int] = field(default_factory=list)
     handoffs: list[int] = field(default_factory=list)
+    failed_handoffs: int = 0
     routed_to: Counter = field(default_factory=Counter)
     tool_calls: Counter = field(default_factory=Counter)
     tool_errors: Counter = field(default_factory=Counter)
@@ -239,6 +244,7 @@ class ModelStats:
             if "tool_rounds" in trace:
                 self.tool_rounds.append(trace["tool_rounds"])
                 self.handoffs.append(trace.get("handoffs") or 0)
+                self.failed_handoffs += trace.get("failed_handoffs") or 0
             if trace.get("routed_to"):
                 self.routed_to[trace["routed_to"]] += 1
             for call in trace["tool_calls"]:
@@ -404,6 +410,7 @@ def _headline(summary: dict) -> dict:
                 "mean_tool_rounds": s.mean_tool_rounds,
                 "median_tool_rounds": s.median_tool_rounds,
                 "mean_handoffs": s.mean_handoffs,
+                "failed_handoffs": s.failed_handoffs if s.handoffs else None,
                 "routed_to": dict(s.routed_to.most_common()),
                 "tool_error_rate": s.tool_error_rate,
                 "by_track": {row["track"]: row["values"][s.key] for row in summary["by_track"]},

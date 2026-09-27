@@ -7,6 +7,7 @@ import httpx
 
 from .config import TARGETS
 from .mcp_http import MCPSession
+from .redact import describe_error
 
 CBIOPORTAL_INFO_URL = "https://www.cbioportal.org/api/info"
 DEPLOYMENTS = {"cbioportal_mcp": "cbioagent-clickhouse-mcp", "cbioportal_navigator": "cbioportal-navigator"}
@@ -16,7 +17,7 @@ def _probe(fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001 - version info must never fail a run
-        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+        return {"error": describe_error(exc)}
 
 
 def cbioportal_api() -> dict:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import httpx
 
 from .config import Target
+from .redact import describe_error, redact
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
@@ -60,10 +61,10 @@ class AgentClient:
         try:
             resp = await self.http.post("/api/agents/v1/chat/completions", json=body)
         except httpx.HTTPError as exc:
-            return AgentReply("", None, None, f"{type(exc).__name__}: {exc}", time.monotonic() - t0, started)
+            return AgentReply("", None, None, describe_error(exc, 2000), time.monotonic() - t0, started)
         latency = time.monotonic() - t0
         if resp.status_code != 200:
-            return AgentReply("", None, resp.status_code, resp.text[:2000], latency, started)
+            return AgentReply("", None, resp.status_code, redact(resp.text)[:2000], latency, started)
         data = resp.json()
         choices = data.get("choices") or [{}]
         usage = data.get("usage") or {}

@@ -12,6 +12,7 @@ from .compare import write_compare
 from .config import MODELS, TARGETS, load_settings
 from .dataset import DEFAULT_QUESTIONS, load_questions, parse_selection
 from .grade import Judge
+from .redact import describe_error, redact
 from .report import write_index, write_report
 from .run import (
     Run,
@@ -61,7 +62,9 @@ def _agent_prompt(settings, target: str) -> dict:
     try:
         return fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
     except Exception as exc:
-        raise click.ClickException(f"could not read the {target} agent's prompt via kubectl: {exc}") from exc
+        raise click.ClickException(
+            f"could not read the {target} agent's prompt via kubectl: {describe_error(exc, 2000)}"
+        ) from exc
 
 
 def _database_connector(settings) -> str | None:
@@ -91,7 +94,7 @@ def _client(
                 transcript_dir=transcript_dir,
             )
         except RuntimeError as exc:
-            raise click.ClickException(str(exc)) from exc
+            raise click.ClickException(redact(str(exc))) from exc
     return AgentClient(TARGETS[target], settings.api_key)
 
 
@@ -181,9 +184,9 @@ def run(
         except Exception as exc:  # noqa: BLE001 - only the claude-code runner needs the prompt itself
             if runner == "claude-code":
                 raise click.ClickException(
-                    f"could not read the {target} agent's prompt via kubectl: {exc}"
+                    f"could not read the {target} agent's prompt via kubectl: {describe_error(exc, 2000)}"
                 ) from exc
-            agent_error = f"{type(exc).__name__}: {exc}"[:200]
+            agent_error = describe_error(exc)
     prompt = agent["instructions"] if agent and runner == "claude-code" else None
     if resume:
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
@@ -308,19 +311,30 @@ def report(run_id: str | None) -> None:
 @click.option("--model-a", default=None, help="Model of RUN_A to compare (needed when it ran several).")
 @click.option("--model-b", default=None, help="Model of RUN_B to compare (needed when it ran several).")
 @click.option(
+    "--allow-mismatch",
+    is_flag=True,
+    help="Compare even if the judge, questions file or a question's text, history or references differ "
+    "(those questions are marked).",
+)
+@click.option(
     "--out",
     type=click.Path(file_okay=False, path_type=Path),
     default=None,
     help="Output directory. Default: results/compare/<A>-<model>_vs_<B>-<model>/.",
 )
-def compare(run_a: str, run_b: str, model_a: str | None, model_b: str | None, out: Path | None) -> None:
+def compare(
+    run_a: str, run_b: str, model_a: str | None, model_b: str | None, allow_mismatch: bool, out: Path | None
+) -> None:
     """Compare RUN_B against the baseline RUN_A per question and in aggregate (repeats pooled).
 
-    Writes compare.html, compare.md and compare.json, and prints the markdown."""
+    Refuses runs graded differently unless --allow-mismatch. Writes compare.html, compare.md and compare.json,
+    and prints the markdown."""
     try:
-        result = compare_runs(Run.load(run_a), Run.load(run_b), model_a, model_b)
+        result = compare_runs(Run.load(run_a), Run.load(run_b), model_a, model_b, allow_mismatch)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
     html = write_compare(result, out)
     click.echo((html.parent / "compare.md").read_text())
+    for warning in result["warnings"]:
+        click.echo(f"Warning: {warning}", err=True)
     click.echo(f"Report: {html}")

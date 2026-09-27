@@ -6,6 +6,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .redact import describe_error
+
 NAV_END = "Login\n"
 TEXT_CHARS = 1500
 # The single-page app goes network-idle before it draws anything below the site header, so wait for page text
@@ -70,7 +72,7 @@ async def _render_one(browser, url: str, shots_dir: Path, rel_dir: str) -> Rende
         await page.screenshot(path=shots_dir / name, type="jpeg", quality=60)
         return Render(url, True, text, None, f"{rel_dir}/{name}", time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001 - a page that fails to load is a result, not a crash
-        return Render(url, False, "", f"{type(exc).__name__}: {exc}"[:300], None, time.monotonic() - started)
+        return Render(url, False, "", describe_error(exc, 300), None, time.monotonic() - started)
     finally:
         await page.close()
 

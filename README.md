@@ -100,11 +100,39 @@ off to (prompt hash, model, last update) and the LibreChat and MCP image tags, w
 uv run cbioportal-mcp-qa compare 20260923-1919 20260927-1200 --model-a haiku
 ```
 
-Writes `results/compare/<A>-<model>_vs_<B>-<model>/compare.{html,md,json}`: pass rate, precision, coverage,
-median/p90 latency, share of answers under 10s, LLM calls, tool rounds, handoffs and cost; the same by
-category and track; and every question with its outcome per repeat, pass variance and latency spread,
+Writes `results/compare/<A>-<model>_vs_<B>-<model>/compare.{html,md,json}` and prints the markdown: the
+headline metrics below, the same by category and track (with precision, recall, p90, share under 10s and LLM
+calls per answer), and every question with its outcome per repeat, pass variance and latency spread,
 regressions first. Only questions both runs asked are compared. Runs recorded before per-call traces show
-"–" for tool rounds and routing.
+"–" for tool rounds, handoffs and routing.
+
+**Comparable runs only.** `compare` refuses, and says why, when the runs used a different judge model or
+questions file, or when a question's text, conversation history, track, `expected_answer`, `expected_links` or
+`notes` differ between the runs (or between one run's repeats) — their pass/fail would measure different
+things. Regrade the older run against the current questions (`grade <run> --refresh-questions`) and compare
+again, or pass `--allow-mismatch` to compare anyway: the affected questions are then marked ⚠ and a warning is
+printed.
+
+**Every turn is counted.** A turn is one question × repeat. Each side reports its *expected* turns (questions ×
+the run's `repeats`), *completed* (HTTP 200), *failed* (an HTTP error or timeout), *missing* (never recorded,
+e.g. an interrupted run), *ungraded* (completed, has a reference, no grade yet) and *no reference* turns, in
+the headline, per category and per question; an incomplete side gets a warning. *Eligible* turns are the
+graded, failed and missing turns of questions with a reference: a failed or missing turn counts as not passed.
+Ungraded turns are left out until graded.
+
+| Metric | Definition |
+|---|---|
+| **Recall** | passes / eligible turns — the headline score; failed and missing turns count against it |
+| **Precision** | passes / attempted answers (pass + fail; declines are not attempts) |
+| **Attempt rate** | attempted answers / eligible turns (declines, failures and missing turns are not attempts); recall = precision × attempt rate |
+| Pass rate | passes / graded answers — the per-run report's definition, which leaves failed turns out; shown for continuity |
+| Latency | median and p90 over completed turns, and again over completed + failed turns with each failure at its elapsed time |
+| Under 10s | completed turns under 10s, over completed turns and over completed + failed turns (a failure is never fast) |
+
+The per-run report's **coverage** is different from the attempt rate: it is the share of *graded answers* that
+weren't declines, so failed requests don't lower it. **p90** everywhere (reports, `summary.json`, compare) is
+the upper nearest-rank value, `sorted(values)[⌊0.9·n⌋]` (clamped to the last value): with 10 or fewer values
+it is the maximum, so small samples err high.
 
 Output goes to `results/<run-id>/`: `run.json` (every answer, trace and grade), `report.html`, and
 `summary.json`, plus `results/index.html` listing all runs. Commit the run directory to publish it.

@@ -298,7 +298,8 @@ def test_compare_pools_repeats_against_the_old_baseline(results):
     assert m["pass_rate"]["a"] == 75.0
     assert m["pass_rate"]["b"] == pytest.approx(100 * 8 / 12)
     assert m["pass_rate"]["verdict"] == "worse"
-    assert m["coverage"]["b"] == pytest.approx(100 * 11 / 12)
+    assert m["recall"]["b"] == pytest.approx(100 * 8 / 12)  # complete run: recall = graded pass rate
+    assert m["attempt_rate"]["b"] == pytest.approx(100 * 11 / 12)
     assert m["fast_share"]["a"] == 50.0 and m["fast_share"]["b"] == pytest.approx(100 * 5 / 12)
     assert m["median_latency"]["verdict"] == "better"  # ~17.7s → 16s
     assert m["mean_tool_rounds"]["a"] is None and m["mean_tool_rounds"]["b"] is not None
@@ -311,10 +312,11 @@ def test_compare_pools_repeats_against_the_old_baseline(results):
     assert r["question_verdicts"] == {"better": 0, "worse": 1, "same": 3}
     assert r["b"]["consistency"]["flaky"] == 1 and r["a"]["consistency"]["flaky"] == 0
     cats = {c["key"]: c for c in r["by_category"]}
-    assert cats["Study discovery"]["a"] == 100.0
-    assert cats["Study discovery"]["b"] == pytest.approx(100 * 5 / 6)
-    assert cats["Study discovery"]["fast_share_b"] == pytest.approx(100 * 5 / 6)
-    assert cats["Expression & multi-omics"]["n"] == {"a": 1, "b": 3}
+    assert cats["Study discovery"]["a"]["recall"] == 100.0
+    assert cats["Study discovery"]["b"]["recall"] == pytest.approx(100 * 5 / 6)
+    assert cats["Study discovery"]["b"]["fast_share"] == pytest.approx(100 * 5 / 6)
+    assert cats["Expression & multi-omics"]["a"]["eligible"] == 1
+    assert cats["Expression & multi-omics"]["b"]["eligible"] == 3
     assert {t["key"] for t in r["by_track"]} == {"data", "analysis"}
 
 
@@ -323,10 +325,13 @@ def test_compare_writes_html_markdown_and_json(results, tmp_path):
     out = write_compare(compare(baseline, router, "sonnet"))
     assert out == tmp_path / "compare" / f"{BASELINE}-sonnet_vs_20260927-1200-router" / "compare.html"
     html = out.read_text()
-    assert "Handoff router" in html and "Sonnet 5" in html and "Answers under 10s" in html
+    assert "Handoff router" in html and "Sonnet 5" in html and "Under 10s, of completed turns" in html
     assert "✓✗✓" in html and "Expression &amp; multi-omics" in html
     md = (out.parent / "compare.md").read_text()
-    assert "| Pass rate | 75.0% | 66.7% | -8.3 pp ▼ |" in md
+    assert (
+        "| Recall: passes / eligible turns (failed or missing = not passed) | 75.0% | 66.7% | -8.3 pp ▼ |"
+        in md
+    )
     assert (
         "Routed to (B): `agent_cbiobeta_data` 9, `agent_cbiobeta_navigation` 3" in md
     )  # shared questions only

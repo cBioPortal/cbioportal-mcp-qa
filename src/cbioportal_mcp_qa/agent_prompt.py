@@ -9,6 +9,8 @@ import hashlib
 import json
 import subprocess
 
+from .redact import describe_error
+
 MONGO_SECRET = "cbioagent-mongodb-creds"
 MONGO_SECRET_KEY = "mongodb-passwords"
 
@@ -68,7 +70,7 @@ def describe_agents(agent_id: str, context: str | None = None, fetch=fetch_agent
         try:
             agent = fetch(current, context)
         except Exception as exc:  # noqa: BLE001 - recorded, never fatal
-            out[current] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+            out[current] = {"error": describe_error(exc)}
             continue
         edges = [e for e in agent.get("edges") or [] if isinstance(e, str)]
         out[current] = prompt_fingerprint(agent["instructions"]) | {
