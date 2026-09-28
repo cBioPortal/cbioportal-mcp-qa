@@ -26,8 +26,9 @@ def test_secret_named_keys_mask_their_value(key):
     assert scrub({key: UNKNOWN, "nested": [{key: UNKNOWN}]}) == {key: "***", "nested": [{key: "***"}]}
 
 
-@pytest.mark.parametrize("value", ["", "   ", None, 0, 12, True, [], {}, {"inner": 1}])
-def test_empty_and_non_string_values_are_kept(value):
+# Numbers and nested values under a secret key are masked since round 7 (tests/test_review_round7.py).
+@pytest.mark.parametrize("value", ["", "   ", None, True, False, [], {}, [""], {"inner": None}])
+def test_empty_values_are_kept(value):
     assert scrub({"password": value}) == {"password": value}
 
 

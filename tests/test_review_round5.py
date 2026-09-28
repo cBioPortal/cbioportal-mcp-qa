@@ -248,6 +248,14 @@ WRITERS = {
     "copy", "copyfile", "copy2", "copytree", "move", "rename", "replace", "symlink_to", "hardlink_to",
     "mkstemp", "NamedTemporaryFile",
 }  # fmt: skip
+# Methods that only ever write files: any access to them is a write, even taken as a value
+# (`writer = path.write_text`) or through an aliased class (`P(x).write_text`).
+FILE_ONLY = {"write_text", "write_bytes", "screenshot", "FileHandler", "copyfile", "copy2", "copytree",
+             "copyfileobj", "symlink_to", "hardlink_to", "mkstemp", "NamedTemporaryFile"}  # fmt: skip
+# Modules whose `open` takes the mode second, like the builtin (`builtins.open(p, "w")`, `io.open`, ...).
+OPEN_MODULES = {"builtins", "io", "codecs", "os"}
+# Importing a writer by name (`from shutil import copyfile`, `from builtins import open as o`) is a write.
+WRITER_MODULES = {"shutil", "builtins", "io", "codecs", "os", "logging", "tempfile"}
 
 
 def file_writes(source: str) -> list[str]:
@@ -262,6 +270,12 @@ def file_writes(source: str) -> list[str]:
     }
     found = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in FILE_ONLY:
+            found.append(f"{node.attr}:{node.lineno}")
+            continue
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in WRITER_MODULES:
+            found += [f"{a.name}:{node.lineno}" for a in node.names if a.name in WRITERS | {"open"}]
+            continue
         if not isinstance(node, ast.Call):
             continue
         func = node.func
@@ -272,7 +286,7 @@ def file_writes(source: str) -> list[str]:
             # builtins.open(path, mode) / os.open(path, flags) / Path.open(mode): writing unless a literal read mode
             args = (
                 node.args[1:]
-                if isinstance(func, ast.Name) or getattr(func.value, "id", None) == "os"
+                if isinstance(func, ast.Name) or getattr(func.value, "id", None) in OPEN_MODULES
                 else node.args
             )
             mode = next(
@@ -286,10 +300,10 @@ def file_writes(source: str) -> list[str]:
                 continue
             if mode is None and getattr(getattr(func, "value", None), "id", None) != "os":
                 continue  # open(path) reads
-        elif name not in WRITERS or (name == "replace" and len(node.args) != 1):
+        elif name in FILE_ONLY or name not in WRITERS or (name == "replace" and len(node.args) != 1):
             continue  # str.replace(old, new) takes two arguments, Path.replace(target) one
         found.append(f"{name}:{node.lineno}")
-    return found
+    return sorted(set(found))
 
 
 def test_only_persist_writes_files():
@@ -322,6 +336,14 @@ def test_only_persist_writes_files():
         'logging.FileHandler("results/debug.log")',
         "json.dump(obj, f)",
         "tmp.replace(target)",
+        'import builtins\nbuiltins.open("results/out.json", "w")',
+        "io.open(p, 'a')",
+        "codecs.open(p, 'x')",
+        'from pathlib import Path\nwriter = Path("results/out.json").write_text\nwriter("text")',
+        'from pathlib import Path as P\nP("results/out.json").write_bytes(b"x")',
+        "wt = Path.write_text",
+        "from shutil import copyfile",
+        "from builtins import open as o",
     ],
 )
 def test_the_writer_guard_catches(sample):
@@ -329,7 +351,17 @@ def test_the_writer_guard_catches(sample):
 
 
 @pytest.mark.parametrize(
-    "sample", ["open(p)", "path.open()", 'open(p, "r")', "text.replace('a', 'b')", "json.dumps(x)"]
+    "sample",
+    [
+        "open(p)",
+        "path.open()",
+        'open(p, "r")',
+        "builtins.open(p)",
+        "io.open(p, 'rb')",
+        "text.replace('a', 'b')",
+        "json.dumps(x)",
+        "from os import path",
+    ],
 )
 def test_the_writer_guard_ignores_reads(sample):
     assert not file_writes(sample), sample
