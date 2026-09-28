@@ -62,29 +62,22 @@ def test_quoted_values_do_not_reach_saved_results(results_dir, cmd):
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
+        # Everything after the password flag is masked to the end of the line, whatever the quoting.
         ('mongosh -p "alpha beta"', "mongosh -p ***"),
-        ("mongosh -p 'alpha;omega' --quiet", "mongosh -p *** --quiet"),
+        ("mongosh -p 'alpha;omega' --quiet", "mongosh -p ***"),
         ('mongosh --eval "x[0]" -p SECRET', 'mongosh --eval "x[0]" -p ***'),
-        (
-            "mongosh --eval 'db.x.find({a: \"; -p\"})' -p S3",
-            "mongosh --eval 'db.x.find({a: \"; -p\"})' -p ***",
-        ),
-        (
-            "Command '['sh', '-c', 'mongosh -p \"alpha beta\"']' returned non-zero exit status 1.",
-            "Command '['sh', '-c', 'mongosh -p ***']' returned non-zero exit status 1.",
-        ),
-        ("['mongosh', '-p', 'alpha beta', '--quiet']", "['mongosh', '-p', '***', '--quiet']"),
-        (
-            "Command 'mongosh -p SECRET' returned non-zero exit status 1.",
-            "Command 'mongosh -p ***' returned non-zero exit status 1.",
-        ),
-        ('mongosh -p "alpha beta\nnext line', "mongosh -p ***\nnext line"),  # unclosed: the rest of the line
-        ('curl -u "admin:alpha beta" x', 'curl -u "admin:***" x'),
+        ("mongosh -p alpha; ssh -p 2222 host", "mongosh -p ***"),
+        ("['mongosh', '-p', 'alpha beta', '--quiet']", "['mongosh', '-p***"),
+        ("Command 'mongosh -p SECRET' returned non-zero exit status 1.", "Command 'mongosh -p ***"),
+        ('curl -u "admin:alpha beta" x', 'curl -u "admin:***'),
+        # The next line is kept, unless a quote left open in the masked part may run onto it.
+        ("mongosh -p alpha\nkubectl -n ns get pods", "mongosh -p ***\nkubectl -n ns get pods"),
+        ('mongosh -p "alpha\nbeta"\nkubectl -n ns', "mongosh -p ***"),
+        ("mongosh \\\n  -p alpha \\\n  beta\nnext", "mongosh \\\n  -p ***\nnext"),
         ('PGPASSWORD="alpha beta" psql -p 5432', 'PGPASSWORD="***" psql -p 5432'),
-        ("mongosh -p alpha; ssh -p 2222 host", "mongosh -p ***; ssh -p 2222 host"),
     ],
 )
-def test_quoted_values_are_masked_in_full(text, expected):
+def test_the_rest_of_the_line_is_masked(text, expected):
     assert redact(text) == expected
 
 

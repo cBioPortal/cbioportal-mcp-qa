@@ -77,9 +77,9 @@ def test_harmless_flags_are_kept(text):
     assert redact(text) == text
 
 
-def test_the_db_client_rule_stops_at_the_end_of_the_command():
-    text = f"mongosh -p {SECRET}; ssh -p 2222 host | grep -p x"
-    assert redact(text) == "mongosh -p ***; ssh -p 2222 host | grep -p x"
+def test_the_db_client_rule_masks_to_the_end_of_the_line():
+    text = f"mongosh -p {SECRET}; ssh -p 2222 host | grep -p x\nkubectl -n ns get pods"
+    assert redact(text) == "mongosh -p ***\nkubectl -n ns get pods"
     assert SECRET not in describe_error(subprocess.CalledProcessError(1, ["mongosh", "-p", SECRET]))
 
 

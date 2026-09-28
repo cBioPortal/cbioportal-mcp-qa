@@ -17,7 +17,7 @@ from cbioportal_mcp_qa import run as run_mod
 from cbioportal_mcp_qa.agent import AgentClient
 from cbioportal_mcp_qa.compare import compare, to_markdown, write_compare
 from cbioportal_mcp_qa.config import TARGETS
-from cbioportal_mcp_qa.redact import describe_error, redact
+from cbioportal_mcp_qa.redact import CommandFailed, describe_error, redact
 from cbioportal_mcp_qa.report import quantile, summarize, write_report
 from cbioportal_mcp_qa.run import Run, record_key
 from cbioportal_mcp_qa.traces import UNKNOWN, trace_stats
@@ -43,18 +43,18 @@ def _fake_kubectl(monkeypatch):
             stderr=f"MongoServerError: Authentication failed. uri=mongodb://cbioagent:{SECRET}@localhost",
         )
 
-    monkeypatch.setattr(agent_prompt.subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "run", run)
 
 
 def test_failed_mongosh_exec_does_not_leak_the_password(results_dir, monkeypatch):
     _fake_kubectl(monkeypatch)
-    # The raw exception carries the password (in the command's URI), which is what used to be recorded.
-    with pytest.raises(subprocess.CalledProcessError) as raised:
+    # The command carries the password (in its URI); the error raised where it fails carries no command.
+    with pytest.raises(CommandFailed) as raised:
         agent_prompt.fetch_agent_prompt(ROUTER)
-    assert SECRET in str(raised.value)
+    assert SECRET not in str(raised.value) and str(raised.value).startswith("kubectl exited with status 1: ")
 
     agents = agent_prompt.describe_agents(ROUTER)
-    assert "CalledProcessError" in agents[ROUTER]["error"] and "***@localhost" in agents[ROUTER]["error"]
+    assert "CommandFailed" in agents[ROUTER]["error"] and "***@localhost" in agents[ROUTER]["error"]
     probe = versions._probe(lambda: agent_prompt.fetch_agent_prompt(ROUTER))
     bench = Run.create(
         "beta-router",
