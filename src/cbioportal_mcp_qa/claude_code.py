@@ -19,6 +19,8 @@ from pathlib import Path
 
 from .agent import AgentReply
 from .config import MODELS
+from .persist import write_private_json, write_text
+from .redact import redact
 from .traces import ToolCall, TraceStats, excerpt
 
 # Deliberately unlike the database connector's "claude_ai_cBioPortal_MCP": with two cBioPortal-looking tool
@@ -108,8 +110,7 @@ def loaded_servers(lines: list[str]) -> set[str] | None:
 def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
     """The MCP servers a Claude Code session loads, read from the stream-json init event of a trivial call."""
     config = os.path.join(workdir, "probe-mcp.json")
-    with open(config, "w") as f:
-        json.dump(setup.mcp_config(), f)
+    write_private_json(config, setup.mcp_config())
     cmd = [
         "claude",
         "-p",
@@ -130,7 +131,7 @@ def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
         )
         servers = loaded_servers(out.stdout.splitlines())
         if servers is None:
-            raise RuntimeError(f"could not start claude to probe MCP servers: {out.stderr[-500:]}")
+            raise RuntimeError(f"could not start claude to probe MCP servers: {redact(out.stderr)[-500:]}")
         seen |= servers
         if any(name.startswith("claude_ai_") for name in servers):
             break
@@ -240,7 +241,7 @@ def format_transcript(lines: list[str]) -> str:
                 out.append(f"{label}\n{text[:RESULT_CHARS]}{more}\n")
         if event.get("type") == "result":
             out.append(f"═ answer ({event.get('subtype')})\n{event.get('result') or ''}\n")
-    return "\n".join(out)
+    return redact("\n".join(out))
 
 
 def parse_stream(lines: list[str], started: float, latency_s: float) -> AgentReply:
@@ -260,23 +261,25 @@ def parse_stream(lines: list[str], started: float, latency_s: float) -> AgentRep
                     calls[block["id"]] = ToolCall(
                         short_tool_name(block["name"]),
                         True,
-                        input=excerpt(json.dumps(block.get("input"), ensure_ascii=False)),
+                        input=excerpt(redact(json.dumps(block.get("input"), ensure_ascii=False))),
                     )
         elif event.get("type") == "user":
             for block in message.get("content") or []:
                 if block.get("type") != "tool_result" or block.get("tool_use_id") not in calls:
                     continue
                 call = calls[block["tool_use_id"]]
-                call.result = excerpt(tool_result_text(block.get("content")))
+                call.result = excerpt(redact(tool_result_text(block.get("content"))))
                 if block.get("is_error"):
                     content = block.get("content")
                     call.ok = False
-                    call.error = (content if isinstance(content, str) else json.dumps(content))[:500]
+                    call.error = redact(content if isinstance(content, str) else json.dumps(content))[:500]
     result = next((e for e in events if e.get("type") == "result"), None)
     trace = TraceStats("", "", len(message_ids), list(calls.values()), sorted(models))
     if result is None or result.get("is_error"):
         error = (result or {}).get("result") or (result or {}).get("subtype") or "no result event"
-        return AgentReply("", None, None, str(error)[:2000], latency_s, started, trace=trace.to_dict())
+        return AgentReply(
+            "", None, None, redact(str(error))[:2000], latency_s, started, trace=trace.to_dict()
+        )
     usage = result.get("usage") or {}
     cache_read = usage.get("cache_read_input_tokens") or 0
     cache_write = usage.get("cache_creation_input_tokens") or 0
@@ -319,8 +322,7 @@ class ClaudeCodeClient:
         self.env = {**os.environ, "MAX_THINKING_TOKENS": "0"}
         self.setup = tool_setup(database_url, navigator_url, database_connector, self._workdir.name, self.env)
         self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
-        with open(self.mcp_config_path, "w") as f:
-            json.dump(self.setup.mcp_config(), f)
+        write_private_json(self.mcp_config_path, self.setup.mcp_config())
 
     async def aclose(self) -> None:
         self._workdir.cleanup()
@@ -391,8 +393,8 @@ class ClaudeCodeClient:
         if self.transcript_dir is not None and reply.trace is not None:
             self.transcript_dir.mkdir(parents=True, exist_ok=True)
             name = hashlib.sha1(f"{model}:{question}:{started}".encode()).hexdigest()[:12] + ".txt"
-            (self.transcript_dir / name).write_text(f"Q ({model}): {question}\n\n{format_transcript(lines)}")
+            write_text(self.transcript_dir / name, f"Q ({model}): {question}\n\n{format_transcript(lines)}")
             reply.trace["url"] = f"{self.transcript_dir.name}/{name}"
         if reply.error and proc.returncode:
-            reply.error = f"{reply.error} (exit {proc.returncode}: {stderr.decode()[-500:]})"
+            reply.error = f"{reply.error} (exit {proc.returncode}: {redact(stderr.decode())[-500:]})"
         return reply

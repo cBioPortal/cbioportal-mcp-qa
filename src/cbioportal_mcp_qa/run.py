@@ -11,8 +11,9 @@ from tqdm import tqdm
 
 from .agent import AgentClient
 from .claude_code import ClaudeCodeClient
-from .dataset import Question
+from .dataset import DEFINITION_FIELDS, Question, asked_question
 from .grade import Judge, StudyValidator, cbio_links, tool_log
+from .persist import write_json
 from .render import render_links
 from .traces import Langfuse
 
@@ -27,6 +28,11 @@ class Run:
     def __init__(self, path: Path, data: dict):
         self.path = path
         self.data = data
+        # Put back the text and history a legacy refresh moved to `asked`, so grading and snapshots use them.
+        for rec in data.get("records", {}).values():
+            if "asked" in rec:
+                rec["question"] = asked_question(rec)
+                del rec["asked"]
 
     @classmethod
     def create(
@@ -76,9 +82,7 @@ class Run:
         return self.data["records"]
 
     def save(self) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=1))
-        tmp.replace(self.path)
+        write_json(self.path, self.data, indent=1)
 
 
 async def collect_answers(
@@ -136,19 +140,47 @@ def attach_traces(run: Run, langfuse: Langfuse) -> int:
 
 
 def grade_answers(run: Run, judge: Judge) -> None:
+    """Grade answers without a grade. Each grade records its judge model and a snapshot of the question it was
+    graded against (`graded`), so `compare` checks what was actually graded."""
+    # Grades from before per-turn judges were all made by the run's judge.
+    for rec in run.records.values():
+        if rec.get("grade") and "judge_model" not in rec["grade"]:
+            rec["grade"]["judge_model"] = run.data.get("judge_model")
     studies = StudyValidator()
     pending = [
         rec for rec in run.records.values() if rec["reply"].get("status") == 200 and not rec.get("grade")
     ]
     for rec in tqdm(pending, desc="grading", unit="ans"):
         q = Question.from_dict(rec["question"])
-        rec["grade"] = judge.grade(
+        grade = judge.grade(
             q, rec["reply"]["answer"], studies, run.data.get("renders", {}), tool_log(rec, run.dir)
         ).to_dict()
+        rec["grade"] = grade | {
+            "judge_model": judge.model,
+            "graded": {f: rec["question"].get(f) for f in DEFINITION_FIELDS},
+        }
+        record_judges(run)
         run.save()
+    record_judges(run)
+    run.save()
 
 
-def render_navigation_links(run: Run, executable: str | None, concurrency: int = 3) -> int:
+def record_judges(run: Run) -> None:
+    """`judge_models`: every judge model the run's grades used. `judge_model` becomes that judge when there is
+    exactly one (e.g. after regrading everything with another judge); with several it stays as it was, and
+    `judge_models` shows the mix."""
+    used = sorted(
+        {g["judge_model"] for r in run.records.values() if (g := r.get("grade")) and g.get("judge_model")}
+    )
+    if used:
+        run.data["judge_models"] = used
+        if len(used) == 1:
+            run.data["judge_model"] = used[0]
+
+
+def render_navigation_links(
+    run: Run, executable: str | None, concurrency: int = 3, screenshots: bool = True
+) -> int:
     """Open the cBioPortal links in navigation answers, and group comparison links in any answer (their session ids
     can't be decoded), and record what each page shows. Returns the number rendered."""
     renders = run.data.setdefault("renders", {})
@@ -164,7 +196,9 @@ def render_navigation_links(run: Run, executable: str | None, concurrency: int =
     )
     if not urls:
         return 0
-    results = asyncio.run(render_links(urls, run.dir / "shots", "shots", executable, concurrency))
+    results = asyncio.run(
+        render_links(urls, run.dir / "shots", "shots", executable, concurrency, screenshots)
+    )
     renders.update({url: r.to_dict() for url, r in results.items()})
     run.save()
     return len(results)

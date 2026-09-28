@@ -37,6 +37,29 @@ Every question has a **track**, and the report shows pass rates per track and mo
 
 Questions without any reference are still asked and reported, but not graded.
 
+### Secrets in published results
+
+`results/` is published with GitHub Pages, so everything the benchmark writes there goes through one
+redaction boundary (`persist.py`). run.json, summary.json, the HTML and Markdown reports, compare outputs,
+transcripts and the recorded agent prompt are deep-scrubbed on the way out:
+
+- **Known values first**: every secret the benchmark loads or can see is masked wherever it appears, also
+  URL-encoded, JSON-escaped, backslash-escaped or HTML-escaped. That covers the LibreChat and Langfuse keys, the
+  cBioAgent Mongo password read from its k8s secret, and every environment variable whose name contains PASS,
+  PWD, SECRET, TOKEN, KEY, AUTH or CREDENTIAL. It also covers the password of any URI in the environment, both
+  as written and percent-decoded. Values under 6 characters are ignored.
+- **Structure**: the value of any key named like a credential (`password`, `*_token`, `apiKey`,
+  `Authorization`, `Cookie`, ...) is masked whole, and a list of strings is also read as a command line.
+- **Patterns** for anything else: URI userinfo, bearer tokens, key=value secrets, password flags of database
+  clients and `--password`-style flags. They mask to the end of the line, or of the text when the quoting after
+  them can't be trusted.
+- Failed commands are recorded as `<executable> exited with status N` and the redacted tail of their output,
+  never with their arguments.
+
+**Screenshots are not redacted**: they are pixels. The `shots/` of a run only hold the public cBioPortal pages
+that navigation answers linked to. Pass `--no-screenshots` to `run` or `render` to keep the page text without
+them.
+
 ## Setup
 
 ```bash
@@ -71,10 +94,77 @@ uv run cbioportal-mcp-qa run --resume 20260923-1800
 uv run cbioportal-mcp-qa traces 20260923-1800
 uv run cbioportal-mcp-qa grade 20260923-1800 --regrade
 
-# After fixing references in input/questions.yaml, regrade an existing run against them
+# After fixing references in input/questions.yaml, regrade an existing run against them (only the expected
+# answer, links, notes and track are refreshed; the judge still sees the question text and history that were asked)
 uv run cbioportal-mcp-qa grade 20260923-1800 --refresh-questions
 uv run cbioportal-mcp-qa report 20260923-1800
 ```
+
+### Targets
+
+| `--target` | Agent | `--models` | Request |
+|---|---|---|---|
+| `beta` | unified beta agent `agent_OHVSJI9Gd6gwsDnFSL-Xl` | `haiku`, `sonnet` | with the `cBioPortalChatBeta` / `cBioPortalChatBetaSonnet` spec |
+| `beta-router` | handoff router `agent_cbiobeta_router` | `router` | no spec: the router and its specialists run their own models |
+| `beta-unified` | unified beta agent | `unified` | no spec: the agent's own model |
+| `prod` | prod agent `agent_9ZXhcwLIsROBQX0u4JS5F` | `haiku`, `sonnet` | with the prod specs |
+
+Once beta's `cBioPortalChatBeta` spec points at the router, `--target beta` returns 400 (the spec no longer
+selects a model for the unified agent) and `beta-unified` is the single-agent baseline. `router` and `unified`
+stand for whatever models the agents call, so their answers are priced per LLM call from the Langfuse trace.
+Each trace records every LLM call (model, agent, start/end, tokens, cost), the handoffs (`lc_transfer_to_*`),
+the agent that answered (`routed_to`), and tool rounds; `summary.json` has the routing distribution, p90
+latency, LLM calls and tool rounds per answer. `run.json` records the target agent and every agent it hands
+off to (prompt hash, model, last update) and the LibreChat and MCP image tags, where kubectl can read them.
+
+### Comparing runs
+
+```bash
+# B against baseline A, per question and per category, repeats pooled (A's model must be named if it ran several)
+uv run cbioportal-mcp-qa compare 20260923-1919 20260927-1200 --model-a haiku
+```
+
+Writes `results/compare/<A>-<model>_vs_<B>-<model>/compare.{html,md,json}` and prints the markdown: the
+headline metrics below, the same by category and track (with precision, recall, p90, share under 10s and LLM
+calls per answer), and every question with its outcome per repeat, pass variance and latency spread,
+regressions first. Only questions both runs asked are compared. Runs recorded before per-call traces show
+"–" for tool rounds, handoffs and routing.
+
+**Comparable runs only.** `compare` refuses, and says why, when the runs used a different judge model (or
+either run mixes judge models) or questions file, or when a question's text, conversation history, track,
+`expected_answer`, `expected_links` or `notes` differ between the runs (or between one run's repeats) — their
+pass/fail would measure different things. Each grade records the judge model that made it and a snapshot of
+the question it was graded against, and `compare` checks those; grades from before per-answer judges fall back
+to the run's `judge_model`. Regrade the older run against the current references (`grade <run>
+--refresh-questions`) and compare again, or pass `--allow-mismatch` to compare anyway: the affected questions
+are then marked ⚠ and a warning is printed.
+
+`--refresh-questions` never changes the question text or history, since the answer was to what was asked. So
+even after regrading 20260923-1919, the 9 questions reworded since then still differ from runs that asked the
+new wording and can only be compared with `--allow-mismatch`. For a clean beta comparison, record a fresh
+3-repeat baseline (`run --target beta-unified --repeats 3`) on the current questions file rather than relying on
+the regraded 09-23 run.
+
+**Every turn is counted.** A turn is one question × repeat. Each side reports its *expected* turns (questions ×
+the run's `repeats`), *completed* (HTTP 200), *failed* (an HTTP error or timeout), *missing* (never recorded,
+e.g. an interrupted run), *ungraded* (completed, has a reference, no grade yet) and *no reference* turns, in
+the headline, per category and per question; an incomplete side gets a warning. *Eligible* turns are the
+graded, failed and missing turns of questions with a reference: a failed or missing turn counts as not passed.
+Ungraded turns are left out until graded.
+
+| Metric | Definition |
+|---|---|
+| **Recall** | passes / eligible turns — the headline score; failed and missing turns count against it |
+| **Precision** | passes / attempted answers (pass + fail; declines are not attempts) |
+| **Attempt rate** | attempted answers / eligible turns (declines, failures and missing turns are not attempts); recall = precision × attempt rate |
+| Pass rate | passes / graded answers — the per-run report's definition, which leaves failed turns out; shown for continuity |
+| Latency | median and p90 over completed turns, and again over completed + failed turns with each failure at its elapsed time |
+| Under 10s | completed turns under 10s, over completed turns and over completed + failed turns (a failure is never fast) |
+
+The per-run report's **coverage** is different from the attempt rate: it is the share of *graded answers* that
+weren't declines, so failed requests don't lower it. **p90** everywhere (reports, `summary.json`, compare) is
+the upper nearest-rank value, `sorted(values)[⌊0.9·n⌋]` (clamped to the last value): with 10 or fewer values
+it is the maximum, so small samples err high.
 
 Output goes to `results/<run-id>/`: `run.json` (every answer, trace and grade), `report.html`, and
 `summary.json`, plus `results/index.html` listing all runs. Commit the run directory to publish it.

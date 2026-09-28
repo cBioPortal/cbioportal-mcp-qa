@@ -5,11 +5,22 @@ from pathlib import Path
 import click
 
 from .agent import AgentClient
-from .agent_prompt import fetch_agent_prompt, prompt_fingerprint
+from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
 from .claude_code import ClaudeCodeClient, find_connector
+from .compare import compare as compare_runs
+from .compare import write_compare
 from .config import MODELS, TARGETS, load_settings
-from .dataset import DEFAULT_QUESTIONS, load_questions, parse_selection
+from .dataset import (
+    ASKED_FIELDS,
+    DEFAULT_QUESTIONS,
+    REFERENCE_FIELDS,
+    definition_fields,
+    load_questions,
+    parse_selection,
+)
 from .grade import Judge
+from .persist import write_text
+from .redact import describe_error, redact
 from .report import write_index, write_report
 from .run import (
     Run,
@@ -22,14 +33,18 @@ from .run import (
 from .traces import Langfuse
 from .versions import collect as collect_versions
 
-MODEL_CHOICES = [k for k in MODELS if k in TARGETS["beta"].specs]
+MODEL_CHOICES = [k for k in MODELS if any(k in t.specs for t in TARGETS.values())]
 
 
-def _models(value: str) -> list[str]:
-    models = [m.strip() for m in value.split(",") if m.strip()]
-    unknown = [m for m in models if m not in MODEL_CHOICES]
+def _models(value: str | None, target: str, runner: str = "agents-api") -> list[str]:
+    """The models to ask, checked against what the target offers (default: all of them)."""
+    offered = list(TARGETS[target].specs)
+    models = [m.strip() for m in value.split(",") if m.strip()] if value else offered
+    unknown = [m for m in models if m not in offered]
     if unknown:
-        raise click.BadParameter(f"unknown model(s) {unknown}; choose from {MODEL_CHOICES}")
+        raise click.BadParameter(f"target {target} has no model(s) {unknown}; choose from {offered}")
+    if runner == "claude-code" and (no_cc := [m for m in models if not MODELS[m].claude_code_id]):
+        raise click.BadParameter(f"the claude-code runner can't run {no_cc}: they aren't a single model")
     return models
 
 
@@ -51,11 +66,22 @@ runner_option = click.option(
 )
 
 
+screenshots_option = click.option(
+    "--screenshots/--no-screenshots",
+    default=True,
+    show_default=True,
+    help="Save a screenshot of each rendered page. Screenshots are pixels, so they aren't redacted; they only "
+    "show the public cBioPortal pages answers linked to.",
+)
+
+
 def _agent_prompt(settings, target: str) -> dict:
     try:
         return fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
     except Exception as exc:
-        raise click.ClickException(f"could not read the {target} agent's prompt via kubectl: {exc}") from exc
+        raise click.ClickException(
+            f"could not read the {target} agent's prompt via kubectl: {describe_error(exc, 2000)}"
+        ) from exc
 
 
 def _database_connector(settings) -> str | None:
@@ -85,7 +111,7 @@ def _client(
                 transcript_dir=transcript_dir,
             )
         except RuntimeError as exc:
-            raise click.ClickException(str(exc)) from exc
+            raise click.ClickException(redact(str(exc))) from exc
     return AgentClient(TARGETS[target], settings.api_key)
 
 
@@ -101,11 +127,12 @@ def cli() -> None:
 @cli.command()
 @click.argument("question")
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
-@click.option("--model", type=click.Choice(MODEL_CHOICES), default="haiku", show_default=True)
+@click.option("--model", type=click.Choice(MODEL_CHOICES), default=None, help="Default: the target's first.")
 @runner_option
-def ask(question: str, target: str, model: str, runner: str) -> None:
+def ask(question: str, target: str, model: str | None, runner: str) -> None:
     """Ask the deployed agent a single question."""
     settings = load_settings()
+    model = _models(model, target, runner)[0]
 
     async def go():
         client = _client(settings, target, runner)
@@ -127,7 +154,12 @@ def ask(question: str, target: str, model: str, runner: str) -> None:
 
 @cli.command()
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
-@click.option("--models", "models_arg", default="haiku,sonnet", show_default=True, help="Comma-separated.")
+@click.option(
+    "--models",
+    "models_arg",
+    default=None,
+    help="Comma-separated. Default: every model the target offers (beta: haiku,sonnet; beta-router: router).",
+)
 @click.option("--questions", "selection", default=None, help='Question ids, e.g. "1-10,15". Default: all.')
 @click.option(
     "--questions-file",
@@ -147,9 +179,20 @@ def ask(question: str, target: str, model: str, runner: str) -> None:
     show_default=True,
     help="Open navigation answers' links in Chromium.",
 )
+@screenshots_option
 @runner_option
 def run(
-    target, models_arg, selection, questions_file, repeats, concurrency, resume, no_grade, render, runner
+    target,
+    models_arg,
+    selection,
+    questions_file,
+    repeats,
+    concurrency,
+    resume,
+    no_grade,
+    render,
+    screenshots,
+    runner,
 ) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
@@ -160,6 +203,8 @@ def run(
         bench = Run.load(resume)
         target = bench.data["target"]
         runner = bench.data.get("runner", "agents-api")
+    else:
+        models = _models(models_arg, target, runner)
     agent = None
     if runner == "claude-code" or not resume:
         try:
@@ -167,9 +212,9 @@ def run(
         except Exception as exc:  # noqa: BLE001 - only the claude-code runner needs the prompt itself
             if runner == "claude-code":
                 raise click.ClickException(
-                    f"could not read the {target} agent's prompt via kubectl: {exc}"
+                    f"could not read the {target} agent's prompt via kubectl: {describe_error(exc, 2000)}"
                 ) from exc
-            agent_error = f"{type(exc).__name__}: {exc}"[:200]
+            agent_error = describe_error(exc)
     prompt = agent["instructions"] if agent and runner == "claude-code" else None
     if resume:
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
@@ -183,16 +228,27 @@ def run(
             }
         else:
             prompt_info["error"] = agent_error
-        extra = {"agent_prompt": prompt_info, "versions": collect_versions(settings, runner, target)}
+        root = TARGETS[target].agent_id
+        extra = {
+            "agent_prompt": prompt_info,
+            "target_config": {"url": TARGETS[target].url, "agent_id": root, "specs": TARGETS[target].specs},
+            # The target agent and every agent it hands off to (the router's specialists).
+            "agents": describe_agents(
+                root,
+                settings.kube_context,
+                lambda agent_id, ctx: (
+                    agent if agent and agent_id == root else fetch_agent_prompt(agent_id, ctx)
+                ),
+            ),
+            "versions": collect_versions(settings, runner, target),
+        }
         if runner == "claude-code":
             extra["database_mcp"] = _database_connector(settings) or settings.database_mcp_url
             extra["navigator_mcp"] = settings.navigator_mcp_url
-        bench = Run.create(
-            target, _models(models_arg), repeats, settings.judge_model, str(questions_file), runner, extra
-        )
+        bench = Run.create(target, models, repeats, settings.judge_model, str(questions_file), runner, extra)
         if agent:
             # A record of the prompt this run tested (the benchmark itself always reads the live agent).
-            (bench.dir / "agent-prompt.md").write_text(agent["instructions"])
+            write_text(bench.dir / "agent-prompt.md", agent["instructions"])
     click.echo(
         f"Run {bench.data['run_id']} ({runner}): {len(questions)} questions × {bench.data['models']} × "
         f"{bench.data['repeats']} against {TARGETS[target].agent_id} ({target})"
@@ -223,7 +279,8 @@ def run(
         wait_for_ingestion()
         click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")
     if render:
-        click.echo(f"Rendered {render_navigation_links(bench, settings.chromium_path)} navigation links")
+        rendered = render_navigation_links(bench, settings.chromium_path, screenshots=screenshots)
+        click.echo(f"Rendered {rendered} navigation links")
     if not no_grade:
         grade_answers(bench, _judge(settings))
     click.echo(f"Report: {write_report(bench)}")
@@ -232,10 +289,12 @@ def run(
 @cli.command("render")
 @click.argument("run_id")
 @click.option("--concurrency", type=int, default=3, show_default=True)
-def render_cmd(run_id: str, concurrency: int) -> None:
+@screenshots_option
+def render_cmd(run_id: str, concurrency: int, screenshots: bool) -> None:
     """Open the cBioPortal links in navigation answers and record what each page shows (then regrade them)."""
     bench = Run.load(run_id)
-    click.echo(f"Rendered {render_navigation_links(bench, load_settings().chromium_path, concurrency)} links")
+    rendered = render_navigation_links(bench, load_settings().chromium_path, concurrency, screenshots)
+    click.echo(f"Rendered {rendered} links")
     click.echo(f"Report: {write_report(bench)}")
 
 
@@ -254,18 +313,35 @@ def traces(run_id: str) -> None:
 @click.option(
     "--refresh-questions",
     is_flag=True,
-    help="Replace the run's copy of each question with the current questions file (implies --regrade).",
+    help="Update each question's references (expected answer, links, notes, track) from the current questions "
+    "file, then regrade (implies --regrade). The question text and history stay as they were asked.",
 )
 def grade(run_id: str, regrade: bool, refresh_questions: bool) -> None:
     """Grade answers that don't have a grade yet."""
     bench = Run.load(run_id)
     if refresh_questions:
         current = {q.id: asdict(q) for q in load_questions(Path(bench.data["questions_file"]))}
+        reworded = set()
         for rec in bench.records.values():
-            rec["question"] = current.get(rec["question"]["id"], rec["question"])
+            new = current.get(rec["question"]["id"])
+            if new is None:
+                continue
+            asked, now = definition_fields(rec["question"]), definition_fields(new)
+            if any(asked[f] != now[f] for f in ASKED_FIELDS):
+                reworded.add(rec["question"]["id"])
+            # The answer was to the text and history that were asked, so only the references change.
+            rec["question"] = rec["question"] | {f: new[f] for f in REFERENCE_FIELDS}
+        if reworded:
+            click.echo(
+                f"Warning: {len(reworded)} questions were reworded since this run asked them "
+                f"({', '.join(map(str, sorted(reworded)))}). They keep the text that was asked and are graded "
+                "against the current references; `compare` flags them against runs that asked the new text.",
+                err=True,
+            )
     if regrade or refresh_questions:
         for rec in bench.records.values():
             rec.pop("grade", None)
+        bench.save()
     grade_answers(bench, _judge(load_settings()))
     click.echo(f"Report: {write_report(bench)}")
 
@@ -275,3 +351,38 @@ def grade(run_id: str, regrade: bool, refresh_questions: bool) -> None:
 def report(run_id: str | None) -> None:
     """Re-render a run's report (or just the results index when no run id is given)."""
     click.echo(write_report(Run.load(run_id)) if run_id else write_index())
+
+
+@cli.command()
+@click.argument("run_a")
+@click.argument("run_b")
+@click.option("--model-a", default=None, help="Model of RUN_A to compare (needed when it ran several).")
+@click.option("--model-b", default=None, help="Model of RUN_B to compare (needed when it ran several).")
+@click.option(
+    "--allow-mismatch",
+    is_flag=True,
+    help="Compare even if the judge, questions file or a question's text, history or references differ "
+    "(those questions are marked).",
+)
+@click.option(
+    "--out",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Output directory. Default: results/compare/<A>-<model>_vs_<B>-<model>/.",
+)
+def compare(
+    run_a: str, run_b: str, model_a: str | None, model_b: str | None, allow_mismatch: bool, out: Path | None
+) -> None:
+    """Compare RUN_B against the baseline RUN_A per question and in aggregate (repeats pooled).
+
+    Refuses runs graded differently unless --allow-mismatch. Writes compare.html, compare.md and compare.json,
+    and prints the markdown."""
+    try:
+        result = compare_runs(Run.load(run_a), Run.load(run_b), model_a, model_b, allow_mismatch)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    html = write_compare(result, out)
+    click.echo((html.parent / "compare.md").read_text())
+    for warning in result["warnings"]:
+        click.echo(f"Warning: {warning}", err=True)
+    click.echo(f"Report: {html}")

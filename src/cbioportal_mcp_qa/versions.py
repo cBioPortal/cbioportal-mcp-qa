@@ -5,18 +5,19 @@ import subprocess
 
 import httpx
 
+from .config import TARGETS
 from .mcp_http import MCPSession
+from .redact import describe_error, run_command
 
 CBIOPORTAL_INFO_URL = "https://www.cbioportal.org/api/info"
 DEPLOYMENTS = {"cbioportal_mcp": "cbioagent-clickhouse-mcp", "cbioportal_navigator": "cbioportal-navigator"}
-LIBRECHAT_DEPLOYMENTS = {"beta": "cbioagent-librechat-beta", "prod": "cbioagent-librechat"}
 
 
 def _probe(fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001 - version info must never fail a run
-        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+        return {"error": describe_error(exc)}
 
 
 def cbioportal_api() -> dict:
@@ -36,10 +37,10 @@ def mcp_server(url: str) -> dict:
     return {"name": info.get("name"), "version": info.get("version")}
 
 
-def image_digests(context: str | None) -> dict:
-    """Running image of each MCP deployment in the cluster (cbioportal/mcp images carry no git labels)."""
+def _ready_containers(context: str | None) -> dict:
+    """The first container status of a ready pod of each MCP deployment."""
     cmd = ["kubectl", *(["--context", context] if context else []), "get", "pods", "-o", "json"]
-    pods = json.loads(subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60).stdout)
+    pods = json.loads(run_command(cmd, timeout=60))
     out = {}
     for key, prefix in DEPLOYMENTS.items():
         for pod in pods["items"]:
@@ -47,9 +48,19 @@ def image_digests(context: str | None) -> dict:
             statuses = pod.get("status", {}).get("containerStatuses") or []
             if name.startswith(prefix + "-") and name.count("-") == prefix.count("-") + 2 and statuses:
                 if statuses[0].get("ready"):
-                    out[key] = statuses[0].get("imageID", "").split("@")[-1][:19]
+                    out[key] = statuses[0]
                     break
     return out
+
+
+def image_digests(context: str | None) -> dict:
+    """Running image of each MCP deployment in the cluster (cbioportal/mcp images carry no git labels)."""
+    return {k: s.get("imageID", "").split("@")[-1][:19] for k, s in _ready_containers(context).items()}
+
+
+def image_tags(context: str | None) -> dict:
+    """Image reference (repository:tag) each MCP deployment runs."""
+    return {k: s.get("image", "") for k, s in _ready_containers(context).items()}
 
 
 def librechat_image(target: str, context: str | None) -> str:
@@ -59,10 +70,10 @@ def librechat_image(target: str, context: str | None) -> str:
         *(["--context", context] if context else []),
         "get",
         "deployment",
-        LIBRECHAT_DEPLOYMENTS[target],
+        TARGETS[target].librechat_deployment,
     ]
     cmd += ["-o", "jsonpath={.spec.template.spec.containers[0].image}"]
-    return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60).stdout.strip()
+    return run_command(cmd, timeout=60).strip()
 
 
 def claude_code() -> str:
@@ -73,6 +84,7 @@ def collect(settings, runner: str, target: str) -> dict:
     versions = {
         "cbioportal_api": _probe(cbioportal_api),
         "image_digests": _probe(lambda: image_digests(settings.kube_context)),
+        "image_tags": _probe(lambda: image_tags(settings.kube_context)),
         "cbioportal_navigator": _probe(lambda: mcp_server(settings.navigator_mcp_url)),
     }
     if settings.database_mcp_url:

@@ -1,7 +1,10 @@
 import os
+import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
+
+from .redact import add_env_secrets, add_secret
 
 
 @dataclass(frozen=True)
@@ -24,10 +27,13 @@ class Price:
 
 @dataclass(frozen=True)
 class Model:
+    """A model under test. Without a bedrock_id and price it is a label for whatever the agent runs (e.g. the
+    handoff router, which calls several models): each answer is then priced per LLM call from its trace."""
+
     key: str
     label: str
-    bedrock_id: str
-    price: Price
+    bedrock_id: str | None
+    price: Price | None
     claude_code_id: str | None = None
 
 
@@ -48,18 +54,39 @@ MODELS = {
         "us.anthropic.claude-sonnet-4-6",
         Price(3.0, 15.0, 3.75, 0.30),
     ),
+    "router": Model("router", "Handoff router", None, None),
+    "unified": Model("unified", "Unified agent", None, None),
 }
-PRICES_BY_BEDROCK_ID = {m.bedrock_id: m.price for m in MODELS.values()}
+PRICES_BY_BEDROCK_ID = {m.bedrock_id: m.price for m in MODELS.values() if m.bedrock_id and m.price}
+
+
+def _model_family(model_id: str) -> str:
+    """`us.anthropic.claude-haiku-4-5-20251001-v1:0` -> `claude-haiku-4-5-20251001`."""
+    name = model_id.rsplit("/", 1)[-1]
+    name = re.sub(r"^((us|eu|apac|global)\.)?(anthropic\.)?", "", name)
+    return re.sub(r"-v\d+(:\d+)?$", "", name)
+
+
+def price_for(model_id: str | None) -> Price | None:
+    """List price for a model id as Langfuse records it (Bedrock id, with or without region prefix)."""
+    if not model_id:
+        return None
+    if model_id in PRICES_BY_BEDROCK_ID:
+        return PRICES_BY_BEDROCK_ID[model_id]
+    family = _model_family(model_id)
+    return next((p for bid, p in PRICES_BY_BEDROCK_ID.items() if _model_family(bid) == family), None)
 
 
 @dataclass(frozen=True)
 class Target:
-    """A deployed LibreChat instance and the modelSpec that selects each model."""
+    """A deployed LibreChat instance, its agent, and the modelSpec that selects each model. A model whose spec is
+    None is asked without a spec, so the agent runs its own model_parameters."""
 
     name: str
     url: str
     agent_id: str
-    specs: dict[str, str]
+    specs: dict[str, str | None]
+    librechat_deployment: str
 
 
 TARGETS = {
@@ -68,12 +95,30 @@ TARGETS = {
         "https://beta.chat.cbioportal.org",
         "agent_OHVSJI9Gd6gwsDnFSL-Xl",
         {"haiku": "cBioPortalChatBeta", "sonnet": "cBioPortalChatBetaSonnet"},
+        "cbioagent-librechat-beta",
+    ),
+    # Once cBioPortalChatBeta points at the handoff router (knowledgesystems-k8s-deployment#655), the specs above
+    # no longer select a model for the unified agent (400 invalid_spec). These ask an agent directly, no spec.
+    "beta-router": Target(
+        "beta-router",
+        "https://beta.chat.cbioportal.org",
+        "agent_cbiobeta_router",
+        {"router": None},
+        "cbioagent-librechat-beta",
+    ),
+    "beta-unified": Target(
+        "beta-unified",
+        "https://beta.chat.cbioportal.org",
+        "agent_OHVSJI9Gd6gwsDnFSL-Xl",
+        {"unified": None},
+        "cbioagent-librechat-beta",
     ),
     "prod": Target(
         "prod",
         "https://chat.cbioportal.org",
         "agent_9ZXhcwLIsROBQX0u4JS5F",
         {"haiku": "cBioPortalChat", "sonnet": "cBioPortalChatSonnet"},
+        "cbioagent-librechat",
     ),
 }
 
@@ -97,7 +142,9 @@ class Settings:
 
 def load_settings() -> Settings:
     load_dotenv()
-    return Settings(
+    # Everything written to results/ masks these (and any other secret-looking variable) wherever they appear.
+    add_env_secrets()
+    settings = Settings(
         api_key=os.environ.get("LIBRECHAT_API_KEY", ""),
         langfuse_host=os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com"),
         langfuse_public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
@@ -112,3 +159,6 @@ def load_settings() -> Settings:
         database_connector=os.environ.get("CLAUDE_AI_DATABASE_CONNECTOR") or None,
         kube_context=os.environ.get("KUBE_CONTEXT") or None,
     )
+    for value in (settings.api_key, settings.langfuse_secret_key, settings.langfuse_public_key):
+        add_secret(value)
+    return settings

@@ -23,6 +23,34 @@ CATEGORIES = (
 )
 
 
+# What the agent was asked, and what its answer is graded against. `grade --refresh-questions` updates only the
+# references: the answer was to the text and history that were asked.
+ASKED_FIELDS = ("question", "history")
+REFERENCE_FIELDS = ("expected_answer", "expected_links", "notes", "track")
+DEFINITION_FIELDS = ASKED_FIELDS + REFERENCE_FIELDS
+
+
+def _norm(value):
+    if value in (None, "", [], ()):
+        return None
+    if isinstance(value, str):
+        return value.strip()
+    return list(value) if isinstance(value, tuple) else value
+
+
+def asked_question(rec: dict) -> dict:
+    """A record's question as the agent was asked it. Runs refreshed before references-only refreshes replaced
+    `question` with the current file's and kept the asked text and history in `asked`, which wins."""
+    return rec["question"] | (rec.get("asked") or {})
+
+
+def definition_fields(question: dict) -> dict:
+    """A question's definition fields, normalized so equivalent empty or stored forms compare equal."""
+    fields = {f: _norm(question.get(f)) for f in DEFINITION_FIELDS}
+    fields["track"] = fields["track"] or "data"
+    return fields
+
+
 @dataclass(frozen=True)
 class Question:
     id: int
