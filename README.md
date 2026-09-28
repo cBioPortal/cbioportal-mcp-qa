@@ -71,7 +71,8 @@ uv run cbioportal-mcp-qa run --resume 20260923-1800
 uv run cbioportal-mcp-qa traces 20260923-1800
 uv run cbioportal-mcp-qa grade 20260923-1800 --regrade
 
-# After fixing references in input/questions.yaml, regrade an existing run against them
+# After fixing references in input/questions.yaml, regrade an existing run against them (only the expected
+# answer, links, notes and track are refreshed; the judge still sees the question text and history that were asked)
 uv run cbioportal-mcp-qa grade 20260923-1800 --refresh-questions
 uv run cbioportal-mcp-qa report 20260923-1800
 ```
@@ -106,12 +107,20 @@ calls per answer), and every question with its outcome per repeat, pass variance
 regressions first. Only questions both runs asked are compared. Runs recorded before per-call traces show
 "–" for tool rounds, handoffs and routing.
 
-**Comparable runs only.** `compare` refuses, and says why, when the runs used a different judge model or
-questions file, or when a question's text, conversation history, track, `expected_answer`, `expected_links` or
-`notes` differ between the runs (or between one run's repeats) — their pass/fail would measure different
-things. Regrade the older run against the current questions (`grade <run> --refresh-questions`) and compare
-again, or pass `--allow-mismatch` to compare anyway: the affected questions are then marked ⚠ and a warning is
-printed.
+**Comparable runs only.** `compare` refuses, and says why, when the runs used a different judge model (or
+either run mixes judge models) or questions file, or when a question's text, conversation history, track,
+`expected_answer`, `expected_links` or `notes` differ between the runs (or between one run's repeats) — their
+pass/fail would measure different things. Each grade records the judge model that made it and a snapshot of
+the question it was graded against, and `compare` checks those; grades from before per-answer judges fall back
+to the run's `judge_model`. Regrade the older run against the current references (`grade <run>
+--refresh-questions`) and compare again, or pass `--allow-mismatch` to compare anyway: the affected questions
+are then marked ⚠ and a warning is printed.
+
+`--refresh-questions` never changes the question text or history, since the answer was to what was asked. So
+even after regrading 20260923-1919, the 9 questions reworded since then still differ from runs that asked the
+new wording and can only be compared with `--allow-mismatch`. For a clean beta comparison, record a fresh
+3-repeat baseline (`run --target beta-unified --repeats 3`) on the current questions file rather than relying on
+the regraded 09-23 run.
 
 **Every turn is counted.** A turn is one question × repeat. Each side reports its *expected* turns (questions ×
 the run's `repeats`), *completed* (HTTP 200), *failed* (an HTTP error or timeout), *missing* (never recorded,

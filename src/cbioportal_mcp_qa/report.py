@@ -421,7 +421,7 @@ def _headline(summary: dict) -> dict:
     }
 
 
-RUN_SETUP_KEYS = ("agent_prompt", "agents", "versions", "database_mcp", "questions_file")
+RUN_SETUP_KEYS = ("agent_prompt", "agents", "versions", "database_mcp", "questions_file", "judge_models")
 
 # Each questions file is its own test set: its runs get a separate table on the index, in this order.
 QUESTION_SETS = {

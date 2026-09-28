@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import MODELS
-from .dataset import CATEGORIES, TRACKS
+from .dataset import CATEGORIES, DEFINITION_FIELDS, TRACKS, definition_fields
 from .report import (
     FAST_S,
     OUTCOME_ICONS,
@@ -46,11 +46,6 @@ from .report import (
 from .run import RESULTS_DIR, Run
 
 MISSING_ICON = "?"
-# What makes two runs' answers to a question comparable: it was asked and graded against the same thing.
-DEFINITION_FIELDS = ("question", "history", "expected_answer", "expected_links", "notes", "track")
-# What the agent was actually asked. `grade --refresh-questions` keeps these in the record's `asked` before
-# replacing its question, since the answer was to that text.
-ASKED_FIELDS = ("question", "history")
 
 
 class IncompatibleRuns(ValueError):
@@ -295,18 +290,11 @@ def _by_question(run: Run, model: str) -> dict[int, list[dict]]:
     return out
 
 
-def _norm(value):
-    if value in (None, "", [], ()):
-        return None
-    return list(value) if isinstance(value, tuple) else value
-
-
 def definition(rec: dict) -> str:
-    """The fields that decide how a record's question was asked and graded, as a comparable string."""
-    question = rec["question"] | (rec.get("asked") or {})
-    fields = {f: _norm(question.get(f)) for f in DEFINITION_FIELDS}
-    fields["track"] = fields["track"] or "data"
-    return json.dumps(fields, sort_keys=True, ensure_ascii=False)
+    """How a record's question was asked and graded, as a comparable string: the snapshot its grade recorded,
+    else (ungraded turns, and grades from before snapshots) the record's question."""
+    graded = (rec.get("grade") or {}).get("graded")
+    return json.dumps(definition_fields(graded or rec["question"]), sort_keys=True, ensure_ascii=False)
 
 
 def definition_mismatch(recs_a: list[dict], recs_b: list[dict]) -> list[str]:
@@ -318,12 +306,28 @@ def definition_mismatch(recs_a: list[dict], recs_b: list[dict]) -> list[str]:
     return out
 
 
-def _run_setup_mismatch(run_a: Run, run_b: Run) -> list[str]:
-    problems = []
-    for key, what in (("judge_model", "judge model"), ("questions_file", "questions file")):
-        a, b = run_a.data.get(key), run_b.data.get(key)
-        if a != b:
-            problems.append(f"{what} differs: A {a!r}, B {b!r}")
+def judges(run: Run, records: list[dict]) -> list[str]:
+    """Judge models that graded these records: each grade's own, else (grades from before per-turn judges) the
+    run's. A run nothing was graded in yet reports its configured judge."""
+    used = {
+        rec["grade"].get("judge_model") or run.data.get("judge_model") for rec in records if rec.get("grade")
+    }
+    return sorted(used or {run.data.get("judge_model")}, key=str)
+
+
+def _run_setup_mismatch(run_a: Run, run_b: Run, judges_a: list[str], judges_b: list[str]) -> list[str]:
+    problems = [
+        f"{side} was graded by more than one judge model: {', '.join(map(str, j))}"
+        for side, j in (("A", judges_a), ("B", judges_b))
+        if len(j) > 1
+    ]
+    if judges_a != judges_b:
+        problems.append(
+            f"judge model differs: A {', '.join(map(str, judges_a))}, B {', '.join(map(str, judges_b))}"
+        )
+    a, b = run_a.data.get("questions_file"), run_b.data.get("questions_file")
+    if a != b:
+        problems.append(f"questions file differs: A {a!r}, B {b!r}")
     return problems
 
 
@@ -398,7 +402,9 @@ def compare(
     rep_a, rep_b = run_a.data.get("repeats", 1), run_b.data.get("repeats", 1)
     common = sorted(qa.keys() & qb.keys())
 
-    setup_problems = _run_setup_mismatch(run_a, run_b)
+    judges_a = judges(run_a, [r for q in common for r in qa[q]])
+    judges_b = judges(run_b, [r for q in common for r in qb[q]])
+    setup_problems = _run_setup_mismatch(run_a, run_b, judges_a, judges_b)
     mismatched = {qid: m for qid in common if (m := definition_mismatch(qa[qid], qb[qid]))}
     if (setup_problems or mismatched) and not allow_mismatch:
         lines = list(setup_problems)
@@ -471,7 +477,7 @@ def compare(
             "median_latency_stdev": median(stdevs),
         }
 
-    def describe(side: str, run: Run, model: str) -> dict:
+    def describe(side: str, run: Run, model: str, judge_models: list[str]) -> dict:
         pool = totals[side]
         return {
             "run_id": run.data["run_id"],
@@ -480,7 +486,8 @@ def compare(
             "model": model,
             "label": MODELS[model].label,
             "repeats": run.data.get("repeats", 1),
-            "judge_model": run.data.get("judge_model"),
+            "judge_model": ", ".join(map(str, judge_models)),
+            "judge_models": judge_models,
             "questions_file": run.data.get("questions_file"),
             "created_at": run.data.get("created_at"),
             "agent_id": (run.data.get("agent_prompt") or {}).get("agent_id"),
@@ -492,8 +499,8 @@ def compare(
 
     seen = set(by_category)
     return {
-        "a": describe("a", run_a, model_a),
-        "b": describe("b", run_b, model_b),
+        "a": describe("a", run_a, model_a, judges_a),
+        "b": describe("b", run_b, model_b, judges_b),
         "n_questions": len(common),
         "only_a": sorted(qa.keys() - qb.keys()),
         "only_b": sorted(qb.keys() - qa.keys()),
@@ -597,8 +604,9 @@ def to_markdown(result: dict, per_question_limit: int = 40) -> str:
             f"## {title}",
             "",
             "| | Completed/expected (failed, missing, ungraded) A · B | Recall A | Recall B | Δ | Precision A | B "
-            "| Median latency A | B | p90 A | B | <10s A | B | LLM calls A | B |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Attempt rate A | B | Median latency A | B | p90 A | B | Median incl. failed A | B "
+            "| p90 incl. failed A | B | <10s A | B | LLM calls A | B |",
+            "|---|---|" + "---:|" * 21,
         ]
         for r in rows:
             ra, rb = r["a"], r["b"]
@@ -609,9 +617,12 @@ def to_markdown(result: dict, per_question_limit: int = 40) -> str:
             lines.append(
                 f"| {r['label']} | {counts} | {_fmt(ra['recall'], 'pct')} | {_fmt(rb['recall'], 'pct')} | "
                 f"{_fmt(r['delta'], 'pct', signed=True)} | {_fmt(ra['precision'], 'pct')} | "
-                f"{_fmt(rb['precision'], 'pct')} | {_fmt(ra['median_latency'], 'secs')} | "
+                f"{_fmt(rb['precision'], 'pct')} | {_fmt(ra['attempt_rate'], 'pct')} | "
+                f"{_fmt(rb['attempt_rate'], 'pct')} | {_fmt(ra['median_latency'], 'secs')} | "
                 f"{_fmt(rb['median_latency'], 'secs')} | {_fmt(ra['p90_latency'], 'secs')} | "
-                f"{_fmt(rb['p90_latency'], 'secs')} | {_fmt(ra['fast_share'], 'pct')} | "
+                f"{_fmt(rb['p90_latency'], 'secs')} | {_fmt(ra['median_latency_all'], 'secs')} | "
+                f"{_fmt(rb['median_latency_all'], 'secs')} | {_fmt(ra['p90_latency_all'], 'secs')} | "
+                f"{_fmt(rb['p90_latency_all'], 'secs')} | {_fmt(ra['fast_share'], 'pct')} | "
                 f"{_fmt(rb['fast_share'], 'pct')} | {_fmt(ra['mean_llm_calls'], 'num')} | "
                 f"{_fmt(rb['mean_llm_calls'], 'num')} |"
             )

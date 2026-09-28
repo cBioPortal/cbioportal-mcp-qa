@@ -7,10 +7,17 @@ import click
 from .agent import AgentClient
 from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
 from .claude_code import ClaudeCodeClient, find_connector
-from .compare import ASKED_FIELDS, write_compare
 from .compare import compare as compare_runs
+from .compare import write_compare
 from .config import MODELS, TARGETS, load_settings
-from .dataset import DEFAULT_QUESTIONS, load_questions, parse_selection
+from .dataset import (
+    ASKED_FIELDS,
+    DEFAULT_QUESTIONS,
+    REFERENCE_FIELDS,
+    definition_fields,
+    load_questions,
+    parse_selection,
+)
 from .grade import Judge
 from .redact import describe_error, redact
 from .report import write_index, write_report
@@ -282,17 +289,31 @@ def traces(run_id: str) -> None:
 @click.option(
     "--refresh-questions",
     is_flag=True,
-    help="Replace the run's copy of each question with the current questions file (implies --regrade).",
+    help="Update each question's references (expected answer, links, notes, track) from the current questions "
+    "file, then regrade (implies --regrade). The question text and history stay as they were asked.",
 )
 def grade(run_id: str, regrade: bool, refresh_questions: bool) -> None:
     """Grade answers that don't have a grade yet."""
     bench = Run.load(run_id)
     if refresh_questions:
         current = {q.id: asdict(q) for q in load_questions(Path(bench.data["questions_file"]))}
+        reworded = set()
         for rec in bench.records.values():
-            # The answer was to the text and history asked at the time; keep them so `compare` still sees it.
-            rec.setdefault("asked", {k: rec["question"].get(k) for k in ASKED_FIELDS})
-            rec["question"] = current.get(rec["question"]["id"], rec["question"])
+            new = current.get(rec["question"]["id"])
+            if new is None:
+                continue
+            asked, now = definition_fields(rec["question"]), definition_fields(new)
+            if any(asked[f] != now[f] for f in ASKED_FIELDS):
+                reworded.add(rec["question"]["id"])
+            # The answer was to the text and history that were asked, so only the references change.
+            rec["question"] = rec["question"] | {f: new[f] for f in REFERENCE_FIELDS}
+        if reworded:
+            click.echo(
+                f"Warning: {len(reworded)} questions were reworded since this run asked them "
+                f"({', '.join(map(str, sorted(reworded)))}). They keep the text that was asked and are graded "
+                "against the current references; `compare` flags them against runs that asked the new text.",
+                err=True,
+            )
     if regrade or refresh_questions:
         for rec in bench.records.values():
             rec.pop("grade", None)
