@@ -13,7 +13,12 @@ def results_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-SUBSCRIPTION = {"mode": "subscription", "auth_method": "claude.ai", "api_provider": "firstParty"}
+SUBSCRIPTION = {
+    "mode": "subscription",
+    "auth_method": "claude.ai",
+    "api_provider": "firstParty",
+    "subscription_type": "max",
+}
 
 
 @pytest.fixture(autouse=True)

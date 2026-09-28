@@ -82,6 +82,14 @@ def claude_code_options(f):
         "only managed settings apply, so effortLevel, hooks and plugins from ~/.claude stay out.",
     )(f)
     f = click.option(
+        "--claude-code-trust-org-policy",
+        is_flag=True,
+        envvar="CLAUDE_CODE_TRUST_ORG_POLICY",
+        help="Run claude-code sessions on a Team or Enterprise login (or any plan but Pro/Max). Their "
+        "organization can push server-managed settings that a session applies without caching, so the billing "
+        "guard can't check them beforehand; this trusts that policy not to bill per token.",
+    )(f)
+    f = click.option(
         "--claude-code-allow-api-billing",
         is_flag=True,
         envvar="CLAUDE_CODE_ALLOW_API_BILLING",
@@ -166,6 +174,7 @@ def _client(
     transcript_dir: Path | None = None,
     allow_api_billing: bool = False,
     user_settings: bool = False,
+    trust_org_policy: bool = False,
 ):
     if runner == "claude-code":
         try:
@@ -177,6 +186,7 @@ def _client(
                 transcript_dir=transcript_dir,
                 allow_api_billing=allow_api_billing,
                 isolate_settings=not user_settings,
+                trust_org_policy=trust_org_policy,
             )
         except RuntimeError as exc:
             raise click.ClickException(redact(str(exc))) from exc
@@ -204,6 +214,7 @@ def ask(
     model: str | None,
     runner: str,
     claude_code_allow_api_billing: bool,
+    claude_code_trust_org_policy: bool,
     claude_code_user_settings: bool,
     require_beta_mcp: bool,
 ) -> None:
@@ -219,6 +230,7 @@ def ask(
             runner,
             allow_api_billing=claude_code_allow_api_billing,
             user_settings=claude_code_user_settings,
+            trust_org_policy=claude_code_trust_org_policy,
         )
         try:
             return await client.ask(question, model)
@@ -279,6 +291,7 @@ def run(
     screenshots,
     runner,
     claude_code_allow_api_billing,
+    claude_code_trust_org_policy,
     claude_code_user_settings,
     require_beta_mcp,
 ) -> None:
@@ -313,6 +326,7 @@ def run(
         prompt,
         allow_api_billing=claude_code_allow_api_billing,
         user_settings=claude_code_user_settings,
+        trust_org_policy=claude_code_trust_org_policy,
     )
     if resume:
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")

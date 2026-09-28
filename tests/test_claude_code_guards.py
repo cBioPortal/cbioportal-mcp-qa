@@ -149,6 +149,9 @@ def test_client_refuses_an_api_key_helper_in_loaded_settings(monkeypatch, tmp_pa
         ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp")
 
 
+PRO = {"mode": "subscription", "auth_method": "claude.ai", "subscription_type": "pro", "organization": False}
+
+
 def test_client_strips_billing_env_and_records_the_auth_mode(monkeypatch):
     for name, value in BILLING_ENV.items():
         monkeypatch.setenv(name, value)
@@ -156,9 +159,7 @@ def test_client_strips_billing_env_and_records_the_auth_mode(monkeypatch):
     monkeypatch.setattr(
         claude_code,
         "auth_status",
-        lambda env: (
-            seen.setdefault("env", dict(env)) and {"mode": "subscription", "auth_method": "claude.ai"}
-        ),
+        lambda env: seen.setdefault("env", dict(env)) and dict(PRO),
     )
     client = ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp")
     try:
@@ -166,8 +167,10 @@ def test_client_strips_billing_env_and_records_the_auth_mode(monkeypatch):
         assert not set(BILLING_ENV) & set(seen["env"]) and not set(BILLING_ENV) & set(client.env)
         assert client.describe() == {
             "auth_mode": "subscription",
-            "auth_status": {"mode": "subscription", "auth_method": "claude.ai"},
+            "auth_status": PRO,
+            "account_type": "pro",
             "allow_api_billing": False,
+            "trust_org_policy": False,
             "stripped_env": sorted(BILLING_ENV),
             "setting_sources": "managed only",
         }

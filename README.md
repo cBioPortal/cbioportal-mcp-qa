@@ -226,17 +226,25 @@ profile or federation credentials. The guard fails closed. By default the runner
   an OAuth token that reports its `subscriptionType`, with no `ANTHROPIC_AUTH_TOKEN` in any settings source.
   `auth status` reports a bearer token and a subscription token alike as `oauth_token`. It also reads the user
   settings the isolated sessions skip, so an `apiKeyHelper` or bearer token there refuses too;
+- refuses to start on a plan that can receive **server-managed settings**: only Claude for Teams and
+  Enterprise can ([server-managed settings](https://code.claude.com/docs/en/server-managed-settings)). A
+  `claude -p` session fetches and applies its organization's policy without caching it, so an
+  `ANTHROPIC_AUTH_TOKEN` or API key the policy sets can't be checked beforehand. Only `subscriptionType`
+  `pro` and `max` start by default. Team, Enterprise, and an unrecognised or missing plan need
+  `--claude-code-trust-org-policy` (or `CLAUDE_CODE_TRUST_ORG_POLICY=1`), which trusts the organization's
+  Claude Code policy not to route sessions to per-token billing. **A login in an MSK claude.ai organization
+  reports `team`, so it needs this flag** (`claude auth status` shows your plan as `subscriptionType`). It doesn't relax the other checks;
 - as a backstop, stops the run if a session's `apiKeySource` names a key, token, helper or bearer. A bearer
   token reports `none` there, like the subscription, which is why the checks above run first.
 
-`--claude-code-allow-api-billing` (or `CLAUDE_CODE_ALLOW_API_BILLING=1`) turns all of this off. `run.json`
+`--claude-code-allow-api-billing` (or `CLAUDE_CODE_ALLOW_API_BILLING=1`) turns all of these checks off. `run.json`
 records `claude_code.auth_mode` (`subscription`, or with the opt-in `api-key`, `cloud-provider`, `unconfirmed`),
-the `claude auth status` method, provider and subscription type (no identity), and the names of the removed
-variables.
+`claude_code.account_type` (the plan), `trust_org_policy` and `allow_api_billing`, the `claude auth status`
+method, provider and whether the login belongs to an organization (no email, org id or name), and the names of
+the removed variables.
 
-Not covered: server-managed settings that a `-p` session fetches fresh apply only in that session and aren't
-cached, so they can't be read beforehand. A `CLAUDE_CODE_OAUTH_TOKEN` whose `auth status` doesn't show a
-subscription type is refused; use `/login` or the opt-in.
+A `CLAUDE_CODE_OAUTH_TOKEN` whose `auth status` doesn't show a subscription type is refused; use `/login` or
+the opt-ins.
 
 ### Settings isolation
 

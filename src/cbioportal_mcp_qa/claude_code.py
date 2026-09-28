@@ -53,6 +53,11 @@ API_BILLING_ENV = re.compile(
 MANAGED_SETTINGS_DIRS = (Path("/Library/Application Support/ClaudeCode"), Path("/etc/claude-code"))
 MANAGED_PREFERENCES_DIR = Path("/Library/Managed Preferences")
 MDM_PLIST = "com.anthropic.claudecode.plist"
+# Plans whose logins can't receive server-managed settings, which only Claude for Teams and Enterprise have
+# (https://code.claude.com/docs/en/server-managed-settings). A `-p` session fetches and applies such a policy
+# without caching it, so a credential in its `env` can't be seen beforehand (and a bearer token there reports
+# apiKeySource "none"): any other plan needs --claude-code-trust-org-policy.
+NO_ORG_POLICY_PLANS = {"pro", "max"}
 # A session's apiKeySource on the subscription login (also with a bearer token: that one is caught before).
 NO_API_KEY_SOURCE = "none"
 
@@ -151,6 +156,8 @@ def auth_status(env: Mapping[str, str]) -> dict:
     info = {"mode": mode, "auth_method": method, "api_provider": provider}
     if subscription:
         info["subscription_type"] = subscription
+    # Whether the login belongs to an organization (not which: ids and names stay out of run.json).
+    info["organization"] = bool(status.get("orgId") or status.get("orgName"))
     return info
 
 
@@ -173,9 +180,13 @@ def bills_per_token(source: str | None) -> bool:
     return any(word in source.lower() for word in ("key", "token", "helper", "bearer"))
 
 
-def check_billing(env: Mapping[str, str], isolate_settings: bool, allow_api_billing: bool) -> dict:
+def check_billing(
+    env: Mapping[str, str], isolate_settings: bool, allow_api_billing: bool, trust_org_policy: bool = False
+) -> dict:
     """The auth status sessions will run with. Unless API billing is allowed, anything but a confirmed
-    subscription login is refused here, before the first model call (the connector probe included)."""
+    subscription login is refused here, before the first model call (the connector probe included), and so is
+    a plan that can receive server-managed settings (Team, Enterprise, or one this doesn't recognise) unless
+    its organization's policy is trusted."""
     found = api_billing_settings(settings_files(env, isolate_settings))
     status = auth_status(env)
     if allow_api_billing:
@@ -197,6 +208,16 @@ def check_billing(env: Mapping[str, str], isolate_settings: bool, allow_api_bill
             f"{'; ' + ', '.join(bearer) if bearer else ''}); log in with `claude` (/login) for this "
             "CLAUDE_CONFIG_DIR, remove an apiKeyHelper or billing variable from its settings, or pass "
             "--claude-code-allow-api-billing"
+        )
+    plan = str(status.get("subscription_type") or "").lower()
+    if plan not in NO_ORG_POLICY_PLANS and not trust_org_policy:
+        raise RuntimeError(
+            f"this Claude login's plan ({status.get('subscription_type')!r}) can receive server-managed settings "
+            "from its organization, which a `claude -p` session fetches and applies without caching, so a "
+            "credential they set (e.g. ANTHROPIC_AUTH_TOKEN) can't be checked before answers are billed to it. "
+            "If you trust your organization's Claude Code policy not to route sessions to per-token billing, pass "
+            "--claude-code-trust-org-policy (or CLAUDE_CODE_TRUST_ORG_POLICY=1); only Pro and Max logins run "
+            "without it"
         )
     return status
 
@@ -545,6 +566,7 @@ class ClaudeCodeClient:
         transcript_dir: Path | None = None,
         allow_api_billing: bool = False,
         isolate_settings: bool = True,
+        trust_org_policy: bool = False,
     ):
         self.system_prompt = system_prompt
         self.transcript_dir = transcript_dir
@@ -556,7 +578,8 @@ class ClaudeCodeClient:
         self.allow_api_billing = allow_api_billing
         self.isolate_settings = isolate_settings
         self.env, self.stripped_env = session_env(os.environ, allow_api_billing)
-        self.auth = check_billing(self.env, isolate_settings, allow_api_billing)
+        self.trust_org_policy = trust_org_policy
+        self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
         self.setup = tool_setup(
             database_url,
@@ -578,7 +601,9 @@ class ClaudeCodeClient:
         return {
             "auth_mode": self.auth["mode"],
             "auth_status": self.auth,
+            "account_type": self.auth.get("subscription_type"),
             "allow_api_billing": self.allow_api_billing,
+            "trust_org_policy": self.trust_org_policy,
             "stripped_env": self.stripped_env,
             "setting_sources": "managed only" if self.isolate_settings else "user, project, local",
         }
