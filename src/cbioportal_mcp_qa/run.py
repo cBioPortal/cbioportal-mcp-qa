@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from .agent import AgentClient
 from .claude_code import ClaudeCodeClient
-from .dataset import DEFINITION_FIELDS, Question
+from .dataset import DEFINITION_FIELDS, Question, asked_question
 from .grade import Judge, StudyValidator, cbio_links, tool_log
 from .render import render_links
 from .traces import Langfuse
@@ -27,6 +27,11 @@ class Run:
     def __init__(self, path: Path, data: dict):
         self.path = path
         self.data = data
+        # Put back the text and history a legacy refresh moved to `asked`, so grading and snapshots use them.
+        for rec in data.get("records", {}).values():
+            if "asked" in rec:
+                rec["question"] = asked_question(rec)
+                del rec["asked"]
 
     @classmethod
     def create(

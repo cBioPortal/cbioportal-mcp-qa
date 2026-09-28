@@ -38,6 +38,12 @@ def _norm(value):
     return list(value) if isinstance(value, tuple) else value
 
 
+def asked_question(rec: dict) -> dict:
+    """A record's question as the agent was asked it. Runs refreshed before references-only refreshes replaced
+    `question` with the current file's and kept the asked text and history in `asked`, which wins."""
+    return rec["question"] | (rec.get("asked") or {})
+
+
 def definition_fields(question: dict) -> dict:
     """A question's definition fields, normalized so equivalent empty or stored forms compare equal."""
     fields = {f: _norm(question.get(f)) for f in DEFINITION_FIELDS}

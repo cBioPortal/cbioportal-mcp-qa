@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import MODELS
-from .dataset import CATEGORIES, DEFINITION_FIELDS, TRACKS, definition_fields
+from .dataset import CATEGORIES, DEFINITION_FIELDS, TRACKS, asked_question, definition_fields
 from .report import (
     FAST_S,
     OUTCOME_ICONS,
@@ -292,9 +292,9 @@ def _by_question(run: Run, model: str) -> dict[int, list[dict]]:
 
 def definition(rec: dict) -> str:
     """How a record's question was asked and graded, as a comparable string: the snapshot its grade recorded,
-    else (ungraded turns, and grades from before snapshots) the record's question."""
+    else (ungraded turns, and grades from before snapshots) the record's question as it was asked."""
     graded = (rec.get("grade") or {}).get("graded")
-    return json.dumps(definition_fields(graded or rec["question"]), sort_keys=True, ensure_ascii=False)
+    return json.dumps(definition_fields(graded or asked_question(rec)), sort_keys=True, ensure_ascii=False)
 
 
 def definition_mismatch(recs_a: list[dict], recs_b: list[dict]) -> list[str]:
