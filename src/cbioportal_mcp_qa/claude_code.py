@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .agent import AgentReply
 from .config import MODELS
+from .redact import redact
 from .traces import ToolCall, TraceStats, excerpt
 
 # Deliberately unlike the database connector's "claude_ai_cBioPortal_MCP": with two cBioPortal-looking tool
@@ -130,7 +131,7 @@ def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
         )
         servers = loaded_servers(out.stdout.splitlines())
         if servers is None:
-            raise RuntimeError(f"could not start claude to probe MCP servers: {out.stderr[-500:]}")
+            raise RuntimeError(f"could not start claude to probe MCP servers: {redact(out.stderr)[-500:]}")
         seen |= servers
         if any(name.startswith("claude_ai_") for name in servers):
             break
@@ -394,5 +395,5 @@ class ClaudeCodeClient:
             (self.transcript_dir / name).write_text(f"Q ({model}): {question}\n\n{format_transcript(lines)}")
             reply.trace["url"] = f"{self.transcript_dir.name}/{name}"
         if reply.error and proc.returncode:
-            reply.error = f"{reply.error} (exit {proc.returncode}: {stderr.decode()[-500:]})"
+            reply.error = f"{reply.error} (exit {proc.returncode}: {redact(stderr.decode())[-500:]})"
         return reply

@@ -7,9 +7,8 @@ agent at the start of every run, and run.json records only its hash.
 import base64
 import hashlib
 import json
-import subprocess
 
-from .redact import describe_error
+from .redact import describe_error, run_command
 
 MONGO_SECRET = "cbioagent-mongodb-creds"
 MONGO_SECRET_KEY = "mongodb-passwords"
@@ -17,7 +16,7 @@ MONGO_SECRET_KEY = "mongodb-passwords"
 
 def _kubectl(args: list[str], context: str | None) -> str:
     cmd = ["kubectl", *(["--context", context] if context else []), *args]
-    return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120).stdout
+    return run_command(cmd, timeout=120)
 
 
 def fetch_agent_prompt(agent_id: str, context: str | None = None) -> dict:
