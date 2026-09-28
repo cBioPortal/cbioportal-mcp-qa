@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 
 from .config import price_for
+from .redact import redact
 
 SCHEMA_ERROR = "did not match expected schema"
 # LibreChat (@librechat/agents) gives a router one tool per handoff edge, named after the destination agent id.
@@ -265,7 +266,7 @@ def _tool_calls(obs: dict) -> list[ToolCall]:
             continue
         kwargs = msg.get("kwargs") or {}
         content = kwargs.get("content")
-        text = content if isinstance(content, str) else json.dumps(content)
+        text = redact(content if isinstance(content, str) else json.dumps(content))
         failed = kwargs.get("status") == "error"
         call_args = args.get(kwargs.get("tool_call_id"))
         calls.append(
@@ -273,7 +274,7 @@ def _tool_calls(obs: dict) -> list[ToolCall]:
                 short_tool_name(kwargs.get("name") or "?"),
                 not failed,
                 text[:500] if failed else None,
-                excerpt(json.dumps(call_args, ensure_ascii=False)) if call_args is not None else None,
+                excerpt(redact(json.dumps(call_args, ensure_ascii=False))) if call_args is not None else None,
                 excerpt(text),
             )
         )

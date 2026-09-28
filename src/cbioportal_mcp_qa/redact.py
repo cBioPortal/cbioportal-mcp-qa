@@ -1,31 +1,34 @@
-"""Keep credentials out of text that ends up in results (exception messages, failed commands).
+"""Keep credentials out of everything written under results/ (reported at GitHub Pages).
 
-A failed `kubectl exec ... mongosh -p PASS` raises a CalledProcessError whose message repeats the whole
-command. Commands are never recorded: a failed command is described by its executable's name, its exit status
-and the (redacted) tail of what it printed (`run_command`, `describe_error`).
+Two layers, applied to every string `persist` writes:
 
-Free text can still echo a command (stderr, other exceptions), so every recorded message goes through
-`redact`, which fails closed rather than parsing shell quoting:
+1. **Known values.** The secrets the benchmark itself loads (`add_secret`: API keys from the settings, the
+   cBioAgent Mongo password read from its k8s secret) and every secret-looking environment variable
+   (`add_env_secrets`) are masked wherever they appear, also URL-encoded, JSON-escaped, backslash-escaped or
+   HTML-escaped. Only values of 6+ characters count, so short values can't mask ordinary text.
+2. **Patterns**, for secrets the benchmark never saw (an agent echoing another credential):
+   - URI userinfo, bearer/basic tokens, secret-looking key=value / "key": "value" pairs, well-known key shapes.
+   - After an assignment to a `*PASSWORD`/`*PASSWD`/`*TOKEN`/`*SECRET` name, a long password flag
+     (`--password`, `--token`, ...) or `-u user:`: everything to the end of the line.
+   - After a database client (`mongosh`, `mongo*`, `mysql*`, `mariadb*`: `-p`; `redis-cli`: `-a`), that
+     client's password flag on the same line (command): everything to the end of the line. A bare flag followed
+     by another flag (`mysql -p -h db`, which prompts) is left alone, so `kubectl -n ns`, `ssh -p 2222`,
+     `psql -p 5432` and `redis-cli -p 6379` (ports) stay readable.
+   Quoting is never parsed; the rules fail closed instead. JSON escapes (`\\t`, `\\n`) read as whitespace
+   when finding flags. "The end of the line" runs on across backslash-continued lines, and becomes the end of
+   the whole text when the rest holds an escaped quote or a JSON escape, or the masked part leaves a quote open
+   (a quoted newline).
 
-- URI userinfo, bearer/basic tokens, secret-looking key=value pairs and well-known key shapes are masked.
-- A long password flag (`--password`, `--token`, `--api-key`, ...), in any command: everything after it to the
-  end of the line.
-- `-u user:...` / `--user user:...` (e.g. curl): everything after the colon to the end of the line.
-- When the text names a database client (`mongosh`, `mongo`, `mongodump`, ..., `mysql`, `mysqldump`,
-  `mariadb`: `-p`; `redis-cli`: `-a`), everything after that client's password flag to the end of the line.
-  The flag stands alone (after whitespace, or as a quoted list item) or has its value attached (`-pX`,
-  `-p=X`); a bare flag followed by another flag (`mysql -p -h db`, which prompts) is left alone. So
-  `kubectl -n ns`, `ssh -p 2222`, `psql -p 5432` and `redis-cli -p 6379` (ports) stay readable. `psql` takes
-  no password flag (its password comes from PGPASSWORD=..., a key=value pair).
-
-"The end of the line" runs on across backslash-continued lines, and to the end of the text when the masked
-part holds an unclosed quote (a quoted newline). Masking the rest of such a line is the price of never
-reading quoting wrong.
+Failed commands are never recorded: a failure is described by its executable's name, its exit status and the
+(redacted) tail of what it printed (`run_command`, `describe_error`).
 """
 
+import html
+import json
 import os
 import re
 import subprocess
+from urllib.parse import quote, quote_plus
 
 MASK = "***"
 TAIL = 300  # characters of a failed command's output kept
@@ -43,7 +46,7 @@ _PATTERNS = [
             # so ordinary words like "tokens: 1200" are left alone.
             r"(?i)([\"']?\b(?:[\w-]*(?=passw)|[\w-]*[_-])?(?:password|passwd|pwd|secret|token|api[-_]?key|access[-_]?key)"
             r"(?:[_-][\w-]*)?\b[\"']?\s*[:=]\s*)"
-            r"(?:\"(?:[^\"\\\n]|\\.)*(\"?)|'(?:[^'\\\n]|\\.)*('?)|[^\s'\",}&]+)"
+            r"(?:\"(?:[^\"\\\n]|\\.)+(\"?)|'(?:[^'\\\n]|\\.)+('?)|[^\s'\",}&]+)"
         ),
         lambda m: (
             m[1]
@@ -82,23 +85,92 @@ _LONG_FLAG = re.compile(
 _USER_PASS = re.compile(rf"{_FLAG_START}(?:-u|--user)(?:=|\s+|['\"]\s*,\s*)['\"]?[^\s:'\"]*:")
 
 
-def _line_end(text: str, pos: int) -> int:
-    """End of the line from `pos`, running on across backslash-continued lines, or the end of the text when
-    the part up to it holds an unclosed quote."""
-    end = text.find("\n", pos)
-    while end > 0 and text[end - 1] == "\\":
-        end = text.find("\n", end + 1)
-    end = len(text) if end < 0 else end
-    part = text[pos:end]
-    return len(text) if part.count('"') % 2 or part.count("'") % 2 else end
+# An empty value (`password=""` in sample code, `TOKEN=` alone) holds nothing to mask.
+_ASSIGNMENT = re.compile(
+    r"(?i)(?<![\w-])(?:[\w-]*[_-])?(?:password|passwd|token|secret)(?:[_-][\w-]*)?\s*="
+    r"(?!\s*(?:\"\"|''|[,;)\n]|$))"
+)
+_JSON_ESCAPE = re.compile(r"\\[tnr]")
+# An escaped quote or JSON escape: the remainder's quoting can't be trusted.
+_ESCAPES = re.compile(r"\\[\"'\\/bfnrtu]")
+
+# --- Known values -------------------------------------------------------------------------------------------------
+
+MIN_SECRET = 6
+_known: set[str] = set()
+_known_re: re.Pattern | None = None
+known_version = 0  # bumped whenever a value is added, so cached redactions are redone
+_SECRET_ENV = re.compile(
+    r"(?i)(?:^|_)(?:password|passwd|secret|token|api_?key|access_key|private_key|credentials?|auth_key)(?:_|$)"
+)
+_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/@:]*:([^\s/@]+)@")
 
 
-def _mask_from(text: str, starts: list[int]) -> str:
+def _forms(value: str) -> set[str]:
+    json_escaped = json.dumps(value)[1:-1]
+    return {
+        value,
+        quote(value, safe=""),
+        quote_plus(value),
+        json_escaped,
+        json.dumps(json_escaped)[1:-1],  # JSON inside JSON
+        re.sub(r"([\\\"'$`])", r"\\\1", value),
+        html.escape(value),
+        html.escape(value, quote=False),
+    }
+
+
+def add_secret(value: str | None) -> None:
+    """Mask `value` (6+ characters) and its encoded forms wherever results are written."""
+    global _known_re, known_version
+    if not value or len(value) < MIN_SECRET:
+        return
+    new = {f for f in _forms(value) if len(f) >= MIN_SECRET} - _known
+    if new:
+        _known.update(new)
+        _known_re = re.compile("|".join(map(re.escape, sorted(_known, key=len, reverse=True))))
+        known_version += 1
+
+
+def add_env_secrets(environ=os.environ) -> None:
+    """Secret-looking environment variables, and the password of any URI with userinfo in the environment."""
+    for key, value in environ.items():
+        if _SECRET_ENV.search(key):
+            add_secret(value)
+        for m in _USERINFO.finditer(value):
+            add_secret(m[1])
+
+
+def mask_known(text: str) -> str:
+    return _known_re.sub(MASK, text) if _known_re and text else text
+
+
+# --- Patterns -----------------------------------------------------------------------------------------------------
+
+
+def _line_end(norm: str, pos: int) -> int:
+    """End of the line from `pos`, running on across backslash-continued lines."""
+    end = norm.find("\n", pos)
+    while end > 0 and norm[end - 1] == "\\":
+        end = norm.find("\n", end + 1)
+    return len(norm) if end < 0 else end
+
+
+def _open_quote(part: str) -> bool:
+    return bool(part.count('"') % 2 or part.count("'") % 2)
+
+
+def _mask_from(text: str, norm: str, starts: list[int]) -> str:
+    """Mask from each start to the end of its line, or of the text when the quoting after it can't be trusted:
+    an escaped quote or JSON escape anywhere after it, or a quote the masked part leaves open."""
+    last_escape = max((m.start() for m in _ESCAPES.finditer(text)), default=-1)
     out, last = [], 0
     for start in sorted(starts):
         if start < last:
             continue  # already masked
-        end = _line_end(text, start)
+        end = len(text) if last_escape >= start else _line_end(norm, start)
+        if _open_quote(text[start:end]):
+            end = len(text)
         out.append(text[last:start] + (" " if text[start : start + 1].isspace() else "") + MASK)
         last = end
     return "".join(out) + text[last:]
@@ -107,12 +179,24 @@ def _mask_from(text: str, starts: list[int]) -> str:
 def redact(text: str | None) -> str | None:
     if not text:
         return text
+    text = mask_known(text)
+    # JSON escapes read as whitespace when finding flags; `norm` keeps `text`'s positions.
+    norm = _JSON_ESCAPE.sub("  ", text)
+    starts = [m.end() for p in (_LONG_FLAG, _USER_PASS, _ASSIGNMENT) for m in p.finditer(norm)]
+    searched = dict.fromkeys(_SHORT_FLAGS, 0)  # per flag, how far the text has been searched
+    for m in _DB_CLIENT.finditer(norm):
+        flag = DB_CLIENT_PASSWORD_FLAGS[m[0]]
+        if m.end() < searched[flag]:
+            continue  # an earlier client's command already covers this one
+        # The client's command: the rest of its line, or of the text when the line leaves a quote open.
+        end = _line_end(norm, m.end())
+        end = len(norm) if _open_quote(norm[m.end() : end]) else end
+        starts += [f.end() for f in _SHORT_FLAGS[flag].finditer(norm, m.end(), end)]
+        searched[flag] = end
+    text = _mask_from(text, norm, starts)
     for pattern, replacement in _PATTERNS:
         text = pattern.sub(replacement, text)
-    starts = [m.end() for m in _LONG_FLAG.finditer(text)] + [m.end() for m in _USER_PASS.finditer(text)]
-    for flag in {DB_CLIENT_PASSWORD_FLAGS[m[0]] for m in _DB_CLIENT.finditer(text)}:
-        starts += [m.end() for m in _SHORT_FLAGS[flag].finditer(text)]
-    return _mask_from(text, starts)
+    return text
 
 
 def _executable(cmd) -> str:
@@ -154,7 +238,9 @@ def run_command(cmd: list[str], timeout: float) -> str:
     try:
         return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout).stdout
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise CommandFailed(command_failure(exc)) from None
+        failure = command_failure(exc)
+    # Raised outside the except block, so the original exception (and its argv) isn't kept as __context__.
+    raise CommandFailed(failure)
 
 
 def describe_error(exc: BaseException, limit: int = 200) -> str:

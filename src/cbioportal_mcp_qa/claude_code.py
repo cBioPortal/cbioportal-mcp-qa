@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .agent import AgentReply
 from .config import MODELS
+from .persist import write_text
 from .redact import redact
 from .traces import ToolCall, TraceStats, excerpt
 
@@ -241,7 +242,7 @@ def format_transcript(lines: list[str]) -> str:
                 out.append(f"{label}\n{text[:RESULT_CHARS]}{more}\n")
         if event.get("type") == "result":
             out.append(f"═ answer ({event.get('subtype')})\n{event.get('result') or ''}\n")
-    return "\n".join(out)
+    return redact("\n".join(out))
 
 
 def parse_stream(lines: list[str], started: float, latency_s: float) -> AgentReply:
@@ -261,23 +262,25 @@ def parse_stream(lines: list[str], started: float, latency_s: float) -> AgentRep
                     calls[block["id"]] = ToolCall(
                         short_tool_name(block["name"]),
                         True,
-                        input=excerpt(json.dumps(block.get("input"), ensure_ascii=False)),
+                        input=excerpt(redact(json.dumps(block.get("input"), ensure_ascii=False))),
                     )
         elif event.get("type") == "user":
             for block in message.get("content") or []:
                 if block.get("type") != "tool_result" or block.get("tool_use_id") not in calls:
                     continue
                 call = calls[block["tool_use_id"]]
-                call.result = excerpt(tool_result_text(block.get("content")))
+                call.result = excerpt(redact(tool_result_text(block.get("content"))))
                 if block.get("is_error"):
                     content = block.get("content")
                     call.ok = False
-                    call.error = (content if isinstance(content, str) else json.dumps(content))[:500]
+                    call.error = redact(content if isinstance(content, str) else json.dumps(content))[:500]
     result = next((e for e in events if e.get("type") == "result"), None)
     trace = TraceStats("", "", len(message_ids), list(calls.values()), sorted(models))
     if result is None or result.get("is_error"):
         error = (result or {}).get("result") or (result or {}).get("subtype") or "no result event"
-        return AgentReply("", None, None, str(error)[:2000], latency_s, started, trace=trace.to_dict())
+        return AgentReply(
+            "", None, None, redact(str(error))[:2000], latency_s, started, trace=trace.to_dict()
+        )
     usage = result.get("usage") or {}
     cache_read = usage.get("cache_read_input_tokens") or 0
     cache_write = usage.get("cache_creation_input_tokens") or 0
@@ -392,7 +395,7 @@ class ClaudeCodeClient:
         if self.transcript_dir is not None and reply.trace is not None:
             self.transcript_dir.mkdir(parents=True, exist_ok=True)
             name = hashlib.sha1(f"{model}:{question}:{started}".encode()).hexdigest()[:12] + ".txt"
-            (self.transcript_dir / name).write_text(f"Q ({model}): {question}\n\n{format_transcript(lines)}")
+            write_text(self.transcript_dir / name, f"Q ({model}): {question}\n\n{format_transcript(lines)}")
             reply.trace["url"] = f"{self.transcript_dir.name}/{name}"
         if reply.error and proc.returncode:
             reply.error = f"{reply.error} (exit {proc.returncode}: {redact(stderr.decode())[-500:]})"

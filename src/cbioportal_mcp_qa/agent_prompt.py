@@ -8,7 +8,7 @@ import base64
 import hashlib
 import json
 
-from .redact import describe_error, run_command
+from .redact import add_secret, describe_error, run_command
 
 MONGO_SECRET = "cbioagent-mongodb-creds"
 MONGO_SECRET_KEY = "mongodb-passwords"
@@ -25,9 +25,13 @@ def fetch_agent_prompt(agent_id: str, context: str | None = None) -> dict:
     pod = next((p for p in pods if p.startswith("pod/cbioagent-mongodb-")), None)
     if pod is None:
         raise RuntimeError("no cbioagent-mongodb pod in the current kubectl context")
-    password = base64.b64decode(
-        _kubectl(["get", "secret", MONGO_SECRET, "-o", f"jsonpath={{.data.{MONGO_SECRET_KEY}}}"], context)
-    ).decode()
+    encoded = _kubectl(
+        ["get", "secret", MONGO_SECRET, "-o", f"jsonpath={{.data.{MONGO_SECRET_KEY}}}"], context
+    )
+    password = base64.b64decode(encoded).decode()
+    # Masked wherever it could surface in results: the mongosh URI below carries it.
+    for value in (encoded.strip(), password):
+        add_secret(value)
     script = (
         f"const a = db.agents.findOne({{id: {json.dumps(agent_id)}}}); "
         "print(JSON.stringify(a ? {instructions: a.instructions, updated_at: a.updatedAt, model: a.model, "

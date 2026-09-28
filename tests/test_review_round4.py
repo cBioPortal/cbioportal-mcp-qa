@@ -119,7 +119,8 @@ def test_run_command_raises_without_the_command(monkeypatch):
     with pytest.raises(CommandFailed) as raised:
         run_command(["kubectl", *ARGS], timeout=5)
     assert str(raised.value) == "kubectl exited with status 1: auth failed for mongosh -p ***"
-    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+    # Nothing chained: the CalledProcessError (and its argv) isn't even kept as the context.
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
 
 
 def test_output_tail_is_redacted_before_it_is_cut():

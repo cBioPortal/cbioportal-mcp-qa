@@ -11,6 +11,7 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 from .checks import internal_leaks
 from .config import MODELS, PRICES_BY_BEDROCK_ID, TARGETS
 from .dataset import CATEGORIES, TRACKS, load_questions
+from .persist import write_json, write_rendered
 from .run import RESULTS_DIR, Run
 from .traces import SCHEMA_ERROR
 
@@ -376,8 +377,8 @@ def _env() -> Environment:
 def write_report(run: Run) -> Path:
     summary = summarize(run)
     out = run.dir / "report.html"
-    out.write_text(_env().get_template("report.html.j2").render(**summary))
-    (run.dir / "summary.json").write_text(json.dumps(_headline(summary), indent=1))
+    write_rendered(out, _env().get_template("report.html.j2").render, **summary)
+    write_json(run.dir / "summary.json", _headline(summary), indent=1)
     write_index()
     return out
 
@@ -534,11 +535,12 @@ def write_index() -> Path:
         )
     ]
     env = _env()
-    (RESULTS_DIR / "test-sets.html").write_text(
-        env.get_template("test_sets.html.j2").render(question_sets=question_sets, track_labels=TRACK_LABELS)
-    )
+    for name in ("test_sets", "index"):
+        write_rendered(
+            RESULTS_DIR / f"{name.replace('_', '-')}.html",
+            env.get_template(f"{name}.html.j2").render,
+            question_sets=question_sets,
+            track_labels=TRACK_LABELS,
+        )
     out = RESULTS_DIR / "index.html"
-    out.write_text(
-        env.get_template("index.html.j2").render(question_sets=question_sets, track_labels=TRACK_LABELS)
-    )
     return out

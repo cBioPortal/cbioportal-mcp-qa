@@ -19,6 +19,7 @@ from .dataset import (
     parse_selection,
 )
 from .grade import Judge
+from .persist import write_text
 from .redact import describe_error, redact
 from .report import write_index, write_report
 from .run import (
@@ -227,7 +228,7 @@ def run(
         bench = Run.create(target, models, repeats, settings.judge_model, str(questions_file), runner, extra)
         if agent:
             # A record of the prompt this run tested (the benchmark itself always reads the live agent).
-            (bench.dir / "agent-prompt.md").write_text(agent["instructions"])
+            write_text(bench.dir / "agent-prompt.md", agent["instructions"])
     click.echo(
         f"Run {bench.data['run_id']} ({runner}): {len(questions)} questions × {bench.data['models']} × "
         f"{bench.data['repeats']} against {TARGETS[target].agent_id} ({target})"

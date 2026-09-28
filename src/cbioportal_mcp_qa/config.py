@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from .redact import add_env_secrets, add_secret
+
 
 @dataclass(frozen=True)
 class Price:
@@ -140,7 +142,9 @@ class Settings:
 
 def load_settings() -> Settings:
     load_dotenv()
-    return Settings(
+    # Everything written to results/ masks these (and any other secret-looking variable) wherever they appear.
+    add_env_secrets()
+    settings = Settings(
         api_key=os.environ.get("LIBRECHAT_API_KEY", ""),
         langfuse_host=os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com"),
         langfuse_public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
@@ -155,3 +159,6 @@ def load_settings() -> Settings:
         database_connector=os.environ.get("CLAUDE_AI_DATABASE_CONNECTOR") or None,
         kube_context=os.environ.get("KUBE_CONTEXT") or None,
     )
+    for value in (settings.api_key, settings.langfuse_secret_key, settings.langfuse_public_key):
+        add_secret(value)
+    return settings

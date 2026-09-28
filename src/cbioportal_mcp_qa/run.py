@@ -13,6 +13,7 @@ from .agent import AgentClient
 from .claude_code import ClaudeCodeClient
 from .dataset import DEFINITION_FIELDS, Question, asked_question
 from .grade import Judge, StudyValidator, cbio_links, tool_log
+from .persist import write_json
 from .render import render_links
 from .traces import Langfuse
 
@@ -82,7 +83,7 @@ class Run:
 
     def save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=1))
+        write_json(tmp, self.data, indent=1)
         tmp.replace(self.path)
 
 

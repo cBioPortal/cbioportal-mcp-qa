@@ -29,6 +29,7 @@ from pathlib import Path
 
 from .config import MODELS
 from .dataset import CATEGORIES, DEFINITION_FIELDS, TRACKS, asked_question, definition_fields
+from .persist import write_json, write_rendered
 from .report import (
     FAST_S,
     OUTCOME_ICONS,
@@ -674,16 +675,19 @@ def default_out_dir(result: dict) -> Path:
 def write_compare(result: dict, out_dir: Path | None = None) -> Path:
     out_dir = out_dir or default_out_dir(result)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "compare.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
-    (out_dir / "compare.md").write_text(to_markdown(result))
+    write_json(out_dir / "compare.json", result, indent=1, ensure_ascii=False)
+    write_rendered(out_dir / "compare.md", to_markdown, result=result)
     env = _env()
     # select_autoescape() in _env() matches *.html, not *.html.j2; question text must be escaped here.
     env.autoescape = True
     env.filters["fmt"] = _fmt
     out = out_dir / "compare.html"
-    out.write_text(
-        env.get_template("compare.html.j2").render(
-            r=result, side_name=_side_name, counts_text=_counts_text, missing_icon=MISSING_ICON
-        )
+    write_rendered(
+        out,
+        env.get_template("compare.html.j2").render,
+        r=result,
+        side_name=_side_name,
+        counts_text=_counts_text,
+        missing_icon=MISSING_ICON,
     )
     return out
