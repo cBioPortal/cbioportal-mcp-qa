@@ -82,9 +82,7 @@ class Run:
         return self.data["records"]
 
     def save(self) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        write_json(tmp, self.data, indent=1)
-        tmp.replace(self.path)
+        write_json(self.path, self.data, indent=1)
 
 
 async def collect_answers(
@@ -180,7 +178,9 @@ def record_judges(run: Run) -> None:
             run.data["judge_model"] = used[0]
 
 
-def render_navigation_links(run: Run, executable: str | None, concurrency: int = 3) -> int:
+def render_navigation_links(
+    run: Run, executable: str | None, concurrency: int = 3, screenshots: bool = True
+) -> int:
     """Open the cBioPortal links in navigation answers, and group comparison links in any answer (their session ids
     can't be decoded), and record what each page shows. Returns the number rendered."""
     renders = run.data.setdefault("renders", {})
@@ -196,7 +196,9 @@ def render_navigation_links(run: Run, executable: str | None, concurrency: int =
     )
     if not urls:
         return 0
-    results = asyncio.run(render_links(urls, run.dir / "shots", "shots", executable, concurrency))
+    results = asyncio.run(
+        render_links(urls, run.dir / "shots", "shots", executable, concurrency, screenshots)
+    )
     renders.update({url: r.to_dict() for url, r in results.items()})
     run.save()
     return len(results)

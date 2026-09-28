@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .agent import AgentReply
 from .config import MODELS
-from .persist import write_text
+from .persist import write_private_json, write_text
 from .redact import redact
 from .traces import ToolCall, TraceStats, excerpt
 
@@ -110,8 +110,7 @@ def loaded_servers(lines: list[str]) -> set[str] | None:
 def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
     """The MCP servers a Claude Code session loads, read from the stream-json init event of a trivial call."""
     config = os.path.join(workdir, "probe-mcp.json")
-    with open(config, "w") as f:
-        json.dump(setup.mcp_config(), f)
+    write_private_json(config, setup.mcp_config())
     cmd = [
         "claude",
         "-p",
@@ -323,8 +322,7 @@ class ClaudeCodeClient:
         self.env = {**os.environ, "MAX_THINKING_TOKENS": "0"}
         self.setup = tool_setup(database_url, navigator_url, database_connector, self._workdir.name, self.env)
         self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
-        with open(self.mcp_config_path, "w") as f:
-            json.dump(self.setup.mcp_config(), f)
+        write_private_json(self.mcp_config_path, self.setup.mcp_config())
 
     async def aclose(self) -> None:
         self._workdir.cleanup()

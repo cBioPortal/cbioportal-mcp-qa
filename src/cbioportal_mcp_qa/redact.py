@@ -28,7 +28,7 @@ import json
 import os
 import re
 import subprocess
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, unquote
 
 MASK = "***"
 TAIL = 300  # characters of a failed command's output kept
@@ -100,9 +100,9 @@ MIN_SECRET = 6
 _known: set[str] = set()
 _known_re: re.Pattern | None = None
 known_version = 0  # bumped whenever a value is added, so cached redactions are redone
-_SECRET_ENV = re.compile(
-    r"(?i)(?:^|_)(?:password|passwd|secret|token|api_?key|access_key|private_key|credentials?|auth_key)(?:_|$)"
-)
+_SECRET_ENV = re.compile(r"(?i)pass|pwd|secret|token|key|auth|credential")
+# The shell's working directories, not credentials: registering them would mask every local path.
+_NOT_SECRET_ENV = {"PWD", "OLDPWD"}
 _USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/@:]*:([^\s/@]+)@")
 
 
@@ -135,10 +135,12 @@ def add_secret(value: str | None) -> None:
 def add_env_secrets(environ=os.environ) -> None:
     """Secret-looking environment variables, and the password of any URI with userinfo in the environment."""
     for key, value in environ.items():
-        if _SECRET_ENV.search(key):
+        if _SECRET_ENV.search(key) and key.upper() not in _NOT_SECRET_ENV:
             add_secret(value)
         for m in _USERINFO.finditer(value):
+            # As written in the URI (percent-encoded) and as the password it stands for.
             add_secret(m[1])
+            add_secret(unquote(m[1]))
 
 
 def mask_known(text: str) -> str:
@@ -166,8 +168,8 @@ def _mask_from(text: str, norm: str, starts: list[int]) -> str:
     last_escape = max((m.start() for m in _ESCAPES.finditer(text)), default=-1)
     out, last = [], 0
     for start in sorted(starts):
-        if start < last:
-            continue  # already masked
+        if start < last or not text[start:].strip():
+            continue  # already masked, or nothing after the flag
         end = len(text) if last_escape >= start else _line_end(norm, start)
         if _open_quote(text[start:end]):
             end = len(text)

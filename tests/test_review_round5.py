@@ -1,8 +1,8 @@
 """Fifth review of #70: one redaction boundary for everything written, and known secret values masked first."""
 
+import ast
 import html
 import json
-import re
 import subprocess
 from pathlib import Path
 from urllib.parse import quote
@@ -242,21 +242,97 @@ def test_scrub_keeps_types_and_walks_keys():
     assert out[("t", 1)] == ("mongosh -p ***",)
 
 
-def test_only_persist_writes_files():
-    # Every write under results/ must go through persist; the only other writes are Claude's temp MCP configs.
-    writes = re.compile(r"\.write_text\(|\.write_bytes\(|json\.dump\(|open\([^)]*[\"'][wa]")
-    found = {
-        f"{p.name}:{i}"
-        for p in SRC.glob("*.py")
-        if p.name != "persist.py"
-        for i, line in enumerate(p.read_text().splitlines(), 1)
-        if writes.search(line)
+# Calls that write files: methods/functions by name, and `open` in a writing mode.
+WRITERS = {
+    "write_text", "write_bytes", "screenshot", "dump", "savefig", "to_csv", "to_parquet", "FileHandler",
+    "copy", "copyfile", "copy2", "copytree", "move", "rename", "replace", "symlink_to", "hardlink_to",
+    "mkstemp", "NamedTemporaryFile",
+}  # fmt: skip
+
+
+def file_writes(source: str) -> list[str]:
+    """Every call in `source` that could write a file, as `name:line`."""
+    tree = ast.parse(source)
+    # persist's own helpers (`write_text(path, text)` imported from .persist) are the sanctioned way to write.
+    from_persist = {
+        a.asname or a.name
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ImportFrom) and (n.module or "").endswith("persist")
+        for a in n.names
     }
-    temp_configs = {n for n in found if n.startswith("claude_code.py:")}
-    assert found == temp_configs and len(temp_configs) == 4, found
-    for n in temp_configs:
-        line = (SRC / "claude_code.py").read_text().splitlines()[int(n.split(":")[1]) - 1]
-        assert "config" in line or "json.dump(" in line, line
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ""
+        if isinstance(func, ast.Name) and name in from_persist:
+            continue
+        if name == "open":
+            # builtins.open(path, mode) / os.open(path, flags) / Path.open(mode): writing unless a literal read mode
+            args = (
+                node.args[1:]
+                if isinstance(func, ast.Name) or getattr(func.value, "id", None) == "os"
+                else node.args
+            )
+            mode = next(
+                (k.value for k in node.keywords if k.arg in ("mode", "flags")), args[0] if args else None
+            )
+            if (
+                isinstance(mode, ast.Constant)
+                and isinstance(mode.value, str)
+                and not set(mode.value) & set("wax+")
+            ):
+                continue
+            if mode is None and getattr(getattr(func, "value", None), "id", None) != "os":
+                continue  # open(path) reads
+        elif name not in WRITERS or (name == "replace" and len(node.args) != 1):
+            continue  # str.replace(old, new) takes two arguments, Path.replace(target) one
+        found.append(f"{name}:{node.lineno}")
+    return found
+
+
+def test_only_persist_writes_files():
+    # Every write under results/ (and Claude's temp MCP configs) goes through persist.py, in every subpackage.
+    offenders = {
+        f"{p.relative_to(SRC)}:{w}"
+        for p in SRC.rglob("*.py")
+        if p.name != "persist.py"
+        for w in file_writes(p.read_text())
+    }
+    assert offenders == set(), offenders
+    assert {w.split(":")[0] for w in file_writes((SRC / "persist.py").read_text())} >= {
+        "write_text",
+        "screenshot",
+    }
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "await page.screenshot(path=shots_dir / name)",
+        'path.open(mode="w")',
+        'path.open("a")',
+        "open(p, 'wb')",
+        "open(p, mode)",
+        "os.open(p, os.O_WRONLY)",
+        "path.write_text (secret)",
+        "shutil.copyfile(src, dst)",
+        "shutil.copy2(src, dst)",
+        'logging.FileHandler("results/debug.log")',
+        "json.dump(obj, f)",
+        "tmp.replace(target)",
+    ],
+)
+def test_the_writer_guard_catches(sample):
+    assert file_writes(sample), sample
+
+
+@pytest.mark.parametrize(
+    "sample", ["open(p)", "path.open()", 'open(p, "r")', "text.replace('a', 'b')", "json.dumps(x)"]
+)
+def test_the_writer_guard_ignores_reads(sample):
+    assert not file_writes(sample), sample
 
 
 def test_real_results_are_not_over_masked():

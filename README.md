@@ -37,6 +37,29 @@ Every question has a **track**, and the report shows pass rates per track and mo
 
 Questions without any reference are still asked and reported, but not graded.
 
+### Secrets in published results
+
+`results/` is published with GitHub Pages, so everything the benchmark writes there goes through one
+redaction boundary (`persist.py`). run.json, summary.json, the HTML and Markdown reports, compare outputs,
+transcripts and the recorded agent prompt are deep-scrubbed on the way out:
+
+- **Known values first**: every secret the benchmark loads or can see is masked wherever it appears, also
+  URL-encoded, JSON-escaped, backslash-escaped or HTML-escaped. That covers the LibreChat and Langfuse keys, the
+  cBioAgent Mongo password read from its k8s secret, and every environment variable whose name contains PASS,
+  PWD, SECRET, TOKEN, KEY, AUTH or CREDENTIAL. It also covers the password of any URI in the environment, both
+  as written and percent-decoded. Values under 6 characters are ignored.
+- **Structure**: the value of any key named like a credential (`password`, `*_token`, `apiKey`,
+  `Authorization`, `Cookie`, ...) is masked whole, and a list of strings is also read as a command line.
+- **Patterns** for anything else: URI userinfo, bearer tokens, key=value secrets, password flags of database
+  clients and `--password`-style flags. They mask to the end of the line, or of the text when the quoting after
+  them can't be trusted.
+- Failed commands are recorded as `<executable> exited with status N` and the redacted tail of their output,
+  never with their arguments.
+
+**Screenshots are not redacted**: they are pixels. The `shots/` of a run only hold the public cBioPortal pages
+that navigation answers linked to. Pass `--no-screenshots` to `run` or `render` to keep the page text without
+them.
+
 ## Setup
 
 ```bash

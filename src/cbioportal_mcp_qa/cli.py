@@ -66,6 +66,15 @@ runner_option = click.option(
 )
 
 
+screenshots_option = click.option(
+    "--screenshots/--no-screenshots",
+    default=True,
+    show_default=True,
+    help="Save a screenshot of each rendered page. Screenshots are pixels, so they aren't redacted; they only "
+    "show the public cBioPortal pages answers linked to.",
+)
+
+
 def _agent_prompt(settings, target: str) -> dict:
     try:
         return fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
@@ -170,9 +179,20 @@ def ask(question: str, target: str, model: str | None, runner: str) -> None:
     show_default=True,
     help="Open navigation answers' links in Chromium.",
 )
+@screenshots_option
 @runner_option
 def run(
-    target, models_arg, selection, questions_file, repeats, concurrency, resume, no_grade, render, runner
+    target,
+    models_arg,
+    selection,
+    questions_file,
+    repeats,
+    concurrency,
+    resume,
+    no_grade,
+    render,
+    screenshots,
+    runner,
 ) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
@@ -259,7 +279,8 @@ def run(
         wait_for_ingestion()
         click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")
     if render:
-        click.echo(f"Rendered {render_navigation_links(bench, settings.chromium_path)} navigation links")
+        rendered = render_navigation_links(bench, settings.chromium_path, screenshots=screenshots)
+        click.echo(f"Rendered {rendered} navigation links")
     if not no_grade:
         grade_answers(bench, _judge(settings))
     click.echo(f"Report: {write_report(bench)}")
@@ -268,10 +289,12 @@ def run(
 @cli.command("render")
 @click.argument("run_id")
 @click.option("--concurrency", type=int, default=3, show_default=True)
-def render_cmd(run_id: str, concurrency: int) -> None:
+@screenshots_option
+def render_cmd(run_id: str, concurrency: int, screenshots: bool) -> None:
     """Open the cBioPortal links in navigation answers and record what each page shows (then regrade them)."""
     bench = Run.load(run_id)
-    click.echo(f"Rendered {render_navigation_links(bench, load_settings().chromium_path, concurrency)} links")
+    rendered = render_navigation_links(bench, load_settings().chromium_path, concurrency, screenshots)
+    click.echo(f"Rendered {rendered} links")
     click.echo(f"Report: {write_report(bench)}")
 
 
