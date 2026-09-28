@@ -125,29 +125,36 @@ def _database_connector(settings) -> str | None:
 
 
 def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) -> str | None:
-    """Which database MCP (beta, prod, local, unknown) the claude-code runner reaches; warns, or with
-    `require_beta` fails, when a beta target would be answered from another one."""
+    """Which database MCP (beta, prod, local, unknown, conflict) the claude-code runner reaches. Warns when a
+    beta target would be answered from another one or it can't be told, and on any target when
+    DATABASE_MCP_ENV contradicts the URL; with `require_beta`, a beta target fails instead."""
     if runner != "claude-code":
         return None
     env = database_mcp_env(settings)
-    if not target.startswith("beta") or env == "beta":
+    beta = target.startswith("beta")
+    if env != "conflict" and (not beta or env == "beta"):
         return env
     where = settings.database_mcp_url or f"the claude.ai connector for {settings.database_connector_url}"
-    problem = (
-        f"--target {target} but the database MCP is {env.upper()} ({where}), not beta's "
-        f"({TARGETS[target].mcp_deployment}): answers use prod's server, guides and ClickHouse buffers."
-        if env == "prod"
-        else f"--target {target} but it can't be told whether the database MCP ({where}) is beta's; set "
-        "DATABASE_MCP_ENV=beta if it is (e.g. a port-forward of the beta service)."
-    )
-    if require_beta:
+    if env == "conflict":
+        problem = (
+            f"DATABASE_MCP_ENV={settings.database_mcp_env} contradicts the database MCP's URL ({where}); unset "
+            "it or fix DATABASE_MCP_URL."
+        )
+    elif env == "prod":
+        problem = (
+            f"--target {target} but the database MCP is PROD ({where}), not beta's "
+            f"({TARGETS[target].mcp_deployment}): answers use prod's server, guides and ClickHouse buffers."
+        )
+    else:
+        problem = (
+            f"--target {target} but the database MCP ({where}) is {env}, not beta's; set DATABASE_MCP_ENV=beta "
+            "if it is (e.g. a port-forward of the beta service)."
+        )
+    if require_beta and beta:
         raise click.ClickException(f"{problem} See README: point DATABASE_MCP_URL at the beta MCP.")
     bar = "!" * 100
-    click.echo(
-        f"{bar}\nWARNING: {problem}\nPoint DATABASE_MCP_URL at the beta MCP (README) or pass "
-        f"--require-beta-mcp to make this an error.\n{bar}",
-        err=True,
-    )
+    hint = "Point DATABASE_MCP_URL at the beta MCP (README) or pass --require-beta-mcp to make this an error."
+    click.echo(f"{bar}\nWARNING: {problem}\n{hint if beta else ''}\n{bar}", err=True)
     return env
 
 

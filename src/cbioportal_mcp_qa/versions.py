@@ -23,20 +23,31 @@ def deployments(target: str) -> dict[str, str]:
     return {"cbioportal_mcp": TARGETS[target].mcp_deployment, "cbioportal_navigator": NAVIGATOR_DEPLOYMENT}
 
 
-def database_mcp_env(settings) -> str:
-    """Which database MCP the claude-code runner reaches: prod (the claude.ai connector or a URL on the public
-    host or prod's service), beta (beta's service), else what DATABASE_MCP_ENV declares (beta, prod, local) for
-    a port-forward or local image, else unknown."""
-    url = settings.database_mcp_url or settings.database_connector_url
-    host = (urlparse(url).hostname or "").lower()
+def _env_from_host(url: str) -> str | None:
+    """prod or beta when the URL's host says so: the public host, or a deployment's in-cluster service name
+    (bare or as a cluster DNS name)."""
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
     if host in PROD_MCP_HOSTS:
         return "prod"
     service = host.split(".")[0]
     if service in {t.mcp_deployment for t in TARGETS.values()}:
         return "beta" if service.endswith("-beta") else "prod"
-    if settings.database_mcp_url and settings.database_mcp_env in DATABASE_MCP_ENVS:
-        return settings.database_mcp_env
-    return "unknown"
+    return None
+
+
+def database_mcp_env(settings) -> str:
+    """Which database MCP the claude-code runner reaches: what the URL's host says (the claude.ai connector's
+    public endpoint and prod's service are prod, beta's service is beta), else what DATABASE_MCP_ENV declares
+    (beta, prod, local) for a port-forward or local image, else unknown. A declaration that contradicts the
+    host is a conflict."""
+    url = settings.database_mcp_url or settings.database_connector_url
+    from_host = _env_from_host(url)
+    declared = settings.database_mcp_env
+    if declared and declared not in DATABASE_MCP_ENVS:
+        return "conflict" if from_host else "unknown"
+    if from_host and declared and declared != from_host:
+        return "conflict"
+    return from_host or declared or "unknown"
 
 
 def _probe(fn):

@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import plistlib
 import re
 import subprocess
 import tempfile
@@ -35,17 +36,25 @@ CONNECTOR_ATTEMPTS = 4
 HEADERS = {"x-user-id": "cbioportal-mcp-qa", "x-user-email": "cbioportal-mcp-qa@localhost"}
 
 # What `claude -p` bills before the subscription login (https://code.claude.com/docs/en/authentication): a
-# cloud provider (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY), ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY ("in
-# non-interactive mode (-p), the key is always used when present"), then an apiKeyHelper from the settings.
+# cloud provider (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY/...), ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY ("in
+# non-interactive mode (-p), the key is always used when present"), an apiKeyHelper from the settings, and a
+# named Anthropic profile or federation credentials (ANTHROPIC_PROFILE, ANTHROPIC_FEDERATION_RULE_ID).
 # ANTHROPIC_BASE_URL goes too: a gateway would receive the subscription login. CLAUDE_CODE_OAUTH_TOKEN stays,
 # it is a subscription token.
 API_BILLING_ENV = re.compile(
-    r"^(?:ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|CLAUDE_CODE_USE_\w+)$"
+    r"^(?:ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|ANTHROPIC_PROFILE|ANTHROPIC_FEDERATION_\w+"
+    r"|ANTHROPIC_IDENTITY_TOKEN\w*|CLAUDE_CODE_USE_\w+)$"
 )
-# Settings files a session still reads with --setting-sources "" (user, project and local skipped): the managed
-# ones (https://code.claude.com/docs/en/managed-settings). MDM and claude.ai-console policies aren't files; the
-# session's own apiKeySource (`bills_per_token`) catches what they set.
+# Settings a session still reads with --setting-sources "" (user, project and local skipped): the managed ones
+# (https://code.claude.com/docs/en/managed-settings): the system files and their drop-in directory, the macOS
+# `com.anthropic.claudecode` managed-preferences profile (MDM), and the server-managed settings cached at
+# <config dir>/remote-settings.json. A server-managed payload fetched fresh by a `-p` session isn't cached, so it
+# can't be read here; neither can a policyHelper's output, so a policyHelper is refused.
 MANAGED_SETTINGS_DIRS = (Path("/Library/Application Support/ClaudeCode"), Path("/etc/claude-code"))
+MANAGED_PREFERENCES_DIR = Path("/Library/Managed Preferences")
+MDM_PLIST = "com.anthropic.claudecode.plist"
+# A session's apiKeySource on the subscription login (also with a bearer token: that one is caught before).
+NO_API_KEY_SOURCE = "none"
 
 
 def session_env(base: Mapping[str, str], allow_api_billing: bool = False) -> tuple[dict, list[str]]:
@@ -58,39 +67,61 @@ def session_env(base: Mapping[str, str], allow_api_billing: bool = False) -> tup
     return env, stripped
 
 
+def config_dir(env: Mapping[str, str]) -> Path:
+    return Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
+
+
 def settings_files(env: Mapping[str, str], isolate_settings: bool) -> list[Path]:
-    """The settings files a benchmark session loads (its working directory is empty, so no project files)."""
+    """The settings sources a benchmark session loads that exist on this machine (its working directory is empty,
+    so no project files)."""
     files = [
         f
         for d in MANAGED_SETTINGS_DIRS
         for f in [d / "managed-settings.json", *sorted(d.glob("managed-settings.d/*.json"))]
     ]
+    files += [MANAGED_PREFERENCES_DIR / MDM_PLIST, *sorted(MANAGED_PREFERENCES_DIR.glob(f"*/{MDM_PLIST}"))]
+    files.append(config_dir(env) / "remote-settings.json")
     if not isolate_settings:
-        home = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
-        files.append(home / "settings.json")
+        files.append(config_dir(env) / "settings.json")
     return [p for p in files if p.is_file()]
 
 
+def _dicts(obj):
+    """Every dict in a settings document, however nested (the server-managed cache wraps the settings)."""
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from _dicts(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _dicts(value)
+
+
 def api_billing_settings(files: list[Path]) -> list[str]:
-    """`file: key` for each setting that would bill per token: an apiKeyHelper, or a billing variable in `env`."""
+    """`file: key` for each setting that would (or might) bill per token: an apiKeyHelper, a policyHelper (its
+    output can't be checked), or a billing variable in an `env` block. An unreadable file counts too."""
     found = []
     for path in files:
         try:
-            settings = json.loads(path.read_text())
-        except (OSError, ValueError):
+            raw = path.read_bytes()
+            doc = plistlib.loads(raw) if path.suffix == ".plist" else json.loads(raw)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            found.append(f"{path}: unreadable")
             continue
-        if not isinstance(settings, dict):
-            continue
-        if settings.get("apiKeyHelper"):
-            found.append(f"{path}: apiKeyHelper")
-        env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
-        found += [f"{path}: env.{k}" for k in sorted(env) if API_BILLING_ENV.match(k)]
-    return found
+        for settings in _dicts(doc):
+            found += [f"{path}: {k}" for k in ("apiKeyHelper", "policyHelper") if settings.get(k)]
+            env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+            found += [f"{path}: env.{k}" for k in sorted(env) if API_BILLING_ENV.match(k) and env[k]]
+    return list(dict.fromkeys(found))
 
 
 def auth_status(env: Mapping[str, str]) -> dict:
     """How `claude` authenticates with this environment, from `claude auth status` (no model call): `mode` is
-    subscription, api-key, cloud-provider, none or unknown. Identity (email, org) is left out."""
+    subscription, api-key, cloud-provider, none or unconfirmed. Identity (email, org) is left out.
+
+    `claude auth status` reports a bearer token (ANTHROPIC_AUTH_TOKEN) and a subscription token
+    (CLAUDE_CODE_OAUTH_TOKEN) alike as `oauth_token`, so only a login that also names its subscription type
+    counts as the subscription."""
     out = subprocess.run(
         ["claude", "auth", "status", "--json"],
         env=dict(env),
@@ -102,28 +133,29 @@ def auth_status(env: Mapping[str, str]) -> dict:
     try:
         status = json.loads(out.stdout)
     except ValueError:
-        return {"mode": "unknown", "error": redact(out.stderr or out.stdout)[-300:]}
+        return {"mode": "unconfirmed", "error": redact(out.stderr or out.stdout)[-300:]}
     method, provider = status.get("authMethod"), status.get("apiProvider")
+    subscription = status.get("subscriptionType")
     if provider and provider != "firstParty":
         mode = "cloud-provider"
     elif method in ("api_key", "api_key_helper") or (
         method == "oauth_token" and env.get("ANTHROPIC_AUTH_TOKEN")
     ):
-        mode = "api-key"  # ANTHROPIC_AUTH_TOKEN also reports as oauth_token
-    elif method in ("claude.ai", "oauth_token"):
+        mode = "api-key"
+    elif method in ("claude.ai", "oauth_token") and subscription:
         mode = "subscription"  # the /login OAuth, or CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`)
     elif method == "none" or status.get("loggedIn") is False:
         mode = "none"
     else:
-        mode = "unknown"
+        mode = "unconfirmed"
     info = {"mode": mode, "auth_method": method, "api_provider": provider}
-    if status.get("subscriptionType"):
-        info["subscription_type"] = status["subscriptionType"]
+    if subscription:
+        info["subscription_type"] = subscription
     return info
 
 
 def api_key_source(lines: list[str]) -> str | None:
-    """The session's `apiKeySource` from its stream-json init event ("none" on the subscription login)."""
+    """The session's `apiKeySource` from its stream-json init event."""
     for line in lines:
         if line.startswith("{") and '"init"' in line:
             event = json.loads(line)
@@ -133,31 +165,38 @@ def api_key_source(lines: list[str]) -> str | None:
 
 
 def bills_per_token(source: str | None) -> bool:
-    """Whether a session's apiKeySource is an API key (ANTHROPIC_API_KEY, apiKeyHelper, a Console /login key)."""
-    return bool(source) and "key" in source.lower()
+    """Whether a session's apiKeySource names a per-token credential (ANTHROPIC_API_KEY, apiKeyHelper, a Console
+    /login key, a token or bearer source). A bearer token reports "none" like the subscription, so this is only
+    the backstop for what `check_billing` can't see."""
+    if not source or source == NO_API_KEY_SOURCE:
+        return False
+    return any(word in source.lower() for word in ("key", "token", "helper", "bearer"))
 
 
 def check_billing(env: Mapping[str, str], isolate_settings: bool, allow_api_billing: bool) -> dict:
-    """The auth status sessions will run with; unless API billing is allowed, refuse anything but the
-    subscription (before the first model call)."""
+    """The auth status sessions will run with. Unless API billing is allowed, anything but a confirmed
+    subscription login is refused here, before the first model call (the connector probe included)."""
     found = api_billing_settings(settings_files(env, isolate_settings))
     status = auth_status(env)
     if allow_api_billing:
         return status
     if found:
         raise RuntimeError(
-            "these settings would bill claude per token instead of the subscription login: "
+            "these settings would (or might) bill claude per token instead of the subscription login: "
             f"{', '.join(found)}; remove them or pass --claude-code-allow-api-billing"
         )
-    if isolate_settings and status.get("auth_method") == "api_key_helper":
-        # `claude auth status` reads the user settings that isolated sessions skip, so a helper there hides the
-        # login below it. Each session's apiKeySource still shows what it bills.
-        return status | {"mode": "unconfirmed", "note": "auth status sees a user-settings apiKeyHelper"}
+    # `claude auth status` also reads the user settings the sessions skip: a bearer token set there reports as
+    # `oauth_token` too, so the login below it can't be confirmed.
+    bearer = [f for f in api_billing_settings(settings_files(env, False)) if "ANTHROPIC_AUTH_TOKEN" in f]
+    if status["mode"] == "subscription" and status.get("auth_method") == "oauth_token" and bearer:
+        status = status | {"mode": "unconfirmed"}
     if status["mode"] != "subscription":
         raise RuntimeError(
-            f"claude isn't on a subscription login (claude auth status: {status.get('auth_method')!r}, provider "
-            f"{status.get('api_provider')!r}); log in with `claude` (/login) for this CLAUDE_CONFIG_DIR, remove "
-            "an apiKeyHelper from its settings, or pass --claude-code-allow-api-billing"
+            f"claude isn't on a confirmed subscription login (claude auth status: {status.get('auth_method')!r}, "
+            f"provider {status.get('api_provider')!r}, subscription {status.get('subscription_type')!r}"
+            f"{'; ' + ', '.join(bearer) if bearer else ''}); log in with `claude` (/login) for this "
+            "CLAUDE_CONFIG_DIR, remove an apiKeyHelper or billing variable from its settings, or pass "
+            "--claude-code-allow-api-billing"
         )
     return status
 

@@ -206,24 +206,37 @@ runner before changing prod. Reports and the results index label the runner.
 
 In `claude -p`, anything below takes precedence over the subscription login, in this order
 ([authentication docs](https://code.claude.com/docs/en/authentication)): a cloud provider
-(`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY`), `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` ("in
-non-interactive mode (`-p`), the key is always used when present"), then an `apiKeyHelper`. So by default the
-runner:
+(`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` / ...), `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` ("in
+non-interactive mode (`-p`), the key is always used when present"), an `apiKeyHelper`, then a named Anthropic
+profile or federation credentials. The guard fails closed. By default the runner:
 
-- removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` and every `CLAUDE_CODE_USE_*` from
-  the sessions' environment (`CLAUDE_CODE_OAUTH_TOKEN`, a subscription token, stays);
-- refuses to start if a settings file the sessions load sets an `apiKeyHelper` or one of those variables in
-  its `env`, or if `claude auth status` doesn't report a subscription login;
-- stops the run if a session's `apiKeySource` is still an API key (e.g. from MDM or console-managed settings,
-  which aren't files).
+- removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_PROFILE`,
+  `ANTHROPIC_FEDERATION_*`, `ANTHROPIC_IDENTITY_TOKEN*` and every `CLAUDE_CODE_USE_*` from the sessions'
+  environment. `CLAUDE_CODE_OAUTH_TOKEN`, a subscription token, stays;
+- before any model call (the connector probe included), reads every settings source the isolated sessions
+  still load ([managed settings](https://code.claude.com/docs/en/managed-settings)):
+  - `managed-settings.json` and `managed-settings.d/*.json` in `/Library/Application Support/ClaudeCode/` or
+    `/etc/claude-code/`;
+  - the macOS MDM profile (`/Library/Managed Preferences/[<user>/]com.anthropic.claudecode.plist`);
+  - the server-managed settings cache `$CLAUDE_CONFIG_DIR/remote-settings.json`.
 
-`claude auth status` always reads the user settings, so an `apiKeyHelper` in `~/.claude/settings.json` hides the
-login beneath it even though the isolated sessions (below) skip it. The run then starts with `auth_mode:
-unconfirmed` and relies on the per-session check.
+  It refuses to start if any of them sets an `apiKeyHelper`, a `policyHelper` (its output can't be checked),
+  or one of those variables in `env`, or can't be read;
+- refuses to start unless `claude auth status` confirms a subscription login. That means a claude.ai login or
+  an OAuth token that reports its `subscriptionType`, with no `ANTHROPIC_AUTH_TOKEN` in any settings source.
+  `auth status` reports a bearer token and a subscription token alike as `oauth_token`. It also reads the user
+  settings the isolated sessions skip, so an `apiKeyHelper` or bearer token there refuses too;
+- as a backstop, stops the run if a session's `apiKeySource` names a key, token, helper or bearer. A bearer
+  token reports `none` there, like the subscription, which is why the checks above run first.
 
-`--claude-code-allow-api-billing` (or `CLAUDE_CODE_ALLOW_API_BILLING=1`) keeps them. `run.json` records
-`claude_code.auth_mode` (`subscription`, `api-key`, `cloud-provider`, `unconfirmed`), the `claude auth status` method and
-provider (no identity), and the names of the removed variables.
+`--claude-code-allow-api-billing` (or `CLAUDE_CODE_ALLOW_API_BILLING=1`) turns all of this off. `run.json`
+records `claude_code.auth_mode` (`subscription`, or with the opt-in `api-key`, `cloud-provider`, `unconfirmed`),
+the `claude auth status` method, provider and subscription type (no identity), and the names of the removed
+variables.
+
+Not covered: server-managed settings that a `-p` session fetches fresh apply only in that session and aren't
+cached, so they can't be read beforehand. A `CLAUDE_CODE_OAUTH_TOKEN` whose `auth status` doesn't show a
+subscription type is refused; use `/login` or the opt-in.
 
 ### Settings isolation
 
@@ -257,7 +270,10 @@ uv run cbioportal-mcp-qa run --runner claude-code --target beta --require-beta-m
 ```
 
 A port-forward's URL doesn't say what's behind it, so declare it with `DATABASE_MCP_ENV` (`beta`, `prod` or
-`local`); otherwise it's recorded as `unknown` and `--require-beta-mcp` refuses it. With a port-forward,
+`local`); otherwise it's recorded as `unknown` and `--require-beta-mcp` refuses it. A declaration that
+contradicts the URL's host (e.g. `DATABASE_MCP_ENV=beta` with the connector or `mcp.cbioportal.org`, or with
+prod's service name) is recorded as `conflict`: that prints a warning on any target and fails
+`--require-beta-mcp`. With a port-forward,
 dropped connections show up as tool errors such as `ECONNRESET` that the deployed agent wouldn't have hit.
 Prod's service works the same way (`svc/cbioagent-clickhouse-mcp`). `run.json`'s `versions` records the
 deployments it read for the target (`versions.deployments`) and their image tags and digests.

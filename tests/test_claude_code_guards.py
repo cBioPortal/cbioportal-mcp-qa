@@ -102,7 +102,7 @@ def test_billing_settings_are_found_in_the_files_sessions_load(monkeypatch, tmp_
         ({"loggedIn": True, "authMethod": "api_key_helper", "apiProvider": "firstParty"}, {}, "api-key"),
         ({"loggedIn": True, "authMethod": "third_party", "apiProvider": "bedrock"}, {}, "cloud-provider"),
         ({"loggedIn": False, "authMethod": "none", "apiProvider": "firstParty"}, {}, "none"),
-        ({"loggedIn": True, "authMethod": "something_new", "apiProvider": "firstParty"}, {}, "unknown"),
+        ({"loggedIn": True, "authMethod": "something_new", "apiProvider": "firstParty"}, {}, "unconfirmed"),
     ],
 )
 def test_auth_status_names_the_billing_mode(monkeypatch, status, env, mode):
@@ -138,19 +138,15 @@ def test_client_refuses_an_api_key_helper_in_loaded_settings(monkeypatch, tmp_pa
     (tmp_path / "settings.json").write_text(json.dumps({"apiKeyHelper": "echo sk-helper"}))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
 
-    # `claude auth status` reads the user settings whatever the sessions load, so it reports the helper.
+    with pytest.raises(RuntimeError, match="apiKeyHelper"):
+        ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp", isolate_settings=False)
+    # Isolated sessions skip the user settings, but `claude auth status` doesn't, so it reports the helper and
+    # the login below it can't be confirmed: refused as well (fail closed).
     monkeypatch.setattr(
         claude_code, "auth_status", lambda env: {"mode": "api-key", "auth_method": "api_key_helper"}
     )
-    with pytest.raises(RuntimeError, match="apiKeyHelper"):
-        ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp", isolate_settings=False)
-    # Isolated sessions don't load the user settings file, so its helper doesn't apply; what they bill is
-    # checked per session instead.
-    client = ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp")
-    try:
-        assert client.describe()["auth_mode"] == "unconfirmed"
-    finally:
-        asyncio.run(client.aclose())
+    with pytest.raises(RuntimeError, match="confirmed subscription"):
+        ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp")
 
 
 def test_client_strips_billing_env_and_records_the_auth_mode(monkeypatch):
@@ -290,8 +286,8 @@ def _settings(url=None, env=None, connector_url="https://mcp.cbioportal.org/db/m
     ("url", "declared", "expected"),
     [
         (None, None, "prod"),  # the claude.ai connector for the public (prod) endpoint
-        (None, "beta", "prod"),  # a declaration can't make the public endpoint beta
-        ("https://mcp.cbioportal.org/db/mcp", "beta", "prod"),
+        (None, "beta", "conflict"),  # a declaration can't make the public endpoint beta
+        ("https://mcp.cbioportal.org/db/mcp", "beta", "conflict"),
         ("http://cbioagent-clickhouse-mcp:80/db/mcp", None, "prod"),
         ("http://cbioagent-clickhouse-mcp-beta:80/db/mcp", None, "beta"),
         ("http://cbioagent-clickhouse-mcp-beta.default.svc.cluster.local/db/mcp", None, "beta"),
