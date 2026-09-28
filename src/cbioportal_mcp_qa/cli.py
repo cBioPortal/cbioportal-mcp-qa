@@ -6,7 +6,7 @@ import click
 
 from .agent import AgentClient
 from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
-from .claude_code import ClaudeCodeClient, find_connector
+from .claude_code import ClaudeCodeClient, find_connector, prompt_parity
 from .compare import compare as compare_runs
 from .compare import write_compare
 from .config import MODELS, TARGETS, load_settings
@@ -32,6 +32,7 @@ from .run import (
 )
 from .traces import Langfuse
 from .versions import collect as collect_versions
+from .versions import database_mcp_env
 
 MODEL_CHOICES = [k for k in MODELS if any(k in t.specs for t in TARGETS.values())]
 
@@ -66,6 +67,39 @@ runner_option = click.option(
 )
 
 
+def claude_code_options(f):
+    """Options of the claude-code runner (ignored by the Agents API runner)."""
+    f = click.option(
+        "--require-beta-mcp",
+        is_flag=True,
+        help="claude-code runner on a beta target: fail unless the database MCP is beta's (DATABASE_MCP_URL at "
+        "beta's service, or DATABASE_MCP_ENV=beta for a port-forward or local image) instead of warning.",
+    )(f)
+    f = click.option(
+        "--claude-code-user-settings",
+        is_flag=True,
+        help="Load the Claude home's user settings (and project/local ones) in claude-code sessions. By default "
+        "only managed settings apply, so effortLevel, hooks and plugins from ~/.claude stay out.",
+    )(f)
+    f = click.option(
+        "--claude-code-trust-org-policy",
+        is_flag=True,
+        envvar="CLAUDE_CODE_TRUST_ORG_POLICY",
+        help="Run claude-code sessions on a Team or Enterprise login (or any plan but Pro/Max). Their "
+        "organization can push server-managed settings that a session applies without caching, so the billing "
+        "guard can't check them beforehand; this trusts that policy not to bill per token.",
+    )(f)
+    f = click.option(
+        "--claude-code-allow-api-billing",
+        is_flag=True,
+        envvar="CLAUDE_CODE_ALLOW_API_BILLING",
+        help="Let claude-code sessions use ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL, a "
+        "cloud provider (CLAUDE_CODE_USE_*) or an apiKeyHelper, billed per token. By default those are "
+        "removed or refused so answers bill the subscription login.",
+    )(f)
+    return f
+
+
 screenshots_option = click.option(
     "--screenshots/--no-screenshots",
     default=True,
@@ -98,8 +132,49 @@ def _database_connector(settings) -> str | None:
     return connector
 
 
+def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) -> str | None:
+    """Which database MCP (beta, prod, local, unknown, conflict) the claude-code runner reaches. Warns when a
+    beta target would be answered from another one or it can't be told, and on any target when
+    DATABASE_MCP_ENV contradicts the URL; with `require_beta`, a beta target fails instead."""
+    if runner != "claude-code":
+        return None
+    env = database_mcp_env(settings)
+    beta = target.startswith("beta")
+    if env != "conflict" and (not beta or env == "beta"):
+        return env
+    where = settings.database_mcp_url or f"the claude.ai connector for {settings.database_connector_url}"
+    if env == "conflict":
+        problem = (
+            f"DATABASE_MCP_ENV={settings.database_mcp_env} contradicts the database MCP's URL ({where}); unset "
+            "it or fix DATABASE_MCP_URL."
+        )
+    elif env == "prod":
+        problem = (
+            f"--target {target} but the database MCP is PROD ({where}), not beta's "
+            f"({TARGETS[target].mcp_deployment}): answers use prod's server, guides and ClickHouse buffers."
+        )
+    else:
+        problem = (
+            f"--target {target} but the database MCP ({where}) is {env}, not beta's; set DATABASE_MCP_ENV=beta "
+            "if it is (e.g. a port-forward of the beta service)."
+        )
+    if require_beta and beta:
+        raise click.ClickException(f"{problem} See README: point DATABASE_MCP_URL at the beta MCP.")
+    bar = "!" * 100
+    hint = "Point DATABASE_MCP_URL at the beta MCP (README) or pass --require-beta-mcp to make this an error."
+    click.echo(f"{bar}\nWARNING: {problem}\n{hint if beta else ''}\n{bar}", err=True)
+    return env
+
+
 def _client(
-    settings, target: str, runner: str, prompt: str | None = None, transcript_dir: Path | None = None
+    settings,
+    target: str,
+    runner: str,
+    prompt: str | None = None,
+    transcript_dir: Path | None = None,
+    allow_api_billing: bool = False,
+    user_settings: bool = False,
+    trust_org_policy: bool = False,
 ):
     if runner == "claude-code":
         try:
@@ -109,6 +184,9 @@ def _client(
                 settings.navigator_mcp_url,
                 database_connector=_database_connector(settings),
                 transcript_dir=transcript_dir,
+                allow_api_billing=allow_api_billing,
+                isolate_settings=not user_settings,
+                trust_org_policy=trust_org_policy,
             )
         except RuntimeError as exc:
             raise click.ClickException(redact(str(exc))) from exc
@@ -129,13 +207,31 @@ def cli() -> None:
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
 @click.option("--model", type=click.Choice(MODEL_CHOICES), default=None, help="Default: the target's first.")
 @runner_option
-def ask(question: str, target: str, model: str | None, runner: str) -> None:
+@claude_code_options
+def ask(
+    question: str,
+    target: str,
+    model: str | None,
+    runner: str,
+    claude_code_allow_api_billing: bool,
+    claude_code_trust_org_policy: bool,
+    claude_code_user_settings: bool,
+    require_beta_mcp: bool,
+) -> None:
     """Ask the deployed agent a single question."""
     settings = load_settings()
     model = _models(model, target, runner)[0]
+    _check_database_mcp(settings, target, runner, require_beta_mcp)
 
     async def go():
-        client = _client(settings, target, runner)
+        client = _client(
+            settings,
+            target,
+            runner,
+            allow_api_billing=claude_code_allow_api_billing,
+            user_settings=claude_code_user_settings,
+            trust_org_policy=claude_code_trust_org_policy,
+        )
         try:
             return await client.ask(question, model)
         finally:
@@ -181,6 +277,7 @@ def ask(question: str, target: str, model: str | None, runner: str) -> None:
 )
 @screenshots_option
 @runner_option
+@claude_code_options
 def run(
     target,
     models_arg,
@@ -193,6 +290,10 @@ def run(
     render,
     screenshots,
     runner,
+    claude_code_allow_api_billing,
+    claude_code_trust_org_policy,
+    claude_code_user_settings,
+    require_beta_mcp,
 ) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
@@ -216,6 +317,17 @@ def run(
                 ) from exc
             agent_error = describe_error(exc)
     prompt = agent["instructions"] if agent and runner == "claude-code" else None
+    mcp_env = _check_database_mcp(settings, target, runner, require_beta_mcp)
+    # Before the run exists: the claude-code runner refuses to start on per-token billing.
+    client = _client(
+        settings,
+        target,
+        runner,
+        prompt,
+        allow_api_billing=claude_code_allow_api_billing,
+        user_settings=claude_code_user_settings,
+        trust_org_policy=claude_code_trust_org_policy,
+    )
     if resume:
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
         if prompt and recorded and prompt_fingerprint(prompt)["sha256"] != recorded:
@@ -243,8 +355,12 @@ def run(
             "versions": collect_versions(settings, runner, target),
         }
         if runner == "claude-code":
-            extra["database_mcp"] = _database_connector(settings) or settings.database_mcp_url
+            extra["database_mcp"] = client.setup.connector or settings.database_mcp_url
+            extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
+            extra["claude_code"] = client.describe() | {
+                "prompt": prompt_parity(prompt, settings.database_mcp_url)
+            }
         bench = Run.create(target, models, repeats, settings.judge_model, str(questions_file), runner, extra)
         if agent:
             # A record of the prompt this run tested (the benchmark itself always reads the live agent).
@@ -254,7 +370,8 @@ def run(
         f"{bench.data['repeats']} against {TARGETS[target].agent_id} ({target})"
     )
 
-    client = _client(settings, target, runner, prompt, bench.dir / "transcripts")
+    if runner == "claude-code":
+        client.transcript_dir = bench.dir / "transcripts"
 
     async def go():
         try:
@@ -269,6 +386,8 @@ def run(
             f"`claude` with the same CLAUDE_CONFIG_DIR), then continue with "
             f"`cbioportal-mcp-qa run --resume {bench.data['run_id']}`. Stopped before grading."
         )
+    if getattr(client, "api_billing", None):
+        raise click.ClickException(f"{client.api_billing}. Stopped before grading.")
     if getattr(client, "usage_limit", None):
         raise click.ClickException(
             f"Claude subscription limit: {client.usage_limit}. Once it resets, continue with "

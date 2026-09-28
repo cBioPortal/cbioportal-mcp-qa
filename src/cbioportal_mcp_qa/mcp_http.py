@@ -25,6 +25,7 @@ class MCPSession:
             headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
         )
         self.session_id: str | None = None
+        self.instructions: str | None = None
         self._id = 0
 
     def __enter__(self) -> "MCPSession":
@@ -45,7 +46,7 @@ class MCPSession:
         return {} if notify else _message(resp)
 
     def initialize(self) -> dict:
-        """The server's `serverInfo` (name, version)."""
+        """The server's `serverInfo` (name, version). Its `instructions`, if any, are kept in `self.instructions`."""
         result = self._post(
             "initialize",
             {
@@ -55,6 +56,7 @@ class MCPSession:
             },
         ).get("result", {})
         self._post("notifications/initialized", notify=True)
+        self.instructions = result.get("instructions") or None
         return result.get("serverInfo", {})
 
     def call_tool(self, name: str, arguments: dict) -> str:
