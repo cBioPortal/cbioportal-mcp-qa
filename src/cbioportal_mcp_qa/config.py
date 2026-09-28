@@ -87,6 +87,9 @@ class Target:
     agent_id: str
     specs: dict[str, str | None]
     librechat_deployment: str
+    # The database MCP the target's LibreChat talks to. Beta runs its own (knowledgesystems-k8s-deployment#658:
+    # `cbioportal/mcp:beta` on beta's ClickHouse buffers, in-cluster only); the navigator is shared.
+    mcp_deployment: str = "cbioagent-clickhouse-mcp"
 
 
 TARGETS = {
@@ -96,6 +99,7 @@ TARGETS = {
         "agent_OHVSJI9Gd6gwsDnFSL-Xl",
         {"haiku": "cBioPortalChatBeta", "sonnet": "cBioPortalChatBetaSonnet"},
         "cbioagent-librechat-beta",
+        "cbioagent-clickhouse-mcp-beta",
     ),
     # Once cBioPortalChatBeta points at the handoff router (knowledgesystems-k8s-deployment#655), the specs above
     # no longer select a model for the unified agent (400 invalid_spec). These ask an agent directly, no spec.
@@ -105,6 +109,7 @@ TARGETS = {
         "agent_cbiobeta_router",
         {"router": None},
         "cbioagent-librechat-beta",
+        "cbioagent-clickhouse-mcp-beta",
     ),
     "beta-unified": Target(
         "beta-unified",
@@ -112,6 +117,7 @@ TARGETS = {
         "agent_OHVSJI9Gd6gwsDnFSL-Xl",
         {"unified": None},
         "cbioagent-librechat-beta",
+        "cbioagent-clickhouse-mcp-beta",
     ),
     "prod": Target(
         "prod",
@@ -138,6 +144,7 @@ class Settings:
     navigator_mcp_url: str
     database_connector: str | None
     kube_context: str | None
+    database_mcp_env: str | None = None
 
 
 def load_settings() -> Settings:
@@ -158,6 +165,8 @@ def load_settings() -> Settings:
         navigator_mcp_url=os.environ.get("NAVIGATOR_MCP_URL", "https://mcp.cbioportal.org/navigator/mcp"),
         database_connector=os.environ.get("CLAUDE_AI_DATABASE_CONNECTOR") or None,
         kube_context=os.environ.get("KUBE_CONTEXT") or None,
+        # What a DATABASE_MCP_URL that can't be told apart by its host (a port-forward, a local image) serves.
+        database_mcp_env=(os.environ.get("DATABASE_MCP_ENV") or "").strip().lower() or None,
     )
     for value in (settings.api_key, settings.langfuse_secret_key, settings.langfuse_public_key):
         add_secret(value)

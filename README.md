@@ -187,71 +187,127 @@ Claude Code (`claude -p`) instead of the deployed agent:
   If the subscription's usage limit is hit (or the connector's login expires), the run stops asking, skips
   grading, and prints the `--resume` command to continue once the limit resets.
 
-With a port-forward, dropped connections show up as tool errors such as `ECONNRESET` that the deployed agent
-wouldn't have hit — prefer the connector. The prompt the run tested is saved as `results/<run>/agent-prompt.md`
-(a record; runs always read the live agent) and named in the report header with the agent, its hash and when
-the agent was last updated. Each answer's transcript (tool calls with their SQL
-and results, then the answer) is saved under `results/<run>/transcripts/` and linked from the report, in
-place of the Langfuse trace link. Costs in claude-code reports are list-price equivalents; nothing is billed
-per token.
-
-Scores are close to, not identical with, the deployed agent (different harness: no LibreChat recursion limit
-or eager tool execution). Compare claude-code runs with each other; confirm on beta with the Agents API
-runner before changing prod. Reports and the results index label the runner.
-
-The MCP servers are the deployed ones, with nothing to configure in the usual case:
-
-- **Navigator:** its public endpoint `https://mcp.cbioportal.org/navigator/mcp` (no login needed).
-- **Database:** its public endpoint `https://mcp.cbioportal.org/db/mcp` needs an OAuth login, so the runner
-  uses your claude.ai connector for it — found by that URL in `claude mcp list`, whatever you named it — and
-  hides every other claude.ai connector from the model. Add the connector in claude.ai once.
-
 ```bash
 uv run cbioportal-mcp-qa run --runner claude-code --questions 1-20
 uv run cbioportal-mcp-qa ask "what is the median age in os target gdc" --runner claude-code
 ```
 
-Optional: `DATABASE_MCP_URL` points the runner at a database MCP by URL instead — e.g. a locally built,
-unmerged cbioportal-mcp branch (below) or a `kubectl port-forward svc/cbioagent-clickhouse-mcp 18080:80`
-(`http://localhost:18080/db/mcp`) if you don't have the connector. `CLAUDE_AI_DATABASE_CONNECTOR` names a
-connector explicitly.
-
-With a port-forward, dropped connections show up as tool errors such as `ECONNRESET` that the deployed agent
-wouldn't have hit — prefer the connector. The prompt the run tested is saved as `results/<run>/agent-prompt.md`
-(a record; runs always read the live agent) and named in the report header with the agent, its hash and when
-the agent was last updated. Each answer's transcript (tool calls with their SQL
-and results, then the answer) is saved under `results/<run>/transcripts/` and linked from the report, in
-place of the Langfuse trace link. Costs in claude-code reports are list-price equivalents; nothing is billed
-per token.
+The prompt the run tested is saved as `results/<run>/agent-prompt.md` (a record; runs always read the live
+agent) and named in the report header with the agent, its hash and when the agent was last updated. Each
+answer's transcript (tool calls with their SQL and results, then the answer) is saved under
+`results/<run>/transcripts/` and linked from the report, in place of the Langfuse trace link. Costs in
+claude-code reports are list-price equivalents; nothing is billed per token.
 
 Scores are close to, not identical with, the deployed agent (different harness: no LibreChat recursion limit
 or eager tool execution). Compare claude-code runs with each other; confirm on beta with the Agents API
 runner before changing prod. Reports and the results index label the runner.
 
-The MCP servers are the deployed ones:
+### Billing guard
 
-- **Navigator:** the public endpoint `https://mcp.cbioportal.org/navigator/mcp` (default `NAVIGATOR_MCP_URL`).
-- **Database:** its public endpoint needs an OAuth login, so either set `CLAUDE_AI_DATABASE_CONNECTOR` to the
-  name of a claude.ai connector for it (as listed by `claude mcp list`, e.g. `claude.ai cBioPortal MCP`) —
-  the runner then hides every other claude.ai connector from the model — or port-forward the in-cluster
-  service and use `DATABASE_MCP_URL`. The connector avoids port-forward drops; both reach the same image and
-  active database.
+In `claude -p`, anything below takes precedence over the subscription login, in this order
+([authentication docs](https://code.claude.com/docs/en/authentication)): a cloud provider
+(`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` / ...), `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` ("in
+non-interactive mode (`-p`), the key is always used when present"), an `apiKeyHelper`, then a named Anthropic
+profile or federation credentials. The guard fails closed. By default the runner:
+
+- removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_PROFILE`,
+  `ANTHROPIC_FEDERATION_*`, `ANTHROPIC_IDENTITY_TOKEN*` and every `CLAUDE_CODE_USE_*` from the sessions'
+  environment. `CLAUDE_CODE_OAUTH_TOKEN`, a subscription token, stays;
+- before any model call (the connector probe included), reads every settings source the isolated sessions
+  still load ([managed settings](https://code.claude.com/docs/en/managed-settings)):
+  - `managed-settings.json` and `managed-settings.d/*.json` in `/Library/Application Support/ClaudeCode/` or
+    `/etc/claude-code/`;
+  - the macOS MDM profile (`/Library/Managed Preferences/[<user>/]com.anthropic.claudecode.plist`);
+  - the server-managed settings cache `$CLAUDE_CONFIG_DIR/remote-settings.json`.
+
+  It refuses to start if any of them sets an `apiKeyHelper`, a `policyHelper` (its output can't be checked),
+  or one of those variables in `env`, or can't be read;
+- refuses to start unless `claude auth status` confirms a subscription login. That means a claude.ai login or
+  an OAuth token that reports its `subscriptionType`, with no `ANTHROPIC_AUTH_TOKEN` in any settings source.
+  `auth status` reports a bearer token and a subscription token alike as `oauth_token`. It also reads the user
+  settings the isolated sessions skip, so an `apiKeyHelper` or bearer token there refuses too;
+- refuses to start on a plan that can receive **server-managed settings**: only Claude for Teams and
+  Enterprise can ([server-managed settings](https://code.claude.com/docs/en/server-managed-settings)). A
+  `claude -p` session fetches and applies its organization's policy without caching it, so an
+  `ANTHROPIC_AUTH_TOKEN` or API key the policy sets can't be checked beforehand. Only `subscriptionType`
+  `pro` and `max` start by default. Team, Enterprise, and an unrecognised or missing plan need
+  `--claude-code-trust-org-policy` (or `CLAUDE_CODE_TRUST_ORG_POLICY=1`), which trusts the organization's
+  Claude Code policy not to route sessions to per-token billing. **A login in an MSK claude.ai organization
+  reports `team`, so it needs this flag** (`claude auth status` shows your plan as `subscriptionType`). It doesn't relax the other checks;
+- as a backstop, stops the run if a session's `apiKeySource` names a key, token, helper or bearer. A bearer
+  token reports `none` there, like the subscription, which is why the checks above run first.
+
+`--claude-code-allow-api-billing` (or `CLAUDE_CODE_ALLOW_API_BILLING=1`) turns all of these checks off. `run.json`
+records `claude_code.auth_mode` (`subscription`, or with the opt-in `api-key`, `cloud-provider`, `unconfirmed`),
+`claude_code.account_type` (the plan), `trust_org_policy` and `allow_api_billing`, the `claude auth status`
+method, provider and whether the login belongs to an organization (no email, org id or name), and the names of
+the removed variables.
+
+A `CLAUDE_CODE_OAUTH_TOKEN` whose `auth status` doesn't show a subscription type is refused; use `/login` or
+the opt-ins.
+
+### Settings isolation
+
+Sessions run with `--setting-sources ""`: the Claude home's user settings (and project/local ones) aren't
+loaded, so `effortLevel`, hooks, enabled plugins and an `apiKeyHelper` in `~/.claude/settings.json` stay out of
+the benchmark. Managed settings still apply. The login and the claude.ai connectors aren't settings, so the
+connector path keeps working; if the connector ever fails to load, the runner stops with an error rather
+than answering without the database. `--claude-code-user-settings` loads the user settings again.
+
+### MCP servers, and benchmarking beta
+
+- **Navigator:** its public endpoint `https://mcp.cbioportal.org/navigator/mcp` (`NAVIGATOR_MCP_URL`; no login
+  needed). Beta and prod share the navigator deployment.
+- **Database:** by default, the claude.ai connector for its public endpoint `https://mcp.cbioportal.org/db/mcp`
+  (`DATABASE_CONNECTOR_URL`), which needs an OAuth login only the connector holds. The runner finds the
+  connector by that URL in `claude mcp list`, whatever you named it (or `CLAUDE_AI_DATABASE_CONNECTOR` names
+  it), and hides every other claude.ai connector from the model. Add the connector in claude.ai once.
+
+That public endpoint is **prod's** database MCP (`cbioagent-clickhouse-mcp`, `cbioportal/mcp:latest`). Beta
+runs its own, `cbioagent-clickhouse-mcp-beta` (`cbioportal/mcp:beta` on beta's ClickHouse buffers; see
+knowledgesystems-k8s-deployment#658, which was still open at the time of writing), with no public endpoint.
+So with a `beta*` target and no `DATABASE_MCP_URL`, answers come from prod's MCP: the runner prints a
+warning and records `database_mcp_env: prod` in `run.json`. `--require-beta-mcp` makes that an error. To
+benchmark beta, point `DATABASE_MCP_URL` at beta's MCP:
 
 ```bash
-export CLAUDE_AI_DATABASE_CONNECTOR="claude.ai cBioPortal MCP"
-uv run cbioportal-mcp-qa run --runner claude-code --questions 1-20
-uv run cbioportal-mcp-qa ask "what is the median age in os target gdc" --runner claude-code
-
-# or, without a connector:
-kubectl port-forward svc/cbioagent-clickhouse-mcp 18080:80 &   # DATABASE_MCP_URL=http://localhost:18080/db/mcp
+# Service and path from k8s-deployment#658 (to be confirmed once it's merged and synced)
+kubectl port-forward svc/cbioagent-clickhouse-mcp-beta 18081:80 &
+export DATABASE_MCP_URL=http://localhost:18081/db/mcp DATABASE_MCP_ENV=beta
+uv run cbioportal-mcp-qa run --runner claude-code --target beta --require-beta-mcp --questions 1-20
 ```
 
-To test an unmerged cbioportal-mcp branch, run its image locally instead and point `DATABASE_MCP_URL` at it:
-`docker run --rm -p 18080:8000 --env-file <clickhouse.env> -e CLICKHOUSE_MCP_SERVER_TRANSPORT=http
--e CLICKHOUSE_MCP_BIND_HOST=0.0.0.0 -e CLICKHOUSE_MCP_BIND_PORT=8000 <image>` (URL `http://localhost:18080/mcp`).
+A port-forward's URL doesn't say what's behind it, so declare it with `DATABASE_MCP_ENV` (`beta`, `prod` or
+`local`); otherwise it's recorded as `unknown` and `--require-beta-mcp` refuses it. A declaration that
+contradicts the URL's host (e.g. `DATABASE_MCP_ENV=beta` with the connector or `mcp.cbioportal.org`, or with
+prod's service name) is recorded as `conflict`: that prints a warning on any target and fails
+`--require-beta-mcp`. With a port-forward,
+dropped connections show up as tool errors such as `ECONNRESET` that the deployed agent wouldn't have hit.
+Prod's service works the same way (`svc/cbioagent-clickhouse-mcp`). `run.json`'s `versions` records the
+deployments it read for the target (`versions.deployments`) and their image tags and digests.
+
+To test an unmerged cbioportal-mcp branch, or the `cbioportal/mcp:beta` image, run it locally and point
+`DATABASE_MCP_URL` at it (`DATABASE_MCP_ENV=beta` for the beta image): `docker run --rm -p 18080:8000
+--env-file <clickhouse.env> -e CLICKHOUSE_MCP_SERVER_TRANSPORT=http -e CLICKHOUSE_MCP_BIND_HOST=0.0.0.0 -e
+CLICKHOUSE_MCP_BIND_PORT=8000 <image>` (URL `http://localhost:18080/mcp`). For the same data as beta, its
+env file must name beta's ClickHouse database (`kubectl get configmap clickhouse-mcp-active-beta -o
+jsonpath='{.data.CLICKHOUSE_DATABASE}'`).
+
+### Server instructions
+
+Beta's LibreChat puts the database MCP's `instructions` (from its initialize response) into the agent's
+system prompt after the agent's own (`serverInstructions: true`, k8s-deployment#654). Claude Code already
+sends every MCP server's `instructions`, with `--system-prompt` too: as a "MCP Server Instructions"
+system-reminder at the start of the first user turn, after the system prompt. This was checked against the
+request Claude Code 2.1.283 sends, captured by a local stand-in for the API. That's the same order, so the
+runner doesn't add them again. For a database MCP reached by URL, `run.json`'s `claude_code.prompt` records
+hashes of the agent instructions, the server instructions and both joined in LibreChat's order (`combined`).
+Through the connector, the server instructions can't be read without its OAuth login, so only the agent
+instructions are hashed.
 
 Every run also records versions (both runners): cBioPortal portal / DB schema / gene table versions from
-`https://www.cbioportal.org/api/info`, and the cbioportal-mcp and navigator server versions and image digests.
+`https://www.cbioportal.org/api/info`, and the cbioportal-mcp and navigator server versions (with a hash of
+the server's instructions) and image digests.
 
 ## Adding questions
 

@@ -4,24 +4,29 @@ The deployed agent's own instructions are the system prompt, the only tools are 
 (no Claude Code built-ins), and extended thinking is off to match the deployment. It runs on the Claude
 subscription of the configured Claude home (CLAUDE_CONFIG_DIR) instead of per-token Bedrock billing, so it
 is the cheap loop for iterating on prompts and guides; the Agents API runner remains the release check.
+Credentials that would bill per token are kept out unless allowed, and so are the Claude home's user settings.
 """
 
 import asyncio
 import hashlib
 import json
 import os
+import plistlib
 import re
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .agent import AgentReply
+from .agent_prompt import prompt_fingerprint
 from .config import MODELS
 from .persist import write_private_json, write_text
-from .redact import redact
+from .redact import describe_error, redact
 from .traces import ToolCall, TraceStats, excerpt
+from .versions import server_instructions
 
 # Deliberately unlike the database connector's "claude_ai_cBioPortal_MCP": with two cBioPortal-looking tool
 # prefixes the model mixes them up and calls navigator tools under the connector's name.
@@ -29,6 +34,192 @@ NAVIGATOR_SERVER = "navigator"
 PROBE_ATTEMPTS = 4
 CONNECTOR_ATTEMPTS = 4
 HEADERS = {"x-user-id": "cbioportal-mcp-qa", "x-user-email": "cbioportal-mcp-qa@localhost"}
+
+# What `claude -p` bills before the subscription login (https://code.claude.com/docs/en/authentication): a
+# cloud provider (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY/...), ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY ("in
+# non-interactive mode (-p), the key is always used when present"), an apiKeyHelper from the settings, and a
+# named Anthropic profile or federation credentials (ANTHROPIC_PROFILE, ANTHROPIC_FEDERATION_RULE_ID).
+# ANTHROPIC_BASE_URL goes too: a gateway would receive the subscription login. CLAUDE_CODE_OAUTH_TOKEN stays,
+# it is a subscription token.
+API_BILLING_ENV = re.compile(
+    r"^(?:ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|ANTHROPIC_PROFILE|ANTHROPIC_FEDERATION_\w+"
+    r"|ANTHROPIC_IDENTITY_TOKEN\w*|CLAUDE_CODE_USE_\w+)$"
+)
+# Settings a session still reads with --setting-sources "" (user, project and local skipped): the managed ones
+# (https://code.claude.com/docs/en/managed-settings): the system files and their drop-in directory, the macOS
+# `com.anthropic.claudecode` managed-preferences profile (MDM), and the server-managed settings cached at
+# <config dir>/remote-settings.json. A server-managed payload fetched fresh by a `-p` session isn't cached, so it
+# can't be read here; neither can a policyHelper's output, so a policyHelper is refused.
+MANAGED_SETTINGS_DIRS = (Path("/Library/Application Support/ClaudeCode"), Path("/etc/claude-code"))
+MANAGED_PREFERENCES_DIR = Path("/Library/Managed Preferences")
+MDM_PLIST = "com.anthropic.claudecode.plist"
+# Plans whose logins can't receive server-managed settings, which only Claude for Teams and Enterprise have
+# (https://code.claude.com/docs/en/server-managed-settings). A `-p` session fetches and applies such a policy
+# without caching it, so a credential in its `env` can't be seen beforehand (and a bearer token there reports
+# apiKeySource "none"): any other plan needs --claude-code-trust-org-policy.
+NO_ORG_POLICY_PLANS = {"pro", "max"}
+# A session's apiKeySource on the subscription login (also with a bearer token: that one is caught before).
+NO_API_KEY_SOURCE = "none"
+
+
+def session_env(base: Mapping[str, str], allow_api_billing: bool = False) -> tuple[dict, list[str]]:
+    """The environment for `claude`, and the names of the billing variables taken out of it. Thinking is off to
+    match the deployed agent (thinking=false); CLAUDE_CONFIG_DIR passes through."""
+    env = {**base, "MAX_THINKING_TOKENS": "0"}
+    stripped = [] if allow_api_billing else sorted(k for k in env if API_BILLING_ENV.match(k))
+    for name in stripped:
+        del env[name]
+    return env, stripped
+
+
+def config_dir(env: Mapping[str, str]) -> Path:
+    return Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
+
+
+def settings_files(env: Mapping[str, str], isolate_settings: bool) -> list[Path]:
+    """The settings sources a benchmark session loads that exist on this machine (its working directory is empty,
+    so no project files)."""
+    files = [
+        f
+        for d in MANAGED_SETTINGS_DIRS
+        for f in [d / "managed-settings.json", *sorted(d.glob("managed-settings.d/*.json"))]
+    ]
+    files += [MANAGED_PREFERENCES_DIR / MDM_PLIST, *sorted(MANAGED_PREFERENCES_DIR.glob(f"*/{MDM_PLIST}"))]
+    files.append(config_dir(env) / "remote-settings.json")
+    if not isolate_settings:
+        files.append(config_dir(env) / "settings.json")
+    return [p for p in files if p.is_file()]
+
+
+def _dicts(obj):
+    """Every dict in a settings document, however nested (the server-managed cache wraps the settings)."""
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from _dicts(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _dicts(value)
+
+
+def api_billing_settings(files: list[Path]) -> list[str]:
+    """`file: key` for each setting that would (or might) bill per token: an apiKeyHelper, a policyHelper (its
+    output can't be checked), or a billing variable in an `env` block. An unreadable file counts too."""
+    found = []
+    for path in files:
+        try:
+            raw = path.read_bytes()
+            doc = plistlib.loads(raw) if path.suffix == ".plist" else json.loads(raw)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            found.append(f"{path}: unreadable")
+            continue
+        for settings in _dicts(doc):
+            found += [f"{path}: {k}" for k in ("apiKeyHelper", "policyHelper") if settings.get(k)]
+            env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+            found += [f"{path}: env.{k}" for k in sorted(env) if API_BILLING_ENV.match(k) and env[k]]
+    return list(dict.fromkeys(found))
+
+
+def auth_status(env: Mapping[str, str]) -> dict:
+    """How `claude` authenticates with this environment, from `claude auth status` (no model call): `mode` is
+    subscription, api-key, cloud-provider, none or unconfirmed. Identity (email, org) is left out.
+
+    `claude auth status` reports a bearer token (ANTHROPIC_AUTH_TOKEN) and a subscription token
+    (CLAUDE_CODE_OAUTH_TOKEN) alike as `oauth_token`, so only a login that also names its subscription type
+    counts as the subscription."""
+    out = subprocess.run(
+        ["claude", "auth", "status", "--json"],
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    try:
+        status = json.loads(out.stdout)
+    except ValueError:
+        return {"mode": "unconfirmed", "error": redact(out.stderr or out.stdout)[-300:]}
+    method, provider = status.get("authMethod"), status.get("apiProvider")
+    subscription = status.get("subscriptionType")
+    if provider and provider != "firstParty":
+        mode = "cloud-provider"
+    elif method in ("api_key", "api_key_helper") or (
+        method == "oauth_token" and env.get("ANTHROPIC_AUTH_TOKEN")
+    ):
+        mode = "api-key"
+    elif method in ("claude.ai", "oauth_token") and subscription:
+        mode = "subscription"  # the /login OAuth, or CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`)
+    elif method == "none" or status.get("loggedIn") is False:
+        mode = "none"
+    else:
+        mode = "unconfirmed"
+    info = {"mode": mode, "auth_method": method, "api_provider": provider}
+    if subscription:
+        info["subscription_type"] = subscription
+    # Whether the login belongs to an organization (not which: ids and names stay out of run.json).
+    info["organization"] = bool(status.get("orgId") or status.get("orgName"))
+    return info
+
+
+def api_key_source(lines: list[str]) -> str | None:
+    """The session's `apiKeySource` from its stream-json init event."""
+    for line in lines:
+        if line.startswith("{") and '"init"' in line:
+            event = json.loads(line)
+            if event.get("subtype") == "init":
+                return event.get("apiKeySource")
+    return None
+
+
+def bills_per_token(source: str | None) -> bool:
+    """Whether a session's apiKeySource names a per-token credential (ANTHROPIC_API_KEY, apiKeyHelper, a Console
+    /login key, a token or bearer source). A bearer token reports "none" like the subscription, so this is only
+    the backstop for what `check_billing` can't see."""
+    if not source or source == NO_API_KEY_SOURCE:
+        return False
+    return any(word in source.lower() for word in ("key", "token", "helper", "bearer"))
+
+
+def check_billing(
+    env: Mapping[str, str], isolate_settings: bool, allow_api_billing: bool, trust_org_policy: bool = False
+) -> dict:
+    """The auth status sessions will run with. Unless API billing is allowed, anything but a confirmed
+    subscription login is refused here, before the first model call (the connector probe included), and so is
+    a plan that can receive server-managed settings (Team, Enterprise, or one this doesn't recognise) unless
+    its organization's policy is trusted."""
+    found = api_billing_settings(settings_files(env, isolate_settings))
+    status = auth_status(env)
+    if allow_api_billing:
+        return status
+    if found:
+        raise RuntimeError(
+            "these settings would (or might) bill claude per token instead of the subscription login: "
+            f"{', '.join(found)}; remove them or pass --claude-code-allow-api-billing"
+        )
+    # `claude auth status` also reads the user settings the sessions skip: a bearer token set there reports as
+    # `oauth_token` too, so the login below it can't be confirmed.
+    bearer = [f for f in api_billing_settings(settings_files(env, False)) if "ANTHROPIC_AUTH_TOKEN" in f]
+    if status["mode"] == "subscription" and status.get("auth_method") == "oauth_token" and bearer:
+        status = status | {"mode": "unconfirmed"}
+    if status["mode"] != "subscription":
+        raise RuntimeError(
+            f"claude isn't on a confirmed subscription login (claude auth status: {status.get('auth_method')!r}, "
+            f"provider {status.get('api_provider')!r}, subscription {status.get('subscription_type')!r}"
+            f"{'; ' + ', '.join(bearer) if bearer else ''}); log in with `claude` (/login) for this "
+            "CLAUDE_CONFIG_DIR, remove an apiKeyHelper or billing variable from its settings, or pass "
+            "--claude-code-allow-api-billing"
+        )
+    plan = str(status.get("subscription_type") or "").lower()
+    if plan not in NO_ORG_POLICY_PLANS and not trust_org_policy:
+        raise RuntimeError(
+            f"this Claude login's plan ({status.get('subscription_type')!r}) can receive server-managed settings "
+            "from its organization, which a `claude -p` session fetches and applies without caching, so a "
+            "credential they set (e.g. ANTHROPIC_AUTH_TOKEN) can't be checked before answers are billed to it. "
+            "If you trust your organization's Claude Code policy not to route sessions to per-token billing, pass "
+            "--claude-code-trust-org-policy (or CLAUDE_CODE_TRUST_ORG_POLICY=1); only Pro and Max logins run "
+            "without it"
+        )
+    return status
 
 
 @dataclass
@@ -80,13 +271,19 @@ def connector_tool_prefix(connector: str) -> str:
 
 
 def tool_setup(
-    database_url: str, navigator_url: str, connector: str | None, workdir: str, env: dict
+    database_url: str,
+    navigator_url: str,
+    connector: str | None,
+    workdir: str,
+    env: dict,
+    isolate_settings: bool = True,
+    allow_api_billing: bool = False,
 ) -> ToolSetup:
     if not connector:
         return ToolSetup({"cbioportal-database": database_url, NAVIGATOR_SERVER: navigator_url})
     setup = ToolSetup({NAVIGATOR_SERVER: navigator_url}, connector)
     wanted = connector_tool_prefix(connector)
-    loaded = probe_mcp_servers(setup, workdir, env)
+    loaded = probe_mcp_servers(setup, workdir, env, isolate_settings, allow_api_billing)
     if wanted not in loaded:
         raise RuntimeError(
             f"claude.ai connector {connector!r} did not load for this Claude home — it may need you to sign in "
@@ -107,7 +304,22 @@ def loaded_servers(lines: list[str]) -> set[str] | None:
     return None
 
 
-def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
+def setting_sources_args(isolate_settings: bool) -> list[str]:
+    """No user, project or local settings: ~/.claude's effortLevel, hooks, plugins and apiKeyHelper stay out of
+    benchmark sessions (managed settings still apply). The login and claude.ai connectors aren't settings."""
+    return ["--setting-sources", ""] if isolate_settings else []
+
+
+def api_billing_error(source: str | None) -> str:
+    return (
+        f"claude billed this session per token (apiKeySource {source!r}), not the subscription login; pass "
+        "--claude-code-allow-api-billing to allow that"
+    )
+
+
+def probe_mcp_servers(
+    setup: ToolSetup, workdir: str, env: dict, isolate_settings: bool = True, allow_api_billing: bool = False
+) -> set[str]:
     """The MCP servers a Claude Code session loads, read from the stream-json init event of a trivial call."""
     config = os.path.join(workdir, "probe-mcp.json")
     write_private_json(config, setup.mcp_config())
@@ -123,15 +335,19 @@ def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
         "stream-json",
     ]
     cmd += ["--verbose", "--no-session-persistence", "--model", MODELS["haiku"].claude_code_id]
+    cmd += setting_sources_args(isolate_settings)
     # claude.ai connectors load only some of the time in headless mode, so retry until one shows up.
     seen: set[str] = set()
     for _ in range(PROBE_ATTEMPTS):
         out = subprocess.run(
             cmd, cwd=workdir, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180
         )
-        servers = loaded_servers(out.stdout.splitlines())
+        lines = out.stdout.splitlines()
+        servers = loaded_servers(lines)
         if servers is None:
             raise RuntimeError(f"could not start claude to probe MCP servers: {redact(out.stderr)[-500:]}")
+        if not allow_api_billing and bills_per_token(source := api_key_source(lines)):
+            raise RuntimeError(api_billing_error(source))
         seen |= servers
         if any(name.startswith("claude_ai_") for name in servers):
             break
@@ -139,7 +355,12 @@ def probe_mcp_servers(setup: ToolSetup, workdir: str, env: dict) -> set[str]:
 
 
 def claude_args(
-    question: str, model: str, system_prompt: str, setup: ToolSetup, mcp_config_path: str
+    question: str,
+    model: str,
+    system_prompt: str,
+    setup: ToolSetup,
+    mcp_config_path: str,
+    isolate_settings: bool = True,
 ) -> list[str]:
     args = [
         "claude",
@@ -159,6 +380,7 @@ def claude_args(
         "stream-json",
         "--verbose",
         "--no-session-persistence",
+        *setting_sources_args(isolate_settings),
     ]
     if setup.connector is None:
         args.insert(args.index("--mcp-config"), "--strict-mcp-config")
@@ -298,6 +520,38 @@ def parse_stream(lines: list[str], started: float, latency_s: float) -> AgentRep
     )
 
 
+# Claude Code sends the MCP servers' `instructions` itself, with --system-prompt too: a "# MCP Server
+# Instructions" system-reminder in the first user turn, after the system prompt (seen in the request Claude
+# Code 2.1.283 sends). That is LibreChat's order with `serverInstructions: true` (agent instructions, then the
+# server's), so the runner doesn't append them again; it records which ones the sessions got.
+SERVER_INSTRUCTIONS_DELIVERY = "claude-code (system-reminder after the system prompt)"
+
+
+def prompt_parity(system_prompt: str, database_url: str | None, fetch=None) -> dict:
+    """Hashes of the agent instructions, the database MCP's server instructions, and both in LibreChat's order
+    (agent instructions, a blank line, server instructions) as `combined`."""
+    out = {
+        "system_prompt": prompt_fingerprint(system_prompt),
+        "server_instructions_delivery": SERVER_INSTRUCTIONS_DELIVERY,
+    }
+    if not database_url:
+        out["server_instructions"] = {
+            "error": "not read: the claude.ai connector's endpoint needs its OAuth login"
+        }
+        return out
+    try:
+        instructions = (fetch or server_instructions)(database_url)
+    except Exception as exc:  # noqa: BLE001 - recorded, never fatal
+        out["server_instructions"] = {"error": describe_error(exc)}
+        return out
+    if not instructions:
+        out["server_instructions"] = None
+        return out
+    out["server_instructions"] = prompt_fingerprint(instructions)
+    out["combined"] = prompt_fingerprint(f"{system_prompt}\n\n{instructions}")
+    return out
+
+
 class ClaudeCodeClient:
     """Same interface as AgentClient: `await ask(question, model)` returns an AgentReply (with its trace)."""
 
@@ -310,22 +564,49 @@ class ClaudeCodeClient:
         timeout_s: float = 900.0,
         retries: int = 1,
         transcript_dir: Path | None = None,
+        allow_api_billing: bool = False,
+        isolate_settings: bool = True,
+        trust_org_policy: bool = False,
     ):
         self.system_prompt = system_prompt
         self.transcript_dir = transcript_dir
         self.signin_expired = False
         self.usage_limit: str | None = None
+        self.api_billing: str | None = None
         self.timeout_s = timeout_s
         self.retries = retries
+        self.allow_api_billing = allow_api_billing
+        self.isolate_settings = isolate_settings
+        self.env, self.stripped_env = session_env(os.environ, allow_api_billing)
+        self.trust_org_policy = trust_org_policy
+        self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
-        # Thinking off to match the deployed agent (thinking=false); CLAUDE_CONFIG_DIR passes through.
-        self.env = {**os.environ, "MAX_THINKING_TOKENS": "0"}
-        self.setup = tool_setup(database_url, navigator_url, database_connector, self._workdir.name, self.env)
+        self.setup = tool_setup(
+            database_url,
+            navigator_url,
+            database_connector,
+            self._workdir.name,
+            self.env,
+            isolate_settings,
+            allow_api_billing,
+        )
         self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
         write_private_json(self.mcp_config_path, self.setup.mcp_config())
 
     async def aclose(self) -> None:
         self._workdir.cleanup()
+
+    def describe(self) -> dict:
+        """How sessions authenticate and which settings they load, for run.json (names only, no values)."""
+        return {
+            "auth_mode": self.auth["mode"],
+            "auth_status": self.auth,
+            "account_type": self.auth.get("subscription_type"),
+            "allow_api_billing": self.allow_api_billing,
+            "trust_org_policy": self.trust_org_policy,
+            "stripped_env": self.stripped_env,
+            "setting_sources": "managed only" if self.isolate_settings else "user, project, local",
+        }
 
     def signin_message(self) -> str:
         return f"claude.ai connector {self.setup.connector!r} needs you to sign in again"
@@ -337,12 +618,12 @@ class ClaudeCodeClient:
         while True:
             if self.signin_expired:
                 return AgentReply("", None, None, self.signin_message(), 0.0, started)
-            if self.usage_limit:
-                return AgentReply("", None, None, self.usage_limit, 0.0, started)
+            if self.usage_limit or self.api_billing:
+                return AgentReply("", None, None, self.usage_limit or self.api_billing, 0.0, started)
             reply = await self._run(question, model, started)
             if reply.error is None:
                 return reply
-            if self.signin_expired or self.usage_limit:
+            if self.signin_expired or self.usage_limit or self.api_billing:
                 return reply
             if "did not load in this session" in reply.error:
                 # The attempt never had the database tools; retry it without using up a regular retry.
@@ -359,7 +640,9 @@ class ClaudeCodeClient:
         t0 = time.monotonic()
         # An empty working directory keeps project CLAUDE.md files out of the context.
         proc = await asyncio.create_subprocess_exec(
-            *claude_args(question, model, self.system_prompt, self.setup, self.mcp_config_path),
+            *claude_args(
+                question, model, self.system_prompt, self.setup, self.mcp_config_path, self.isolate_settings
+            ),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -376,6 +659,12 @@ class ClaudeCodeClient:
             )
         lines = stdout.decode().splitlines()
         reply = parse_stream(lines, started, time.monotonic() - t0)
+        if not self.allow_api_billing and bills_per_token(source := api_key_source(lines)):
+            # Stop asking: every later session would bill the same way.
+            self.api_billing = api_billing_error(source)
+            reply.status = None
+            reply.error = self.api_billing
+            return reply
         if reply.error and USAGE_LIMIT.search(reply.error):
             self.usage_limit = reply.error
             return reply
