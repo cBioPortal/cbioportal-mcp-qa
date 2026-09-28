@@ -1,7 +1,17 @@
 """Scrub credentials out of text that ends up in results (exception messages, failed commands).
 
 A failed `kubectl exec ... mongosh mongodb://user:PASS@host` raises a CalledProcessError whose message repeats
-the whole command, so every recorded exception goes through `redact` before it is saved or printed."""
+the whole command, so every recorded exception goes through `redact` before it is saved or printed.
+
+Short flags are only redacted where they are known to carry a password, so `kubectl -n ns`, `-p 8080` or
+`psql -p 5432` (a port) stay readable:
+
+- After a database client in a command (`mongosh`, `mongo`, `mongodump`, ..., `mysql`, `mysqldump`, `mariadb`:
+  `-p`; `redis-cli`: `-a`), the value of that flag in any form: `-p SECRET`, `-pSECRET`, `-p=SECRET`, or
+  `'-p', 'SECRET'` in a printed argv list. The command runs to the end of the argv list or line, or to `;`, `|`
+  or `&`. `psql` takes no password flag (its password comes from PGPASSWORD=..., redacted as a key=value pair).
+- `-u user:pass` / `--user user:pass` (any command, e.g. curl): the part after the colon.
+"""
 
 import re
 
@@ -25,7 +35,7 @@ _PATTERNS = [
         re.compile(
             # The secret word is the whole key or a _/- separated part of it (LANGFUSE_SECRET_KEY, access_token),
             # so ordinary words like "tokens: 1200" are left alone.
-            r"(?i)([\"']?\b(?:[\w-]*[_-])?(?:password|passwd|pwd|secret|token|api[-_]?key|access[-_]?key)"
+            r"(?i)([\"']?\b(?:[\w-]*(?=passw)|[\w-]*[_-])?(?:password|passwd|pwd|secret|token|api[-_]?key|access[-_]?key)"
             r"(?:[_-][\w-]*)?\b[\"']?\s*[:=]\s*[\"']?)[^\s'\",}&]+"
         ),
         rf"\1{MASK}",
@@ -36,12 +46,36 @@ _PATTERNS = [
 ]
 
 
+# Database clients and the short flag that carries their password.
+DB_CLIENT_PASSWORD_FLAGS = {
+    **dict.fromkeys(("mongosh", "mongo", "mongodump", "mongorestore", "mongoexport", "mongoimport"), "-p"),
+    **dict.fromkeys(("mysql", "mysqldump", "mysqladmin", "mariadb", "mariadb-dump"), "-p"),
+    "redis-cli": "-a",
+}
+_DB_COMMAND = re.compile(
+    r"(?<![\w.-])(?:[\w.-]*/)*(?P<client>"
+    + "|".join(sorted(map(re.escape, DB_CLIENT_PASSWORD_FLAGS), key=len, reverse=True))
+    + r")(?![\w.-])(?P<args>[^\]\n;|&]*)"
+)
+# A flag's value: attached (-pX), after = (-p=X), after whitespace, or as the next item of a printed list
+# (-p', 'X). A following flag (-p -h host: mysql prompts) is not a value.
+_VALUE = r"(=|['\"]?,?\s*['\"]?)(?![-'\"])([^\s'\",\]]+)"
+_USER_PASS = re.compile(r"(?<![\w-])(-u|--user)(=|['\"]?,?\s*['\"]?)([^\s'\",:\]]+):([^\s'\",\]]+)")
+
+
+def _redact_db_command(m: re.Match) -> str:
+    flag = DB_CLIENT_PASSWORD_FLAGS[m["client"]]
+    args = re.sub(rf"(?<![\w-])({re.escape(flag)}){_VALUE}", rf"\1\2{MASK}", m["args"])
+    return m.group(0)[: m.start("args") - m.start()] + args
+
+
 def redact(text: str | None) -> str | None:
     if not text:
         return text
     for pattern, replacement in _PATTERNS:
         text = pattern.sub(replacement, text)
-    return text
+    text = _DB_COMMAND.sub(_redact_db_command, text)
+    return _USER_PASS.sub(rf"\1\2\3:{MASK}", text)
 
 
 def describe_error(exc: BaseException, limit: int = 200) -> str:
