@@ -383,9 +383,24 @@ def test_index_has_one_table_per_question_set(tmp_path, monkeypatch):
     assert main < multiturn
     assert "20260103-0000" in html[main:multiturn] and "20260101-0000" in html[main:multiturn]
     assert "20260102-0000" in html[multiturn:]
+
     # The multi-turn run's different prompt doesn't count as a change for the main set.
     assert 'class="changed"' not in html[main:multiturn]
     assert 'class="chg"' in html  # the legend
+
+
+def test_index_lists_checks_apart_from_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(report_mod, "RESULTS_DIR", tmp_path)
+    assert 'id="checks"' not in report_mod.write_index().read_text()
+    for name, date in (("db-latency-20260101", "2026-01-01"), ("db-latency-20260102", "2026-01-02")):
+        (tmp_path / name).mkdir()
+        check = {"title": f"Latency check {date}", "date": date, "kind": "DB latency check", "summary": "s"}
+        (tmp_path / name / "check.json").write_text(json.dumps(check))
+    html = report_mod.write_index().read_text()
+    checks = html[html.index('<h2 id="checks">') :]
+    assert 'href="#checks">Database checks<' in html
+    assert checks.index("db-latency-20260102/report.html") < checks.index("db-latency-20260101/report.html")
+    assert "DB latency check" in checks
 
 
 def test_test_sets_page_lists_the_questions():
