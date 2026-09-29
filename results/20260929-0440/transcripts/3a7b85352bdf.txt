@@ -1,0 +1,298 @@
+Q (sonnet-5.5): Which cancer types have the highest aneuploidy scores and how does this correlate with mutation burden across TCGA Pan-Cancer studies?
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier AS study, count() AS n, round(avg(a),2) AS mean_as, round(quantile(0.5)(a),1) AS median_as, round(avg(t),2) AS mean_tmb, round(quantile(0.5)(t),2) AS median_tmb, round(rankCorr(a,t),2) AS spearman
+FROM (
+ SELECT cancer_study_identifier, sample_unique_id,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='ANEUPLOIDY_SCORE') AS a,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='TMB_NONSYNONYMOUS') AS t,
+  countIf(attribute_name='ANEUPLOIDY_SCORE' AND toFloat64OrNull(attribute_value) IS NOT NULL) AS ha,
+  countIf(attribute_name='TMB_NONSYNONYMOUS' AND toFloat64OrNull(attribute_value) IS NOT NULL) AS ht
+ FROM clinical_data_derived
+ WHERE attribute_name IN ('ANEUPLOIDY_SCORE','TMB_NONSYNONYMOUS')
+  AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name='pan_cancer_tcga')
+ GROUP BY cancer_study_identifier, sample_unique_id
+ HAVING ha>0 AND ht>0)
+GROUP BY study ORDER BY median_as DESC",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"study":"ucs_tcga_pan_can_atlas_2018","n":56,"mean_as":17.21,"median_as":19,"mean_tmb":4.32,"median_tmb":1.55,"spearman":-0.18},{"study":"tgct_tcga_pan_can_atlas_2018","n":149,"mean_as":18.83,"median_as":19,"mean_tmb":0.49,"median_tmb":0.4,"spearman":0.03},{"study":"acc_tcga_pan_can_atlas_2018","n":89,"mean_as":18.29,"median_as":17,"mean_tmb":2.83,"median_tmb":0.9,"spearman":0.15},{"study":"luad_tcga_pan_can_atlas_2018","n":501,"mean_as":15.04,"median_as":16,"mean_tmb":10.24,"median_tmb":6.87,"spearman":0.26},{"study":"lusc_tcga_pan_can_atlas_2018","n":479,"mean_as":16.21,"median_as":16,"mean_tmb":9.51,"median_tmb":7.73,"spearman":0.17},{"study":"esca_tcga_pan_can_atlas_2018","n":162,"mean_as":14.57,"median_as":14.5,"mean_tmb":5.08,"median_tmb":3.65,"spearman":0.03},{"study":"kich_tcga_pan_can_atlas_2018","n":65,"mean_as":14.86,"median_as":14,"mean_tmb":1.09,"median_tmb":0.67,"spearman":0.21},{"study":"blca_tcga_pan_can_atlas_2018","n":400,"mean_as":13.58,"median_as":14,"mean_tmb":8.57,"median_tmb":5.9,"spearman":0.25},{"study":"ov_tcga_pan_can_atlas_2018","n":504,"mean_as":14,"median_as":13,"mean_tmb":2.26,"median_tmb":1.9,"spearman":-0.07},{"study":"coadread_tcga_pan_can_atlas_2018","n":529,"mean_as":12.32,"median_as":12,"mean_tmb":13.02,"median_tmb":3.5,"spearman":-0.31},{"study":"brca_tcga_pan_can_atlas_2018","n":1024,"mean_as":12.2,"median_as":11,"mean_tmb":2.76,"median_tmb":1.33,"spearman":0.25},{"study":"skcm_tcga_pan_can_atlas_2018","n":431,"mean_as":13.01,"median_as":11,"mean_tmb":23.85,"median_tmb":15.3,"spearman":0.01},{"study":"stad_tcga_pan_can_atlas_2018","n":423,"mean_as":11.17,"median_as":10,"mean_tmb":12.87,"median_tmb":4,"spearman":-0.11},{"study":"hnsc_tcga_pan_can_atlas_2018","n":502,"mean_as":11.41,"median_as":10,"mean_tmb":5.35,"median_tmb":3.58,"spearman":0.13},{"study":"sarc_tcga_pan_can_atlas_2018","n":244,"mean_as":10.86,"median_as":9.5,"mean_tmb":2.38,"median_tmb":1.33,"spearman":0.48},{"study":"chol_tcga_pan_can_atlas_2018","n":36,"mean_as":10.42,"median_as":9,"mean_tmb":2.32,"median_tmb":1.45,"spearman":0.23},{"study":"cesc_tcga_pan_can_atlas_2018","n":288,"mean_as":10.26,"median_as":8,"mean_tmb":6.42,"median_tmb":2.83,"spearman":0.09},{"study":"lihc_tcga_pan_can_atlas_2018","n":355,"mean_as":10.45,"median_as":8,"mean_tmb":3.54,"median_tmb":2.83,"spearman":0.18},{"study":"kirp_tcga_pan_can_atlas_2018","n":274,"mean_as":8.26,"median_as":8,"mean_tmb":2.75,"median_tmb":2.23,"spearman":-0.02},{"study":"gbm_tcga_pan_can_atlas_2018","n":378,"mean_as":8.31,"median_as":7,"mean_tmb":4.03,"median_tmb":1.73,"spearman":0.03},{"study":"paad_tcga_pan_can_atlas_2018","n":162,"mean_as":9.45,"median_as":7,"mean_tmb":4.25,"median_tmb":1.2,"spearman":0.4},{"study":"meso_tcga_pan_can_atlas_2018","n":81,"mean_as":8.16,"median_as":6,"mean_tmb":1.03,"median_tmb":0.93,"spearman":0.17},{"study":"dlbc_tcga_pan_can_atlas_2018","n":41,"mean_as":6.78,"median_as":5,"mean_tmb":3.96,"median_tmb":3.6,"spearman":0.23},{"study":"uvm_tcga_pan_ … (1120 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT count() AS n, round(rankCorr(a,t),3) AS spearman_all, round(corr(a,t),3) AS pearson_all FROM (
+ SELECT sample_unique_id,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='ANEUPLOIDY_SCORE') AS a,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='TMB_NONSYNONYMOUS') AS t,
+  countIf(attribute_name='ANEUPLOIDY_SCORE' AND toFloat64OrNull(attribute_value) IS NOT NULL) AS ha,
+  countIf(attribute_name='TMB_NONSYNONYMOUS' AND toFloat64OrNull(attribute_value) IS NOT NULL) AS ht
+ FROM clinical_data_derived
+ WHERE attribute_name IN ('ANEUPLOIDY_SCORE','TMB_NONSYNONYMOUS')
+  AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name='pan_cancer_tcga')
+ GROUP BY sample_unique_id HAVING ha>0 AND ht>0)"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name='pan_cancer_tcga' ORDER BY 1",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"n":9975,"spearman_all":0.311,"pearson_all":-0.046}]}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"acc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"chol_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"dlbc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"esca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"hnsc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kich_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kirp_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"laml_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lihc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"meso_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"pcpg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"sarc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"stad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"tgct_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"thca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"thym_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucs_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"uvm_tcga_pan_can_atlas_2018"}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+Error: result (81,891 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-pqyf1b1k/c8dc35ff-dc6f-4549-80f3-e08c6d381cbf/tool-results/mcp-navigator-resolve_and_route-1790656974102.txt.
+Format: Plain text
+- For targeted searches (find a string): use grep on the file directly.
+- For analysis or summarization that requires reading the full content: the file's lines are too long for Read's offset/limit. Slice by character range via Bash instead — e.g. python3 -c 'print(open("/home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-pqyf1b1k/c8dc35ff-dc6f-4549-80f3-e08c6d381cbf/tool-results/mcp-navigator-resolve_and_route-1790656974102.txt").read()[A:B])' in ~80,000-char spans until you have read 100% of it.
+- If the Agent tool is available, do this inside a subagent so the full output stays out of your main context. Give it the instruction above verbatim, and be explicit about what it must return — e.g. "Slice /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-pqyf1b1k/c8dc35ff-dc6f-4549-80f3-e08c6d381cbf/tool-results/mcp-navigator-resolve_and_route-1790656974102.txt in ~80,000-char spans via python (read()[A:B]) until you have read all 81,891 characters, then summarize and quote any key findings verbatim." A vague "summarize this" may lose detail.
+
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "summary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=acc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Claml_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tcga_pan_can_atlas_2018%2Cprad_tcga_pan_can_atlas_2018%2Csarc_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018%2Cstad_tcga_pan_can_atlas_2018%2Ctgct_tcga_pan_can_atlas_2018%2Cthca_tcga_pan_can_atlas_2018%2Cthym_tcga_pan_can_atlas_2018%2Cucec_tcga_pan_can_atlas_2018%2Cucs_tcga_pan_can_atlas_2018%2Cuvm_tcga_pan_can_atlas_2018","url":"https://www.cbioportal.org/study/summary?id=acc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Claml_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tcga_pan_can_atlas_2018%2Cprad_tcga_pan_can_atlas_2018%2Csarc_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018%2Cstad_tcga_pan_can_atlas_2018%2Ctgct_tcga_pan_can_atlas_2018%2Cthca_tcga_pan_can_atlas_2018%2Cthym_tcga_pan_can_atlas_2018%2Cucec_tcga_pan_can_atlas_2018%2Cucs_tcga_pan_can_atlas_2018%2Cuvm_tcga_pan_can_atlas_2018","data":{"studyIds":["acc_tcga_pan_can_atlas_2018","blca_tcga_pan_can_atlas_2018","brca_tcga_pan_can_atlas_2018","cesc_tcga_pan_can_atlas_2018","chol_tcga_pan_can_atlas_2018","coadread_tcga_pan_can_atlas_2018","dlbc_tcga_pan_can_atlas_2018","esca_tcga_pan_can_atlas_2018","gbm_tcga_pan_can_atlas_2018","hnsc_tcga_pan_can_atlas_2018","kich_tcga_pan_can_atlas_2018","kirc_tcga_pan_can_atlas_2018","kirp_tcga_pan_can_atlas_2018","laml_tcga_pan_can_atlas_2018","lgg_tcga_pan_can_atlas_2018","lihc_tcga_pan_can_atlas_2018","luad_tcga_pan_can_atlas_2018","lusc_tcga_pan_can_atlas_2018","meso_tcga_pan_can_atlas_2018","ov_tcga_pan_can_atlas_2018","paad_tcga_pan_can_atlas_2018","pcpg_tcga_pan_can_atlas_2018","prad_tcga_pan_can_atlas_2018","sarc_tcga_pan_can_atlas_2018","skcm_tcga_pan_can_atlas_2018","stad_tcga_pan_can_atlas_2018","tgct_tcga_pan_can_atlas_2018","thca_tcga_pan_can_atlas_2018"," … (4218 more chars)
+
+═ answer (success)
+**Cohort:** the 32 TCGA PanCancer Atlas studies. Only samples with both an aneuploidy score and a TMB value are counted (9,975 samples in total). Aneuploidy score (AS) is the number of altered chromosome arms, from 0 to 39. TMB is nonsynonymous mutations per Mb. Correlations are Spearman rank correlations (ρ).
+
+## Highest aneuploidy scores
+
+| Rank | Cancer type | n | Median AS | Mean AS | Median TMB | ρ (AS vs TMB) |
+|---|---|---|---|---|---|---|
+| 1 | Uterine Carcinosarcoma (UCS) | 56 | 19 | 17.2 | 1.55 | −0.18 |
+| 2 | Testicular Germ Cell (TGCT) | 149 | 19 | 18.8 | 0.40 | 0.03 |
+| 3 | Adrenocortical (ACC) | 89 | 17 | 18.3 | 0.90 | 0.15 |
+| 4 | Lung Adenocarcinoma (LUAD) | 501 | 16 | 15.0 | 6.87 | 0.26 |
+| 5 | Lung Squamous (LUSC) | 479 | 16 | 16.2 | 7.73 | 0.17 |
+| 6 | Esophageal (ESCA) | 162 | 14.5 | 14.6 | 3.65 | 0.03 |
+| 7 | Kidney Chromophobe (KICH) | 65 | 14 | 14.9 | 0.67 | 0.21 |
+| 8 | Bladder (BLCA) | 400 | 14 | 13.6 | 5.90 | 0.25 |
+| 9 | Ovarian (OV) | 504 | 13 | 14.0 | 1.90 | −0.07 |
+| 10 | Colorectal (COADREAD) | 529 | 12 | 12.3 | 3.50 | −0.31 |
+
+**Lowest:** thyroid (THCA), AML (LAML) and thymoma (THYM) all have a median AS of 0. Prostate (median 1), low-grade glioma (2), uterine endometrial (3), and pheochromocytoma/paraganglioma, kidney clear cell and uveal melanoma (4 each) are also low.
+
+## Correlation with mutation burden
+
+- **Pan-cancer:** ρ = 0.31 across all 9,975 samples. The Pearson correlation is about −0.05, which reflects a few extreme hypermutated tumors.
+- **Across cancer types, the two measures mostly do not track each other.**
+  - The top-AS cancers are not the high-TMB cancers. Uterine carcinosarcoma, testicular germ cell and adrenocortical tumors have high AS and low median TMB.
+  - Melanoma has the highest median TMB (15.3) but only a mid-range AS (median 11).
+  - Uterine endometrial (UCEC) has the highest mean TMB (35.6, driven by hypermutated tumors) but a low median AS (3).
+- **Within cancer types, the direction varies.**
+  - Positive: sarcoma (ρ 0.48), low-grade glioma (0.47), thymoma (0.45), pancreatic (0.40), thyroid and AML (0.34 each), prostate (0.30), LUAD (0.26), BLCA and BRCA (0.25 each).
+  - Negative: uterine endometrial (−0.40) and colorectal (−0.31). Both contain hypermutated, microsatellite-unstable tumors that are typically chromosomally stable.
+  - Near zero: melanoma, testicular, esophageal, kidney papillary, uveal melanoma and glioblastoma.
+
+I have not computed significance for these correlations or run any multiple-testing correction. The per-study ρ values are descriptive. You can test them in cBioPortal or in R/Python, for example with `cor.test(method="spearman")`.
+
+**Links**
+- [Open all 32 TCGA PanCancer Atlas studies](https://www.cbioportal.org/study/summary?id=acc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Claml_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tcga_pan_can_atlas_2018%2Cprad_tcga_pan_can_atlas_2018%2Csarc_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018%2Cstad_tcga_pan_can_atlas_2018%2Ctgct_tcga_pan_can_atlas_2018%2Cthca_tcga_pan_can_atlas_2018%2Cthym_tcga_pan_can_atlas_2018%2Cucec_tcga_pan_can_atlas_2018%2Cucs_tcga_pan_can_atlas_2018%2Cuvm_tcga_pan_can_atlas_2018)
+- In the study summary, open the "Charts" menu, add "Aneuploidy Score" and "TMB (nonsynonymous)", and use the scatter view to see the relationship.
+
+The link opens all 32 studies together. Samples in the pooled cohort are unique to each study, so they are not double-counted here.

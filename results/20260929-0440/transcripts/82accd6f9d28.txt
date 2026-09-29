@@ -1,0 +1,199 @@
+Q (sonnet-5.5): Is BRCA1 promoter methylation associated with decreased BRCA1 mRNA expression in ovarian cancer?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ list_studies
+{
+ "search": "ovarian"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"ov_tcga","name":"Ovarian Serous Cystadenocarcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"hgsoc","sample_count":617,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ov_tcga"},{"cancer_study_identifier":"hgsoc_tcga_gdc","name":"High-Grade Serous Ovarian Cancer (TCGA GDC, 2025)","type_of_cancer_id":"hgsoc","sample_count":604,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=hgsoc_tcga_gdc"},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"hgsoc","sample_count":585,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=ov_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ovary_geomx_gray_foundation_2024","name":"Ovarian Cancer (Gray Foundation, Cancer Discov 2024)","type_of_cancer_id":"ovary","sample_count":567,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ovary_geomx_gray_foundation_2024"},{"cancer_study_identifier":"ov_tcga_pub","name":"Ovarian Serous Cystadenocarcinoma (TCGA, Nature 2011)","type_of_cancer_id":"hgsoc","sample_count":489,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ov_tcga_pub"},{"cancer_study_identifier":"lgsoc_mapk_msk_2022","name":"Low-Grade Serous Ovarian Cancer (MSK, Clin Cancer Res 2022)","type_of_cancer_id":"lgsoc","sample_count":119,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgsoc_mapk_msk_2022"},{"cancer_study_identifier":"ovary_cptac_gdc","name":"Ovarian Cancer (CPTAC GDC, 2025)","type_of_cancer_id":"ovary","sample_count":112,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ovary_cptac_gdc"},{"cancer_study_identifier":"msk_spectrum_tme_2022","name":"Ovarian Cancer - MSK SPECTRUM (MSK, Nature 2022)","type_of_cancer_id":"ovary","sample_count":82,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_spectrum_tme_2022"},{"cancer_study_identifier":"hgsoc_msk_2021","name":"High-Grade Serous Ovarian Cancer (MSK, NPJ Genome Med 2021)","type_of_cancer_id":"hgsoc","sample_count":45,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=hgsoc_msk_2021"},{"cancer_study_identifier":"ucec_msk_2024","name":"Endometrial and Ovarian Cancer (MSK, Nature Medicine 2024)","type_of_cancer_id":"mixed","sample_count":33,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ucec_msk_2024"},{"cancer_study_identifier":"ovarian_msk_2025","name":"Serous Ovarian Cancer (MSK, 2025)","type_of_cancer_id":"ovary","sample_count":31,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=ovarian_msk_2025"},{"cancer_study_identifier":"mixed_msk_tcga_2021","name":"RAD51B Associated Mixed Cancers (MSK, N … (162 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, count() c FROM genetic_alteration_derived WHERE hugo_gene_symbol='BRCA1' AND cancer_study_identifier IN ('ov_tcga','ov_tcga_pan_can_atlas_2018','ov_tcga_pub','hgsoc_tcga_gdc','ovary_cptac_gdc') AND (profile_type LIKE '%methyl%' OR profile_type LIKE '%mrna%') GROUP BY 1,2 ORDER BY 1,2"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"hgsoc_tcga_gdc","profile_type":"mrna_seq_fpkm","c":427},{"cancer_study_identifier":"hgsoc_tcga_gdc","profile_type":"mrna_seq_fpkm_Zscores","c":427},{"cancer_study_identifier":"hgsoc_tcga_gdc","profile_type":"mrna_seq_read_counts_Zscores","c":427},{"cancer_study_identifier":"hgsoc_tcga_gdc","profile_type":"mrna_seq_tpm","c":427},{"cancer_study_identifier":"hgsoc_tcga_gdc","profile_type":"mrna_seq_tpm_Zscores","c":427},{"cancer_study_identifier":"hgsoc_tcga_gdc","profile_type":"rna_seq_mrna","c":427},{"cancer_study_identifier":"ov_tcga","profile_type":"methylation_hm27","c":592},{"cancer_study_identifier":"ov_tcga","profile_type":"mrna","c":558},{"cancer_study_identifier":"ov_tcga","profile_type":"mrna_U133","c":535},{"cancer_study_identifier":"ov_tcga","profile_type":"mrna_U133_Zscores","c":535},{"cancer_study_identifier":"ov_tcga","profile_type":"mrna_U133_all_sample_Zscores","c":535},{"cancer_study_identifier":"ov_tcga","profile_type":"mrna_median_Zscores","c":558},{"cancer_study_identifier":"ov_tcga","profile_type":"mrna_median_all_sample_Zscores","c":558},{"cancer_study_identifier":"ov_tcga","profile_type":"rna_seq_v2_mrna","c":307},{"cancer_study_identifier":"ov_tcga","profile_type":"rna_seq_v2_mrna_median_Zscores","c":307},{"cancer_study_identifier":"ov_tcga","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","c":307},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna","c":300},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna_median_Zscores","c":300},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","c":300},{"cancer_study_identifier":"ov_tcga_pub","profile_type":"methylation_hm27","c":489},{"cancer_study_identifier":"ov_tcga_pub","profile_type":"mrna","c":489},{"cancer_study_identifier":"ov_tcga_pub","profile_type":"mrna_median_Zscores","c":489},{"cancer_study_identifier":"ov_tcga_pub","profile_type":"mrna_median_all_sample_Zscores","c":489},{"cancer_study_identifier":"ov_tcga_pub","profile_type":"mrna_merged_median_Zscores","c":489},{"cancer_study_identifier":"ovary_cptac_gdc","profile_type":"mrna_seq_fpkm","c":101},{"cancer_study_identifier":"ovary_cptac_gdc","profile_type":"mrna_seq_fpkm_Zscores","c":101},{"cancer_study_identifier":"ovary_cptac_gdc","profile_type":"mrna_seq_read_counts_Zscores","c":101},{"cancer_study_identifier":"ovary_cptac_gdc","profile_type":"mrna_seq_tpm","c":101},{"cancer_study_identifier":"ovary_cptac_gdc","profile_type":"mrna_seq_tpm_Zscores","c":101},{"cancer_study_identifier":"ovary_cptac_gdc","profile_type":"rna_seq_mrna","c":101}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH m AS (SELECT cancer_study_identifier s, sample_unique_id, toFloat64OrNull(alteration_value) v FROM genetic_alteration_derived WHERE hugo_gene_symbol='BRCA1' AND profile_type='methylation_hm27' AND cancer_study_identifier IN ('ov_tcga','ov_tcga_pub') AND toFloat64OrNull(alteration_value) IS NOT NULL),
+e AS (SELECT cancer_study_identifier s, sample_unique_id, toFloat64OrNull(alteration_value) v, profile_type p FROM genetic_alteration_derived WHERE hugo_gene_symbol='BRCA1' AND ((cancer_study_identifier='ov_tcga_pub' AND profile_type='mrna') OR (cancer_study_identifier='ov_tcga' AND profile_type IN ('rna_seq_v2_mrna','mrna_U133','mrna'))) AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT m.s, e.p, count() n, round(rankCorr(m.v,e.v),3) spearman, round(min(m.v),3) mn, round(median(m.v),3) med, round(max(m.v),3) mx, countIf(m.v>0.3) n_meth_gt03, round(avgIf(e.v,m.v>0.3),3) mean_expr_high, round(avgIf(e.v,m.v<=0.3),3) mean_expr_low FROM m INNER JOIN e ON m.sample_unique_id=e.sample_unique_id AND m.s=e.s GROUP BY m.s,e.p ORDER BY 1,2"
+}
+
+◀ result
+{"rows":[{"s":"ov_tcga","p":"mrna","n":550,"spearman":-0.403,"mn":0.011,"med":0.035,"mx":0.955,"n_meth_gt03":72,"mean_expr_high":-3.063,"mean_expr_low":-1.547},{"s":"ov_tcga","p":"mrna_U133","n":530,"spearman":-0.385,"mn":0.011,"med":0.035,"mx":0.941,"n_meth_gt03":65,"mean_expr_high":3.454,"mean_expr_low":4.081},{"s":"ov_tcga","p":"rna_seq_v2_mrna","n":298,"spearman":-0.438,"mn":0.011,"med":0.034,"mx":0.93,"n_meth_gt03":35,"mean_expr_high":39.207,"mean_expr_low":262.975},{"s":"ov_tcga_pub","p":"mrna","n":489,"spearman":-0.364,"mn":0.016,"med":0.065,"mx":0.76,"n_meth_gt03":56,"mean_expr_high":-1.008,"mean_expr_low":0.127}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "ov_tcga_pub",
+  "ov_tcga"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 2 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":2,"studiesWithMetadata":[{"studyId":"ov_tcga_pub","name":"Ovarian Serous Cystadenocarcinoma (TCGA, Nature 2011)","sampleCount":489,"studyViewUrl":"https://www.cbioportal.org/study?id=ov_tcga_pub","metadata":{"clinicalAttributeIds":["ACGH_DATA","CANCER_TYPE","CANCER_TYPE_DETAILED","COMPLETE_DATA","DFS_MONTHS","DFS_STATUS","FRACTION_GENOME_ALTERED","GRADE","MRNA_DATA","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PLATINUM_STATUS","PRIMARY_THERAPY_OUTCOME_SUCCESS","SAMPLE_COUNT","SAMPLE_TYPE","SEQUENCED","SOMATIC_STATUS","TMB_NONSYNONYMOUS","TUMOR_RESIDUAL_DISEASE","TUMOR_STAGE_2009"],"molecularProfileIds":["ov_tcga_pub_gistic","ov_tcga_pub_linear_CNA","ov_tcga_pub_methylation_hm27","ov_tcga_pub_mirna","ov_tcga_pub_mirna_median_Zscores","ov_tcga_pub_mrna","ov_tcga_pub_mrna_median_Zscores","ov_tcga_pub_mrna_median_all_sample_Zscores","ov_tcga_pub_mrna_merged_median_Zscores","ov_tcga_pub_mutations"],"heatmapProfileIds":["ov_tcga_pub_methylation_hm27","ov_tcga_pub_mirna_median_Zscores","ov_tcga_pub_mrna_median_Zscores","ov_tcga_pub_mrna_median_all_sample_Zscores","ov_tcga_pub_mrna_merged_median_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","dna_methylation"]}},{"studyId":"ov_tcga","name":"Ovarian Serous Cystadenocarcinoma (TCGA, Firehose Legacy)","sampleCount":617,"studyViewUrl":"https://www.cbioportal.org/study?id=ov_tcga","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_STAGE","CLIN_M_STAGE","CLIN_N_STAGE","CLIN_T_STAGE","DAYS_TO_COLLECTION","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DAYS_TO_PATIENT_PROGRESSION_FREE","DAYS_TO_SPECIMEN_COLLECTION","DAYS_TO_TUMOR_PROGRESSION","DFS_MONTHS","DFS_STATUS","DISEASE_CODE","ECOG_SCORE","ETHNICITY","EXTRANODAL_INVOLVEMENT","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GRADE","HISTOLOGICAL_DIAGNOSIS","HISTORY_NEOADJUVANT_TRTYN","HISTORY_OTHER_MALIGNANCY","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","INITIAL_PATHOLOGIC_DX_YEAR","IS_FFPE","JEWISH_RELIGION_HERITAGE_INDICATOR","KARNOFSKY_PERFORMANCE_SCORE","LONGEST_DIMENSION","LYMPHOVASCULAR_INVASION_INDICATOR","METHOD_OF_INITIAL_SAMPLE_PROCUREMENT","METHOD_OF_INITIAL_SAMPLE_PROCUREMENT_OTHER","METHOD_OF_SAMPLE_PROCUREMENT","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","OCT_EMBEDDED","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_METHOD_OF_SAMPLE_PROCUREMENT","OTHER_PATIENT_ID","OTHER_SAMPLE_ID","PATHOLOGY_REPORT_FILE_NAME","PATHOLOGY_REPORT_UUID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERFORMANCE_STATUS_TIMING","PHARMACEUTICAL_TX_ADJUVANT","PRIMARY_SITE","PROJECT_CODE","PROSPECTIVE_COLLECTION","RACE … (1612 more chars)
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "ov_tcga_pub"
+ ],
+ "genes": [
+  "BRCA1"
+ ],
+ "tab": "plots",
+ "plotsHorzSelection": {
+  "dataType": "METHYLATION",
+  "selectedGeneOption": "BRCA1"
+ },
+ "plotsVertSelection": {
+  "dataType": "MRNA_EXPRESSION",
+  "selectedGeneOption": "BRCA1"
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pub&gene_list=BRCA1&case_set_id=ov_tcga_pub_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%22672%22%2C%22dataType%22%3A%22METHYLATION%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%22672%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%7D","url":"https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pub&gene_list=BRCA1&case_set_id=ov_tcga_pub_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%22672%22%2C%22dataType%22%3A%22METHYLATION%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%22672%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%7D","data":{"studyIds":["ov_tcga_pub"],"studies":[{"studyId":"ov_tcga_pub","name":"Ovarian Serous Cystadenocarcinoma (TCGA, Nature 2011)","sampleCount":489}],"genes":["BRCA1"],"caseSetId":"ov_tcga_pub_all","pageDescription":"Scatter/box plots: BRCA1 mRNA expression (y-axis) by BRCA1 methylation (x-axis)."}}
+
+═ answer (success)
+In the TCGA ovarian serous cohorts, higher BRCA1 promoter methylation goes with lower BRCA1 mRNA. The correlation is moderate. I haven't computed a p-value or a formal test.
+
+I used the TCGA ovarian studies that have both HM27 methylation and mRNA data. HM27 is the Illumina 27K methylation array, reported as per-gene beta values. I did not include the other ovarian studies, because they have no methylation data for BRCA1.
+
+**Spearman correlation between BRCA1 methylation and BRCA1 mRNA (per sample):**
+
+| Study | mRNA platform | Samples | Spearman ρ |
+|---|---|---|---|
+| [TCGA, Nature 2011](https://www.cbioportal.org/study/summary?id=ov_tcga_pub) | mRNA (`mrna`) | 489 | −0.36 |
+| [TCGA, Firehose Legacy](https://www.cbioportal.org/study/summary?id=ov_tcga) | RNA-seq V2 | 298 | −0.44 |
+| TCGA, Firehose Legacy | Agilent microarray | 550 | −0.40 |
+| TCGA, Firehose Legacy | Affymetrix U133 microarray | 530 | −0.39 |
+
+The correlation is negative in every study and on every expression platform. Most tumors have low BRCA1 methylation (median beta about 0.03 to 0.07), and a minority are clearly methylated.
+
+**Methylated versus unmethylated tumors:** I split tumors at beta > 0.3, a cutoff I chose myself, so it isn't a validated threshold. Methylated tumors had lower mean expression in every comparison.
+
+| Dataset | Methylated tumors | Mean expression, methylated | Mean expression, unmethylated |
+|---|---|---|---|
+| Firehose, RNA-seq V2 (RSEM) | 35 | 39 | 263 |
+| Firehose, Agilent microarray (z-score scale) | 72 | −3.06 | −1.55 |
+| Firehose, Affymetrix U133 microarray (log scale) | 65 | 3.45 | 4.08 |
+| Nature 2011 (z-score scale) | 56 | −1.01 | 0.13 |
+
+Expression units differ between platforms, so compare within a row, not across rows.
+
+**Caveats:**
+- The correlations are moderate, so methylation explains only part of the variation in BRCA1 expression.
+- Copy number loss and other factors also affect expression, and I did not adjust for them.
+- The Nature 2011 and Firehose Legacy studies overlap heavily in their patients, so they aren't independent confirmations.
+- For a p-value, use the cBioPortal plot below, which reports a Spearman correlation for the same comparison. You can also run `scipy.stats.spearmanr` or `cor.test(..., method="spearman")` in R. To compare methylated and unmethylated groups, use the Group Comparison tab.
+
+[View BRCA1 methylation vs. mRNA plot (TCGA, Nature 2011)](https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pub&gene_list=BRCA1&case_set_id=ov_tcga_pub_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%22672%22%2C%22dataType%22%3A%22METHYLATION%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%22672%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%7D)
+
+This shows BRCA1 mRNA expression (y-axis) by BRCA1 methylation (x-axis).

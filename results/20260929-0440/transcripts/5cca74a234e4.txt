@@ -1,0 +1,249 @@
+Q (sonnet-5.5): Are there DNA methylation differences between lower grade glioma molecular subtypes?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "lower grade glioma"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, count() c FROM genetic_alteration_derived WHERE cancer_study_identifier IN ('lgg_tcga','lgg_tcga_pan_can_atlas_2018') AND profile_type LIKE '%methyl%' GROUP BY 1,2"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"lgg_tcga","profile_type":"methylation_hm450","c":8597780}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, attribute_name, attribute_value, count() c FROM clinical_data_derived WHERE cancer_study_identifier IN ('lgg_tcga','lgg_tcga_pan_can_atlas_2018') AND attribute_name IN ('SUBTYPE','IDH_STATUS','IDH_CODEL_SUBTYPE','METHYLATION_SUBTYPE') GROUP BY 1,2,3 ORDER BY 1,2,4 DESC"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","attribute_name":"SUBTYPE","attribute_value":"LGG_IDHmut-non-codel","c":248},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","attribute_name":"SUBTYPE","attribute_value":"LGG_IDHmut-codel","c":167},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","attribute_name":"SUBTYPE","attribute_value":"LGG_IDHwt","c":92},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","attribute_name":"SUBTYPE","c":7}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, attribute_value, count() c FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga' AND (attribute_name ILIKE '%subtype%' OR attribute_name ILIKE '%idh%' OR attribute_name ILIKE '%methyl%' OR attribute_name ILIKE '%cluster%' OR attribute_name ILIKE '%codel%') GROUP BY 1,2 ORDER BY 1,3 DESC LIMIT 60"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT sample_unique_id FROM clinical_data_derived WHERE cancer_study_identifier IN ('lgg_tcga','lgg_tcga_pan_can_atlas_2018') AND attribute_name='SUBTYPE' LIMIT 3"
+}
+
+◀ result
+{"rows":[{"attribute_name":"IDH1_MUTATION","c":391},{"attribute_name":"IDH1_MUTATION","attribute_value":"YES","c":91},{"attribute_name":"IDH1_MUTATION","attribute_value":"NO","c":34},{"attribute_name":"IDH1_MUTATION_TEST_INDICATOR","attribute_value":"NO","c":296},{"attribute_name":"IDH1_MUTATION_TEST_INDICATOR","attribute_value":"YES","c":127},{"attribute_name":"IDH1_MUTATION_TEST_INDICATOR","c":93},{"attribute_name":"IDH1_MUTATION_TEST_METHOD","c":392},{"attribute_name":"IDH1_MUTATION_TEST_METHOD","attribute_value":"IHC","c":113},{"attribute_name":"IDH1_MUTATION_TEST_METHOD","attribute_value":"Sequence Analysis","c":11}]}
+
+◀ result
+{"rows":[{},{},{}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH st AS (SELECT replaceOne(sample_unique_id,'lgg_tcga_pan_can_atlas_2018_','') AS sid, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value!=''),
+m AS (SELECT replaceOne(sample_unique_id,'lgg_tcga_','') AS sid, avg(toFloat64OrNull(alteration_value)) AS mean_beta, count() AS probes FROM genetic_alteration_derived WHERE cancer_study_identifier='lgg_tcga' AND profile_type='methylation_hm450' AND toFloat64OrNull(alteration_value) IS NOT NULL GROUP BY sid)
+SELECT subtype, count() AS samples, round(avg(mean_beta),4) AS avg_of_sample_mean_beta, round(quantile(0.5)(mean_beta),4) AS median_sample_mean_beta, round(min(mean_beta),4) mn, round(max(mean_beta),4) mx FROM st JOIN m USING (sid) GROUP BY subtype"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT (SELECT groupArray(sample_unique_id) FROM (SELECT DISTINCT sample_unique_id FROM genetic_alteration_derived WHERE cancer_study_identifier='lgg_tcga' AND profile_type='methylation_hm450' LIMIT 3)) a, (SELECT groupArray(sample_unique_id) FROM (SELECT sample_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' LIMIT 3)) b"
+}
+
+◀ result
+{"rows":[{"a":["lgg_tcga_TCGA-CS-4938-01","lgg_tcga_TCGA-CS-4941-01","lgg_tcga_TCGA-CS-4942-01"],"b":["","",""]}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT * FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' LIMIT 2"
+}
+
+◀ result
+{"rows":[{"internal_id":680462,"patient_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4938","attribute_name":"SUBTYPE","attribute_value":"LGG_IDHmut-non-codel","cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","type":"patient"},{"internal_id":680463,"patient_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4941","attribute_name":"SUBTYPE","attribute_value":"LGG_IDHwt","cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","type":"patient"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH st AS (SELECT replaceOne(patient_unique_id,'lgg_tcga_pan_can_atlas_2018_','') AS pid, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value!=''),
+m AS (SELECT replaceOne(sample_unique_id,'lgg_tcga_','') AS sid, substring(replaceOne(sample_unique_id,'lgg_tcga_',''),1,12) AS pid, avg(toFloat64OrNull(alteration_value)) AS mean_beta FROM genetic_alteration_derived WHERE cancer_study_identifier='lgg_tcga' AND profile_type='methylation_hm450' AND toFloat64OrNull(alteration_value) IS NOT NULL GROUP BY sid)
+SELECT subtype, count() AS samples, round(avg(mean_beta),4) AS avg_mean_beta, round(quantile(0.5)(mean_beta),4) AS median_mean_beta, round(quantile(0.25)(mean_beta),4) q1, round(quantile(0.75)(mean_beta),4) q3 FROM st JOIN m USING (pid) GROUP BY subtype"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, count() FROM genetic_alteration_derived WHERE cancer_study_identifier='lgg_tcga' AND profile_type='methylation_hm450' AND hugo_gene_symbol='MGMT' GROUP BY 1"
+}
+
+◀ result
+{"rows":[{"subtype":"LGG_IDHwt","samples":94,"avg_mean_beta":0.3825,"median_mean_beta":0.3844,"q1":0.3716,"q3":0.3968},{"subtype":"LGG_IDHmut-codel","samples":170,"avg_mean_beta":0.4622,"median_mean_beta":0.4624,"q1":0.4481,"q3":0.4778},{"subtype":"LGG_IDHmut-non-codel","samples":257,"avg_mean_beta":0.4509,"median_mean_beta":0.4539,"q1":0.4408,"q3":0.4658}]}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"lgg_tcga","count()":530}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lgg_tcga",
+  "lgg_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 2 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":2,"studiesWithMetadata":[{"studyId":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","sampleCount":530,"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga","metadata":{"clinicalAttributeIds":["AGE","ANIMAL_INSECT_ALLERGY_AGE","ANIMAL_INSECT_ALLERGY_HIST","ASTHMA_ECZEMA_ALLERGY_FIRST_DIAGNOSIS","ASTHMA_HISTORY","CANCER_TYPE","CANCER_TYPE_DETAILED","DAYS_TO_COLLECTION","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DAYS_TO_SPECIMEN_COLLECTION","DFS_MONTHS","DFS_STATUS","DISEASE_CODE","ECOG_SCORE","ECZEMA_HISTORY","ETHNICITY","FAMILY_HISTORY_OF_CANCER","FAMILY_HISTORY_OF_PRIMARY_BRAIN_TUMOR","FIRST_SYMPTOM_LONGEST_DURATION","FOOD_ALLERGY_AGE","FOOD_ALLERGY_HISTORY","FOOD_ALLERGY_TYPES","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GRADE","HAY_FEVER_HISTORY","HEADACHE_HISTORY","HISTOLOGICAL_DIAGNOSIS","HISTORY_IONIZING_RT_TO_HEAD","HISTORY_NEOADJUVANT_MEDICATION","HISTORY_NEOADJUVANT_STEROID_TX","HISTORY_NEOADJUVANT_TRTYN","HISTORY_OTHER_MALIGNANCY","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","IDH1_MUTATION","IDH1_MUTATION_TEST_INDICATOR","IDH1_MUTATION_TEST_METHOD","INFORMED_CONSENT_VERIFIED","INHERITED_GENETIC_SYNDROME_INDICATOR","INHERITED_GENETIC_SYNDROME_SPECIFIED","INITIAL_PATHOLOGIC_DX_YEAR","IS_FFPE","KARNOFSKY_PERFORMANCE_SCORE","LATERALITY","LONGEST_DIMENSION","METHOD_OF_SAMPLE_PROCUREMENT","MOLD_OR_DUST_ALLERGY_HISTORY","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","OCT_EMBEDDED","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_METHOD_OF_SAMPLE_PROCUREMENT","OTHER_PATIENT_ID","OTHER_SAMPLE_ID","PATHOLOGY_REPORT_FILE_NAME","PATHOLOGY_REPORT_UUID","PERFORMANCE_STATUS_DAYS_TO","PERFORMANCE_STATUS_TIMING","PROJECT_CODE","PROSPECTIVE_COLLECTION","RACE","RADIATION_TREATMENT_ADJUVANT","RELATED_SYMPTOM_FIRST_PRESENT","RETROSPECTIVE_COLLECTION","SAMPLE_COUNT","SAMPLE_INITIAL_WEIGHT","SAMPLE_TYPE","SAMPLE_TYPE_ID","SEIZURE_HISTORY","SEX","SHORTEST_DIMENSION","SITE_OF_TUMOR_TISSUE","SOMATIC_STATUS","SPECIMEN_CURRENT_WEIGHT","SPECIMEN_FREEZING_METHOD","SPECIMEN_SECOND_LONGEST_DIMENSION","SUPRATENTORIAL_LOCALIZATION","SYMP_CHANGES_MENTAL_STATUS","SYMP_CHANGES_MOTOR_MOVEMENT","SYMP_CHANGES_SENSORY","SYMP_CHANGES_VISUAL","TARGETED_MOLECULAR_THERAPY","TIME_BETWEEN_CLAMPING_AND_FREEZING","TIME_BETWEEN_EXCISION_AND_FREEZING","TISSUE_SOURCE_SITE","TMB_NONSYNONYMOUS","TREATMENT_OUTCOME_FIRST_COURSE","TUMOR_SITE","TUMOR_STATUS","VIAL_NUMBER"],"molecularProfileIds":["lgg_tcga_gistic","lgg_tcga_linear_CNA","lgg_tcga_methylation_hm450","lgg_tcga_mrna","lgg_tcga_mrna_median_Zscores","lgg_tcga_mrna_median_all_sample_Zscores","lgg_tcga_mutations","lgg_tcga_rna_seq_v2_mrna","lgg_tcga_rna_seq_v2_mrna_median_Zscores","lgg_tcga_rna_seq_v2_mrna_median_all_sample_Zscores","lg … (2867 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "IDHmut-non-codel",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHmut-non-codel"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "IDHmut-codel",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHmut-codel"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "IDHwt",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHwt"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "generic_assay_methylation"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/generic_assay_methylation?comparisonId=6abb42aae497aad53593ca52","url":"https://www.cbioportal.org/comparison/generic_assay_methylation?comparisonId=6abb42aae497aad53593ca52","data":{"description":"Group comparison (3 custom groups)","studies":["lgg_tcga_pan_can_atlas_2018"],"totalGroups":3,"groups":[{"name":"IDHmut-non-codel","sampleCount":248},{"name":"IDHmut-codel","sampleCount":167},{"name":"IDHwt","sampleCount":92}],"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"IDHmut-non-codel","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHmut-non-codel%22%7D%5D%7D%5D%7D"},{"groupName":"IDHmut-codel","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHmut-codel%22%7D%5D%7D%5D%7D"},{"groupName":"IDHwt","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHwt%22%7D%5D%7D%5D%7D"}],"pageDescription":"DNA methylation enrichment (HM27/HM450) — probes ranked by differential methylation beta values across groups."}}
+
+═ answer (success)
+Yes, the data point to global methylation differences between the molecular subtypes of TCGA lower grade glioma. I can't give you a significance test, so the statistics need to come from the portal.
+
+**Cohort:** Brain Lower Grade Glioma (TCGA), with subtype labels from the PanCancer Atlas study and HM450 beta values from the Firehose Legacy study. The two were matched by patient ID. The unit is samples, and 521 of them had both a subtype label and methylation data.
+
+**Average beta value per sample, across all HM450 probes**
+
+| Subtype | Samples | Median | IQR (Q1–Q3) |
+|---|---|---|---|
+| IDH-mutant, 1p/19q-codeleted | 170 | 0.462 | 0.448–0.478 |
+| IDH-mutant, non-codeleted | 257 | 0.454 | 0.441–0.466 |
+| IDH-wildtype | 94 | 0.384 | 0.372–0.397 |
+
+- **IDH-wildtype tumors:** They have lower average methylation than either IDH-mutant group. Their interquartile range does not overlap with either mutant group's.
+- **The two IDH-mutant groups:** They are much closer to each other. The codeleted group is only slightly higher, and their interquartile ranges overlap.
+- **Caveat:** This is a crude genome-wide average. It ignores which probes or regions differ, so it says nothing about specific loci.
+- **Not tested:** I ran no statistical test, so these are descriptive differences only.
+
+**Probe-level differences:** The comparison page ranks probes by differential methylation across the three subtypes. It uses the PanCancer Atlas HM450 data, so you can see which specific genes and probes drive the differences and get the statistics there.
+
+- [Methylation comparison of the three LGG subtypes](https://www.cbioportal.org/comparison/generic_assay_methylation?comparisonId=6abb42aae497aad53593ca52) (IDH-mutant non-codel n=248, IDH-mutant codel n=167, IDH-wildtype n=92)
+- [LGG PanCancer Atlas study overview](https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018)
+- [LGG Firehose Legacy study overview](https://www.cbioportal.org/study?id=lgg_tcga)

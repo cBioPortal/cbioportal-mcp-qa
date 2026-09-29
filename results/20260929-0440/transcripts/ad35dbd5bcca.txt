@@ -1,0 +1,272 @@
+Q (sonnet-5.5): Is there a cohort of NSCLC patient samples that have Kras mutations, wild-type p53, and high expression levels of c-Myc?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ search_oncotree
+{
+ "search_term": "NSCLC"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ list_studies
+{
+ "search": "lung",
+ "limit": 50
+}
+
+◀ result
+{"result":[{"code":"NSCLC","name":"Non-Small Cell Lung Cancer","score":100,"mainType":"Non-Small Cell Lung Cancer","tissue":"Lung","hierarchy":"LUNG > NSCLC"},{"code":"NSCLCPD","name":"Poorly Differentiated Non-Small Cell Lung Cancer","score":70,"mainType":"Non-Small Cell Lung Cancer","tissue":"Lung","hierarchy":"LUNG > NSCLC > NSCLCPD"}]}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_met_2021","name":"MSK MetTropism (MSK, Cell 2021)","type_of_cancer_id":"mixed","sample_count":25775,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=msk_met_2021"},{"cancer_study_identifier":"luad_mskcc_2023_met_organotropism","name":"Lung Adenocarcinoma Met Organotropism (MSK, Cancer Cell 2023)","type_of_cancer_id":"luad","sample_count":2653,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=luad_mskcc_2023_met_organotropism"},{"cancer_study_identifier":"nsclc_ctdx_msk_2022","name":"Metastatic Non-Small Cell Lung Cancer (MSK, Nature Medicine 2022)","type_of_cancer_id":"nsclc","sample_count":2621,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nsclc_ctdx_msk_2022"},{"cancer_study_identifier":"nsclc_tcga_broad_2016","name":"Pan-Lung Cancer (TCGA, Nat Genet 2016)","type_of_cancer_id":"nsclc","sample_count":1144,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nsclc_tcga_broad_2016"},{"cancer_study_identifier":"lung_msk_2017","name":"Non-Small Cell Cancer (MSK, Cancer Discov 2017)","type_of_cancer_id":"luad","sample_count":915,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lung_msk_2017"},{"cancer_study_identifier":"luad_mskcc_2020","name":"Lung Adenocarcinoma (MSK, J Thorac Oncol 2020)","type_of_cancer_id":"luad","sample_count":604,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=luad_mskcc_2020"},{"cancer_study_identifier":"luad_tcga","name":"Lung Adenocarcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"luad","sample_count":586,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga"},{"cancer_study_identifier":"luad_tcga_gdc","name":"Lung Adenocarcinoma (TCGA GDC, 2025)","type_of_cancer_id":"luad","sample_count":571,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga_gdc"},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"luad","sample_count":566,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lusc_tcga","name":"Lung Squamous Cell Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"lusc","sample_count":511,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga"},{"cancer_study_identifier":"lusc_tcga_gdc","name":"Lung Squamous Cell Carcinoma (TCGA GDC, 2025)","type_of_cancer_id":"lusc","sample_count":503,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_gdc"},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","name":"Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"lusc","sample_count":487,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"nsclc_tracerx_2017","name":"Non-Small Cell Lung Cancer (TRACERx, NEJM & N … (7167 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH studies AS (SELECT arrayJoin(['luad_tcga_pan_can_atlas_2018','lusc_tcga_pan_can_atlas_2018']) AS s),
+prof AS (
+  SELECT sample_unique_id, cancer_study_identifier FROM sample_to_gene_panel_derived
+  WHERE alteration_type='MUTATION_EXTENDED' AND cancer_study_identifier IN (SELECT s FROM studies)
+),
+myc AS (
+  SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier IN (SELECT s FROM studies) AND hugo_gene_symbol='MYC'
+    AND profile_type='rna_seq_v2_mrna_median_all_sample_Zscores' AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+kras AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE variant_type='mutation' AND mutation_status!='UNCALLED' AND hugo_gene_symbol='KRAS' AND cancer_study_identifier IN (SELECT s FROM studies)),
+tp53 AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE variant_type='mutation' AND mutation_status!='UNCALLED' AND hugo_gene_symbol='TP53' AND cancer_study_identifier IN (SELECT s FROM studies))
+SELECT p.cancer_study_identifier AS study,
+ count() AS profiled_with_mrna,
+ countIf(p.sample_unique_id IN (SELECT sample_unique_id FROM kras)) AS kras_mut,
+ countIf(p.sample_unique_id IN (SELECT sample_unique_id FROM kras) AND p.sample_unique_id NOT IN (SELECT sample_unique_id FROM tp53)) AS kras_mut_tp53_wt,
+ countIf(p.sample_unique_id IN (SELECT sample_unique_id FROM kras) AND p.sample_unique_id NOT IN (SELECT sample_unique_id FROM tp53) AND m.z>=1) AS with_myc_z_ge1,
+ countIf(p.sample_unique_id IN (SELECT sample_unique_id FROM kras) AND p.sample_unique_id NOT IN (SELECT sample_unique_id FROM tp53) AND m.z>=2) AS with_myc_z_ge2
+FROM prof p JOIN myc m USING sample_unique_id
+GROUP BY study"
+}
+
+◀ result
+{"rows":[{"study":"luad_tcga_pan_can_atlas_2018","profiled_with_mrna":510,"kras_mut":154,"kras_mut_tp53_wt":100,"with_myc_z_ge1":13,"with_myc_z_ge2":2},{"study":"lusc_tcga_pan_can_atlas_2018","profiled_with_mrna":481,"kras_mut":7,"kras_mut_tp53_wt":4,"with_myc_z_ge1":0,"with_myc_z_ge2":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH kras AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE variant_type='mutation' AND mutation_status!='UNCALLED' AND hugo_gene_symbol='KRAS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018'),
+tp53 AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE variant_type='mutation' AND mutation_status!='UNCALLED' AND hugo_gene_symbol='TP53' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018')
+SELECT replaceOne(sample_unique_id,'luad_tcga_pan_can_atlas_2018_','') AS sample_id, round(toFloat64OrNull(alteration_value),2) AS myc_z
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier='luad_tcga_pan_can_atlas_2018' AND hugo_gene_symbol='MYC' AND profile_type='rna_seq_v2_mrna_median_all_sample_Zscores'
+ AND toFloat64OrNull(alteration_value)>=1 AND sample_unique_id IN (SELECT sample_unique_id FROM kras) AND sample_unique_id NOT IN (SELECT sample_unique_id FROM tp53)
+ORDER BY myc_z DESC"
+}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"rows":[{"sample_id":"TCGA-05-4250-01","myc_z":2.11},{"sample_id":"TCGA-MP-A4T8-01","myc_z":2.02},{"sample_id":"TCGA-95-A4VN-01","myc_z":1.76},{"sample_id":"TCGA-86-8076-01","myc_z":1.74},{"sample_id":"TCGA-49-4506-01","myc_z":1.59},{"sample_id":"TCGA-75-5126-01","myc_z":1.53},{"sample_id":"TCGA-NJ-A4YP-01","myc_z":1.36},{"sample_id":"TCGA-55-A490-01","myc_z":1.28},{"sample_id":"TCGA-MP-A4SY-01","myc_z":1.24},{"sample_id":"TCGA-55-7725-01","myc_z":1.15},{"sample_id":"TCGA-55-1595-01","myc_z":1.08},{"sample_id":"TCGA-62-A46S-01","myc_z":1.04},{"sample_id":"TCGA-91-6849-01","myc_z":1.03}]}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":566,"studyViewUrl":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["luad_tcga_pan_can_atlas_2018_gistic","luad_tcga_pan_can_atlas_2018_log2CNA","luad_tcga_pan_can_atlas_2018_mutations","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","luad_tcga_pan_can_atlas_2018_rppa","luad_tcga_pan_can_atlas_2018_rppa_Zscores","luad_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["luad_tcga_pan_can_atlas_2018_armlevel_cna","luad_tcga_pan_can_atlas_2018_genetic_ancestry","luad_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","luad_tcga_pan_can_atlas_2018_methylation_hm450"],"heatmapProfileIds":["luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","luad_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","luad_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation"]}}]}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "filterJson": {
+  "sampleIdentifiers": [
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-05-4250-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-MP-A4T8-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-95-A4VN-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-86-8076-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-49-4506-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-75-5126-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-NJ-A4YP-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-55-A490-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-MP-A4SY-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-55-7725-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-55-1595-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-62-A46S-01"
+   },
+   {
+    "studyId": "luad_tcga_pan_can_atlas_2018",
+    "sampleId": "TCGA-91-6849-01"
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22sampleIdentifiers%22%3A%5B%7B%22sampleId%22%3A%22TCGA-05-4250-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-MP-A4T8-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-95-A4VN-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-86-8076-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-49-4506-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-75-5126-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-NJ-A4YP-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-A490-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-MP-A4SY-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-7725-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-1595-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-62-A46S-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-91-6849-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22sampleIdentifiers%22%3A%5B%7B%22sampleId%22%3A%22TCGA-05-4250-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-MP-A4T8-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-95-A4VN-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-86-8076-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-49-4506-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-75-5126-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-NJ-A4YP-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-A490-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-MP-A4SY-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-7725-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-1595-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-62-A46S-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-91-6849-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%5D%7D","data":{"studyIds":["luad_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"luad_tcga_pan_can_atlas_2018","name … (341 more chars)
+
+═ answer (success)
+Yes, but the cohort is small. I searched the TCGA PanCancer Atlas lung cohorts (LUAD and LUSC), which have both mutation and RNA-seq data. The counts are samples with mutation and mRNA data. "Wild-type TP53" means no somatic TP53 mutation of any kind. "High MYC" means an mRNA z-score of at least 1 relative to all samples. That cutoff is my choice, since you didn't specify one.
+
+| Study | Samples with mutation + mRNA data | KRAS-mutant | KRAS-mutant and TP53 wild-type | Also MYC z ≥ 1 | Also MYC z ≥ 2 |
+|---|---|---|---|---|---|
+| [Lung Adenocarcinoma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018) | 510 | 154 (30%) | 100 | **13** | 2 |
+| [Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018) | 481 | 7 | 4 | 0 | 0 |
+
+- **Cohort:** the 13 lung adenocarcinoma samples are your cohort. They come to about 2.5% of the 510 profiled samples and 13% of the 100 KRAS-mutant, TP53 wild-type samples. All 13 have MYC z-scores of 1.03–2.11. The two with z ≥ 2 are TCGA-05-4250-01 (2.11) and TCGA-MP-A4T8-01 (2.02). The other 11 are TCGA-95-A4VN-01, TCGA-86-8076-01, TCGA-49-4506-01, TCGA-75-5126-01, TCGA-NJ-A4YP-01, TCGA-55-A490-01, TCGA-MP-A4SY-01, TCGA-55-7725-01, TCGA-55-1595-01, TCGA-62-A46S-01 and TCGA-91-6849-01.
+- **Squamous:** KRAS mutations are rare in squamous samples, so that study contributes none.
+- **Cutoff:** a stricter cutoff shrinks the cohort quickly. At z ≥ 2 only 2 samples remain. Tell me if you want a different threshold, such as a percentile or a normal-tissue reference.
+- **Other studies:** I did not search other NSCLC cohorts, such as the MSK studies or TRACERx. Many of them lack matched mRNA expression data.
+- **Overlap:** the Firehose Legacy and GDC versions of the TCGA lung studies overlap with the PanCancer Atlas samples, so don't add them together.
+
+[View the 13-sample cohort in Study View](https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22sampleIdentifiers%22%3A%5B%7B%22sampleId%22%3A%22TCGA-05-4250-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-MP-A4T8-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-95-A4VN-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-86-8076-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-49-4506-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-75-5126-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-NJ-A4YP-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-A490-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-MP-A4SY-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-7725-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-55-1595-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-62-A46S-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%2C%7B%22sampleId%22%3A%22TCGA-91-6849-01%22%2C%22studyId%22%3A%22luad_tcga_pan_can_atlas_2018%22%7D%5D%7D)
+
+Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu.

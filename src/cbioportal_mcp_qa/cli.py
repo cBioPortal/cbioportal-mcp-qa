@@ -38,8 +38,12 @@ MODEL_CHOICES = [k for k in MODELS if any(k in t.specs for t in TARGETS.values()
 
 
 def _models(value: str | None, target: str, runner: str = "agents-api") -> list[str]:
-    """The models to ask, checked against what the target offers (default: all of them)."""
+    """The models to ask, checked against what the target offers (default: all of them).
+
+    The claude-code runner doesn't go through the target's LibreChat specs, so any model with a Claude Code id works."""
     offered = list(TARGETS[target].specs)
+    if runner == "claude-code":
+        offered += [k for k, m in MODELS.items() if m.claude_code_id and k not in offered]
     models = [m.strip() for m in value.split(",") if m.strip()] if value else offered
     unknown = [m for m in models if m not in offered]
     if unknown:

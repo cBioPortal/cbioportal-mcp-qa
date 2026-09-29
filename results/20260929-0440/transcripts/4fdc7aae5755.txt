@@ -1,0 +1,260 @@
+Q (sonnet-5.5): In the Pediatric Neuroblastoma study from TARGET what is the survival difference and the corresponding statistical significance between patients who were older than four when diagnosed and the younger ones?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ list_studies
+{
+ "search": "neuroblastoma TARGET"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"nbl_target_2018_pub","name":"Pediatric Neuroblastoma (TARGET, 2018)","type_of_cancer_id":"nbl","sample_count":1089,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nbl_target_2018_pub"},{"cancer_study_identifier":"nbl_target_gdc","name":"Neuroblastoma (TARGET GDC, 2025)","type_of_cancer_id":"nbl","sample_count":533,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nbl_target_gdc"},{"cancer_study_identifier":"nbl_msk_2023","name":"Pediatric Neuroblastoma (MSK, Nat Genet 2023)","type_of_cancer_id":"nbl","sample_count":223,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nbl_msk_2023"}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attr_id, description, patient_attribute FROM clinical_attribute_meta WHERE cancer_study_id = (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier='nbl_target_2018_pub') ORDER BY attr_id"
+}
+
+◀ result
+{"rows":[{"attr_id":"AGE","description":"Age at which a condition or disease was first diagnosed.","patient_attribute":1},{"attr_id":"AGE_IN_DAYS","description":"Age at which a condition or disease was first diagnosed.","patient_attribute":1},{"attr_id":"ANALYSIS_COHORT","description":"Analysis Cohort","patient_attribute":0},{"attr_id":"CANCER_TYPE","description":"Cancer Type","patient_attribute":0},{"attr_id":"CANCER_TYPE_DETAILED","description":"Cancer Type Detailed","patient_attribute":0},{"attr_id":"CNS_SITE_OF_RELAPSE","description":"CNS Site of Relapse","patient_attribute":0},{"attr_id":"DIAGNOSIS","description":"Diagnosis.","patient_attribute":1},{"attr_id":"EFSCENS","description":"Event Free Survival Censored","patient_attribute":1},{"attr_id":"EFS_TIME","description":"EFS time.","patient_attribute":1},{"attr_id":"ETHNICITY","description":"The text for reporting information about ethnicity.","patient_attribute":1},{"attr_id":"FIRST_EVENT","description":"First Event","patient_attribute":1},{"attr_id":"FRACTION_GENOME_ALTERED","description":"Fraction Genome Altered","patient_attribute":0},{"attr_id":"GRADE","description":"Numeric value to express the degree of abnormality of cancer cells, a measure of differentiation and aggressiveness.","patient_attribute":0},{"attr_id":"ICDO","description":"ICDO.","patient_attribute":1},{"attr_id":"ICDO_SNOMED_DESCRIPTION","description":"ICDO snomed description.","patient_attribute":1},{"attr_id":"INSS_STAGE","description":"Staging according to the International Neuroblastoma Staging System","patient_attribute":1},{"attr_id":"LAST_FOLLOWUP_YEAR","description":"Year of Last Followup","patient_attribute":1},{"attr_id":"MKI","description":"MKI.","patient_attribute":0},{"attr_id":"MUTATION_COUNT","description":"Mutation Count","patient_attribute":0},{"attr_id":"MYCN","description":"MYCN.","patient_attribute":0},{"attr_id":"ONCOTREE_CODE","description":"Oncotree Code","patient_attribute":0},{"attr_id":"OS_DAYS","description":"Overall patient survival days","patient_attribute":1},{"attr_id":"OS_MONTHS","description":"Overall survival in months since initial diagonosis.","patient_attribute":1},{"attr_id":"OS_STATUS","description":"Overall patient survival status.","patient_attribute":1},{"attr_id":"PERCENTAGE_NECROSIS","description":"Percent necrosis.","patient_attribute":1},{"attr_id":"PERCENTAGE_TUMOR_PURITY","description":"Percent tumor purity.","patient_attribute":1},{"attr_id":"PERCENT_TUMOR_CELLS_RELAPSE","description":"Numeric value to represent the percentage of malignant cell tumor nuclei content in a tumor sample or specimen obtained at relapse stage","patient_attribute":1},{"attr_id":"PERCENT_TUMOR_VS_STROMA","description":"Numeric representation of the ratio of tumor to stroma.","patient_attribute":1},{"attr_id":"PLOIDY","description":"Ploidy.","patient_attribute":0},{"attr_id":"PROTOCOL","description":"Protocol.","patient_attribute":1},{"attr_id":"RACE","description":"The text for reporting informat … (1406 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH p AS (
+ SELECT patient_unique_id,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='AGE') AS age,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='AGE_IN_DAYS') AS age_days,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='OS_MONTHS') AS os_m,
+  maxIf(attribute_value, attribute_name='OS_STATUS') AS os_s
+ FROM clinical_data_derived
+ WHERE cancer_study_identifier='nbl_target_2018_pub' AND attribute_name IN ('AGE','AGE_IN_DAYS','OS_MONTHS','OS_STATUS')
+ GROUP BY patient_unique_id)
+SELECT count() n, min(age) mn, max(age) mx, countIf(age=min(age)) x, min(age_days), max(age_days), 
+ countIf(age_days/365.25>4) gt4_days, countIf(age>4) gt4_age, countIf(age_days/365.25=4) eq4 FROM p"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 184\n Code: 184. DB::Exception: Aggregate function min(age) is found inside another aggregate function in query. (ILLEGAL_AGGREGATION) (version 26.4.1.2509 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH p AS (
+ SELECT patient_unique_id,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='AGE') AS age,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='AGE_IN_DAYS') AS age_days,
+  maxIf(toFloat64OrNull(attribute_value), attribute_name='OS_MONTHS') AS os_m,
+  maxIf(attribute_value, attribute_name='OS_STATUS') AS os_s
+ FROM clinical_data_derived
+ WHERE cancer_study_identifier='nbl_target_2018_pub' AND attribute_name IN ('AGE','AGE_IN_DAYS','OS_MONTHS','OS_STATUS')
+ GROUP BY patient_unique_id)
+SELECT if(age_days/365.25>4,'>4y','<=4y') g, count() n, min(age) mn, max(age) mx, min(age_days) mind, max(age_days) maxd,
+ countIf(startsWith(os_s,'1')) ev, countIf(startsWith(os_s,'0')) cens, min(os_m) mino, max(os_m) maxo,
+ countIf(age>4) gt4_age, countIf(age_days/365.25=4) eq4
+FROM p WHERE os_m IS NOT NULL AND os_s!='' GROUP BY g"
+}
+
+◀ result
+{"rows":[{"g":">4y","n":250,"mn":5,"mx":21,"mind":1462,"maxd":7612,"ev":121,"cens":129,"mino":1,"maxo":183,"gt4_age":250,"eq4":0},{"g":"<=4y","n":822,"mn":0,"mx":4,"mind":0,"maxd":1460,"ev":276,"cens":546,"mino":1,"maxo":183,"gt4_age":0,"eq4":0}]}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "nbl_target_2018_pub",
+ "attributeIds": [
+  "AGE_IN_DAYS",
+  "AGE"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"nbl_target_2018_pub","attributes":[{"attributeId":"AGE","displayName":"Diagnosis Age","description":"Age at which a condition or disease was first diagnosed.","datatype":"NUMBER","continuous":true,"bins":[{"end":2,"count":435},{"start":3,"end":3,"count":222},{"start":4,"end":4,"count":168},{"start":4,"count":251}]},{"attributeId":"AGE_IN_DAYS","displayName":"Diagnosis Age (days)","description":"Age at which a condition or disease was first diagnosed.","datatype":"NUMBER","continuous":true,"bins":[{"end":469.5,"count":269},{"start":469.5,"end":923.5,"count":269},{"start":923.5,"end":1424,"count":269},{"start":1424,"count":269}]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "nbl_target_2018_pub"
+ ],
+ "groups": [
+  {
+   "name": "Older than 4 years",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "AGE_IN_DAYS",
+      "values": [
+       {
+        "start": 1461
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "4 years or younger",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "AGE_IN_DAYS",
+      "values": [
+       {
+        "end": 1461
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "survival"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6abb41f6c2115c492d8855c6","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6abb41f6c2115c492d8855c6","data":{"description":"Group comparison (2 custom groups)","studies":["nbl_target_2018_pub"],"totalGroups":2,"groups":[{"name":"Older than 4 years","sampleCount":253},{"name":"4 years or younger","sampleCount":836}],"studyViewUrl":"https://www.cbioportal.org/study?id=nbl_target_2018_pub","groupUrls":[{"groupName":"Older than 4 years","url":"https://www.cbioportal.org/study?id=nbl_target_2018_pub#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22AGE_IN_DAYS%22%2C%22values%22%3A%5B%7B%22start%22%3A1461%7D%5D%7D%5D%7D"},{"groupName":"4 years or younger","url":"https://www.cbioportal.org/study?id=nbl_target_2018_pub#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22AGE_IN_DAYS%22%2C%22values%22%3A%5B%7B%22end%22%3A1461%7D%5D%7D%5D%7D"}],"pageDescription":"Kaplan-Meier survival analysis comparing Older than 4 years (253) vs 4 years or younger (836)."}}
+
+═ answer (success)
+I can't calculate the statistical significance here, because a log-rank p-value isn't something my database can compute. I can give you the per-group survival counts and a link to the comparison, where cBioPortal shows the Kaplan-Meier curves and the log-rank p-value.
+
+**Cohort:** Pediatric Neuroblastoma (TARGET, 2018), `nbl_target_2018_pub`. I counted patients who have overall survival data. I split them at 4 years of age at diagnosis, using the age recorded in days.
+
+| Group | Patients | Deaths | Censored (alive at last follow-up) | Follow-up range |
+|---|---|---|---|---|
+| Older than 4 years | 250 | 121 (48%) | 129 | 1–183 months |
+| 4 years or younger | 822 | 276 (34%) | 546 | 1–183 months |
+
+- A larger share of the older group died during follow-up (48% versus 34%). That is a raw proportion and doesn't account for follow-up time.
+- The Kaplan-Meier median survival and the hazard ratio need proper survival modeling, so I haven't reported them. Fewer than half of the patients in each group had a death, so the Kaplan-Meier median is likely not reached in either group.
+- The right test for this comparison is a Kaplan-Meier analysis with a log-rank test. You can also run it yourself in R with `survival::survfit`/`survdiff` or in Python with `lifelines`.
+
+[Open the Kaplan-Meier survival comparison (older than 4 vs. 4 or younger)](https://www.cbioportal.org/comparison/survival?comparisonId=6abb41f6c2115c492d8855c6)
+
+Kaplan-Meier survival analysis comparing Older than 4 years (253) vs 4 years or younger (836). The sample counts in the link (253 and 836) differ slightly from the patient counts above because some patients have more than one sample.
+
+This study is one of several TARGET neuroblastoma cohorts. I chose the "Pediatric Neuroblastoma (TARGET, 2018)" study because it matches the name you gave. The separate "Neuroblastoma (TARGET GDC, 2025)" study is a different cohort, and I can run the same comparison there if you want.
