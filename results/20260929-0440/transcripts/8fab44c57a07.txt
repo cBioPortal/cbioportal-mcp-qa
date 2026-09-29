@@ -1,0 +1,192 @@
+Q (sonnet-5.5): Is there a correlation between ERBB2 gene amplification and ERBB2 protein expression levels in breast cancer samples from the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT profile_type, count() c FROM genetic_alteration_derived WHERE cancer_study_identifier='msk_chord_2024' AND hugo_gene_symbol='ERBB2' GROUP BY profile_type"
+}
+
+◀ result
+{"rows":[{"profile_type":"cna","c":25034}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, attribute_value, count() c FROM clinical_data_derived WHERE cancer_study_identifier='msk_chord_2024' AND attribute_name IN ('HER2') GROUP BY 1,2 ORDER BY c DESC LIMIT 20"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, mutation_sample_count, cna_sample_count, mrna_expression_sample_count, sample_count FROM cancer_study WHERE cancer_study_identifier='msk_chord_2024'"
+}
+
+◀ result
+{"rows":[{"attribute_name":"HER2","c":19582},{"attribute_name":"HER2","attribute_value":"No","c":4502},{"attribute_name":"HER2","attribute_value":"Yes","c":866}]}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_chord_2024","mutation_sample_count":25040,"cna_sample_count":25034,"mrna_expression_sample_count":0,"sample_count":25040}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH br AS (SELECT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='msk_chord_2024' AND attribute_name='CANCER_TYPE' AND attribute_value='Breast Cancer'),
+h AS (SELECT patient_unique_id, any(attribute_value) her2 FROM clinical_data_derived WHERE cancer_study_identifier='msk_chord_2024' AND attribute_name='HER2' GROUP BY patient_unique_id),
+c AS (SELECT sample_unique_id, alteration_value v FROM genetic_alteration_derived WHERE cancer_study_identifier='msk_chord_2024' AND hugo_gene_symbol='ERBB2' AND profile_type='cna')
+SELECT h.her2 AS her2_status, c.v AS cna_value, count() n FROM br JOIN h USING (patient_unique_id) JOIN c USING (sample_unique_id) GROUP BY 1,2 ORDER BY 1,2"
+}
+
+◀ result
+{"rows":[{"her2_status":"No","cna_value":"-2","n":1},{"her2_status":"No","cna_value":"0","n":4413},{"her2_status":"No","cna_value":"2","n":88},{"her2_status":"Yes","cna_value":"0","n":279},{"her2_status":"Yes","cna_value":"2","n":587}]}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "genes": [
+  "ERBB2: AMP"
+ ],
+ "tab": "cancerTypesSummary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/cancerTypesSummary?cancer_study_list=msk_chord_2024&gene_list=ERBB2%3A+AMP&case_set_id=msk_chord_2024_all","url":"https://www.cbioportal.org/results/cancerTypesSummary?cancer_study_list=msk_chord_2024&gene_list=ERBB2%3A+AMP&case_set_id=msk_chord_2024_all","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"genes":["ERBB2"],"caseSetId":"msk_chord_2024_all","pageDescription":"Alteration frequencies for queried genes by cancer type."}}
+
+═ answer (success)
+**MSK-CHORD has no ERBB2 protein expression data, so I can't compute that correlation.** The study is targeted MSK-IMPACT DNA sequencing. It has no protein (RPPA or mass spec) or mRNA profiles. It does have ERBB2 copy-number calls, and a clinical HER2 status for breast patients (yes/no). The HER2 status is a clinical annotation, some of it NLP-derived, not a quantitative protein level. I used it as a rough stand-in for protein-level HER2.
+
+**ERBB2 amplification vs. clinical HER2 status (breast cancer, 5,368 patients, one sample each)**
+
+| Clinical HER2 status | ERBB2 amplified | Not amplified | Homozygous deletion | Total |
+|---|---|---|---|---|
+| HER2 positive | 587 (67.8%) | 279 (32.2%) | 0 | 866 |
+| HER2 negative | 88 (2.0%) | 4,413 (98.0%) | 1 | 4,502 |
+
+- Among the 675 amplified samples, 587 (87%) are HER2 positive.
+- Amplification is far more common in HER2-positive tumors (68%) than in HER2-negative tumors (2%). This is an association in the raw counts, and I ran no statistical test, so there is no p-value or effect size.
+- The 279 HER2-positive samples without amplification could reflect protein overexpression without amplification, the limits of panel copy-number calling, or NLP or annotation error. The data can't tell these apart.
+
+For a true amplification-versus-protein analysis, you would need a breast cohort with RPPA or mRNA data, such as TCGA PanCancer Atlas breast or METABRIC. I can run that if you'd like.
+
+[View ERBB2 amplification by cancer type in MSK-CHORD](https://www.cbioportal.org/results/cancerTypesSummary?cancer_study_list=msk_chord_2024&gene_list=ERBB2%3A+AMP&case_set_id=msk_chord_2024_all)

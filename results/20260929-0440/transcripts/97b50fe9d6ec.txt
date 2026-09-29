@@ -1,0 +1,263 @@
+Q (sonnet-5.5): Help me rank TCGA cancer studies based on median CD3 expression
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-resolution-guide"
+}
+
+◀ result
+# Gene Resolution Guide
+
+Use this guide before querying gene expression, mutation, copy-number, methylation, or structural-variant data when the user's gene term may be ambiguous.
+
+## Routing Triggers
+
+Read this guide when the user mentions:
+
+- a gene family shorthand: `CD3`, `HLA`, `KRT`, `MUC`, `MT-`, `IGH`, `IGK`, `IGL`
+- a marker name that may refer to multiple genes or proteins
+- a gene alias, old symbol, or informal name
+- a wildcard-like term such as "all CD3 genes"
+
+These examples are not exhaustive. Apply this guide to any gene term that may resolve to multiple symbols, aliases, paralogs, family members, or marker genes.
+
+## Core Rule
+
+Do not silently aggregate multiple genes when the user names an ambiguous symbol. Either ask for clarification or choose a clearly standard marker and state the choice.
+
+For example, "CD3 expression" can refer to `CD3D`, `CD3E`, or `CD3G`; in many immune-marker contexts `CD3E` is the standard marker, but the agent must not average all CD3 genes unless the user asks for a combined signature.
+
+## Gene Discovery Query
+
+After validating the gene table exists, search exact symbols first, then prefix/alias-like matches:
+
+```sql
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id
+FROM gene
+WHERE upper(hugo_gene_symbol) = upper('CD3')
+   OR upper(hugo_gene_symbol) LIKE upper('CD3%')
+ORDER BY hugo_gene_symbol
+LIMIT 50;
+```
+
+If aliases are available in this deployment, inspect the relevant alias table before assuming no match. If no alias table exists, state that alias resolution is limited to available gene symbols.
+
+## Answer Pattern
+
+If multiple plausible genes are found:
+
+> "CD3" is ambiguous in cBioPortal gene-symbol terms. I found `CD3D`, `CD3E`, and `CD3G`. Did you mean `CD3E` as a T-cell marker, or should I analyze all three separately?
+
+If the user clearly asks for a combined family/signature:
+
+- report each gene separately by default
+- only compute an average/signature if the user explicitly requests it
+- state exactly how the combined value was calculated
+
+## Do Not
+
+- Do not average multiple genes into one expression value without explicit permission.
+- Do not rewrite an ambiguous symbol to a single gene without telling the user.
+- Do not treat a prefix match as a validated gene symbol.
+
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH cohort AS (
+    SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga'
+),
+ct AS (
+    SELECT sample_unique_id, attribute_value AS cancer_type
+    FROM clinical_data_derived
+    WHERE attribute_name = 'CANCER_TYPE' AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+)
+SELECT g.hugo_gene_symbol AS gene, ct.cancer_type,
+       count() AS samples,
+       round(median(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS median_log2_rsem,
+       round(quantile(0.9)(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS p90_log2_rsem
+FROM genetic_alteration_derived g
+JOIN ct USING (sample_unique_id)
+WHERE g.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+  AND g.hugo_gene_symbol IN ('CD3D','CD3E','CD3G')
+  AND g.profile_type = 'rna_seq_v2_mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+GROUP BY gene, ct.cancer_type
+ORDER BY gene, median_log2_rsem DESC",
+ "max_rows": 200
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga' ORDER BY cancer_study_identifier",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"gene":"CD3D","cancer_type":"Thymic Epithelial Tumor","samples":119,"median_log2_rsem":12.74,"p90_log2_rsem":14.36},{"gene":"CD3D","cancer_type":"Mature B-Cell Neoplasms","samples":48,"median_log2_rsem":10.07,"p90_log2_rsem":11.36},{"gene":"CD3D","cancer_type":"Seminoma","samples":63,"median_log2_rsem":8.7,"p90_log2_rsem":10},{"gene":"CD3D","cancer_type":"Renal Clear Cell Carcinoma","samples":510,"median_log2_rsem":7.14,"p90_log2_rsem":9.06},{"gene":"CD3D","cancer_type":"Non-Seminomatous Germ Cell Tumor","samples":86,"median_log2_rsem":6.96,"p90_log2_rsem":8.54},{"gene":"CD3D","cancer_type":"Cervical Cancer","samples":294,"median_log2_rsem":6.95,"p90_log2_rsem":9.02},{"gene":"CD3D","cancer_type":"Non-Small Cell Lung Cancer","samples":994,"median_log2_rsem":6.95,"p90_log2_rsem":8.68},{"gene":"CD3D","cancer_type":"Esophagogastric Cancer","samples":593,"median_log2_rsem":6.84,"p90_log2_rsem":8.55},{"gene":"CD3D","cancer_type":"Head and Neck Cancer","samples":515,"median_log2_rsem":6.73,"p90_log2_rsem":8.8},{"gene":"CD3D","cancer_type":"Pancreatic Cancer","samples":177,"median_log2_rsem":6.65,"p90_log2_rsem":8.36},{"gene":"CD3D","cancer_type":"Leukemia","samples":173,"median_log2_rsem":6.6,"p90_log2_rsem":8.96},{"gene":"CD3D","cancer_type":"Pleural Mesothelioma","samples":87,"median_log2_rsem":6.47,"p90_log2_rsem":8.36},{"gene":"CD3D","cancer_type":"Melanoma","samples":443,"median_log2_rsem":6.44,"p90_log2_rsem":9.42},{"gene":"CD3D","cancer_type":"Breast Cancer","samples":1082,"median_log2_rsem":6.11,"p90_log2_rsem":8.24},{"gene":"CD3D","cancer_type":"Hepatobiliary Cancer","samples":366,"median_log2_rsem":6,"p90_log2_rsem":8.36},{"gene":"CD3D","cancer_type":"Colorectal Cancer","samples":592,"median_log2_rsem":5.94,"p90_log2_rsem":7.34},{"gene":"CD3D","cancer_type":"Cholangiocarcinoma","samples":36,"median_log2_rsem":5.92,"p90_log2_rsem":8.55},{"gene":"CD3D","cancer_type":"Bladder Cancer","samples":407,"median_log2_rsem":5.88,"p90_log2_rsem":8.56},{"gene":"CD3D","cancer_type":"Endometrial Cancer","samples":584,"median_log2_rsem":5.56,"p90_log2_rsem":7.83},{"gene":"CD3D","cancer_type":"Prostate Cancer","samples":493,"median_log2_rsem":5.45,"p90_log2_rsem":7.1},{"gene":"CD3D","cancer_type":"Thyroid Cancer","samples":498,"median_log2_rsem":5.21,"p90_log2_rsem":7.94},{"gene":"CD3D","cancer_type":"Sarcoma","samples":253,"median_log2_rsem":5.19,"p90_log2_rsem":8.56},{"gene":"CD3D","cancer_type":"Renal Non-Clear Cell Carcinoma","samples":348,"median_log2_rsem":5.16,"p90_log2_rsem":7.15},{"gene":"CD3D","cancer_type":"Ovarian Epithelial Tumor","samples":300,"median_log2_rsem":4.97,"p90_log2_rsem":6.96},{"gene":"CD3D","cancer_type":"Glioblastoma","samples":160,"median_log2_rsem":3.86,"p90_log2_rsem":5.64},{"gene":"CD3D","cancer_type":"Pheochromocytoma","samples":147,"median_log2_rsem":3.78,"p90_log2_rsem":5.55},{"gene":"CD3D","cancer_type":"Miscellaneous Neuroepithelial Tumor","samples":31,"median_log2_rsem":3.65,"p90_log2_rsem":5.05},{"gene":"CD3D"," … (6886 more chars)
+
+◀ result
+{"rows":[{"cancer_study_identifier":"acc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"chol_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"dlbc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"esca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"hnsc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kich_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kirp_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"laml_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lihc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"meso_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"pcpg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"sarc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"stad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"tgct_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"thca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"thym_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucs_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"uvm_tcga_pan_can_atlas_2018"}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+Error: result (81,891 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-pqyf1b1k/43652bf1-d74b-4a70-955b-fb25903f8a03/tool-results/mcp-navigator-resolve_and_route-1790657061531.txt.
+Format: Plain text
+- For targeted searches (find a string): use grep on the file directly.
+- For analysis or summarization that requires reading the full content: the file's lines are too long for Read's offset/limit. Slice by character range via Bash instead — e.g. python3 -c 'print(open("/home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-pqyf1b1k/43652bf1-d74b-4a70-955b-fb25903f8a03/tool-results/mcp-navigator-resolve_and_route-1790657061531.txt").read()[A:B])' in ~80,000-char spans until you have read 100% of it.
+- If the Agent tool is available, do this inside a subagent so the full output stays out of your main context. Give it the instruction above verbatim, and be explicit about what it must return — e.g. "Slice /home/ino/.claude-cbioportal-team/projects/-tmp-mcp-qa-claude-pqyf1b1k/43652bf1-d74b-4a70-955b-fb25903f8a03/tool-results/mcp-navigator-resolve_and_route-1790657061531.txt in ~80,000-char spans via python (read()[A:B]) until you have read all 81,891 characters, then summarize and quote any key findings verbatim." A vague "summarize this" may lose detail.
+
+
+═ answer (success)
+I ranked the TCGA PanCancer Atlas cohorts by median CD3 expression, but "CD3" isn't a single gene. It refers to three genes: CD3D, CD3E and CD3G. I didn't average them. I ranked by **CD3E**, the usual T-cell marker, and show the other two alongside. If you'd rather use a different gene or a combined signature, tell me.
+
+Values are median log2(RSEM+1) from bulk tumor RNA-seq (the batch-normalized `rna_seq_v2_mrna` profile). I grouped by cancer type, and n is the number of samples with expression data. I didn't use Z-scores because they are centered within each study and can't be compared across cancer types.
+
+| Rank | Cancer type | n | CD3E | CD3D | CD3G |
+|---|---|---|---|---|---|
+| 1 | Thymic Epithelial Tumor | 119 | 13.05 | 12.74 | 9.40 |
+| 2 | Mature B-Cell Neoplasms | 48 | 10.76 | 10.07 | 6.70 |
+| 3 | Seminoma | 63 | 9.90 | 8.70 | 6.37 |
+| 4 | Renal Clear Cell Carcinoma | 510 | 8.71 | 7.14 | 5.83 |
+| 5 | Non-Small Cell Lung Cancer | 994 | 8.33 | 6.95 | 5.24 |
+| 6 | Non-Seminomatous Germ Cell Tumor | 86 | 8.22 | 6.96 | 4.75 |
+| 7 | Cervical Cancer | 294 | 8.09 | 6.95 | 4.38 |
+| 8 | Leukemia | 173 | 8.05 | 6.60 | 5.54 |
+| 9 | Pancreatic Cancer | 177 | 8.02 | 6.65 | 4.53 |
+| 10 | Melanoma | 443 | 8.01 | 6.44 | 4.39 |
+| 11 | Pleural Mesothelioma | 87 | 8.00 | 6.47 | 3.79 |
+| 12 | Head and Neck Cancer | 515 | 7.97 | 6.73 | 4.79 |
+| 13 | Esophagogastric Cancer | 593 | 7.96 | 6.84 | 5.42 |
+| 14 | Breast Cancer | 1082 | 7.60 | 6.11 | 4.56 |
+| 15 | Cholangiocarcinoma | 36 | 7.25 | 5.92 | 3.40 |
+| 16 | Endometrial Cancer | 584 | 7.12 | 5.56 | 3.29 |
+| 17 | Hepatobiliary Cancer | 366 | 7.08 | 6.00 | 2.85 |
+| 18 | Prostate Cancer | 493 | 7.08 | 5.45 | 3.50 |
+| 19 | Colorectal Cancer | 592 | 7.05 | 5.94 | 4.19 |
+| 20 | Bladder Cancer | 407 | 6.98 | 5.88 | 3.20 |
+| 21 | Thyroid Cancer | 498 | 6.85 | 5.21 | 3.28 |
+| 22 | Renal Non-Clear Cell Carcinoma | 348 | 6.85 | 5.16 | 2.84 |
+| 23 | Sarcoma | 253 | 6.73 | 5.19 | 2.99 |
+| 24 | Ovarian Epithelial Tumor | 300 | 6.65 | 4.97 | 3.87 |
+| 25 | Pheochromocytoma | 147 | 5.16 | 3.78 | 1.50 |
+| 26 | Glioblastoma | 160 | 5.07 | 3.86 | 1.73 |
+| 27 | Misc. Neuroepithelial Tumor | 31 | 4.86 | 3.65 | 1.77 |
+| 28 | Ocular Melanoma | 80 | 4.72 | 2.61 | 0.94 |
+| 29 | Adrenocortical Carcinoma | 78 | 3.99 | 2.04 | 0.66 |
+| 30 | Glioma | 514 | 2.98 | 1.22 | 0.65 |
+
+- **Top and bottom:** Thymic tumors rank first for all three genes, which fits their high T-cell content. Mature B-cell neoplasms and seminoma follow. Glioma, adrenocortical carcinoma, ocular melanoma and the other neuroepithelial tumors have the lowest expression.
+- **Middle ranks are close:** Ranks 5 to 13 are within about 0.4 log2 units of each other on CD3E, so their order is not robust. The three genes also don't always agree on order. For example, CD3G puts Leukemia and Esophagogastric Cancer higher than CD3E does.
+- **Medians hide variation:** Bulk expression reflects T-cell infiltration as well as tumor cells, and it varies widely within a cancer type. Melanoma has the highest CD3E 90th percentile of the solid tumors (11.02), well above its median. I didn't compute a statistical test for any of these differences.
+- **Cohort:** The 32 TCGA PanCancer Atlas studies. Leukemia and the B-cell neoplasms are the LAML and DLBC cohorts.
+- **Links:** I didn't generate portal links this time, because the study-lookup step failed on the size of its output. You can browse any cohort on [cBioPortal](https://www.cbioportal.org). For the full per-sample distribution, use the Plots tab with CD3E mRNA on one axis.

@@ -1,0 +1,200 @@
+Q (sonnet-5.5): <conversation_so_far>
+<user>
+How does ESR1 mRNA expression differ between PAM50 subtypes in TCGA breast cancer?
+</user>
+
+<assistant>
+In Breast Invasive Carcinoma (TCGA, PanCancer Atlas), ESR1 mRNA is highest in Luminal A and Luminal B tumors, intermediate in Normal-like and HER2-enriched, and lowest in Basal-like tumors. You can see the distribution here:
+[ESR1 expression by subtype](https://www.cbioportal.org/results/plots?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=ESR1)
+</assistant>
+</conversation_so_far>
+
+Continue this conversation: reply to the user's new message.
+
+<user>
+Can you do this with METABRIC instead?
+</user>
+
+▶ list_studies
+{
+ "search": "METABRIC"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","type_of_cancer_id":"brca","sample_count":2509,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brca_metabric"}]}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, count() c, uniq(attribute_value) u FROM clinical_data_derived WHERE cancer_study_identifier='brca_metabric' AND attribute_name ILIKE '%PAM50%' OR (cancer_study_identifier='brca_metabric' AND attribute_name ILIKE '%SUBTYPE%') GROUP BY attribute_name"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type FROM genetic_alteration_derived WHERE cancer_study_identifier='brca_metabric' ORDER BY profile_type"
+}
+
+◀ result
+{"rows":[{"attribute_name":"HISTOLOGICAL_SUBTYPE","c":2509,"u":9},{"attribute_name":"CLAUDIN_SUBTYPE","c":2509,"u":8}]}
+
+◀ result
+{"rows":[{"profile_type":"cna"},{"profile_type":"methylation_promoters_rrbs"},{"profile_type":"mrna"},{"profile_type":"mrna_median_all_sample_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (SELECT sample_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='brca_metabric' AND attribute_name='CLAUDIN_SUBTYPE') SELECT s.subtype, count() n, round(quantile(0.25)(toFloat64OrNull(g.alteration_value)),2) q25, round(median(toFloat64OrNull(g.alteration_value)),2) med, round(quantile(0.75)(toFloat64OrNull(g.alteration_value)),2) q75, round(avg(toFloat64OrNull(g.alteration_value)),2) mean FROM genetic_alteration_derived g JOIN s USING (sample_unique_id) WHERE g.cancer_study_identifier='brca_metabric' AND g.profile_type='mrna' AND g.hugo_gene_symbol='ESR1' AND g.alteration_value NOT IN ('','NA') AND toFloat64OrNull(g.alteration_value) IS NOT NULL GROUP BY s.subtype ORDER BY med DESC"
+}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "brca_metabric"
+ ]
+}
+
+◀ result
+{"rows":[]}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509,"studyViewUrl":"https://www.cbioportal.org/study?id=brca_metabric","metadata":{"clinicalAttributeIds":["AGE_AT_DIAGNOSIS","BREAST_SURGERY","CANCER_TYPE","CANCER_TYPE_DETAILED","CELLULARITY","CHEMOTHERAPY","CLAUDIN_SUBTYPE","COHORT","ER_IHC","ER_STATUS","GRADE","HER2_SNP6","HER2_STATUS","HISTOLOGICAL_SUBTYPE","HORMONE_THERAPY","INFERRED_MENOPAUSAL_STATE","INTCLUST","LATERALITY","LYMPH_NODES_EXAMINED_POSITIVE","MUTATION_COUNT","NPI","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PR_STATUS","RADIO_THERAPY","RFS_MONTHS","RFS_STATUS","SAMPLE_COUNT","SAMPLE_TYPE","SEX","THREEGENE","TMB_NONSYNONYMOUS","TUMOR_SIZE","TUMOR_STAGE","VITAL_STATUS"],"molecularProfileIds":["brca_metabric_cna","brca_metabric_methylation_promoters_rrbs","brca_metabric_mrna","brca_metabric_mrna_median_all_sample_Zscores","brca_metabric_mutations"],"heatmapProfileIds":["brca_metabric_methylation_promoters_rrbs","brca_metabric_mrna_median_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","dna_methylation"]}}]}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 'c' t, sample_unique_id, attribute_value FROM clinical_data_derived WHERE cancer_study_identifier='brca_metabric' AND attribute_name='CLAUDIN_SUBTYPE' LIMIT 3 UNION ALL SELECT 'g', sample_unique_id, alteration_value FROM genetic_alteration_derived WHERE cancer_study_identifier='brca_metabric' AND profile_type='mrna' AND hugo_gene_symbol='ESR1' LIMIT 3"
+}
+
+◀ result
+{"rows":[{"t":"g","sample_unique_id":"brca_metabric_MB-0000","attribute_value":"8.92981686259914"},{"t":"g","sample_unique_id":"brca_metabric_MB-0002","attribute_value":"10.0470593554617"},{"t":"g","sample_unique_id":"brca_metabric_MB-0005","attribute_value":"10.0412809873707"},{"t":"c","attribute_value":"claudin-low"},{"t":"c","attribute_value":"LumA"},{"t":"c","attribute_value":"LumB"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (SELECT patient_unique_id AS sample_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='brca_metabric' AND attribute_name='CLAUDIN_SUBTYPE') SELECT s.subtype, count() n, round(quantile(0.25)(toFloat64OrNull(g.alteration_value)),2) q25, round(median(toFloat64OrNull(g.alteration_value)),2) med, round(quantile(0.75)(toFloat64OrNull(g.alteration_value)),2) q75, round(avg(toFloat64OrNull(g.alteration_value)),2) mean FROM genetic_alteration_derived g JOIN s USING (sample_unique_id) WHERE g.cancer_study_identifier='brca_metabric' AND g.profile_type='mrna' AND g.hugo_gene_symbol='ESR1' AND g.alteration_value NOT IN ('','NA') AND toFloat64OrNull(g.alteration_value) IS NOT NULL GROUP BY s.subtype ORDER BY med DESC"
+}
+
+◀ result
+{"rows":[{"subtype":"LumB","n":475,"q25":10.31,"med":11.15,"q75":11.72,"mean":11},{"subtype":"LumA","n":700,"q25":10.13,"med":10.93,"q75":11.56,"mean":10.81},{"subtype":"NC","n":6,"q25":10.46,"med":10.83,"q75":11.63,"mean":10.93},{"subtype":"Normal","n":148,"q25":8.67,"med":9.76,"q75":10.65,"mean":9.47},{"subtype":"Her2","n":224,"q25":6.07,"med":7.1,"q75":9.6,"mean":7.8},{"subtype":"claudin-low","n":218,"q25":6.03,"med":6.62,"q75":8.87,"mean":7.41},{"subtype":"Basal","n":209,"q25":5.69,"med":5.99,"q75":6.76,"mean":6.42}]}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_metabric"
+ ],
+ "genes": [
+  "ESR1"
+ ],
+ "tab": "plots",
+ "plotsHorzSelection": {
+  "dataType": "CLINICAL_ATTRIBUTE",
+  "selectedGenericAssayOption": "CLAUDIN_SUBTYPE"
+ },
+ "plotsVertSelection": {
+  "dataType": "MRNA_EXPRESSION",
+  "selectedGeneOption": "ESR1",
+  "selectedDataSourceOption": "brca_metabric_mrna"
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/plots?cancer_study_list=brca_metabric&gene_list=ESR1&case_set_id=brca_metabric_all&plots_horz_selection=%7B%22selectedGenericAssayOption%22%3A%22CLAUDIN_SUBTYPE%22%2C%22dataType%22%3A%22CLINICAL_ATTRIBUTE%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%222099%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%2C%22selectedDataSourceOption%22%3A%22brca_metabric_mrna%22%7D","url":"https://www.cbioportal.org/results/plots?cancer_study_list=brca_metabric&gene_list=ESR1&case_set_id=brca_metabric_all&plots_horz_selection=%7B%22selectedGenericAssayOption%22%3A%22CLAUDIN_SUBTYPE%22%2C%22dataType%22%3A%22CLINICAL_ATTRIBUTE%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%222099%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%2C%22selectedDataSourceOption%22%3A%22brca_metabric_mrna%22%7D","data":{"studyIds":["brca_metabric"],"studies":[{"studyId":"brca_metabric","name":"Breast Cancer (METABRIC, Nature 2012 & Nat Commun 2016)","sampleCount":2509}],"genes":["ESR1"],"caseSetId":"brca_metabric_all","pageDescription":"Scatter/box plots: ESR1 mRNA expression (y-axis) by clinical_attribute (x-axis)."}}
+
+═ answer (success)
+In METABRIC (Breast Cancer, Nature 2012 & Nat Commun 2016), ESR1 mRNA is highest in Luminal B and Luminal A tumors and lowest in Basal-like tumors. The values below are log-intensity expression from the microarray data (the study's mRNA profile). I counted patients that have both a subtype label and ESR1 expression.
+
+| PAM50 / Claudin subtype | n | Median | IQR (25th–75th) |
+|---|---|---|---|
+| Luminal B | 475 | 11.15 | 10.31–11.72 |
+| Luminal A | 700 | 10.93 | 10.13–11.56 |
+| Normal-like | 148 | 9.76 | 8.67–10.65 |
+| HER2-enriched | 224 | 7.10 | 6.07–9.60 |
+| Claudin-low | 218 | 6.62 | 6.03–8.87 |
+| Basal-like | 209 | 5.99 | 5.69–6.76 |
+| NC (not classified) | 6 | 10.83 | 10.46–11.63 |
+
+- **Subtype labels:** METABRIC stores PAM50 calls in the `CLAUDIN_SUBTYPE` attribute. It also includes a claudin-low class and a small NC group of 6 samples, which is too few to interpret.
+- **Comparison with TCGA:** the overall ordering matches TCGA, with Luminal highest and Basal-like lowest. Luminal B has a slightly higher median than Luminal A here. Claudin-low has no counterpart in the TCGA PAM50 labels.
+- **Spread:** HER2-enriched and claudin-low have wide IQRs, so ESR1 is heterogeneous within those groups.
+- **Statistics:** I didn't run any significance tests. The medians and IQRs are descriptive only. Group Comparison in cBioPortal can test the differences.
+- **TCGA values:** the METABRIC values are not on the same scale as the TCGA RSEM values, so compare the ordering and not the numbers.
+- **Correction to my earlier reply:** it described TCGA subtype levels I hadn't checked against the data. Please treat that ordering as unverified.
+
+[View ESR1 mRNA by subtype in METABRIC (Plots tab)](https://www.cbioportal.org/results/plots?cancer_study_list=brca_metabric&gene_list=ESR1&case_set_id=brca_metabric_all&plots_horz_selection=%7B%22selectedGenericAssayOption%22%3A%22CLAUDIN_SUBTYPE%22%2C%22dataType%22%3A%22CLINICAL_ATTRIBUTE%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%222099%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%2C%22selectedDataSourceOption%22%3A%22brca_metabric_mrna%22%7D)
+
+[METABRIC study overview](https://www.cbioportal.org/study?id=brca_metabric)

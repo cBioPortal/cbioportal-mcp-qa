@@ -1,0 +1,99 @@
+Q (sonnet-5.5): Can you identify a mutations that are highly specific to a single cancer type?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH cohort AS (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name='pan_cancer_tcga'),
+sct AS (SELECT cd.sample_unique_id AS sample_unique_id, any(cd.attribute_value) AS cancer_type FROM clinical_data_derived cd WHERE cd.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort) AND cd.attribute_name='CANCER_TYPE' GROUP BY cd.sample_unique_id),
+v AS (SELECT DISTINCT g.hugo_gene_symbol AS gene, g.mutation_variant AS variant, g.sample_unique_id AS sid, sct.cancer_type AS ct
+ FROM genomic_event_derived g JOIN sct ON sct.sample_unique_id=g.sample_unique_id
+ WHERE g.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort) AND g.variant_type='mutation' AND g.mutation_status!='UNCALLED' AND g.off_panel=0 AND g.mutation_type IN ('Missense_Mutation','In_Frame_Del','In_Frame_Ins') AND g.mutation_variant!=''),
+pc AS (SELECT gene, variant, ct, count() AS n FROM v GROUP BY gene, variant, ct),
+tot AS (SELECT gene, variant, sum(n) AS total, argMax(ct,n) AS top_ct, max(n) AS top_n FROM pc GROUP BY gene, variant)
+SELECT gene, variant, total, top_ct, top_n, round(top_n*100/total,1) AS pct_in_top FROM tot WHERE total>=15 AND top_n*100/total>=90 ORDER BY total DESC LIMIT 25"
+}
+
+◀ result
+{"rows":[{"gene":"IDH1","variant":"R132H","total":388,"top_ct":"Glioma","top_n":358,"pct_in_top":92.3},{"gene":"GTF2I","variant":"L424H","total":61,"top_ct":"Thymic Epithelial Tumor","top_n":59,"pct_in_top":96.7},{"gene":"PTEN","variant":"R130G","total":43,"top_ct":"Endometrial Cancer","top_n":42,"pct_in_top":97.7},{"gene":"GNA11","variant":"Q209L","total":37,"top_ct":"Ocular Melanoma","top_n":34,"pct_in_top":91.9},{"gene":"BRAF","variant":"V600K","total":35,"top_ct":"Melanoma","top_n":35,"pct_in_top":100},{"gene":"PPP2R1A","variant":"P179R","total":32,"top_ct":"Endometrial Cancer","top_n":30,"pct_in_top":93.8},{"gene":"GNAQ","variant":"Q209P","total":30,"top_ct":"Ocular Melanoma","top_n":27,"pct_in_top":90},{"gene":"FGFR2","variant":"S252W","total":26,"top_ct":"Endometrial Cancer","top_n":25,"pct_in_top":96.2},{"gene":"EGFR","variant":"L858R","total":23,"top_ct":"Non-Small Cell Lung Cancer","top_n":23,"pct_in_top":100},{"gene":"DNMT3A","variant":"R882H","total":22,"top_ct":"Leukemia","top_n":21,"pct_in_top":95.5},{"gene":"IDH2","variant":"R140Q","total":18,"top_ct":"Leukemia","top_n":17,"pct_in_top":94.4},{"gene":"EGFR","variant":"E746_A750del","total":17,"top_ct":"Non-Small Cell Lung Cancer","top_n":17,"pct_in_top":100}]}
+
+═ answer (success)
+Yes. Several specific protein-level mutations are almost entirely confined to one cancer type. I searched the TCGA PanCancer Atlas cohort (32 studies, whole-exome sequencing, counted by sample). I kept missense and in-frame variants seen in at least 15 samples, with at least 90% of carriers in one cancer type.
+
+| Mutation | Samples with it | Dominant cancer type | Samples in that type | Share of carriers in that type |
+|---|---|---|---|---|
+| **BRAF V600K** | 35 | Melanoma | 35 | 100% |
+| **EGFR L858R** | 23 | Non-small cell lung cancer | 23 | 100% |
+| **EGFR E746_A750del** | 17 | Non-small cell lung cancer | 17 | 100% |
+| **PTEN R130G** | 43 | Endometrial cancer | 42 | 97.7% |
+| **GTF2I L424H** | 61 | Thymic epithelial tumor | 59 | 96.7% |
+| **FGFR2 S252W** | 26 | Endometrial cancer | 25 | 96.2% |
+| **DNMT3A R882H** | 22 | Leukemia | 21 | 95.5% |
+| **IDH2 R140Q** | 18 | Leukemia | 17 | 94.4% |
+| **PPP2R1A P179R** | 32 | Endometrial cancer | 30 | 93.8% |
+| **IDH1 R132H** | 388 | Glioma | 358 | 92.3% |
+| **GNA11 Q209L** | 37 | Ocular melanoma | 34 | 91.9% |
+| **GNAQ Q209P** | 30 | Ocular melanoma | 27 | 90.0% |
+
+**Caveats**
+- **Type labels are broad.** In this cohort, lung adenocarcinoma and lung squamous cell carcinoma are both labeled "Non-small cell lung cancer". The EGFR mutations are therefore specific to lung cancer, not necessarily to one histology.
+- **These are shares of carriers, not how often the mutation occurs within the cancer type.** They also don't say whether the mutation is a driver. This data has no driver annotation for TCGA.
+- **Specificity is limited to the cohort.** A variant that looks exclusive here might appear in other cancer types in larger cohorts, or in cancer types not represented in TCGA.
+- **Frequent BRAF V600E is not on the list.** It occurs in several cancer types, so it fails the 90% cutoff. BRAF V600K is exclusive to melanoma here.
+- **Several variants sit just under the cutoff.** For example, IDH1 R132H is in glioma at 92.3%, and the remaining carriers are in other cancer types.
+
+I can narrow this to one cancer type, use a stricter or looser cutoff, or repeat it in a larger cohort such as MSK-IMPACT. I can also open any of these variants in the cBioPortal Mutations tab if you want.

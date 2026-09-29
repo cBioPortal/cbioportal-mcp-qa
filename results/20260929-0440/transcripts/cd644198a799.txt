@@ -1,0 +1,269 @@
+Q (sonnet-5.5): How does the mutation landscape differ between primary and metastatic samples from the same patients in the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT countIf(n > 1) AS multi_sample_patients, countIf(has_p AND has_m) AS primary_and_met
+FROM (SELECT patient_unique_id, count() AS n, has(groupArray(attribute_value), 'Primary') AS has_p, has(groupArray(attribute_value), 'Metastasis') AS has_m
+FROM clinical_data_derived WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE' GROUP BY patient_unique_id)"
+}
+
+◀ result
+{"rows":[{"multi_sample_patients":90,"primary_and_met":26}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH st AS (SELECT sample_unique_id, attribute_value AS stype FROM clinical_data_derived WHERE cancer_study_identifier='msk_chord_2024' AND attribute_name='SAMPLE_TYPE' AND attribute_value IN ('Primary','Metastasis')),
+top AS (SELECT hugo_gene_symbol FROM top_mutated_genes_in_study(study='msk_chord_2024', top_n=15)),
+alt AS (SELECT g.hugo_gene_symbol AS gene, st.stype AS stype, uniqExact(g.sample_unique_id) AS altered
+  FROM genomic_event_derived g JOIN st USING sample_unique_id
+  WHERE g.cancer_study_identifier='msk_chord_2024' AND g.variant_type='mutation' AND g.mutation_status!='UNCALLED' AND g.off_panel=0 AND g.hugo_gene_symbol IN (SELECT hugo_gene_symbol FROM top)
+  GROUP BY gene, stype),
+prof AS (SELECT c.hugo_gene_symbol AS gene, st.stype AS stype, uniqExact(c.sample_unique_id) AS profiled
+  FROM mutation_panel_gene_coverage c JOIN st USING sample_unique_id
+  WHERE c.cancer_study_identifier='msk_chord_2024' AND c.hugo_gene_symbol IN (SELECT hugo_gene_symbol FROM top)
+  GROUP BY gene, stype)
+SELECT a.gene, a.stype, a.altered, p.profiled, round(a.altered*100/p.profiled,1) AS pct
+FROM alt a JOIN prof p ON a.gene=p.gene AND a.stype=p.stype ORDER BY a.gene, a.stype",
+ "max_rows": 100
+}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ]
+}
+
+◀ result
+{"rows":[{"gene":"APC","stype":"Metastasis","altered":1400,"profiled":8878,"pct":15.8},{"gene":"APC","stype":"Primary","altered":3345,"profiled":15928,"pct":21},{"gene":"ARID1A","stype":"Metastasis","altered":634,"profiled":8878,"pct":7.1},{"gene":"ARID1A","stype":"Primary","altered":1199,"profiled":15928,"pct":7.5},{"gene":"ATM","stype":"Metastasis","altered":483,"profiled":8878,"pct":5.4},{"gene":"ATM","stype":"Primary","altered":890,"profiled":15928,"pct":5.6},{"gene":"CDKN2A","stype":"Metastasis","altered":483,"profiled":8878,"pct":5.4},{"gene":"CDKN2A","stype":"Primary","altered":846,"profiled":15928,"pct":5.3},{"gene":"EGFR","stype":"Metastasis","altered":779,"profiled":8878,"pct":8.8},{"gene":"EGFR","stype":"Primary","altered":1338,"profiled":15928,"pct":8.4},{"gene":"FAT1","stype":"Metastasis","altered":421,"profiled":8878,"pct":4.7},{"gene":"FAT1","stype":"Primary","altered":818,"profiled":15928,"pct":5.1},{"gene":"KMT2C","stype":"Metastasis","altered":552,"profiled":8878,"pct":6.2},{"gene":"KMT2C","stype":"Primary","altered":1059,"profiled":15928,"pct":6.6},{"gene":"KMT2D","stype":"Metastasis","altered":569,"profiled":8878,"pct":6.4},{"gene":"KMT2D","stype":"Primary","altered":1203,"profiled":15928,"pct":7.6},{"gene":"KRAS","stype":"Metastasis","altered":2326,"profiled":8878,"pct":26.2},{"gene":"KRAS","stype":"Primary","altered":4751,"profiled":15928,"pct":29.8},{"gene":"NF1","stype":"Metastasis","altered":424,"profiled":8878,"pct":4.8},{"gene":"NF1","stype":"Primary","altered":778,"profiled":15928,"pct":4.9},{"gene":"PIK3CA","stype":"Metastasis","altered":1327,"profiled":8878,"pct":14.9},{"gene":"PIK3CA","stype":"Primary","altered":2351,"profiled":15928,"pct":14.8},{"gene":"SMAD4","stype":"Metastasis","altered":643,"profiled":8878,"pct":7.2},{"gene":"SMAD4","stype":"Primary","altered":1142,"profiled":15928,"pct":7.2},{"gene":"STK11","stype":"Metastasis","altered":428,"profiled":8878,"pct":4.8},{"gene":"STK11","stype":"Primary","altered":755,"profiled":15928,"pct":4.7},{"gene":"TP53","stype":"Metastasis","altered":4890,"profiled":8878,"pct":55.1},{"gene":"TP53","stype":"Primary","altered":8104,"profiled":15928,"pct":50.9},{"gene":"ZFHX3","stype":"Metastasis","altered":382,"profiled":8393,"pct":4.6},{"gene":"ZFHX3","stype":"Primary","altered":828,"profiled":15394,"pct":5.4}]}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","metadata":{"clinicalAttributeIds":["ADRENAL_GLANDS","BONE","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_GROUP","CLINICAL_SUMMARY","CNS_BRAIN","CURRENT_AGE_DEID","DIAGNOSIS_DESCRIPTION","ETHNICITY","FRACTION_GENOME_ALTERED","GENDER","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","GLEASON_SAMPLE_LEVEL","HER2","HISTORY_OF_PDL1","HR","ICD_O_HISTOLOGY_DESCRIPTION","INTRA_ABDOMINAL","LIVER","LUNG","LYMPH_NODES","METASTATIC_SITE","MSI_COMMENT","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","NUM_ICDO_DX","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER","PATHOLOGICAL_GROUP","PDL1_POSITIVE","PLEURA","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","REPRODUCTIVE_ORGANS","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["msk_chord_2024_cna","msk_chord_2024_mutations","msk_chord_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "msk_chord_2024",
+ "attributeIds": [
+  "SAMPLE_TYPE"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"msk_chord_2024","attributes":[{"attributeId":"SAMPLE_TYPE","displayName":"Sample Type","description":"The type assigned to a sample (i.e., normal, primary, met, recurrence). Source: MPath","datatype":"STRING","values":["Local Recurrence","Unknown","Primary","Metastasis"]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "groups": [
+  {
+   "name": "Primary",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SAMPLE_TYPE",
+      "values": [
+       {
+        "value": "Primary"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Metastasis",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SAMPLE_TYPE",
+      "values": [
+       {
+        "value": "Metastasis"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "alterations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/alterations?comparisonId=6ab49e90c2115c492d884a5c","url":"https://www.cbioportal.org/comparison/alterations?comparisonId=6ab49e90c2115c492d884a5c","data":{"description":"Group comparison (2 custom groups)","studies":["msk_chord_2024"],"totalGroups":2,"groups":[{"name":"Primary","sampleCount":15928},{"name":"Metastasis","sampleCount":8878}],"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","groupUrls":[{"groupName":"Primary","url":"https://www.cbioportal.org/study?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SAMPLE_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Primary%22%7D%5D%7D%5D%7D"},{"groupName":"Metastasis","url":"https://www.cbioportal.org/study?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SAMPLE_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Metastasis%22%7D%5D%7D%5D%7D"}],"pageDescription":"Comparison of genomic alteration rates across Primary (15928) vs Metastasis (8878)."}}
+
+═ answer (success)
+MSK-CHORD has almost no patients with both a primary and a metastatic sample, so a true same-patient comparison isn't possible. I ran an unpaired comparison of all primary and all metastatic samples instead.
+
+## Why a paired comparison isn't possible
+- The study has 24,950 patients and 25,040 samples. Only 90 patients have more than one sample, and those samples come from two different cancer types (second primaries).
+- Only **26 patients** have both a Primary and a Metastasis sample. That is too few for a meaningful paired analysis.
+
+## Unpaired comparison: all primary vs all metastatic samples
+The counts are samples, not patients. The denominator is samples profiled for each gene, since the MSK-IMPACT panel versions differ in coverage. The cohort mixes five cancer types (lung, colorectal, breast, prostate, pancreatic), so differences can partly reflect cancer-type composition and where each type is sampled.
+
+There are 15,928 primary and 8,878 metastatic samples. Genes are the 15 most frequently mutated in the study; ZFHX3 is profiled in 15,394 primary and 8,393 metastatic samples.
+
+| Gene | Primary | Metastasis |
+|---|---|---|
+| TP53 | 8,104 (50.9%) | 4,890 (55.1%) |
+| KRAS | 4,751 (29.8%) | 2,326 (26.2%) |
+| APC | 3,345 (21.0%) | 1,400 (15.8%) |
+| PIK3CA | 2,351 (14.8%) | 1,327 (14.9%) |
+| EGFR | 1,338 (8.4%) | 779 (8.8%) |
+| KMT2D | 1,203 (7.6%) | 569 (6.4%) |
+| ARID1A | 1,199 (7.5%) | 634 (7.1%) |
+| SMAD4 | 1,142 (7.2%) | 643 (7.2%) |
+| KMT2C | 1,059 (6.6%) | 552 (6.2%) |
+| ATM | 890 (5.6%) | 483 (5.4%) |
+| CDKN2A | 846 (5.3%) | 483 (5.4%) |
+| ZFHX3 | 828 (5.4%) | 382 (4.6%) |
+| FAT1 | 818 (5.1%) | 421 (4.7%) |
+| NF1 | 778 (4.9%) | 424 (4.8%) |
+| STK11 | 755 (4.7%) | 428 (4.8%) |
+
+## What the counts show
+- **Similar in both groups:** most frequently mutated genes, including PIK3CA, SMAD4, EGFR, CDKN2A, ATM, NF1 and STK11, are within about 1 percentage point of each other.
+- **Largest gaps:** TP53 is higher in metastases (55.1% vs 50.9%). APC (21.0% vs 15.8%) and KRAS (29.8% vs 26.2%) are higher in primaries.
+- **Significance:** I haven't tested any of these differences, so I can't say which are significant. The Group Comparison link below runs the appropriate tests (Fisher's exact with multiple-testing correction) across all genes.
+- **Composition confound:** the APC and KRAS differences may partly reflect colorectal cancer being sampled differently between primary and metastatic sites, rather than a change in the tumors.
+
+## Links
+- [Primary vs Metastasis alteration enrichment (MSK-CHORD)](https://www.cbioportal.org/comparison/alterations?comparisonId=6ab49e90c2115c492d884a5c) compares 15,928 primary and 8,878 metastatic samples across all genes.
+- [MSK-CHORD study overview](https://www.cbioportal.org/study?id=msk_chord_2024)
+
+A within-cancer-type comparison, such as primary vs metastasis for lung only, would remove the composition confound. I can run that if you'd like.

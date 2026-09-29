@@ -1,0 +1,147 @@
+Q (sonnet-5.5): In the TCGA PanCancer Atlas ovarian cancer study, what is the correlation between EGFR mRNA expression and EGFR protein (RPPA) levels?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ list_studies
+{
+ "search": "ovarian pan_can_atlas"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"hgsoc","sample_count":585,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=ov_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type FROM genetic_alteration_derived WHERE cancer_study_identifier='ov_tcga_pan_can_atlas_2018' AND hugo_gene_symbol='EGFR'"
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"log2CNA"},{"profile_type":"protein_quantification"},{"profile_type":"protein_quantification_zscores"},{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rppa"},{"profile_type":"rppa_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH a AS (SELECT sample_unique_id, toFloat64OrNull(alteration_value) v FROM genetic_alteration_derived WHERE cancer_study_identifier='ov_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna' AND hugo_gene_symbol='EGFR' AND toFloat64OrNull(alteration_value) IS NOT NULL),
+b AS (SELECT sample_unique_id, profile_type p, toFloat64OrNull(alteration_value) v FROM genetic_alteration_derived WHERE cancer_study_identifier='ov_tcga_pan_can_atlas_2018' AND profile_type IN ('rppa','protein_quantification') AND hugo_gene_symbol='EGFR' AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT b.p, rankCorr(a.v,b.v) spearman, corr(a.v,b.v) pearson, count() n FROM a INNER JOIN b USING (sample_unique_id) GROUP BY b.p"
+}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "ov_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"rows":[{"p":"rppa","spearman":0.45149383521936215,"pearson":0.5079751654575803,"n":236},{"p":"protein_quantification","spearman":0.6751129211403184,"pearson":0.6324871712537709,"n":74}]}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":585,"studyViewUrl":"https://www.cbioportal.org/study?id=ov_tcga_pan_can_atlas_2018","metadata":{"clinicalAttributeIds":["AGE","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","ANEUPLOIDY_SCORE","BUFFA_HYPOXIA_SCORE","CANCER_TYPE","CANCER_TYPE_ACRONYM","CANCER_TYPE_DETAILED","DAYS_LAST_FOLLOWUP","DAYS_TO_BIRTH","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DFS_MONTHS","DFS_STATUS","DSS_MONTHS","DSS_STATUS","ETHNICITY","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GENETIC_ANCESTRY_LABEL","GRADE","HISTORY_NEOADJUVANT_TRTYN","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","IN_PANCANPATHWAYS_FREEZE","MSI_SCORE_MANTIS","MSI_SENSOR_SCORE","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PATH_M_STAGE","PATH_N_STAGE","PATH_T_STAGE","PERSON_NEOPLASM_CANCER_STATUS","PFS_MONTHS","PFS_STATUS","PRIMARY_LYMPH_NODE_PRESENTATION_ASSESSMENT","PRIOR_DX","RACE","RADIATION_THERAPY","RAGNUM_HYPOXIA_SCORE","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SUBTYPE","TBL_SCORE","TISSUE_PROSPECTIVE_COLLECTION_INDICATOR","TISSUE_RETROSPECTIVE_COLLECTION_INDICATOR","TISSUE_SOURCE_SITE","TISSUE_SOURCE_SITE_CODE","TMB_NONSYNONYMOUS","TUMOR_TISSUE_SITE","TUMOR_TYPE","WEIGHT","WINTER_HYPOXIA_SCORE"],"molecularProfileIds":["ov_tcga_pan_can_atlas_2018_gistic","ov_tcga_pan_can_atlas_2018_log2CNA","ov_tcga_pan_can_atlas_2018_mutations","ov_tcga_pan_can_atlas_2018_protein_quantification","ov_tcga_pan_can_atlas_2018_protein_quantification_zscores","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ov_tcga_pan_can_atlas_2018_rppa","ov_tcga_pan_can_atlas_2018_rppa_Zscores","ov_tcga_pan_can_atlas_2018_structural_variants"],"genericAssayProfiles":["ov_tcga_pan_can_atlas_2018_armlevel_cna","ov_tcga_pan_can_atlas_2018_genetic_ancestry","ov_tcga_pan_can_atlas_2018_methylation_hm27_hm450_merge","ov_tcga_pan_can_atlas_2018_methylation_hm450","ov_tcga_pan_can_atlas_2018_phosphoprotein_quantification"],"heatmapProfileIds":["ov_tcga_pan_can_atlas_2018_protein_quantification_zscores","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_Zscores","ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna_median_all_sample_Zscores","ov_tcga_pan_can_atlas_2018_rppa_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna","protein","generic_assay_armlevel_cna","generic_assay_genetic_ancestry","generic_assay_methylation","generic_assay_phosphosite_quantification"]}}]}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "ov_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "EGFR"
+ ],
+ "tab": "plots",
+ "plotsHorzSelection": {
+  "dataType": "MRNA_EXPRESSION",
+  "selectedGeneOption": "EGFR",
+  "selectedDataSourceOption": "ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna"
+ },
+ "plotsVertSelection": {
+  "dataType": "PROTEIN_LEVEL",
+  "selectedGeneOption": "EGFR",
+  "selectedDataSourceOption": "ov_tcga_pan_can_atlas_2018_rppa"
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=ov_tcga_pan_can_atlas_2018_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%2C%22selectedDataSourceOption%22%3A%22ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22PROTEIN_LEVEL%22%2C%22selectedDataSourceOption%22%3A%22ov_tcga_pan_can_atlas_2018_rppa%22%7D","url":"https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=ov_tcga_pan_can_atlas_2018_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%2C%22selectedDataSourceOption%22%3A%22ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22PROTEIN_LEVEL%22%2C%22selectedDataSourceOption%22%3A%22ov_tcga_pan_can_atlas_2018_rppa%22%7D","data":{"studyIds":["ov_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":585}],"genes":["EGFR"],"caseSetId":"ov_tcga_pan_can_atlas_2018_all","pageDescription":"Scatter/box plots: EGFR protein expression (y-axis) by EGFR mRNA expression (x-axis)."}}
+
+═ answer (success)
+In the TCGA PanCancer Atlas ovarian study (Ovarian Serous Cystadenocarcinoma, 585 samples), EGFR mRNA and EGFR RPPA protein show a moderate positive correlation.
+
+| Comparison | Spearman | Pearson | Samples with both measures |
+|---|---|---|---|
+| mRNA (RSEM) vs RPPA protein | **0.45** | 0.51 | 236 |
+
+- I used the non-Z-score RSEM mRNA values. The Spearman coefficient is rank-based, so it is the more robust of the two numbers.
+- The coefficients are descriptive only. I did not compute p-values, so I can't say whether they are statistically significant.
+- The study also has a mass-spectrometry protein profile (`protein_quantification`). For EGFR it gives a stronger correlation with mRNA: Spearman 0.68, Pearson 0.63. That comes from only 74 samples, so it is less reliable.
+
+[View the EGFR mRNA vs. protein scatter plot in cBioPortal](https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=ov_tcga_pan_can_atlas_2018_all&plots_horz_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22MRNA_EXPRESSION%22%2C%22selectedDataSourceOption%22%3A%22ov_tcga_pan_can_atlas_2018_rna_seq_v2_mrna%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22PROTEIN_LEVEL%22%2C%22selectedDataSourceOption%22%3A%22ov_tcga_pan_can_atlas_2018_rppa%22%7D)
+
+The plot shows EGFR protein (y-axis) against EGFR mRNA (x-axis), and the portal reports its own correlation statistics there.

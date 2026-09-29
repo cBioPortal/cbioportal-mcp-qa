@@ -1,0 +1,225 @@
+Q (sonnet-5.5): is there a relatinoship between mgmt methylation and idh1 mutation in glioma?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ list_studies
+{
+ "search": "glioma"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"glioma_mskcc_2019","name":"Glioma (MSK, Clin Cancer Res 2019)","type_of_cancer_id":"difg","sample_count":1004,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=glioma_mskcc_2019"},{"cancer_study_identifier":"difg_glass","name":"Diffuse Glioma (GLASS Consortium)","type_of_cancer_id":"difg","sample_count":693,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=difg_glass"},{"cancer_study_identifier":"difg_tcga_gdc","name":"Diffuse Glioma (TCGA GDC, 2025)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=difg_tcga_gdc"},{"cancer_study_identifier":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"difg_glass_2019","name":"Diffuse Glioma (GLASS Consortium, Nature 2019)","type_of_cancer_id":"difg","sample_count":444,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=difg_glass_2019"},{"cancer_study_identifier":"brain_cptac_2020","name":"Pediatric Brain Cancer (CPTAC/CHOP, Cell 2020)","type_of_cancer_id":"brain","sample_count":218,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brain_cptac_2020"},{"cancer_study_identifier":"pcpg_tcga","name":"Pheochromocytoma and Paraganglioma (TCGA, Firehose Legacy)","type_of_cancer_id":"mnet","sample_count":184,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pcpg_tcga"},{"cancer_study_identifier":"pcpg_tcga_pan_can_atlas_2018","name":"Pheochromocytoma and Paraganglioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"soft_tissue","sample_count":178,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pcpg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"pcpg_tcga_pub","name":"Pheochromocytoma and Paraganglioma (TCGA, Cell 2017)","type_of_cancer_id":"soft_tissue","sample_count":178,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pcpg_tcga_pub"},{"cancer_study_identifier":"hnsc_a5consortium_2025","name":"Hereditary SDHB-Mutant Pheochromocytomas and Paragangliomas (A5 Consortium, Nature Comm 2025)","type_of_cancer_id":"hnsc","sample_count":94,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=hnsc_a5consortium_2025"},{"cancer_study_identifier":"glioma_msk_2018","name":"Glioma (MSK, Nature 2019)","type_of_cancer_id":"difg","sample_count":91,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=glioma_msk_2018"},{"cancer_study_identifier":"difg_msk_2023","name":"IDH-mutated Diffuse Glioma (MSK, Clin Cancer Res 2024)","type_of_cance … (855 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, count(DISTINCT sample_unique_id) n FROM genetic_alteration_derived WHERE hugo_gene_symbol='MGMT' AND (profile_type LIKE '%methyl%') GROUP BY 1,2 ORDER BY 1"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, attribute_name, count() n FROM clinical_data_derived WHERE upper(attribute_name) LIKE '%MGMT%' GROUP BY 1,2 ORDER BY 1"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"acc_tcga","profile_type":"methylation_hm450","n":80},{"cancer_study_identifier":"all_phase2_target_2018_pub","profile_type":"methylation_hm27","n":149},{"cancer_study_identifier":"aml_target_2018_pub","profile_type":"methylation_hm27","n":184},{"cancer_study_identifier":"blca_mskcc_solit_2012","profile_type":"methylation_hm27","n":24},{"cancer_study_identifier":"blca_tcga","profile_type":"methylation_hm450","n":413},{"cancer_study_identifier":"blca_tcga_pub","profile_type":"methylation_hm450","n":131},{"cancer_study_identifier":"blca_tcga_pub_2017","profile_type":"methylation_hm450","n":413},{"cancer_study_identifier":"brca_metabric","profile_type":"methylation_promoters_rrbs","n":1417},{"cancer_study_identifier":"brca_tcga","profile_type":"methylation_hm450","n":788},{"cancer_study_identifier":"brca_tcga_pub","profile_type":"methylation_hm27","n":311},{"cancer_study_identifier":"brca_tcga_pub2015","profile_type":"methylation_hm450","n":553},{"cancer_study_identifier":"cesc_tcga","profile_type":"methylation_hm450","n":309},{"cancer_study_identifier":"chol_tcga","profile_type":"methylation_hm450","n":36},{"cancer_study_identifier":"coadread_tcga","profile_type":"methylation_hm450","n":396},{"cancer_study_identifier":"coadread_tcga_pub","profile_type":"methylation_hm27","n":236},{"cancer_study_identifier":"dlbc_tcga","profile_type":"methylation_hm450","n":48},{"cancer_study_identifier":"esca_tcga","profile_type":"methylation_hm450","n":186},{"cancer_study_identifier":"gbm_cptac_2021","profile_type":"methylation_epic","n":94},{"cancer_study_identifier":"gbm_mayo_pdx_sarkaria_2019","profile_type":"methylation_hm450","n":73},{"cancer_study_identifier":"gbm_tcga","profile_type":"methylation_hm450","n":153},{"cancer_study_identifier":"gbm_tcga","profile_type":"methylation_hm27","n":285},{"cancer_study_identifier":"gbm_tcga_pub","profile_type":"methylation_hm27","n":58},{"cancer_study_identifier":"hnsc_tcga","profile_type":"methylation_hm450","n":530},{"cancer_study_identifier":"hnsc_tcga_pub","profile_type":"methylation_hm450","n":279},{"cancer_study_identifier":"kich_tcga","profile_type":"methylation_hm450","n":66},{"cancer_study_identifier":"kich_tcga_pub","profile_type":"methylation_hm450","n":66},{"cancer_study_identifier":"kirc_tcga","profile_type":"methylation_hm27","n":219},{"cancer_study_identifier":"kirc_tcga","profile_type":"methylation_hm450","n":320},{"cancer_study_identifier":"kirp_tcga","profile_type":"methylation_hm450","n":276},{"cancer_study_identifier":"kirp_tcga","profile_type":"methylation_hm27","n":16},{"cancer_study_identifier":"laml_tcga","profile_type":"methylation_hm27","n":194},{"cancer_study_identifier":"laml_tcga","profile_type":"methylation_hm450","n":194},{"cancer_study_identifier":"laml_tcga_pub","profile_type":"methylation_hm27","n":194},{"cancer_study_identifier":"laml_tcga_pub","profile_type":"methylation_hm450","n":194},{"cancer_study_identifier":"lgg_tcga","profile_type":"methylati … (2714 more chars)
+
+◀ result
+{"rows":[{"cancer_study_identifier":"difg_glass","attribute_name":"MGMT_METHYLATION_METHOD","n":693},{"cancer_study_identifier":"difg_glass","attribute_name":"MGMT_METHYLATION","n":693},{"cancer_study_identifier":"difg_glass_2019","attribute_name":"MGMT_METHYLATION","n":444},{"cancer_study_identifier":"difg_glass_2019","attribute_name":"MGMT_METHYLATION_METHOD","n":444},{"cancer_study_identifier":"difg_msk_2023","attribute_name":"MGMT_STATUS","n":73},{"cancer_study_identifier":"gbm_tcga_pub2013","attribute_name":"MGMT_STATUS","n":577},{"cancer_study_identifier":"glioma_mskcc_2019","attribute_name":"MGMT_STATUS","n":924},{"cancer_study_identifier":"lgg_ucsf_2014","attribute_name":"MGMT_STATUS","n":61},{"cancer_study_identifier":"lgggbm_tcga_pub","attribute_name":"MGMT_PROMOTER_STATUS","n":1122},{"cancer_study_identifier":"lung_msk_mind_2020","attribute_name":"MGMT_STATUS","n":247},{"cancer_study_identifier":"msk_access_2021","attribute_name":"MGMT_STATUS","n":1446}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH m AS (SELECT sample_unique_id, cancer_study_identifier st, attribute_value v FROM clinical_data_derived WHERE (cancer_study_identifier='lgggbm_tcga_pub' AND attribute_name='MGMT_PROMOTER_STATUS') OR (cancer_study_identifier='glioma_mskcc_2019' AND attribute_name='MGMT_STATUS')),
+i AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE cancer_study_identifier IN ('lgggbm_tcga_pub','glioma_mskcc_2019') AND hugo_gene_symbol='IDH1' AND variant_type='mutation' AND upper(mutation_status)!='GERMLINE'),
+p AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE cancer_study_identifier IN ('lgggbm_tcga_pub','glioma_mskcc_2019') AND off_panel=FALSE)
+SELECT st, v, sample_unique_id IN (SELECT sample_unique_id FROM i) AS idh1_mut, count() n FROM m WHERE sample_unique_id IN (SELECT sample_unique_id FROM p) GROUP BY st,v,idh1_mut ORDER BY st,v,idh1_mut"
+}
+
+◀ result
+{"rows":[{"st":"lgggbm_tcga_pub","idh1_mut":0,"n":173},{"st":"lgggbm_tcga_pub","idh1_mut":1,"n":1},{"st":"lgggbm_tcga_pub","v":"Methylated","idh1_mut":0,"n":229},{"st":"lgggbm_tcga_pub","v":"Methylated","idh1_mut":1,"n":379},{"st":"lgggbm_tcga_pub","v":"Unmethylated","idh1_mut":0,"n":281},{"st":"lgggbm_tcga_pub","v":"Unmethylated","idh1_mut":1,"n":31}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lgggbm_tcga_pub"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"lgggbm_tcga_pub","name":"Merged Cohort of LGG and GBM (TCGA, Cell 2016)","sampleCount":1122,"studyViewUrl":"https://www.cbioportal.org/study?id=lgggbm_tcga_pub","metadata":{"clinicalAttributeIds":["ABSOLUTE_EXTRACT_PLOIDY","AGE","ATRX_STATUS","BCR_STATUS","BRAF_KIAA1549_FUSION","BRAF_V600E_STATUS","CANCER_TYPE","CANCER_TYPE_DETAILED","CHR_19_20_CO_GAIN","CHR_7_GAIN_CHR_10_LOSS","DAXX_STATUS","ESTIMATE_COMBINED_SCORE","ESTIMATE_IMMUNE_SCORE","ESTIMATE_STROMAL_SCORE","GRADE","HISTOLOGICAL_DIAGNOSIS","HM27","HM450","IDH_1P19Q_SUBTYPE","IDH_CODEL_SUBTYPE","IDH_SPECIFIC_DNA_METHYLATION_CLUSTER","IDH_SPECIFIC_RNA_EXPRESSION_CLUSTER","IDH_STATUS","KARNOFSKY_PERFORMANCE_SCORE","MGMT_PROMOTER_STATUS","MUTATION_COUNT","ONCOTREE_CODE","ORIGINAL_SUBTYPE","OS_MONTHS","OS_STATUS","PAN_GLIOMA_DNA_METHYLATION_CLUSTER","PAN_GLIOMA_RNA_EXPRESSION_CLUSTER","PERCENT_ANEUPLOIDY","PURITY_ABSOLUTE","RANDOM_FOREST_STURM_CLUSTER","RNASEQ_DATA","RPPA","RPPA_CLUSTER","SAMPLE_COUNT","SEX","SNP6","SOMATIC_STATUS","STUDY","SUPERVISED_DNA_METHYLATION_CLUSTER","TELOMERE_LENGTH_ESTIMATE_IN_BLOOD_NORMAL_KB","TELOMERE_LENGTH_ESTIMATE_IN_TUMOR_KB","TELOMERE_MAINTENANCE","TERT_EXPRESSION_LOG2","TERT_EXPRESSION_STATUS","TERT_PROMOTER_STATUS","TISSUE_SOURCE_SITE","TMB_NONSYNONYMOUS","TRANSCRIPTOME_SUBTYPE","U133A","WHOLE_EXOME_SEQUENCING","WHOLE_GENOME_SEQUENCING"],"molecularProfileIds":["lgggbm_tcga_pub_gistic","lgggbm_tcga_pub_log2CNA","lgggbm_tcga_pub_mutations"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "lgggbm_tcga_pub",
+ "attributeIds": [
+  "MGMT_PROMOTER_STATUS"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"lgggbm_tcga_pub","attributes":[{"attributeId":"MGMT_PROMOTER_STATUS","displayName":"MGMT promoter status","description":"MGMT promoter status","datatype":"STRING","values":["Methylated","NA","Unmethylated"]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgggbm_tcga_pub"
+ ],
+ "groups": [
+  {
+   "name": "MGMT methylated",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "MGMT_PROMOTER_STATUS",
+      "values": [
+       {
+        "value": "Methylated"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "MGMT unmethylated",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "MGMT_PROMOTER_STATUS",
+      "values": [
+       {
+        "value": "Unmethylated"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "mutations",
+ "selectedGene": "IDH1"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/mutations?comparisonId=6abb42cfe497aad53593ca54&selectedGene=IDH1","url":"https://www.cbioportal.org/comparison/mutations?comparisonId=6abb42cfe497aad53593ca54&selectedGene=IDH1","data":{"description":"Group comparison (2 custom groups)","studies":["lgggbm_tcga_pub"],"totalGroups":2,"groups":[{"name":"MGMT methylated","sampleCount":613},{"name":"MGMT unmethylated","sampleCount":319}],"studyViewUrl":"https://www.cbioportal.org/study?id=lgggbm_tcga_pub","groupUrls":[{"groupName":"MGMT methylated","url":"https://www.cbioportal.org/study?id=lgggbm_tcga_pub#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22MGMT_PROMOTER_STATUS%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Methylated%22%7D%5D%7D%5D%7D"},{"groupName":"MGMT unmethylated","url":"https://www.cbioportal.org/study?id=lgggbm_tcga_pub#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22MGMT_PROMOTER_STATUS%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Unmethylated%22%7D%5D%7D%5D%7D"}],"pageDescription":"Mutation frequency (protein change) compared across MGMT methylated (613) vs MGMT unmethylated (319)."}}
+
+═ answer (success)
+In the TCGA merged glioma cohort, IDH1 mutation is much more common in MGMT-methylated tumors than in unmethylated ones. I haven't run a significance test.
+
+**Cohort:** Merged Cohort of LGG and GBM (TCGA, Cell 2016), `lgggbm_tcga_pub`. I counted samples with both an MGMT promoter methylation call and mutation profiling.
+
+| MGMT promoter status | IDH1-mutant | IDH1 wild-type | Total | % IDH1-mutant |
+|---|---|---|---|---|
+| Methylated | 379 | 229 | 608 | 62.3% |
+| Unmethylated | 31 | 281 | 312 | 9.9% |
+
+- 174 samples had no MGMT call and are excluded. One of them was IDH1-mutant.
+- The test for this 2×2 table is Fisher's exact (two-tailed). I can't compute it here. You can run it in the comparison link below, or in R with `fisher.test(matrix(c(379,229,31,281), nrow=2, byrow=TRUE))`.
+- Both groups mix lower-grade glioma and GBM. That mix could drive part of the pattern, so you may want to stratify by grade or by IDH/1p19q subtype.
+- The MGMT call is a promoter methylation category from the study, not a per-probe beta value.
+- Other glioma studies have MGMT status too, for example MSK glioma (`glioma_mskcc_2019`) and GLASS (`difg_glass`). I didn't include them because my sample matching returned no rows for MSK, and I didn't look at GLASS.
+
+[Compare IDH1 mutations: MGMT methylated vs unmethylated (Group Comparison)](https://www.cbioportal.org/comparison/mutations?comparisonId=6abb42cfe497aad53593ca54&selectedGene=IDH1)
+
+Group sizes in the link are 613 methylated and 319 unmethylated. They are slightly larger than my counts because the link counts all samples with an MGMT call, including some without mutation profiling.
+
+[Open the study in Study View](https://www.cbioportal.org/study?id=lgggbm_tcga_pub)

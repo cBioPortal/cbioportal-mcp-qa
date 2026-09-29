@@ -1,0 +1,242 @@
+Q (sonnet-5.5): What is the correlation between tumor mutational burden and microsatellite instability status in colorectal cancer patients from the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH crc AS (SELECT DISTINCT sample_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='msk_chord_2024' AND attribute_name='CANCER_TYPE' AND attribute_value='Colorectal Cancer'),
+d AS (SELECT sample_unique_id,
+ anyIf(attribute_value, attribute_name='MSI_TYPE') AS msi,
+ anyIf(toFloat64OrNull(attribute_value), attribute_name='TMB_NONSYNONYMOUS') AS tmb,
+ anyIf(toFloat64OrNull(attribute_value), attribute_name='MSI_SCORE') AS msi_score
+ FROM clinical_data_derived WHERE cancer_study_identifier='msk_chord_2024' AND attribute_name IN ('MSI_TYPE','TMB_NONSYNONYMOUS','MSI_SCORE') AND sample_unique_id IN (SELECT sample_unique_id FROM crc) GROUP BY sample_unique_id)
+SELECT msi, count() AS samples, countIf(tmb IS NOT NULL) AS n_tmb, round(avg(tmb),2) AS mean_tmb, round(quantile(0.5)(tmb),2) AS median_tmb, round(min(tmb),2) AS min_tmb, round(max(tmb),2) AS max_tmb, countIf(msi_score IS NOT NULL) AS n_score, round(avg(msi_score),2) AS mean_msi_score, round(corr(tmb, msi_score),3) AS pearson_tmb_score
+FROM d GROUP BY msi ORDER BY samples DESC"
+}
+
+◀ result
+{"rows":[{"msi":"Stable","samples":4682,"n_tmb":4682,"mean_tmb":7.58,"median_tmb":5.87,"min_tmb":0,"max_tmb":570.96,"n_score":4682,"mean_msi_score":0.62,"pearson_tmb_score":0.019},{"msi":"Instable","samples":586,"n_tmb":586,"mean_tmb":64.63,"median_tmb":56.68,"min_tmb":0,"max_tmb":490.57,"n_score":586,"mean_msi_score":29.33,"pearson_tmb_score":0.226},{"msi":"Indeterminate","samples":188,"n_tmb":188,"mean_tmb":18.57,"median_tmb":6.56,"min_tmb":1.64,"max_tmb":343.53,"n_score":188,"mean_msi_score":4.69,"pearson_tmb_score":0.331},{"msi":"Do not report","samples":49,"n_tmb":49,"mean_tmb":7.06,"median_tmb":3.33,"min_tmb":0,"max_tmb":74.31,"n_score":49,"mean_msi_score":0.98,"pearson_tmb_score":-0.009},{"samples":38,"n_tmb":38,"mean_tmb":8.06,"median_tmb":3.69,"min_tmb":0,"max_tmb":95.12,"n_score":0}]}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "filterAttributeId": "CANCER_TYPE",
+ "filterValues": "Colorectal Cancer",
+ "tab": "plots"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/plots?id=msk_chord_2024&filterAttributeId=CANCER_TYPE&filterValues=Colorectal+Cancer","url":"https://www.cbioportal.org/study/plots?id=msk_chord_2024&filterAttributeId=CANCER_TYPE&filterValues=Colorectal+Cancer","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"tab":"plots","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Scatter/box plots comparing any two data elements."}}
+
+═ answer (success)
+In MSK-CHORD colorectal cancer samples, MSI-Instable tumors have a much higher TMB than MSI-Stable tumors. I did not compute a single overall correlation coefficient or p-value. The database can't run those tests, so what I have is TMB summarized by MSI group.
+
+**TMB (`TMB_NONSYNONYMOUS`, mutations/Mb) by MSI class**
+
+The unit is samples, and all Colorectal Cancer samples in the study are included.
+
+| MSI_TYPE | Samples | Mean TMB | Median TMB | Range |
+|---|---|---|---|---|
+| Stable | 4,682 | 7.58 | 5.87 | 0 – 571 |
+| Instable | 586 | 64.63 | 56.68 | 0 – 491 |
+| Indeterminate | 188 | 18.57 | 6.56 | 1.6 – 344 |
+| Do not report | 49 | 7.06 | 3.33 | 0 – 74 |
+| No MSI_TYPE recorded | 38 | 8.06 | 3.69 | 0 – 95 |
+
+- **Group difference:** The median TMB is about 10 times higher in MSI-Instable samples than in MSI-Stable samples (56.7 vs 5.9 mut/Mb). Means show the same gap (64.6 vs 7.6).
+- **Mean above median:** In the Stable group the mean is above the median because a few hypermutated samples pull it up.
+- **Mean MSI score:** The mean `MSI_SCORE` is 29.3 in Instable and 0.62 in Stable samples.
+- **Within-group correlation:** The Pearson correlation between TMB and MSI score is weak in both groups. It is 0.02 in Stable samples and 0.23 in Instable samples. So the association comes mostly from the MSI class itself, and TMB tracks the continuous MSI score only loosely.
+- **Overlap:** Some Instable samples have a low TMB (minimum 0) and some Stable samples have a very high TMB (maximum 571).
+
+**Test to run for a formal answer:** For TMB across MSI groups, use a Wilcoxon rank-sum test (Mann-Whitney U) for two groups, or Kruskal-Wallis for three or more. For a rank correlation with the continuous score, use Spearman. Run these in cBioPortal Group Comparison, in R (`wilcox.test`, `cor.test(method="spearman")`) or in Python (`scipy.stats.mannwhitneyu`, `spearmanr`).
+
+**Caveats:**
+- MSK-IMPACT panel versions differ in size, which affects TMB estimates.
+- TMB is not adjusted for the small number of patients with more than one sample.
+
+[Open the colorectal cohort in MSK-CHORD (Plots tab)](https://www.cbioportal.org/study/plots?id=msk_chord_2024&filterAttributeId=CANCER_TYPE&filterValues=Colorectal+Cancer)
+On this page you can set the axes to `MSI_TYPE` or `MSI_SCORE` against `TMB_NONSYNONYMOUS`. Plots for these attributes are only available if the page offers them for this study.
