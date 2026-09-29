@@ -534,6 +534,12 @@ def write_index() -> Path:
             set(QUESTION_SETS) | set(sets), key=lambda f: (order.index(f) if f in order else len(order), f)
         )
     ]
+    # Other published checks (e.g. a database latency check) aren't benchmark runs: each folder has a check.json
+    # with its title, date and summary, and the index lists them in their own table.
+    checks = [
+        json.loads(path.read_text()) | {"dir": path.parent.name} for path in RESULTS_DIR.glob("*/check.json")
+    ]
+    checks.sort(key=lambda c: (c.get("date") or "", c["dir"]), reverse=True)
     env = _env()
     for name in ("test_sets", "index"):
         write_rendered(
@@ -541,6 +547,7 @@ def write_index() -> Path:
             env.get_template(f"{name}.html.j2").render,
             question_sets=question_sets,
             track_labels=TRACK_LABELS,
+            checks=checks,
         )
     out = RESULTS_DIR / "index.html"
     return out

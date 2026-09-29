@@ -1,0 +1,1742 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live ClickHouse latency check — 2026-09-29</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  --m-haiku: #2a78d6; --m-sonnet: #eb6834; --m-sonnet-4-6: #1baf7a; --m-sonnet-5-5: #c2418a; --m-router: #b07d00; --m-unified: #6b6a65;
+  --o-pass: #0ca30c; --o-fail: #d03b3b; --o-declined: #898781; --o-ungraded: #c3c2b7; --o-error: #52514e;
+  --bad-ink: #b42828; --good-ink: #006300;
+  --changed: #6d4bc4;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --m-haiku: #3987e5; --m-sonnet: #d95926; --m-sonnet-4-6: #199e70; --m-sonnet-5-5: #e06aa9; --m-router: #d9a21b; --m-unified: #a3a29b;
+    --o-ungraded: #52514e; --o-error: #c3c2b7; --bad-ink: #e66767; --good-ink: #0ca30c;
+    --changed: #a98bf2;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --m-haiku: #3987e5; --m-sonnet: #d95926; --m-sonnet-4-6: #199e70; --m-sonnet-5-5: #e06aa9; --m-router: #d9a21b; --m-unified: #a3a29b;
+  --o-ungraded: #52514e; --o-error: #c3c2b7; --bad-ink: #e66767; --good-ink: #0ca30c;
+    --changed: #a98bf2;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding-block: 32px 64px; padding-inline: 16px; background: var(--page); color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1180px; margin: 0 auto; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 40px 0 12px; }
+a { color: var(--m-haiku); }
+.meta { color: var(--ink-2); margin: 0; }
+.meta code { font-size: 12px; }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 16px; }
+.note { color: var(--ink-2); font-size: 13px; margin: 8px 0 0; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: 0; }
+.m-haiku { --m: var(--m-haiku); } .m-sonnet { --m: var(--m-sonnet); } .m-sonnet-4-6 { --m: var(--m-sonnet-4-6); } .m-sonnet-5-5 { --m: var(--m-sonnet-5-5); }
+.m-router { --m: var(--m-router); } .m-unified { --m: var(--m-unified); }
+.swatch.model { background: var(--m); }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.tile h3 { font-size: 13px; font-weight: 600; margin: 0 0 12px; color: var(--ink-2); }
+.tile .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 4px 0; }
+.tile .value { font-size: 22px; font-weight: 600; }
+.tile .sub { color: var(--muted); font-size: 12px; }
+
+.stack { display: flex; height: 22px; gap: 2px; margin: 6px 0; }
+.stack span { display: block; height: 100%; min-width: 2px; }
+.stack span:first-child { border-radius: 4px 0 0 4px; } .stack span:last-child { border-radius: 0 4px 4px 0; }
+.stack span:only-child { border-radius: 4px; }
+.o-pass { background: var(--o-pass); } .o-fail { background: var(--o-fail); } .o-declined { background: var(--o-declined); }
+.o-ungraded { background: var(--o-ungraded); } .o-error { background: var(--o-error); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--ink-2); font-size: 13px; }
+.legend b { color: var(--ink); font-weight: 600; }
+.verdict-row { margin-bottom: 16px; }
+.verdict-row .name { font-weight: 600; }
+
+.bars { display: grid; grid-template-columns: minmax(140px, 260px) 1fr; gap: 10px 16px; align-items: center; }
+.bars .label { font-size: 13px; }
+.bars .label .sub { color: var(--muted); font-size: 12px; }
+.bar-pair { display: grid; gap: 3px; }
+.bar { display: flex; align-items: center; gap: 8px; height: 14px; }
+.bar i { display: block; height: 100%; background: var(--m); border-radius: 0 4px 4px 0; min-width: 2px; }
+.bar em { font-style: normal; font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.bar.none em { color: var(--muted); }
+
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--ink-2); font-weight: 600; font-size: 12px; }
+td.bad { color: var(--bad-ink); font-weight: 600; }
+td.good { color: var(--good-ink); font-weight: 600; }
+td.text { text-align: left; white-space: normal; min-width: 280px; }
+.card.warn { border-color: var(--bad-ink); margin-top: 12px; } .card.warn p { margin: 4px 0; color: var(--bad-ink); }
+.mismatch { color: var(--bad-ink); font-weight: 600; }
+
+.filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+.filters input[type=search] { font: inherit; padding: 6px 10px; border: 1px solid var(--axis); border-radius: 6px;
+  background: var(--surface); color: var(--ink); min-width: 240px; }
+details.q { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; margin-bottom: 8px; }
+details.q > summary { list-style: none; cursor: pointer; padding: 10px 14px; display: grid;
+  grid-template-columns: 44px 1fr auto; gap: 12px; align-items: center; }
+details.q > summary::-webkit-details-marker { display: none; }
+.qid { color: var(--muted); font-variant-numeric: tabular-nums; }
+.qtext .type { display: block; color: var(--muted); font-size: 12px; }
+.badges { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--ring); font-size: 12px; white-space: nowrap; }
+.badge .dot { width: 8px; height: 8px; border-radius: 2px; background: var(--m); }
+.badge .icon { font-weight: 700; }
+.badge.o-pass, .badge.o-fail, .badge.o-declined, .badge.o-ungraded, .badge.o-error { background: none; }
+.badge.o-pass .icon { color: var(--good-ink); } .badge.o-fail .icon, .badge.o-error .icon { color: var(--bad-ink); }
+.track { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 4px; border: 1px solid var(--ring); color: var(--ink-2); margin-right: 6px; }
+.filters select { font: inherit; padding: 5px 8px; border: 1px solid var(--axis); border-radius: 6px; background: var(--surface); color: var(--ink); }
+.qbody { padding: 0 14px 14px; }
+.ref { color: var(--ink-2); font-size: 13px; margin-bottom: 12px; }
+.ref dt { font-weight: 600; color: var(--ink); margin-top: 6px; }
+.ref dd { margin: 0; white-space: pre-wrap; }
+.ref dd.history .turn { margin-bottom: 6px; }
+.ref dd.history .turn.assistant { color: var(--ink-2); }
+.answers { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+.answer { border: 1px solid var(--ring); border-radius: 8px; padding: 10px 12px; border-top: 3px solid var(--m); }
+.answer h4 { margin: 0 0 6px; font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+.answer .stats { color: var(--muted); font-size: 12px; font-weight: 400; }
+.answer pre { white-space: pre-wrap; word-break: break-word; font: 13px/1.5 system-ui, sans-serif; margin: 0;
+  max-height: 420px; overflow: auto; }
+.answer .judge { font-size: 13px; color: var(--ink-2); border-top: 1px solid var(--grid); margin-top: 8px; padding-top: 8px; }
+.answer .err { color: var(--bad-ink); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.shots { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.shots img { width: 280px; max-width: 100%; border: 1px solid var(--ring); border-radius: 6px; display: block; }
+.hidden { display: none !important; }
+</style>
+
+<style>
+.tile .value { font-size: 20px; }
+.prose { max-width: 860px; }
+.prose p, .prose li { color: var(--ink); }
+.prose ul { padding-left: 20px; margin: 8px 0; }
+.pill { display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 4px; border: 1px solid var(--ring); color: var(--ink-2); margin-right: 6px; }
+.card.caveat { border-color: var(--changed); margin: 16px 0 0; }
+.card.caveat p { margin: 4px 0; }
+pre.sql { background: var(--page); border: 1px solid var(--grid); border-radius: 6px; padding: 8px 10px; margin: 6px 0;
+  font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; }
+details.sqlq summary { cursor: pointer; font-size: 13px; }
+td code, th code { font-size: 12px; }
+h3 { font-size: 15px; margin: 24px 0 8px; }
+</style>
+</head>
+<body>
+<main>
+<p class="meta"><a href="../index.html">← All runs and checks</a></p>
+
+<h1>Live ClickHouse latency check — 2026-09-29</h1>
+<p class="meta"><span class="pill">DB latency check</span>Not a benchmark run: no questions were asked and nothing was graded. Direct, read-only timings of the SQL behind three open cbioportal-mcp PRs, on the current public database.</p>
+<div class="card caveat">
+<p><strong>None of these PRs is merged or deployed.</strong> <a href="https://github.com/cBioPortal/cbioportal-mcp/pull/151">#151</a>, <a href="https://github.com/cBioPortal/cbioportal-mcp/pull/154">#154</a> and <a href="https://github.com/cBioPortal/cbioportal-mcp/pull/160">#160</a> are open. All numbers come from the current public ClickHouse database (<code>cbioportal_public_librechat_blue</code>), with each PR's SQL run inline, next to what is deployed today. They describe the database side only, not what users would see end to end.</p>
+</div>
+<div class="tiles" style="margin-top:16px"><div class="card tile"><h3>#160 · IN-subquery rewrite</h3><div class="value">0.24–0.60 s</div><p class="sub" style="margin:6px 0 0">saved per eligible view call; median 0.29 s over 8 gene × alteration cases. Results identical in all 8.</p></div><div class="card tile"><h3>#154 · precomputed lookups</h3><div class="value">0.08–1.35 s</div><p class="sub" style="margin:6px 0 0">live fallback SQL today, vs an estimated ~3–4 ms keyed lookup once the tables exist.</p></div><div class="card tile"><h3>#151 · schema cache</h3><div class="value">1.4–2.6 ms</div><p class="sub" style="margin:6px 0 0">server time of each SHOW TABLES / DESCRIBE a cache hit would avoid.</p></div><div class="card tile"><h3>DB share of answer latency</h3><div class="value">not measured</div><p class="sub" style="margin:6px 0 0">the 09-23 run artifacts record tool names and timings but not the SQL each call ran, so no answer could be replayed.</p></div></div><p class="meta" style="margin-top:12px"><a href="#method">Method</a> · <a href="#queries">All queries</a> · <a href="#pr160">#160</a> · <a href="#pr154">#154</a> · <a href="#pr151">#151</a> · <a href="#limitations">Limitations</a> · <a href="#data">Data</a> · <a href="param-views.html">Parameterized views</a></p>
+<div class="prose">
+<h2>Summary</h2>
+<ul>
+<li><strong>#160</strong> (rewrite the per-gene frequency views to filter through an <code>IN</code> subquery) saves <strong>0.24–0.60 s per call</strong>, median <strong>0.29 s</strong>, on TP53 and ERBB2 for mutation, amplification, deep deletion and structural variant. Every case returns the same rows as the deployed view (identical SHA-256 over the sorted result). Rows read don't change: the saving is join/filter work, not I/O.</li>
+<li><strong>#154</strong> (domain tools backed by precomputed aggregate tables): the live fallback SQL those tools run when the tables are missing takes <strong>0.08–1.35 s</strong>. A keyed lookup on a small table takes about <strong>3–4 ms</strong> today; that is an estimate for the future tables, which don't exist yet. Its bigger potential win, replacing several exploratory SQL calls and model turns with one tool call, can't be timed from the database.</li>
+<li><strong>#151</strong> (cache SHOW TABLES / DESCRIBE TABLE / study guides for an hour) avoids <strong>1.4–2.6 ms</strong> of server time per hit. The ~0.55 s laptop round trip per call is mostly client start-up and connection set-up and says nothing about in-cluster MCP calls.</li>
+<li><strong>The database's share of answer latency was not measured.</strong> The <a href="../20260923-1919/report.html">2026-09-23 run</a> records 292 answers and 1,467 SQL tool calls, but not the SQL each call executed, so no historical answer could be replayed. That share is unknown, not zero.</li>
+<li><strong>Conclusion:</strong> median answer time on 09-23 was 29.6 s (Haiku) and 71.9 s (Sonnet), with a median of 9–10 LLM calls per answer. Savings of tenths of a second per SQL call won't get answers under 10 s on their own; model and tool round trips dominate, so cutting the number of rounds (e.g. purpose-built tools like #154) is the hypothesis to test next.</li>
+</ul>
+</div>
+
+<h3>For scale: the 2026-09-23 run</h3>
+<div class="card table-wrap" style="padding:4px 8px"><table><thead><tr><th style="text-align:left">Model</th><th>Answers</th><th>SQL tool calls</th><th>Median answer s</th><th>p90 answer s</th><th>Median LLM calls</th></tr></thead><tbody><tr><td style="text-align:left">Haiku</td><td>146</td><td>708</td><td>29.57</td><td>74.85</td><td>9</td></tr><tr><td style="text-align:left">Sonnet</td><td>146</td><td>759</td><td>71.93</td><td>157.28</td><td>10</td></tr></tbody></table></div>
+
+<h2 id="method">Method and safety</h2>
+<div class="prose">
+<ul>
+<li><strong>Read-only, one query at a time.</strong> Every query ran from a fresh <code>clickhouse client</code> with <code>readonly=1</code>, <code>max_threads=4</code>, <code>max_execution_time=120</code> s and an 8 GB memory cap, strictly sequentially with a 2 s pause before each. No writes, <code>CREATE</code>, <code>INSERT</code> or setting changes; no unfiltered scans of the coverage views; the #154 table-build SELECTs were restricted to one study each.</li>
+<li><strong>Warm-up + 3 runs, median.</strong> Each of the 43 queries ran once as a discarded warm-up, then three timed runs (129 timed executions, all successful, all under the caps; slowest single run 2.03 s). Each column below is its own median over the three runs.</li>
+<li><strong>Server time</strong> is ClickHouse's own elapsed time from the response statistics (with rows and bytes read; bytes are uncompressed logical bytes, not network bytes). <code>system.query_log</code> was not accessible (permission denied, error 497), so it wasn't used.</li>
+<li><strong>Laptop round trip</strong> is the whole fresh client process: start-up, TLS connection, query and response, from a laptop. It is <em>not</em> representative of the MCP server's in-cluster connection and is shown only for completeness.</li>
+<li><strong>Result parity</strong>: SHA-256 over the sorted canonical result rows, computed outside the timed query and checked stable across all four executions. Only aggregate results were handled.</li>
+<li>These are warm-query timings on today's data and load; the database, its load and query caching may have differed on 09-23.</li>
+</ul>
+</div>
+
+<h2 id="queries">Every measured query</h2>
+<p class="meta">Medians of three warm runs. Times in ms. The exact SQL of each is below the table and in <a href="queries.json">queries.json</a>.</p>
+<div class="card table-wrap" style="padding:4px 8px"><table><thead><tr><th style="text-align:left">Query</th><th>Server ms</th><th>Rows read</th><th>Bytes read</th><th>Laptop round trip ms</th></tr></thead><tbody><tr><td style="text-align:left"><strong>Schema and metadata</strong></td><td></td><td></td><td></td><td></td></tr><tr><td style="text-align:left"><code>metadata-show-tables</code></td><td>2.58</td><td>82</td><td>5,543</td><td>568.46</td></tr><tr><td style="text-align:left"><code>metadata-describe-cancer_study</code></td><td>1.72</td><td>24</td><td>3,736</td><td>566.20</td></tr><tr><td style="text-align:left"><code>metadata-describe-genomic_event_derived</code></td><td>1.38</td><td>19</td><td>2,563</td><td>548.27</td></tr><tr><td style="text-align:left"><code>metadata-describe-sample_to_gene_panel_derived</code></td><td>1.37</td><td>5</td><td>459</td><td>539.48</td></tr><tr><td style="text-align:left"><code>metadata-describe-clinical_data_derived</code></td><td>1.38</td><td>7</td><td>1,586</td><td>541.05</td></tr><tr><td style="text-align:left"><code>metadata-describe-sample_derived</code></td><td>1.55</td><td>12</td><td>969</td><td>590.97</td></tr><tr><td style="text-align:left"><code>metadata-describe-gene</code></td><td>1.37</td><td>4</td><td>307</td><td>543.38</td></tr><tr><td style="text-align:left"><code>metadata-describe-genetic_profile</code></td><td>1.40</td><td>12</td><td>963</td><td>555.84</td></tr><tr><td style="text-align:left"><code>metadata-version-timezone</code></td><td>1.90</td><td>1</td><td>1</td><td>546.55</td></tr><tr><td style="text-align:left"><code>metadata-settings</code></td><td>42.75</td><td>1,609</td><td>603,095</td><td>712.86</td></tr><tr><td style="text-align:left"><code>inventory</code></td><td>3.49</td><td>82</td><td>7,019</td><td>556.85</td></tr><tr><td style="text-align:left"><strong>Keyed-lookup estimates</strong></td><td></td><td></td><td></td><td></td></tr><tr><td style="text-align:left"><code>lookup-estimate-gene</code></td><td>4.00</td><td>44,896</td><td>510,560</td><td>547.76</td></tr><tr><td style="text-align:left"><code>lookup-estimate-study</code></td><td>3.06</td><td>548</td><td>13,834</td><td>552.48</td></tr><tr><td style="text-align:left"><strong>#160 before/after</strong></td><td></td><td></td><td></td><td></td></tr><tr><td style="text-align:left"><code>160-before-TP53-mutation</code></td><td>991.79</td><td>30,599,882</td><td>567,050,014</td><td>1,704.56</td></tr><tr><td style="text-align:left"><code>160-after-TP53-mutation</code></td><td>394.83</td><td>30,599,882</td><td>567,050,014</td><td>992.66</td></tr><tr><td style="text-align:left"><code>160-before-TP53-amplification</code></td><td>875.87</td><td>43,829,849</td><td>681,771,092</td><td>1,420.19</td></tr><tr><td style="text-align:left"><code>160-after-TP53-amplification</code></td><td>489.16</td><td>43,829,849</td><td>681,771,092</td><td>1,058.41</td></tr><tr><td style="text-align:left"><code>160-before-TP53-deep_deletion</code></td><td>753.27</td><td>43,829,849</td><td>702,416,428</td><td>1,444.88</td></tr><tr><td style="text-align:left"><code>160-after-TP53-deep_deletion</code></td><td>468.67</td><td>43,829,849</td><td>702,416,428</td><td>1,017.18</td></tr><tr><td style="text-align:left"><code>160-before-TP53-structural_variant</code></td><td>485.29</td><td>14,117,465</td><td>294,297,667</td><td>1,107.88</td></tr><tr><td style="text-align:left"><code>160-after-TP53-structural_variant</code></td><td>211.08</td><td>14,117,465</td><td>294,297,667</td><td>1,033.98</td></tr><tr><td style="text-align:left"><code>160-before-ERBB2-mutation</code></td><td>744.86</td><td>30,599,882</td><td>538,585,958</td><td>1,340.93</td></tr><tr><td style="text-align:left"><code>160-after-ERBB2-mutation</code></td><td>361.58</td><td>30,599,882</td><td>538,585,958</td><td>1,035.03</td></tr><tr><td style="text-align:left"><code>160-before-ERBB2-amplification</code></td><td>765.85</td><td>43,829,849</td><td>701,038,072</td><td>1,394.65</td></tr><tr><td style="text-align:left"><code>160-after-ERBB2-amplification</code></td><td>496.49</td><td>43,829,849</td><td>701,038,072</td><td>1,087.27</td></tr><tr><td style="text-align:left"><code>160-before-ERBB2-deep_deletion</code></td><td>732.77</td><td>43,829,849</td><td>680,061,820</td><td>1,295.10</td></tr><tr><td style="text-align:left"><code>160-after-ERBB2-deep_deletion</code></td><td>487.97</td><td>43,829,849</td><td>680,061,820</td><td>1,093.79</td></tr><tr><td style="text-align:left"><code>160-before-ERBB2-structural_variant</code></td><td>572.37</td><td>14,117,465</td><td>290,145,240</td><td>1,216.84</td></tr><tr><td style="text-align:left"><code>160-after-ERBB2-structural_variant</code></td><td>270.05</td><td>14,117,465</td><td>290,145,240</td><td>859.12</td></tr><tr><td style="text-align:left"><strong>#154 live fallback</strong></td><td></td><td></td><td></td><td></td></tr><tr><td style="text-align:left"><code>154-frequency-msk_chord_2024</code></td><td>186.83</td><td>6,162,615</td><td>22,762,255</td><td>875.77</td></tr><tr><td style="text-align:left"><code>154-top-mutation-msk_chord_2024</code></td><td>282.01</td><td>10,281,781</td><td>46,600,333</td><td>838.16</td></tr><tr><td style="text-align:left"><code>154-profiled-msk_chord_2024</code></td><td>138.48</td><td>2,916,228</td><td>32,829,525</td><td>781.63</td></tr><tr><td style="text-align:left"><code>154-frequency-brca_tcga_pan_can_atlas_2018</code></td><td>82.09</td><td>6,432,951</td><td>16,190,499</td><td>648.44</td></tr><tr><td style="text-align:left"><code>154-top-mutation-brca_tcga_pan_can_atlas_2018</code></td><td>310.15</td><td>10,019,637</td><td>32,958,606</td><td>889.98</td></tr><tr><td style="text-align:left"><code>154-profiled-brca_tcga_pan_can_atlas_2018</code></td><td>78.31</td><td>2,850,692</td><td>9,002,888</td><td>641.21</td></tr><tr><td style="text-align:left"><code>154-cancer-type-TP53</code></td><td>1,348.46</td><td>30,599,882</td><td>567,050,014</td><td>1,902.63</td></tr><tr><td style="text-align:left"><code>154-cancer-type-TP53-pan-cancer-tcga</code></td><td>852.74</td><td>30,599,882</td><td>567,050,014</td><td>1,408.48</td></tr><tr><td style="text-align:left"><strong>#154 table-build SELECTs (one study each)</strong></td><td></td><td></td><td></td><td></td></tr><tr><td style="text-align:left"><code>154-build-study_gene_alteration_counts-msk_chord_2024</code></td><td>558.55</td><td>13,498,040</td><td>84,986,876</td><td>1,231.98</td></tr><tr><td style="text-align:left"><code>154-build-study_gene_alteration_counts-brca_tcga_pan_can_atlas_2018</code></td><td>547.78</td><td>14,038,712</td><td>87,346,296</td><td>1,753.96</td></tr><tr><td style="text-align:left"><code>154-build-cancer_type_gene_alteration_counts-msk_chord_2024</code></td><td>997.13</td><td>13,718,830</td><td>91,693,482</td><td>1,895.59</td></tr><tr><td style="text-align:left"><code>154-build-cancer_type_gene_alteration_counts-brca_tcga_pan_can_atlas_2018</code></td><td>1,036.70</td><td>14,161,198</td><td>93,593,018</td><td>2,821.80</td></tr><tr><td style="text-align:left"><code>154-build-study_profiled_counts-msk_chord_2024</code></td><td>69.33</td><td>2,916,228</td><td>32,829,525</td><td>698.10</td></tr><tr><td style="text-align:left"><code>154-build-study_profiled_counts-brca_tcga_pan_can_atlas_2018</code></td><td>35.99</td><td>2,850,692</td><td>9,002,888</td><td>686.03</td></tr></tbody></table></div>
+<details class="card" style="margin-top:12px"><summary style="cursor:pointer"><strong>SQL for all 43 queries</strong></summary><details class="sqlq"><summary><code>metadata-show-tables</code></summary><pre class="sql">SHOW TABLES</pre></details><details class="sqlq"><summary><code>metadata-describe-cancer_study</code></summary><pre class="sql">DESCRIBE TABLE cancer_study</pre></details><details class="sqlq"><summary><code>metadata-describe-genomic_event_derived</code></summary><pre class="sql">DESCRIBE TABLE genomic_event_derived</pre></details><details class="sqlq"><summary><code>metadata-describe-sample_to_gene_panel_derived</code></summary><pre class="sql">DESCRIBE TABLE sample_to_gene_panel_derived</pre></details><details class="sqlq"><summary><code>metadata-describe-clinical_data_derived</code></summary><pre class="sql">DESCRIBE TABLE clinical_data_derived</pre></details><details class="sqlq"><summary><code>metadata-describe-sample_derived</code></summary><pre class="sql">DESCRIBE TABLE sample_derived</pre></details><details class="sqlq"><summary><code>metadata-describe-gene</code></summary><pre class="sql">DESCRIBE TABLE gene</pre></details><details class="sqlq"><summary><code>metadata-describe-genetic_profile</code></summary><pre class="sql">DESCRIBE TABLE genetic_profile</pre></details><details class="sqlq"><summary><code>metadata-version-timezone</code></summary><pre class="sql">SELECT version(), timezone()</pre></details><details class="sqlq"><summary><code>metadata-settings</code></summary><pre class="sql">SELECT name, value FROM system.settings LIMIT 1000</pre></details><details class="sqlq"><summary><code>inventory</code></summary><pre class="sql">SELECT name, total_rows, total_bytes FROM system.tables WHERE database=currentDatabase() ORDER BY name</pre></details><details class="sqlq"><summary><code>lookup-estimate-gene</code></summary><pre class="sql">SELECT hugo_gene_symbol, entrez_gene_id FROM gene WHERE hugo_gene_symbol=&#x27;TP53&#x27;</pre></details><details class="sqlq"><summary><code>lookup-estimate-study</code></summary><pre class="sql">SELECT cancer_study_identifier FROM cancer_study WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;</pre></details><details class="sqlq"><summary><code>160-before-TP53-mutation</code></summary><pre class="sql">SELECT * FROM gene_alteration_frequency_by_cancer_type(preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;TP53&#x27;, alteration=&#x27;mutation&#x27;)</pre></details><details class="sqlq"><summary><code>160-after-TP53-mutation</code></summary><pre class="sql">WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = &#x27;all_studies_non_redundant&#x27;
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.hugo_gene_symbol = &#x27;TP53&#x27;
+      AND ged.off_panel = 0
+      AND (
+        (&#x27;mutation&#x27; = &#x27;mutation&#x27;
+            AND ged.variant_type = &#x27;mutation&#x27;
+            AND ged.mutation_status != &#x27;UNCALLED&#x27;)
+        OR (&#x27;mutation&#x27; = &#x27;amplification&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = 2)
+        OR (&#x27;mutation&#x27; = &#x27;deep_deletion&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = -2)
+        OR (&#x27;mutation&#x27; = &#x27;structural_variant&#x27;
+            AND ged.variant_type = &#x27;structural_variant&#x27;)
+      )
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    -- Map the user-facing alteration token to the alteration_type stored
+    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
+    -- as the mutation view, but with the matching alteration_type filter.
+    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    -- IN-subquery instead of JOIN gene: resolves the symbol to its entrez
+    -- id(s) once, rather than joining every panel row against the gene
+    -- table before filtering. COUNT(DISTINCT) downstream makes the result
+    -- identical even for symbols with several (or duplicated) gene rows.
+    -- IS NOT NULL keeps NULL keys unmatched (as the equality JOIN did) even
+    -- under transform_null_in=1.
+    WHERE gpl.gene_id IN (
+        SELECT entrez_gene_id FROM gene
+        WHERE hugo_gene_symbol = &#x27;TP53&#x27; AND entrez_gene_id IS NOT NULL)
+      AND stgp.alteration_type = multiIf(
+          &#x27;mutation&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;mutation&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;mutation&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;mutation&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM sample_to_gene_panel_derived
+    WHERE gene_panel_id = &#x27;WES&#x27;
+      AND alteration_type = multiIf(
+          &#x27;mutation&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;mutation&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;mutation&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;mutation&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples &gt;= 50</pre></details><details class="sqlq"><summary><code>160-before-TP53-amplification</code></summary><pre class="sql">SELECT * FROM gene_alteration_frequency_by_cancer_type(preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;TP53&#x27;, alteration=&#x27;amplification&#x27;)</pre></details><details class="sqlq"><summary><code>160-after-TP53-amplification</code></summary><pre class="sql">WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = &#x27;all_studies_non_redundant&#x27;
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.hugo_gene_symbol = &#x27;TP53&#x27;
+      AND ged.off_panel = 0
+      AND (
+        (&#x27;amplification&#x27; = &#x27;mutation&#x27;
+            AND ged.variant_type = &#x27;mutation&#x27;
+            AND ged.mutation_status != &#x27;UNCALLED&#x27;)
+        OR (&#x27;amplification&#x27; = &#x27;amplification&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = 2)
+        OR (&#x27;amplification&#x27; = &#x27;deep_deletion&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = -2)
+        OR (&#x27;amplification&#x27; = &#x27;structural_variant&#x27;
+            AND ged.variant_type = &#x27;structural_variant&#x27;)
+      )
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    -- Map the user-facing alteration token to the alteration_type stored
+    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
+    -- as the mutation view, but with the matching alteration_type filter.
+    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    -- IN-subquery instead of JOIN gene: resolves the symbol to its entrez
+    -- id(s) once, rather than joining every panel row against the gene
+    -- table before filtering. COUNT(DISTINCT) downstream makes the result
+    -- identical even for symbols with several (or duplicated) gene rows.
+    -- IS NOT NULL keeps NULL keys unmatched (as the equality JOIN did) even
+    -- under transform_null_in=1.
+    WHERE gpl.gene_id IN (
+        SELECT entrez_gene_id FROM gene
+        WHERE hugo_gene_symbol = &#x27;TP53&#x27; AND entrez_gene_id IS NOT NULL)
+      AND stgp.alteration_type = multiIf(
+          &#x27;amplification&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;amplification&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;amplification&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;amplification&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM sample_to_gene_panel_derived
+    WHERE gene_panel_id = &#x27;WES&#x27;
+      AND alteration_type = multiIf(
+          &#x27;amplification&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;amplification&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;amplification&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;amplification&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples &gt;= 50</pre></details><details class="sqlq"><summary><code>160-before-TP53-deep_deletion</code></summary><pre class="sql">SELECT * FROM gene_alteration_frequency_by_cancer_type(preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;TP53&#x27;, alteration=&#x27;deep_deletion&#x27;)</pre></details><details class="sqlq"><summary><code>160-after-TP53-deep_deletion</code></summary><pre class="sql">WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = &#x27;all_studies_non_redundant&#x27;
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.hugo_gene_symbol = &#x27;TP53&#x27;
+      AND ged.off_panel = 0
+      AND (
+        (&#x27;deep_deletion&#x27; = &#x27;mutation&#x27;
+            AND ged.variant_type = &#x27;mutation&#x27;
+            AND ged.mutation_status != &#x27;UNCALLED&#x27;)
+        OR (&#x27;deep_deletion&#x27; = &#x27;amplification&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = 2)
+        OR (&#x27;deep_deletion&#x27; = &#x27;deep_deletion&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = -2)
+        OR (&#x27;deep_deletion&#x27; = &#x27;structural_variant&#x27;
+            AND ged.variant_type = &#x27;structural_variant&#x27;)
+      )
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    -- Map the user-facing alteration token to the alteration_type stored
+    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
+    -- as the mutation view, but with the matching alteration_type filter.
+    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    -- IN-subquery instead of JOIN gene: resolves the symbol to its entrez
+    -- id(s) once, rather than joining every panel row against the gene
+    -- table before filtering. COUNT(DISTINCT) downstream makes the result
+    -- identical even for symbols with several (or duplicated) gene rows.
+    -- IS NOT NULL keeps NULL keys unmatched (as the equality JOIN did) even
+    -- under transform_null_in=1.
+    WHERE gpl.gene_id IN (
+        SELECT entrez_gene_id FROM gene
+        WHERE hugo_gene_symbol = &#x27;TP53&#x27; AND entrez_gene_id IS NOT NULL)
+      AND stgp.alteration_type = multiIf(
+          &#x27;deep_deletion&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM sample_to_gene_panel_derived
+    WHERE gene_panel_id = &#x27;WES&#x27;
+      AND alteration_type = multiIf(
+          &#x27;deep_deletion&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples &gt;= 50</pre></details><details class="sqlq"><summary><code>160-before-TP53-structural_variant</code></summary><pre class="sql">SELECT * FROM gene_alteration_frequency_by_cancer_type(preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;TP53&#x27;, alteration=&#x27;structural_variant&#x27;)</pre></details><details class="sqlq"><summary><code>160-after-TP53-structural_variant</code></summary><pre class="sql">WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = &#x27;all_studies_non_redundant&#x27;
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.hugo_gene_symbol = &#x27;TP53&#x27;
+      AND ged.off_panel = 0
+      AND (
+        (&#x27;structural_variant&#x27; = &#x27;mutation&#x27;
+            AND ged.variant_type = &#x27;mutation&#x27;
+            AND ged.mutation_status != &#x27;UNCALLED&#x27;)
+        OR (&#x27;structural_variant&#x27; = &#x27;amplification&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = 2)
+        OR (&#x27;structural_variant&#x27; = &#x27;deep_deletion&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = -2)
+        OR (&#x27;structural_variant&#x27; = &#x27;structural_variant&#x27;
+            AND ged.variant_type = &#x27;structural_variant&#x27;)
+      )
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    -- Map the user-facing alteration token to the alteration_type stored
+    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
+    -- as the mutation view, but with the matching alteration_type filter.
+    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    -- IN-subquery instead of JOIN gene: resolves the symbol to its entrez
+    -- id(s) once, rather than joining every panel row against the gene
+    -- table before filtering. COUNT(DISTINCT) downstream makes the result
+    -- identical even for symbols with several (or duplicated) gene rows.
+    -- IS NOT NULL keeps NULL keys unmatched (as the equality JOIN did) even
+    -- under transform_null_in=1.
+    WHERE gpl.gene_id IN (
+        SELECT entrez_gene_id FROM gene
+        WHERE hugo_gene_symbol = &#x27;TP53&#x27; AND entrez_gene_id IS NOT NULL)
+      AND stgp.alteration_type = multiIf(
+          &#x27;structural_variant&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM sample_to_gene_panel_derived
+    WHERE gene_panel_id = &#x27;WES&#x27;
+      AND alteration_type = multiIf(
+          &#x27;structural_variant&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples &gt;= 50</pre></details><details class="sqlq"><summary><code>160-before-ERBB2-mutation</code></summary><pre class="sql">SELECT * FROM gene_alteration_frequency_by_cancer_type(preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;ERBB2&#x27;, alteration=&#x27;mutation&#x27;)</pre></details><details class="sqlq"><summary><code>160-after-ERBB2-mutation</code></summary><pre class="sql">WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = &#x27;all_studies_non_redundant&#x27;
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.hugo_gene_symbol = &#x27;ERBB2&#x27;
+      AND ged.off_panel = 0
+      AND (
+        (&#x27;mutation&#x27; = &#x27;mutation&#x27;
+            AND ged.variant_type = &#x27;mutation&#x27;
+            AND ged.mutation_status != &#x27;UNCALLED&#x27;)
+        OR (&#x27;mutation&#x27; = &#x27;amplification&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = 2)
+        OR (&#x27;mutation&#x27; = &#x27;deep_deletion&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = -2)
+        OR (&#x27;mutation&#x27; = &#x27;structural_variant&#x27;
+            AND ged.variant_type = &#x27;structural_variant&#x27;)
+      )
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    -- Map the user-facing alteration token to the alteration_type stored
+    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
+    -- as the mutation view, but with the matching alteration_type filter.
+    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    -- IN-subquery instead of JOIN gene: resolves the symbol to its entrez
+    -- id(s) once, rather than joining every panel row against the gene
+    -- table before filtering. COUNT(DISTINCT) downstream makes the result
+    -- identical even for symbols with several (or duplicated) gene rows.
+    -- IS NOT NULL keeps NULL keys unmatched (as the equality JOIN did) even
+    -- under transform_null_in=1.
+    WHERE gpl.gene_id IN (
+        SELECT entrez_gene_id FROM gene
+        WHERE hugo_gene_symbol = &#x27;ERBB2&#x27; AND entrez_gene_id IS NOT NULL)
+      AND stgp.alteration_type = multiIf(
+          &#x27;mutation&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;mutation&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;mutation&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;mutation&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM sample_to_gene_panel_derived
+    WHERE gene_panel_id = &#x27;WES&#x27;
+      AND alteration_type = multiIf(
+          &#x27;mutation&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;mutation&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;mutation&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;mutation&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples &gt;= 50</pre></details><details class="sqlq"><summary><code>160-before-ERBB2-amplification</code></summary><pre class="sql">SELECT * FROM gene_alteration_frequency_by_cancer_type(preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;ERBB2&#x27;, alteration=&#x27;amplification&#x27;)</pre></details><details class="sqlq"><summary><code>160-after-ERBB2-amplification</code></summary><pre class="sql">WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = &#x27;all_studies_non_redundant&#x27;
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.hugo_gene_symbol = &#x27;ERBB2&#x27;
+      AND ged.off_panel = 0
+      AND (
+        (&#x27;amplification&#x27; = &#x27;mutation&#x27;
+            AND ged.variant_type = &#x27;mutation&#x27;
+            AND ged.mutation_status != &#x27;UNCALLED&#x27;)
+        OR (&#x27;amplification&#x27; = &#x27;amplification&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = 2)
+        OR (&#x27;amplification&#x27; = &#x27;deep_deletion&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = -2)
+        OR (&#x27;amplification&#x27; = &#x27;structural_variant&#x27;
+            AND ged.variant_type = &#x27;structural_variant&#x27;)
+      )
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    -- Map the user-facing alteration token to the alteration_type stored
+    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
+    -- as the mutation view, but with the matching alteration_type filter.
+    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    -- IN-subquery instead of JOIN gene: resolves the symbol to its entrez
+    -- id(s) once, rather than joining every panel row against the gene
+    -- table before filtering. COUNT(DISTINCT) downstream makes the result
+    -- identical even for symbols with several (or duplicated) gene rows.
+    -- IS NOT NULL keeps NULL keys unmatched (as the equality JOIN did) even
+    -- under transform_null_in=1.
+    WHERE gpl.gene_id IN (
+        SELECT entrez_gene_id FROM gene
+        WHERE hugo_gene_symbol = &#x27;ERBB2&#x27; AND entrez_gene_id IS NOT NULL)
+      AND stgp.alteration_type = multiIf(
+          &#x27;amplification&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;amplification&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;amplification&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;amplification&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM sample_to_gene_panel_derived
+    WHERE gene_panel_id = &#x27;WES&#x27;
+      AND alteration_type = multiIf(
+          &#x27;amplification&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;amplification&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;amplification&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;amplification&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples &gt;= 50</pre></details><details class="sqlq"><summary><code>160-before-ERBB2-deep_deletion</code></summary><pre class="sql">SELECT * FROM gene_alteration_frequency_by_cancer_type(preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;ERBB2&#x27;, alteration=&#x27;deep_deletion&#x27;)</pre></details><details class="sqlq"><summary><code>160-after-ERBB2-deep_deletion</code></summary><pre class="sql">WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = &#x27;all_studies_non_redundant&#x27;
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.hugo_gene_symbol = &#x27;ERBB2&#x27;
+      AND ged.off_panel = 0
+      AND (
+        (&#x27;deep_deletion&#x27; = &#x27;mutation&#x27;
+            AND ged.variant_type = &#x27;mutation&#x27;
+            AND ged.mutation_status != &#x27;UNCALLED&#x27;)
+        OR (&#x27;deep_deletion&#x27; = &#x27;amplification&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = 2)
+        OR (&#x27;deep_deletion&#x27; = &#x27;deep_deletion&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = -2)
+        OR (&#x27;deep_deletion&#x27; = &#x27;structural_variant&#x27;
+            AND ged.variant_type = &#x27;structural_variant&#x27;)
+      )
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    -- Map the user-facing alteration token to the alteration_type stored
+    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
+    -- as the mutation view, but with the matching alteration_type filter.
+    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    -- IN-subquery instead of JOIN gene: resolves the symbol to its entrez
+    -- id(s) once, rather than joining every panel row against the gene
+    -- table before filtering. COUNT(DISTINCT) downstream makes the result
+    -- identical even for symbols with several (or duplicated) gene rows.
+    -- IS NOT NULL keeps NULL keys unmatched (as the equality JOIN did) even
+    -- under transform_null_in=1.
+    WHERE gpl.gene_id IN (
+        SELECT entrez_gene_id FROM gene
+        WHERE hugo_gene_symbol = &#x27;ERBB2&#x27; AND entrez_gene_id IS NOT NULL)
+      AND stgp.alteration_type = multiIf(
+          &#x27;deep_deletion&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM sample_to_gene_panel_derived
+    WHERE gene_panel_id = &#x27;WES&#x27;
+      AND alteration_type = multiIf(
+          &#x27;deep_deletion&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;deep_deletion&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples &gt;= 50</pre></details><details class="sqlq"><summary><code>160-before-ERBB2-structural_variant</code></summary><pre class="sql">SELECT * FROM gene_alteration_frequency_by_cancer_type(preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;ERBB2&#x27;, alteration=&#x27;structural_variant&#x27;)</pre></details><details class="sqlq"><summary><code>160-after-ERBB2-structural_variant</code></summary><pre class="sql">WITH cohort AS (
+    SELECT cancer_study_identifier
+    FROM cancer_study_query_preferences
+    WHERE preference_name = &#x27;all_studies_non_redundant&#x27;
+),
+sample_cancer_type AS (
+    SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
+    FROM clinical_data_derived cd
+    JOIN cohort c USING (cancer_study_identifier)
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+altered AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
+    FROM genomic_event_derived ged
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    WHERE ged.hugo_gene_symbol = &#x27;ERBB2&#x27;
+      AND ged.off_panel = 0
+      AND (
+        (&#x27;structural_variant&#x27; = &#x27;mutation&#x27;
+            AND ged.variant_type = &#x27;mutation&#x27;
+            AND ged.mutation_status != &#x27;UNCALLED&#x27;)
+        OR (&#x27;structural_variant&#x27; = &#x27;amplification&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = 2)
+        OR (&#x27;structural_variant&#x27; = &#x27;deep_deletion&#x27;
+            AND ged.variant_type = &#x27;cna&#x27;
+            AND ged.cna_alteration = -2)
+        OR (&#x27;structural_variant&#x27; = &#x27;structural_variant&#x27;
+            AND ged.variant_type = &#x27;structural_variant&#x27;)
+      )
+    GROUP BY sct.cancer_type
+),
+profiled_samples_for_gene AS (
+    -- Map the user-facing alteration token to the alteration_type stored
+    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
+    -- as the mutation view, but with the matching alteration_type filter.
+    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    FROM sample_to_gene_panel_derived stgp
+    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    -- IN-subquery instead of JOIN gene: resolves the symbol to its entrez
+    -- id(s) once, rather than joining every panel row against the gene
+    -- table before filtering. COUNT(DISTINCT) downstream makes the result
+    -- identical even for symbols with several (or duplicated) gene rows.
+    -- IS NOT NULL keeps NULL keys unmatched (as the equality JOIN did) even
+    -- under transform_null_in=1.
+    WHERE gpl.gene_id IN (
+        SELECT entrez_gene_id FROM gene
+        WHERE hugo_gene_symbol = &#x27;ERBB2&#x27; AND entrez_gene_id IS NOT NULL)
+      AND stgp.alteration_type = multiIf(
+          &#x27;structural_variant&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+    UNION ALL
+    SELECT sample_unique_id, cancer_study_identifier
+    FROM sample_to_gene_panel_derived
+    WHERE gene_panel_id = &#x27;WES&#x27;
+      AND alteration_type = multiIf(
+          &#x27;structural_variant&#x27; = &#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;,
+          &#x27;structural_variant&#x27; = &#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;,
+          &#x27;&#x27;)
+),
+profiled AS (
+    SELECT sct.cancer_type,
+           COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
+    FROM profiled_samples_for_gene p
+    JOIN cohort c USING (cancer_study_identifier)
+    JOIN sample_cancer_type sct USING (sample_unique_id)
+    GROUP BY sct.cancer_type
+)
+SELECT a.cancer_type,
+       a.altered_samples,
+       p.profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(p.profiled_samples, 0), 1) AS frequency_pct
+FROM altered a
+JOIN profiled p USING (cancer_type)
+WHERE p.profiled_samples &gt;= 50</pre></details><details class="sqlq"><summary><code>154-frequency-msk_chord_2024</code></summary><pre class="sql">WITH
+        events AS (
+            SELECT sample_unique_id,
+                   (variant_type = &#x27;mutation&#x27; AND mutation_status != &#x27;UNCALLED&#x27;) AS is_mutation,
+                   (variant_type = &#x27;cna&#x27; AND cna_alteration = 2) AS is_amplification,
+                   (variant_type = &#x27;cna&#x27; AND cna_alteration = -2) AS is_deep_deletion,
+                   (variant_type = &#x27;structural_variant&#x27; AND mutation_status != &#x27;UNCALLED&#x27;) AS is_structural_variant
+            FROM genomic_event_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+              AND hugo_gene_symbol IN (&#x27;TP53&#x27;)
+              AND off_panel = 0
+        ),
+        profiled AS (
+            SELECT stgp.sample_unique_id AS sample_unique_id,
+                   stgp.alteration_type AS alteration_type
+            FROM sample_to_gene_panel_derived stgp
+            JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+            JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+            JOIN gene ge ON gpl.gene_id = ge.entrez_gene_id
+            WHERE stgp.cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+              AND ge.hugo_gene_symbol IN (&#x27;TP53&#x27;)
+              AND (stgp.alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;) OR (stgp.alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27; AND stgp.genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;)))
+            UNION ALL
+            SELECT sample_unique_id, alteration_type
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+              AND gene_panel_id = &#x27;WES&#x27;
+              AND (alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;) OR (alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27; AND genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;)))
+        )
+        SELECT *
+        FROM (
+            SELECT groupUniqArray(hugo_gene_symbol) AS matched_genes
+            FROM gene WHERE hugo_gene_symbol IN (&#x27;TP53&#x27;)
+        ) AS gene_match
+        CROSS JOIN (
+            SELECT groupUniqArray(cancer_study_identifier) AS matched_studies
+            FROM cancer_study WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+        ) AS study_match
+        CROSS JOIN (
+            SELECT uniqExactIf(sample_unique_id, is_mutation) AS altered_mutation,
+                   uniqExactIf(sample_unique_id, is_amplification) AS altered_amplification,
+                   uniqExactIf(sample_unique_id, is_deep_deletion) AS altered_deep_deletion,
+                   uniqExactIf(sample_unique_id, is_structural_variant)
+                       AS altered_structural_variant,
+                   uniqExactIf(sample_unique_id, is_mutation OR is_amplification
+                       OR is_deep_deletion OR is_structural_variant) AS altered_any
+            FROM events
+        ) AS altered
+        CROSS JOIN (
+            SELECT uniqExactIf(sample_unique_id, alteration_type = &#x27;MUTATION_EXTENDED&#x27;)
+                       AS profiled_MUTATION_EXTENDED,
+                   uniqExactIf(sample_unique_id, alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27;)
+                       AS profiled_COPY_NUMBER_ALTERATION,
+                   uniqExactIf(sample_unique_id, alteration_type = &#x27;STRUCTURAL_VARIANT&#x27;)
+                       AS profiled_STRUCTURAL_VARIANT,
+                   uniqExact(sample_unique_id) AS profiled_ANY
+            FROM profiled
+        ) AS profiled_counts</pre></details><details class="sqlq"><summary><code>154-top-mutation-msk_chord_2024</code></summary><pre class="sql">WITH
+        altered AS (
+            SELECT hugo_gene_symbol, COUNT(DISTINCT sample_unique_id) AS altered_samples
+            FROM genomic_event_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+              AND off_panel = 0
+              AND (variant_type = &#x27;mutation&#x27; AND mutation_status != &#x27;UNCALLED&#x27;)
+            GROUP BY hugo_gene_symbol
+            ORDER BY altered_samples DESC, hugo_gene_symbol ASC
+            LIMIT 20
+        ),
+        wes_samples AS (
+            SELECT DISTINCT sample_unique_id
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+              AND gene_panel_id = &#x27;WES&#x27;
+              AND (alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;))
+        ),
+        panel_profiled AS (
+            SELECT ge.hugo_gene_symbol AS hugo_gene_symbol,
+                   COUNT(DISTINCT stgp.sample_unique_id) AS n
+            FROM sample_to_gene_panel_derived stgp
+            JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+            JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+            JOIN gene ge ON gpl.gene_id = ge.entrez_gene_id
+            WHERE stgp.cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+              AND (stgp.alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;))
+              AND stgp.sample_unique_id NOT IN (SELECT sample_unique_id FROM wes_samples)
+              AND ge.hugo_gene_symbol IN (SELECT hugo_gene_symbol FROM altered)
+            GROUP BY ge.hugo_gene_symbol
+        )
+        SELECT a.hugo_gene_symbol AS hugo_gene_symbol,
+               a.altered_samples AS altered_samples,
+               (SELECT count() FROM wes_samples) + COALESCE(p.n, 0) AS profiled_samples
+        FROM altered a
+        LEFT JOIN panel_profiled p ON a.hugo_gene_symbol = p.hugo_gene_symbol
+        ORDER BY altered_samples DESC, hugo_gene_symbol ASC</pre></details><details class="sqlq"><summary><code>154-profiled-msk_chord_2024</code></summary><pre class="sql">WITH
+        profiled AS (
+            SELECT cancer_study_identifier, alteration_type AS profile_type,
+                   sample_unique_id, gene_panel_id
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+            UNION ALL
+            SELECT cancer_study_identifier, &#x27;COPY_NUMBER_ALTERATION_DISCRETE&#x27; AS profile_type,
+                   sample_unique_id, gene_panel_id
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+              AND ((alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27; AND genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;)))
+            UNION ALL
+            SELECT cancer_study_identifier, &#x27;ANY_MUT_CNA_SV&#x27; AS profile_type,
+                   sample_unique_id, gene_panel_id
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+              AND (alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;) OR (alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27; AND genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;)))
+        ),
+        sample_patient AS (
+            SELECT sample_unique_id, patient_unique_id
+            FROM sample_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+        )
+        SELECT * FROM (
+            SELECT cancer_study_identifier, &#x27;ALL_SAMPLES&#x27; AS profile_type,
+                   COUNT(DISTINCT sample_unique_id) AS samples,
+                   COUNT(DISTINCT patient_unique_id) AS patients,
+                   toUInt64(0) AS wes_samples
+            FROM sample_derived
+            WHERE cancer_study_identifier IN (&#x27;msk_chord_2024&#x27;)
+            GROUP BY cancer_study_identifier
+            UNION ALL
+            SELECT p.cancer_study_identifier, p.profile_type,
+                   COUNT(DISTINCT p.sample_unique_id),
+                   COUNT(DISTINCT nullIf(sp.patient_unique_id, &#x27;&#x27;)),
+                   COUNT(DISTINCT if(p.gene_panel_id = &#x27;WES&#x27;, p.sample_unique_id, NULL))
+            FROM profiled p
+            LEFT JOIN sample_patient sp ON p.sample_unique_id = sp.sample_unique_id
+            GROUP BY p.cancer_study_identifier, p.profile_type
+        )
+        ORDER BY cancer_study_identifier, profile_type = &#x27;ALL_SAMPLES&#x27; DESC,
+                 profile_type = &#x27;ANY_MUT_CNA_SV&#x27; DESC, samples DESC, profile_type</pre></details><details class="sqlq"><summary><code>154-frequency-brca_tcga_pan_can_atlas_2018</code></summary><pre class="sql">WITH
+        events AS (
+            SELECT sample_unique_id,
+                   (variant_type = &#x27;mutation&#x27; AND mutation_status != &#x27;UNCALLED&#x27;) AS is_mutation,
+                   (variant_type = &#x27;cna&#x27; AND cna_alteration = 2) AS is_amplification,
+                   (variant_type = &#x27;cna&#x27; AND cna_alteration = -2) AS is_deep_deletion,
+                   (variant_type = &#x27;structural_variant&#x27; AND mutation_status != &#x27;UNCALLED&#x27;) AS is_structural_variant
+            FROM genomic_event_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+              AND hugo_gene_symbol IN (&#x27;TP53&#x27;)
+              AND off_panel = 0
+        ),
+        profiled AS (
+            SELECT stgp.sample_unique_id AS sample_unique_id,
+                   stgp.alteration_type AS alteration_type
+            FROM sample_to_gene_panel_derived stgp
+            JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+            JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+            JOIN gene ge ON gpl.gene_id = ge.entrez_gene_id
+            WHERE stgp.cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+              AND ge.hugo_gene_symbol IN (&#x27;TP53&#x27;)
+              AND (stgp.alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;) OR (stgp.alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27; AND stgp.genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;)))
+            UNION ALL
+            SELECT sample_unique_id, alteration_type
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+              AND gene_panel_id = &#x27;WES&#x27;
+              AND (alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;) OR (alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27; AND genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;)))
+        )
+        SELECT *
+        FROM (
+            SELECT groupUniqArray(hugo_gene_symbol) AS matched_genes
+            FROM gene WHERE hugo_gene_symbol IN (&#x27;TP53&#x27;)
+        ) AS gene_match
+        CROSS JOIN (
+            SELECT groupUniqArray(cancer_study_identifier) AS matched_studies
+            FROM cancer_study WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+        ) AS study_match
+        CROSS JOIN (
+            SELECT uniqExactIf(sample_unique_id, is_mutation) AS altered_mutation,
+                   uniqExactIf(sample_unique_id, is_amplification) AS altered_amplification,
+                   uniqExactIf(sample_unique_id, is_deep_deletion) AS altered_deep_deletion,
+                   uniqExactIf(sample_unique_id, is_structural_variant)
+                       AS altered_structural_variant,
+                   uniqExactIf(sample_unique_id, is_mutation OR is_amplification
+                       OR is_deep_deletion OR is_structural_variant) AS altered_any
+            FROM events
+        ) AS altered
+        CROSS JOIN (
+            SELECT uniqExactIf(sample_unique_id, alteration_type = &#x27;MUTATION_EXTENDED&#x27;)
+                       AS profiled_MUTATION_EXTENDED,
+                   uniqExactIf(sample_unique_id, alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27;)
+                       AS profiled_COPY_NUMBER_ALTERATION,
+                   uniqExactIf(sample_unique_id, alteration_type = &#x27;STRUCTURAL_VARIANT&#x27;)
+                       AS profiled_STRUCTURAL_VARIANT,
+                   uniqExact(sample_unique_id) AS profiled_ANY
+            FROM profiled
+        ) AS profiled_counts</pre></details><details class="sqlq"><summary><code>154-top-mutation-brca_tcga_pan_can_atlas_2018</code></summary><pre class="sql">WITH
+        altered AS (
+            SELECT hugo_gene_symbol, COUNT(DISTINCT sample_unique_id) AS altered_samples
+            FROM genomic_event_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+              AND off_panel = 0
+              AND (variant_type = &#x27;mutation&#x27; AND mutation_status != &#x27;UNCALLED&#x27;)
+            GROUP BY hugo_gene_symbol
+            ORDER BY altered_samples DESC, hugo_gene_symbol ASC
+            LIMIT 20
+        ),
+        wes_samples AS (
+            SELECT DISTINCT sample_unique_id
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+              AND gene_panel_id = &#x27;WES&#x27;
+              AND (alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;))
+        ),
+        panel_profiled AS (
+            SELECT ge.hugo_gene_symbol AS hugo_gene_symbol,
+                   COUNT(DISTINCT stgp.sample_unique_id) AS n
+            FROM sample_to_gene_panel_derived stgp
+            JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+            JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+            JOIN gene ge ON gpl.gene_id = ge.entrez_gene_id
+            WHERE stgp.cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+              AND (stgp.alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;))
+              AND stgp.sample_unique_id NOT IN (SELECT sample_unique_id FROM wes_samples)
+              AND ge.hugo_gene_symbol IN (SELECT hugo_gene_symbol FROM altered)
+            GROUP BY ge.hugo_gene_symbol
+        )
+        SELECT a.hugo_gene_symbol AS hugo_gene_symbol,
+               a.altered_samples AS altered_samples,
+               (SELECT count() FROM wes_samples) + COALESCE(p.n, 0) AS profiled_samples
+        FROM altered a
+        LEFT JOIN panel_profiled p ON a.hugo_gene_symbol = p.hugo_gene_symbol
+        ORDER BY altered_samples DESC, hugo_gene_symbol ASC</pre></details><details class="sqlq"><summary><code>154-profiled-brca_tcga_pan_can_atlas_2018</code></summary><pre class="sql">WITH
+        profiled AS (
+            SELECT cancer_study_identifier, alteration_type AS profile_type,
+                   sample_unique_id, gene_panel_id
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+            UNION ALL
+            SELECT cancer_study_identifier, &#x27;COPY_NUMBER_ALTERATION_DISCRETE&#x27; AS profile_type,
+                   sample_unique_id, gene_panel_id
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+              AND ((alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27; AND genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;)))
+            UNION ALL
+            SELECT cancer_study_identifier, &#x27;ANY_MUT_CNA_SV&#x27; AS profile_type,
+                   sample_unique_id, gene_panel_id
+            FROM sample_to_gene_panel_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+              AND (alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;) OR (alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27; AND genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;)))
+        ),
+        sample_patient AS (
+            SELECT sample_unique_id, patient_unique_id
+            FROM sample_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+        )
+        SELECT * FROM (
+            SELECT cancer_study_identifier, &#x27;ALL_SAMPLES&#x27; AS profile_type,
+                   COUNT(DISTINCT sample_unique_id) AS samples,
+                   COUNT(DISTINCT patient_unique_id) AS patients,
+                   toUInt64(0) AS wes_samples
+            FROM sample_derived
+            WHERE cancer_study_identifier IN (&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+            GROUP BY cancer_study_identifier
+            UNION ALL
+            SELECT p.cancer_study_identifier, p.profile_type,
+                   COUNT(DISTINCT p.sample_unique_id),
+                   COUNT(DISTINCT nullIf(sp.patient_unique_id, &#x27;&#x27;)),
+                   COUNT(DISTINCT if(p.gene_panel_id = &#x27;WES&#x27;, p.sample_unique_id, NULL))
+            FROM profiled p
+            LEFT JOIN sample_patient sp ON p.sample_unique_id = sp.sample_unique_id
+            GROUP BY p.cancer_study_identifier, p.profile_type
+        )
+        ORDER BY cancer_study_identifier, profile_type = &#x27;ALL_SAMPLES&#x27; DESC,
+                 profile_type = &#x27;ANY_MUT_CNA_SV&#x27; DESC, samples DESC, profile_type</pre></details><details class="sqlq"><summary><code>154-cancer-type-TP53</code></summary><pre class="sql">SELECT * FROM (
+            SELECT cancer_type, &#x27;TP53&#x27; AS hugo_gene_symbol,
+                   altered_samples, profiled_samples
+            FROM gene_alteration_frequency_by_cancer_type(
+                preference=&#x27;all_studies_non_redundant&#x27;, gene=&#x27;TP53&#x27;,
+                alteration=&#x27;mutation&#x27;)
+            )
+        ORDER BY altered_samples / profiled_samples DESC, altered_samples DESC, cancer_type ASC
+        LIMIT 20</pre></details><details class="sqlq"><summary><code>154-cancer-type-TP53-pan-cancer-tcga</code></summary><pre class="sql">SELECT * FROM (
+            SELECT cancer_type, &#x27;TP53&#x27; AS hugo_gene_symbol,
+                   altered_samples, profiled_samples
+            FROM gene_alteration_frequency_by_cancer_type(
+                preference=&#x27;pan_cancer_tcga&#x27;, gene=&#x27;TP53&#x27;,
+                alteration=&#x27;mutation&#x27;)
+            )
+        ORDER BY altered_samples / profiled_samples DESC, altered_samples DESC, cancer_type ASC
+        LIMIT 20</pre></details><details class="sqlq"><summary><code>154-build-study_gene_alteration_counts-msk_chord_2024</code></summary><pre class="sql">WITH
+alteration_to_profile AS (
+    SELECT t.1 AS alteration_type, t.2 AS profile_type
+    FROM (
+        SELECT arrayJoin([
+            (&#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;),
+            (&#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;),
+            (&#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;),
+            (&#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;),
+            (&#x27;any&#x27;,                &#x27;ANY&#x27;)
+        ]) AS t
+    )
+),
+events AS (
+    SELECT cancer_study_identifier,
+           hugo_gene_symbol,
+           sample_unique_id,
+           multiIf(
+               variant_type = &#x27;mutation&#x27; AND mutation_status != &#x27;UNCALLED&#x27;, &#x27;mutation&#x27;,
+               variant_type = &#x27;cna&#x27; AND cna_alteration = 2,                  &#x27;amplification&#x27;,
+               variant_type = &#x27;cna&#x27; AND cna_alteration = -2,                 &#x27;deep_deletion&#x27;,
+               variant_type = &#x27;structural_variant&#x27; AND mutation_status != &#x27;UNCALLED&#x27;,
+                                                                             &#x27;structural_variant&#x27;,
+               &#x27;&#x27;) AS event_type
+    FROM (SELECT * FROM genomic_event_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+    WHERE off_panel = 0
+),
+altered AS (
+    -- event_type, not alteration_type: in ClickHouse a SELECT alias shadows
+    -- the source column in WHERE, so `&#x27;any&#x27; AS alteration_type` below would
+    -- turn a WHERE on alteration_type into a constant.
+    SELECT cancer_study_identifier, hugo_gene_symbol, event_type AS alteration_type,
+           COUNT(DISTINCT sample_unique_id) AS altered_samples,
+           COUNT(*) AS altered_events
+    FROM events
+    WHERE event_type != &#x27;&#x27;
+    GROUP BY cancer_study_identifier, hugo_gene_symbol, event_type
+    UNION ALL
+    SELECT cancer_study_identifier, hugo_gene_symbol, &#x27;any&#x27; AS alteration_type,
+           COUNT(DISTINCT sample_unique_id) AS altered_samples,
+           COUNT(*) AS altered_events
+    FROM events
+    WHERE event_type != &#x27;&#x27;
+    GROUP BY cancer_study_identifier, hugo_gene_symbol
+),
+typed_profile_rows AS (
+    -- Same profile filters as the {mutation,cna,sv}_*_coverage views:
+    -- CNA rows only from DISCRETE profiles.
+    SELECT cancer_study_identifier, alteration_type AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+    WHERE alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;)
+       OR (alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27;
+           AND genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;))
+),
+profile_rows AS (
+    SELECT cancer_study_identifier, profile_type, sample_unique_id, gene_panel_id
+    FROM typed_profile_rows
+    UNION ALL
+    SELECT cancer_study_identifier, &#x27;ANY&#x27; AS profile_type, sample_unique_id, gene_panel_id
+    FROM typed_profile_rows
+),
+sample_buckets AS (
+    -- One row per sample per profile type: its panel-set signature.
+    SELECT cancer_study_identifier, profile_type, sample_unique_id,
+           arraySort(groupUniqArray(gene_panel_id)) AS panels
+    FROM profile_rows
+    GROUP BY cancer_study_identifier, profile_type, sample_unique_id
+),
+wes_profiled AS (
+    SELECT cancer_study_identifier, profile_type, COUNT(*) AS n
+    FROM sample_buckets
+    WHERE has(panels, &#x27;WES&#x27;)
+    GROUP BY cancer_study_identifier, profile_type
+),
+signature_counts AS (
+    SELECT cancer_study_identifier, profile_type, panels, COUNT(*) AS n
+    FROM sample_buckets
+    WHERE NOT has(panels, &#x27;WES&#x27;)
+    GROUP BY cancer_study_identifier, profile_type, panels
+),
+panel_genes AS (
+    -- Same panel -&gt; gene chain as mutation_panel_gene_coverage.
+    SELECT gp.stable_id AS gene_panel_id, g.hugo_gene_symbol AS hugo_gene_symbol
+    FROM gene_panel gp
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+),
+panel_profiled AS (
+    SELECT cancer_study_identifier, profile_type, hugo_gene_symbol, SUM(n) AS n
+    FROM (
+        -- DISTINCT: a gene listed by two panels of one signature counts once.
+        SELECT DISTINCT s.cancer_study_identifier, s.profile_type, s.panels, s.n, pg.hugo_gene_symbol
+        FROM (
+            SELECT cancer_study_identifier, profile_type, panels, n,
+                   arrayJoin(panels) AS gene_panel_id
+            FROM signature_counts
+        ) s
+        JOIN panel_genes pg ON s.gene_panel_id = pg.gene_panel_id
+    )
+    GROUP BY cancer_study_identifier, profile_type, hugo_gene_symbol
+)
+SELECT a.cancer_study_identifier,
+       a.hugo_gene_symbol,
+       a.alteration_type,
+       a.altered_samples,
+       COALESCE(w.n, 0) + COALESCE(p.n, 0) AS profiled_samples,
+       a.altered_events,
+       now() AS built_at
+FROM altered a
+JOIN alteration_to_profile m ON a.alteration_type = m.alteration_type
+LEFT JOIN wes_profiled w
+    ON w.cancer_study_identifier = a.cancer_study_identifier
+   AND w.profile_type = m.profile_type
+LEFT JOIN panel_profiled p
+    ON p.cancer_study_identifier = a.cancer_study_identifier
+   AND p.profile_type = m.profile_type
+   AND p.hugo_gene_symbol = a.hugo_gene_symbol</pre></details><details class="sqlq"><summary><code>154-build-study_gene_alteration_counts-brca_tcga_pan_can_atlas_2018</code></summary><pre class="sql">WITH
+alteration_to_profile AS (
+    SELECT t.1 AS alteration_type, t.2 AS profile_type
+    FROM (
+        SELECT arrayJoin([
+            (&#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;),
+            (&#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;),
+            (&#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;),
+            (&#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;),
+            (&#x27;any&#x27;,                &#x27;ANY&#x27;)
+        ]) AS t
+    )
+),
+events AS (
+    SELECT cancer_study_identifier,
+           hugo_gene_symbol,
+           sample_unique_id,
+           multiIf(
+               variant_type = &#x27;mutation&#x27; AND mutation_status != &#x27;UNCALLED&#x27;, &#x27;mutation&#x27;,
+               variant_type = &#x27;cna&#x27; AND cna_alteration = 2,                  &#x27;amplification&#x27;,
+               variant_type = &#x27;cna&#x27; AND cna_alteration = -2,                 &#x27;deep_deletion&#x27;,
+               variant_type = &#x27;structural_variant&#x27; AND mutation_status != &#x27;UNCALLED&#x27;,
+                                                                             &#x27;structural_variant&#x27;,
+               &#x27;&#x27;) AS event_type
+    FROM (SELECT * FROM genomic_event_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+    WHERE off_panel = 0
+),
+altered AS (
+    -- event_type, not alteration_type: in ClickHouse a SELECT alias shadows
+    -- the source column in WHERE, so `&#x27;any&#x27; AS alteration_type` below would
+    -- turn a WHERE on alteration_type into a constant.
+    SELECT cancer_study_identifier, hugo_gene_symbol, event_type AS alteration_type,
+           COUNT(DISTINCT sample_unique_id) AS altered_samples,
+           COUNT(*) AS altered_events
+    FROM events
+    WHERE event_type != &#x27;&#x27;
+    GROUP BY cancer_study_identifier, hugo_gene_symbol, event_type
+    UNION ALL
+    SELECT cancer_study_identifier, hugo_gene_symbol, &#x27;any&#x27; AS alteration_type,
+           COUNT(DISTINCT sample_unique_id) AS altered_samples,
+           COUNT(*) AS altered_events
+    FROM events
+    WHERE event_type != &#x27;&#x27;
+    GROUP BY cancer_study_identifier, hugo_gene_symbol
+),
+typed_profile_rows AS (
+    -- Same profile filters as the {mutation,cna,sv}_*_coverage views:
+    -- CNA rows only from DISCRETE profiles.
+    SELECT cancer_study_identifier, alteration_type AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+    WHERE alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;)
+       OR (alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27;
+           AND genetic_profile_id IN (SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;))
+),
+profile_rows AS (
+    SELECT cancer_study_identifier, profile_type, sample_unique_id, gene_panel_id
+    FROM typed_profile_rows
+    UNION ALL
+    SELECT cancer_study_identifier, &#x27;ANY&#x27; AS profile_type, sample_unique_id, gene_panel_id
+    FROM typed_profile_rows
+),
+sample_buckets AS (
+    -- One row per sample per profile type: its panel-set signature.
+    SELECT cancer_study_identifier, profile_type, sample_unique_id,
+           arraySort(groupUniqArray(gene_panel_id)) AS panels
+    FROM profile_rows
+    GROUP BY cancer_study_identifier, profile_type, sample_unique_id
+),
+wes_profiled AS (
+    SELECT cancer_study_identifier, profile_type, COUNT(*) AS n
+    FROM sample_buckets
+    WHERE has(panels, &#x27;WES&#x27;)
+    GROUP BY cancer_study_identifier, profile_type
+),
+signature_counts AS (
+    SELECT cancer_study_identifier, profile_type, panels, COUNT(*) AS n
+    FROM sample_buckets
+    WHERE NOT has(panels, &#x27;WES&#x27;)
+    GROUP BY cancer_study_identifier, profile_type, panels
+),
+panel_genes AS (
+    -- Same panel -&gt; gene chain as mutation_panel_gene_coverage.
+    SELECT gp.stable_id AS gene_panel_id, g.hugo_gene_symbol AS hugo_gene_symbol
+    FROM gene_panel gp
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+),
+panel_profiled AS (
+    SELECT cancer_study_identifier, profile_type, hugo_gene_symbol, SUM(n) AS n
+    FROM (
+        -- DISTINCT: a gene listed by two panels of one signature counts once.
+        SELECT DISTINCT s.cancer_study_identifier, s.profile_type, s.panels, s.n, pg.hugo_gene_symbol
+        FROM (
+            SELECT cancer_study_identifier, profile_type, panels, n,
+                   arrayJoin(panels) AS gene_panel_id
+            FROM signature_counts
+        ) s
+        JOIN panel_genes pg ON s.gene_panel_id = pg.gene_panel_id
+    )
+    GROUP BY cancer_study_identifier, profile_type, hugo_gene_symbol
+)
+SELECT a.cancer_study_identifier,
+       a.hugo_gene_symbol,
+       a.alteration_type,
+       a.altered_samples,
+       COALESCE(w.n, 0) + COALESCE(p.n, 0) AS profiled_samples,
+       a.altered_events,
+       now() AS built_at
+FROM altered a
+JOIN alteration_to_profile m ON a.alteration_type = m.alteration_type
+LEFT JOIN wes_profiled w
+    ON w.cancer_study_identifier = a.cancer_study_identifier
+   AND w.profile_type = m.profile_type
+LEFT JOIN panel_profiled p
+    ON p.cancer_study_identifier = a.cancer_study_identifier
+   AND p.profile_type = m.profile_type
+   AND p.hugo_gene_symbol = a.hugo_gene_symbol</pre></details><details class="sqlq"><summary><code>154-build-cancer_type_gene_alteration_counts-msk_chord_2024</code></summary><pre class="sql">WITH
+alteration_to_profile AS (
+    SELECT t.1 AS alteration_type, t.2 AS profile_type
+    FROM (
+        SELECT arrayJoin([
+            (&#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;),
+            (&#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;),
+            (&#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;),
+            (&#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;),
+            (&#x27;any&#x27;,                &#x27;ANY&#x27;)
+        ]) AS t
+    )
+),
+sample_cancer_type AS (
+    SELECT q.preference_name AS preference_name,
+           cd.cancer_study_identifier AS cancer_study_identifier,
+           cd.sample_unique_id AS sample_unique_id,
+           cd.attribute_value AS cancer_type
+    FROM (SELECT * FROM clinical_data_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;) cd
+    JOIN cancer_study_query_preferences q ON cd.cancer_study_identifier = q.cancer_study_identifier
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+events AS (
+    SELECT cancer_study_identifier,
+           hugo_gene_symbol,
+           sample_unique_id,
+           multiIf(
+               variant_type = &#x27;mutation&#x27; AND mutation_status != &#x27;UNCALLED&#x27;, &#x27;mutation&#x27;,
+               variant_type = &#x27;cna&#x27; AND cna_alteration = 2,                  &#x27;amplification&#x27;,
+               variant_type = &#x27;cna&#x27; AND cna_alteration = -2,                 &#x27;deep_deletion&#x27;,
+               variant_type = &#x27;structural_variant&#x27; AND mutation_status != &#x27;UNCALLED&#x27;,
+                                                                             &#x27;structural_variant&#x27;,
+               &#x27;&#x27;) AS event_type
+    FROM (SELECT * FROM genomic_event_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+    WHERE off_panel = 0
+      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences)
+),
+typed_events AS (
+    SELECT sct.preference_name AS preference_name, sct.cancer_type AS cancer_type,
+           e.hugo_gene_symbol AS hugo_gene_symbol, e.event_type AS event_type,
+           e.sample_unique_id AS sample_unique_id
+    FROM events e
+    JOIN sample_cancer_type sct
+        ON e.cancer_study_identifier = sct.cancer_study_identifier
+       AND e.sample_unique_id = sct.sample_unique_id
+    WHERE e.event_type != &#x27;&#x27;
+),
+altered AS (
+    SELECT preference_name, cancer_type, hugo_gene_symbol, event_type AS alteration_type,
+           COUNT(DISTINCT sample_unique_id) AS altered_samples
+    FROM typed_events
+    GROUP BY preference_name, cancer_type, hugo_gene_symbol, event_type
+    UNION ALL
+    SELECT preference_name, cancer_type, hugo_gene_symbol, &#x27;any&#x27; AS alteration_type,
+           COUNT(DISTINCT sample_unique_id) AS altered_samples
+    FROM typed_events
+    GROUP BY preference_name, cancer_type, hugo_gene_symbol
+),
+profile_rows AS (
+    SELECT cancer_study_identifier, alteration_type AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+    WHERE alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;COPY_NUMBER_ALTERATION&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;)
+    UNION ALL
+    SELECT cancer_study_identifier, &#x27;ANY&#x27; AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+    WHERE alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;COPY_NUMBER_ALTERATION&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;)
+),
+sample_buckets AS (
+    SELECT sct.preference_name AS preference_name, sct.cancer_type AS cancer_type,
+           pr.profile_type AS profile_type, pr.sample_unique_id AS sample_unique_id,
+           arraySort(groupUniqArray(pr.gene_panel_id)) AS panels
+    FROM profile_rows pr
+    JOIN sample_cancer_type sct
+        ON pr.cancer_study_identifier = sct.cancer_study_identifier
+       AND pr.sample_unique_id = sct.sample_unique_id
+    GROUP BY preference_name, cancer_type, profile_type, sample_unique_id
+),
+wes_profiled AS (
+    SELECT preference_name, cancer_type, profile_type, COUNT(*) AS n
+    FROM sample_buckets
+    WHERE has(panels, &#x27;WES&#x27;)
+    GROUP BY preference_name, cancer_type, profile_type
+),
+signature_counts AS (
+    SELECT preference_name, cancer_type, profile_type, panels, COUNT(*) AS n
+    FROM sample_buckets
+    WHERE NOT has(panels, &#x27;WES&#x27;)
+    GROUP BY preference_name, cancer_type, profile_type, panels
+),
+panel_genes AS (
+    SELECT gp.stable_id AS gene_panel_id, g.hugo_gene_symbol AS hugo_gene_symbol
+    FROM gene_panel gp
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+),
+panel_profiled AS (
+    SELECT preference_name, cancer_type, profile_type, hugo_gene_symbol, SUM(n) AS n
+    FROM (
+        SELECT DISTINCT s.preference_name, s.cancer_type, s.profile_type, s.panels, s.n,
+                        pg.hugo_gene_symbol
+        FROM (
+            SELECT preference_name, cancer_type, profile_type, panels, n,
+                   arrayJoin(panels) AS gene_panel_id
+            FROM signature_counts
+        ) s
+        JOIN panel_genes pg ON s.gene_panel_id = pg.gene_panel_id
+    )
+    GROUP BY preference_name, cancer_type, profile_type, hugo_gene_symbol
+)
+SELECT a.preference_name,
+       a.cancer_type,
+       a.hugo_gene_symbol,
+       a.alteration_type,
+       a.altered_samples,
+       COALESCE(w.n, 0) + COALESCE(p.n, 0) AS profiled_samples,
+       now() AS built_at
+FROM altered a
+JOIN alteration_to_profile m ON a.alteration_type = m.alteration_type
+LEFT JOIN wes_profiled w
+    ON w.preference_name = a.preference_name
+   AND w.cancer_type = a.cancer_type
+   AND w.profile_type = m.profile_type
+LEFT JOIN panel_profiled p
+    ON p.preference_name = a.preference_name
+   AND p.cancer_type = a.cancer_type
+   AND p.profile_type = m.profile_type
+   AND p.hugo_gene_symbol = a.hugo_gene_symbol</pre></details><details class="sqlq"><summary><code>154-build-cancer_type_gene_alteration_counts-brca_tcga_pan_can_atlas_2018</code></summary><pre class="sql">WITH
+alteration_to_profile AS (
+    SELECT t.1 AS alteration_type, t.2 AS profile_type
+    FROM (
+        SELECT arrayJoin([
+            (&#x27;mutation&#x27;,           &#x27;MUTATION_EXTENDED&#x27;),
+            (&#x27;amplification&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;),
+            (&#x27;deep_deletion&#x27;,      &#x27;COPY_NUMBER_ALTERATION&#x27;),
+            (&#x27;structural_variant&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;),
+            (&#x27;any&#x27;,                &#x27;ANY&#x27;)
+        ]) AS t
+    )
+),
+sample_cancer_type AS (
+    SELECT q.preference_name AS preference_name,
+           cd.cancer_study_identifier AS cancer_study_identifier,
+           cd.sample_unique_id AS sample_unique_id,
+           cd.attribute_value AS cancer_type
+    FROM (SELECT * FROM clinical_data_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;) cd
+    JOIN cancer_study_query_preferences q ON cd.cancer_study_identifier = q.cancer_study_identifier
+    WHERE cd.attribute_name = &#x27;CANCER_TYPE&#x27;
+),
+events AS (
+    SELECT cancer_study_identifier,
+           hugo_gene_symbol,
+           sample_unique_id,
+           multiIf(
+               variant_type = &#x27;mutation&#x27; AND mutation_status != &#x27;UNCALLED&#x27;, &#x27;mutation&#x27;,
+               variant_type = &#x27;cna&#x27; AND cna_alteration = 2,                  &#x27;amplification&#x27;,
+               variant_type = &#x27;cna&#x27; AND cna_alteration = -2,                 &#x27;deep_deletion&#x27;,
+               variant_type = &#x27;structural_variant&#x27; AND mutation_status != &#x27;UNCALLED&#x27;,
+                                                                             &#x27;structural_variant&#x27;,
+               &#x27;&#x27;) AS event_type
+    FROM (SELECT * FROM genomic_event_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+    WHERE off_panel = 0
+      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences)
+),
+typed_events AS (
+    SELECT sct.preference_name AS preference_name, sct.cancer_type AS cancer_type,
+           e.hugo_gene_symbol AS hugo_gene_symbol, e.event_type AS event_type,
+           e.sample_unique_id AS sample_unique_id
+    FROM events e
+    JOIN sample_cancer_type sct
+        ON e.cancer_study_identifier = sct.cancer_study_identifier
+       AND e.sample_unique_id = sct.sample_unique_id
+    WHERE e.event_type != &#x27;&#x27;
+),
+altered AS (
+    SELECT preference_name, cancer_type, hugo_gene_symbol, event_type AS alteration_type,
+           COUNT(DISTINCT sample_unique_id) AS altered_samples
+    FROM typed_events
+    GROUP BY preference_name, cancer_type, hugo_gene_symbol, event_type
+    UNION ALL
+    SELECT preference_name, cancer_type, hugo_gene_symbol, &#x27;any&#x27; AS alteration_type,
+           COUNT(DISTINCT sample_unique_id) AS altered_samples
+    FROM typed_events
+    GROUP BY preference_name, cancer_type, hugo_gene_symbol
+),
+profile_rows AS (
+    SELECT cancer_study_identifier, alteration_type AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+    WHERE alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;COPY_NUMBER_ALTERATION&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;)
+    UNION ALL
+    SELECT cancer_study_identifier, &#x27;ANY&#x27; AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+    WHERE alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;COPY_NUMBER_ALTERATION&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;)
+),
+sample_buckets AS (
+    SELECT sct.preference_name AS preference_name, sct.cancer_type AS cancer_type,
+           pr.profile_type AS profile_type, pr.sample_unique_id AS sample_unique_id,
+           arraySort(groupUniqArray(pr.gene_panel_id)) AS panels
+    FROM profile_rows pr
+    JOIN sample_cancer_type sct
+        ON pr.cancer_study_identifier = sct.cancer_study_identifier
+       AND pr.sample_unique_id = sct.sample_unique_id
+    GROUP BY preference_name, cancer_type, profile_type, sample_unique_id
+),
+wes_profiled AS (
+    SELECT preference_name, cancer_type, profile_type, COUNT(*) AS n
+    FROM sample_buckets
+    WHERE has(panels, &#x27;WES&#x27;)
+    GROUP BY preference_name, cancer_type, profile_type
+),
+signature_counts AS (
+    SELECT preference_name, cancer_type, profile_type, panels, COUNT(*) AS n
+    FROM sample_buckets
+    WHERE NOT has(panels, &#x27;WES&#x27;)
+    GROUP BY preference_name, cancer_type, profile_type, panels
+),
+panel_genes AS (
+    SELECT gp.stable_id AS gene_panel_id, g.hugo_gene_symbol AS hugo_gene_symbol
+    FROM gene_panel gp
+    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+    JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+),
+panel_profiled AS (
+    SELECT preference_name, cancer_type, profile_type, hugo_gene_symbol, SUM(n) AS n
+    FROM (
+        SELECT DISTINCT s.preference_name, s.cancer_type, s.profile_type, s.panels, s.n,
+                        pg.hugo_gene_symbol
+        FROM (
+            SELECT preference_name, cancer_type, profile_type, panels, n,
+                   arrayJoin(panels) AS gene_panel_id
+            FROM signature_counts
+        ) s
+        JOIN panel_genes pg ON s.gene_panel_id = pg.gene_panel_id
+    )
+    GROUP BY preference_name, cancer_type, profile_type, hugo_gene_symbol
+)
+SELECT a.preference_name,
+       a.cancer_type,
+       a.hugo_gene_symbol,
+       a.alteration_type,
+       a.altered_samples,
+       COALESCE(w.n, 0) + COALESCE(p.n, 0) AS profiled_samples,
+       now() AS built_at
+FROM altered a
+JOIN alteration_to_profile m ON a.alteration_type = m.alteration_type
+LEFT JOIN wes_profiled w
+    ON w.preference_name = a.preference_name
+   AND w.cancer_type = a.cancer_type
+   AND w.profile_type = m.profile_type
+LEFT JOIN panel_profiled p
+    ON p.preference_name = a.preference_name
+   AND p.cancer_type = a.cancer_type
+   AND p.profile_type = m.profile_type
+   AND p.hugo_gene_symbol = a.hugo_gene_symbol</pre></details><details class="sqlq"><summary><code>154-build-study_profiled_counts-msk_chord_2024</code></summary><pre class="sql">WITH
+sample_patient AS (
+    SELECT sample_unique_id, patient_unique_id
+    FROM (SELECT * FROM sample_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+),
+discrete_cna_profiles AS (
+    SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;
+),
+profiled AS (
+    SELECT cancer_study_identifier, alteration_type AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+    UNION ALL
+    SELECT cancer_study_identifier, &#x27;COPY_NUMBER_ALTERATION_DISCRETE&#x27; AS profile_type,
+           sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+    WHERE alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27;
+      AND genetic_profile_id IN (SELECT stable_id FROM discrete_cna_profiles)
+    UNION ALL
+    SELECT cancer_study_identifier, &#x27;ANY_MUT_CNA_SV&#x27; AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+    WHERE alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;)
+       OR (alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27;
+           AND genetic_profile_id IN (SELECT stable_id FROM discrete_cna_profiles))
+)
+SELECT cancer_study_identifier,
+       &#x27;ALL_SAMPLES&#x27; AS profile_type,
+       COUNT(DISTINCT sample_unique_id) AS samples,
+       COUNT(DISTINCT patient_unique_id) AS patients,
+       toUInt64(0) AS wes_samples,
+       now() AS built_at
+FROM (SELECT * FROM sample_derived WHERE cancer_study_identifier=&#x27;msk_chord_2024&#x27;)
+GROUP BY cancer_study_identifier
+UNION ALL
+SELECT p.cancer_study_identifier,
+       p.profile_type,
+       COUNT(DISTINCT p.sample_unique_id) AS samples,
+       COUNT(DISTINCT nullIf(sp.patient_unique_id, &#x27;&#x27;)) AS patients,
+       COUNT(DISTINCT if(p.gene_panel_id = &#x27;WES&#x27;, p.sample_unique_id, NULL)) AS wes_samples,
+       now() AS built_at
+FROM profiled p
+LEFT JOIN sample_patient sp ON p.sample_unique_id = sp.sample_unique_id
+GROUP BY p.cancer_study_identifier, p.profile_type</pre></details><details class="sqlq"><summary><code>154-build-study_profiled_counts-brca_tcga_pan_can_atlas_2018</code></summary><pre class="sql">WITH
+sample_patient AS (
+    SELECT sample_unique_id, patient_unique_id
+    FROM (SELECT * FROM sample_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+),
+discrete_cna_profiles AS (
+    SELECT stable_id FROM genetic_profile WHERE datatype = &#x27;DISCRETE&#x27;
+),
+profiled AS (
+    SELECT cancer_study_identifier, alteration_type AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+    UNION ALL
+    SELECT cancer_study_identifier, &#x27;COPY_NUMBER_ALTERATION_DISCRETE&#x27; AS profile_type,
+           sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+    WHERE alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27;
+      AND genetic_profile_id IN (SELECT stable_id FROM discrete_cna_profiles)
+    UNION ALL
+    SELECT cancer_study_identifier, &#x27;ANY_MUT_CNA_SV&#x27; AS profile_type, sample_unique_id, gene_panel_id
+    FROM (SELECT * FROM sample_to_gene_panel_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+    WHERE alteration_type IN (&#x27;MUTATION_EXTENDED&#x27;, &#x27;STRUCTURAL_VARIANT&#x27;)
+       OR (alteration_type = &#x27;COPY_NUMBER_ALTERATION&#x27;
+           AND genetic_profile_id IN (SELECT stable_id FROM discrete_cna_profiles))
+)
+SELECT cancer_study_identifier,
+       &#x27;ALL_SAMPLES&#x27; AS profile_type,
+       COUNT(DISTINCT sample_unique_id) AS samples,
+       COUNT(DISTINCT patient_unique_id) AS patients,
+       toUInt64(0) AS wes_samples,
+       now() AS built_at
+FROM (SELECT * FROM sample_derived WHERE cancer_study_identifier=&#x27;brca_tcga_pan_can_atlas_2018&#x27;)
+GROUP BY cancer_study_identifier
+UNION ALL
+SELECT p.cancer_study_identifier,
+       p.profile_type,
+       COUNT(DISTINCT p.sample_unique_id) AS samples,
+       COUNT(DISTINCT nullIf(sp.patient_unique_id, &#x27;&#x27;)) AS patients,
+       COUNT(DISTINCT if(p.gene_panel_id = &#x27;WES&#x27;, p.sample_unique_id, NULL)) AS wes_samples,
+       now() AS built_at
+FROM profiled p
+LEFT JOIN sample_patient sp ON p.sample_unique_id = sp.sample_unique_id
+GROUP BY p.cancer_study_identifier, p.profile_type</pre></details></details>
+
+<h2 id="pr160">#160 — gene-frequency views through an IN subquery</h2>
+<p class="meta"><a href="https://github.com/cBioPortal/cbioportal-mcp/pull/160">cBioPortal/cbioportal-mcp#160</a> · open, not deployed · measured at PR head <code>93f255d</code></p>
+<div class="prose"><p>“Before” is the currently deployed parameterized view <code>gene_alteration_frequency_by_cancer_type(preference='all_studies_non_redundant', …)</code>. “After” is the PR's SELECT body inlined with the same parameters substituted. CNA is covered by the two supported values, <code>amplification</code> and <code>deep_deletion</code>; there is no generic <code>cna</code> parameter.</p></div>
+<div class="card table-wrap" style="padding:4px 8px"><table><thead><tr><th style="text-align:left">Gene · alteration</th><th>Before ms</th><th>After ms</th><th>Saving ms</th><th>Rows read (both)</th><th>Same result</th></tr></thead><tbody><tr><td style="text-align:left">TP53 · mutation</td><td>991.79</td><td>394.83</td><td><strong>596.96</strong></td><td>30,599,882</td><td>yes</td></tr><tr><td style="text-align:left">TP53 · amplification</td><td>875.87</td><td>489.16</td><td><strong>386.70</strong></td><td>43,829,849</td><td>yes</td></tr><tr><td style="text-align:left">TP53 · deep deletion</td><td>753.27</td><td>468.67</td><td><strong>284.60</strong></td><td>43,829,849</td><td>yes</td></tr><tr><td style="text-align:left">TP53 · structural variant</td><td>485.29</td><td>211.08</td><td><strong>274.21</strong></td><td>14,117,465</td><td>yes</td></tr><tr><td style="text-align:left">ERBB2 · mutation</td><td>744.86</td><td>361.58</td><td><strong>383.28</strong></td><td>30,599,882</td><td>yes</td></tr><tr><td style="text-align:left">ERBB2 · amplification</td><td>765.85</td><td>496.49</td><td><strong>269.36</strong></td><td>43,829,849</td><td>yes</td></tr><tr><td style="text-align:left">ERBB2 · deep deletion</td><td>732.77</td><td>487.97</td><td><strong>244.80</strong></td><td>43,829,849</td><td>yes</td></tr><tr><td style="text-align:left">ERBB2 · structural variant</td><td>572.37</td><td>270.05</td><td><strong>302.32</strong></td><td>14,117,465</td><td>yes</td></tr></tbody></table></div>
+<p class="note">Saving 0.245–0.597 s per call, median 0.293 s. Rows and bytes read are unchanged: the rewrite cuts join/filter work, not the data read. The per-answer gain is this saving times the number of such calls in an answer, which needs the historical SQL to establish.</p>
+
+<h2 id="pr154">#154 — domain tools on precomputed aggregates</h2>
+<p class="meta"><a href="https://github.com/cBioPortal/cbioportal-mcp/pull/154">cBioPortal/cbioportal-mcp#154</a> · open, not deployed · measured at PR head <code>0fb4393</code></p>
+<div class="prose">
+<p>The PR's tools read small precomputed tables and fall back to live SQL when those are missing. None of the three tables exists on the public database, so this measures (1) the exact fallback SQL from the PR's query builders, and (2) the table-build SELECTs, each restricted to one study.</p>
+<ul>
+<li>Alteration frequency: TP53, all alteration types, one aggregate row. Top genes: mutation, top 20. Profiled counts: all profile types. All three on <code>msk_chord_2024</code> and <code>brca_tcga_pan_can_atlas_2018</code>.</li>
+<li>Frequency by cancer type takes a cohort preference instead of a study: TP53 mutation for <code>all_studies_non_redundant</code> and for its default, <code>pan_cancer_tcga</code>.</li>
+<li>Lookup cost is <em>estimated</em> from keyed SELECTs on existing small tables: <code>cancer_study</code> (548 rows) 3.06 ms and <code>gene</code> (44,896 rows) 4.00 ms. These are proxies, not measurements of the PR's tables.</li>
+</ul>
+</div>
+<h3>One fallback call replaced by one lookup</h3>
+<div class="card table-wrap" style="padding:4px 8px"><table><thead><tr><th style="text-align:left">Fallback query</th><th>Fallback s</th><th>Est. saving s</th></tr></thead><tbody><tr><td style="text-align:left"><code>154-frequency-msk_chord_2024</code></td><td>0.187</td><td>0.184</td></tr><tr><td style="text-align:left"><code>154-top-mutation-msk_chord_2024</code></td><td>0.282</td><td>0.279</td></tr><tr><td style="text-align:left"><code>154-profiled-msk_chord_2024</code></td><td>0.138</td><td>0.135</td></tr><tr><td style="text-align:left"><code>154-frequency-brca_tcga_pan_can_atlas_2018</code></td><td>0.082</td><td>0.079</td></tr><tr><td style="text-align:left"><code>154-top-mutation-brca_tcga_pan_can_atlas_2018</code></td><td>0.310</td><td>0.307</td></tr><tr><td style="text-align:left"><code>154-profiled-brca_tcga_pan_can_atlas_2018</code></td><td>0.078</td><td>0.075</td></tr><tr><td style="text-align:left"><code>154-cancer-type-TP53</code></td><td>1.348</td><td>1.345</td></tr><tr><td style="text-align:left"><code>154-cancer-type-TP53-pan-cancer-tcga</code></td><td>0.853</td><td>0.850</td></tr></tbody></table></div>
+<p class="note">Estimated saving = fallback time − 3.06 ms study-lookup estimate. Database side only. In the 09-23 questions, a text screen finds 54 gene-frequency answers (median 5 SQL calls), 26 top-genes answers (median 4) and 6 profiled-count answers (median 2) that such tools could serve (<a href="template-turns.json">template-turns.json</a>; categories overlap). If a tool replaces N such calls with one lookup it saves roughly N × fallback − lookup, but that's an assumption, not a measured benchmark saving, and SQL calls are not the same as sequential model turns.</p>
+<h3>Table-build SELECTs (computation only)</h3>
+<div class="card table-wrap" style="padding:4px 8px"><table><thead><tr><th style="text-align:left">Build SELECT</th><th>Server ms</th><th>Rows read</th></tr></thead><tbody><tr><td style="text-align:left"><code>154-build-study_gene_alteration_counts-msk_chord_2024</code></td><td>558.55</td><td>13,498,040</td></tr><tr><td style="text-align:left"><code>154-build-study_gene_alteration_counts-brca_tcga_pan_can_atlas_2018</code></td><td>547.78</td><td>14,038,712</td></tr><tr><td style="text-align:left"><code>154-build-cancer_type_gene_alteration_counts-msk_chord_2024</code></td><td>997.13</td><td>13,718,830</td></tr><tr><td style="text-align:left"><code>154-build-cancer_type_gene_alteration_counts-brca_tcga_pan_can_atlas_2018</code></td><td>1,036.70</td><td>14,161,198</td></tr><tr><td style="text-align:left"><code>154-build-study_profiled_counts-msk_chord_2024</code></td><td>69.33</td><td>2,916,228</td></tr><tr><td style="text-align:left"><code>154-build-study_profiled_counts-brca_tcga_pan_can_atlas_2018</code></td><td>35.99</td><td>2,850,692</td></tr></tbody></table></div>
+<p class="note">Three build SELECTs back the four tools: <code>study_gene_alteration_counts</code> (frequency, top genes), <code>cancer_type_gene_alteration_counts</code> (by cancer type) and <code>study_profiled_counts</code> (profiled counts). Each source table was replaced by a study-filtered subquery, with all other joins, filters and grouping kept. Timing covers the SELECT only, not inserting into MergeTree; per-study costs can't safely be multiplied into a full-build estimate.</p>
+
+<h2 id="pr151">#151 — schema and guide cache</h2>
+<p class="meta"><a href="https://github.com/cBioPortal/cbioportal-mcp/pull/151">cBioPortal/cbioportal-mcp#151</a> · open, not deployed</p>
+<div class="prose"><p>#151 caches SHOW TABLES, DESCRIBE TABLE and the dynamic study guides, one hour by default. The SHOW/DESCRIBE timings are the database work a cache hit skips.</p></div>
+<div class="card table-wrap" style="padding:4px 8px"><table><thead><tr><th style="text-align:left">Cacheable call</th><th>Server ms saved per hit</th><th>Laptop round trip ms (not in-cluster)</th></tr></thead><tbody><tr><td style="text-align:left"><code>metadata-show-tables</code></td><td>2.58</td><td>568.46</td></tr><tr><td style="text-align:left"><code>metadata-describe-cancer_study</code></td><td>1.72</td><td>566.20</td></tr><tr><td style="text-align:left"><code>metadata-describe-genomic_event_derived</code></td><td>1.38</td><td>548.27</td></tr><tr><td style="text-align:left"><code>metadata-describe-sample_to_gene_panel_derived</code></td><td>1.37</td><td>539.48</td></tr><tr><td style="text-align:left"><code>metadata-describe-clinical_data_derived</code></td><td>1.38</td><td>541.05</td></tr><tr><td style="text-align:left"><code>metadata-describe-sample_derived</code></td><td>1.55</td><td>590.97</td></tr><tr><td style="text-align:left"><code>metadata-describe-gene</code></td><td>1.37</td><td>543.38</td></tr><tr><td style="text-align:left"><code>metadata-describe-genetic_profile</code></td><td>1.40</td><td>555.84</td></tr></tbody></table></div>
+<p class="note">The 09-23 run made 101 list-tables and 327 describe-columns tool calls; the cache hit rate is unknown. <code>SELECT version(), timezone()</code> and <code>system.settings</code> were measured too (main table) but #151 doesn't cache them. Study-guide savings weren't measured. A cache hit still costs the model round trip that asked for the tool.</p>
+
+<h2 id="limitations">Limitations</h2>
+<div class="prose">
+<ul>
+<li><strong>No DB share per answer.</strong> The 09-23 artifacts hold 292 answer latencies and every tool's name and status, but no tool inputs or executed SQL (SQL shown inside answers is an example, not evidence of what ran). No raw trace export was available. So 0 historical answers and 0 historical queries were replayed, and the median/p90 DB share is N/A. Recovering the traces is the outstanding part.</li>
+<li><strong>Laptop, not cluster.</strong> Round-trip numbers include a fresh client process and a TLS handshake from outside the cluster and overstate what the MCP server pays per call.</li>
+<li><strong>Different day, warm cache.</strong> Measured on 2026-09-29, warm; data, load and query-cache state may differ from 09-23.</li>
+<li><strong>#154 lookups are estimates</strong> from small existing tables; the PR's tables were not built. Build timings are per-study SELECTs, not a full build.</li>
+<li><strong>Only three open PRs</strong>, on a handful of genes and two studies. Other genes, studies or query shapes may behave differently.</li>
+</ul>
+</div>
+<h2 id="data">Data and links</h2>
+<div class="prose">
+<ul>
+<li><a href="measurements.csv">measurements.csv</a> / <a href="measurements.jsonl">measurements.jsonl</a>: per-query medians and result hashes. <a href="raw.jsonl">raw.jsonl</a>: every execution including the warm-up (<code>iteration</code> 0).</li>
+<li><a href="queries.json">queries.json</a>: the exact SQL of every measured query. <a href="table-inventory.json">table-inventory.json</a>: row and byte counts of the database's tables.</li>
+<li><a href="turn-inventory.csv">turn-inventory.csv</a>: every 09-23 answer, its latency and LLM/SQL call counts, and why its DB share is missing. <a href="template-turns.json">template-turns.json</a>: the answers the #154 tools could serve.</li>
+<li><a href="param-views.html">Parameterized-view evidence</a>: all 15 deployed parameterized views return rows when given parameters.</li>
+<li>PRs: <a href="https://github.com/cBioPortal/cbioportal-mcp/pull/151">#151</a>, <a href="https://github.com/cBioPortal/cbioportal-mcp/pull/154">#154</a>, <a href="https://github.com/cBioPortal/cbioportal-mcp/pull/160">#160</a> on cBioPortal/cbioportal-mcp. Benchmark: <a href="../20260923-1919/report.html">2026-09-23 run</a>.</li>
+</ul>
+</div>
+
+</main>
+</body>
+</html>
