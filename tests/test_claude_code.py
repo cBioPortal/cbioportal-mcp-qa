@@ -1,6 +1,7 @@
 import json
 
 import httpx
+import pytest
 
 from cbioportal_mcp_qa import versions
 from cbioportal_mcp_qa.agent_prompt import prompt_fingerprint
@@ -352,7 +353,16 @@ def test_client_stops_asking_after_an_expired_login(monkeypatch):
     assert len(calls) == 1 and client.signin_expired
 
 
-def test_client_stops_asking_after_the_usage_limit(monkeypatch):
+@pytest.mark.parametrize(
+    "message",
+    [
+        "You've hit your session limit · resets 3:40am (UTC)",
+        "You've hit your limit · resets 3:40am (UTC)",  # Claude Code 2.1.287
+        "You've hit your weekly limit · resets 3:40am (UTC)",
+        "Claude usage limit reached · resets 3:40am (UTC)",
+    ],
+)
+def test_client_stops_asking_after_the_usage_limit(monkeypatch, message):
     monkeypatch.setattr("cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: set())
     client = ClaudeCodeClient("PROMPT", "http://db/mcp", "https://nav/mcp")
     calls = []
@@ -361,7 +371,7 @@ def test_client_stops_asking_after_the_usage_limit(monkeypatch):
             "type": "result",
             "subtype": "success",
             "is_error": True,
-            "result": "You've hit your session limit · resets 3:40am (UTC)",
+            "result": message,
         }
     )
 
@@ -383,8 +393,8 @@ def test_client_stops_asking_after_the_usage_limit(monkeypatch):
         second = asyncio.run(client.ask("q2", "haiku"))
     finally:
         asyncio.run(client.aclose())
-    assert first.status is None and "session limit" in first.error
-    assert second.status is None and "session limit" in second.error
+    assert first.status is None and first.error == message
+    assert second.status is None and second.error == message
     assert len(calls) == 1 and "resets 3:40am" in client.usage_limit
 
 
