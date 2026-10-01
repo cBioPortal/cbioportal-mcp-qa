@@ -23,7 +23,7 @@ SELECT
   round(100 * altered_samples / profiled_samples, 1) AS pct
 ;
 
--- Per-study breakdown (context for the judge: a pooled answer must not average these percentages).
+-- Baseline for Q2006: per-study breakdown (a pooled answer must not average these percentages).
 WITH
   profiled AS (
     SELECT sample_unique_id FROM mutation_panel_gene_coverage

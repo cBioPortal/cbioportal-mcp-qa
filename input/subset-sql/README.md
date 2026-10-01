@@ -1,8 +1,11 @@
 # Reference SQL for the subset questions
 
 One file per question in [`../questions-subset.yaml`](../questions-subset.yaml) (`<id>.sql`, named by the
-question's `sql` field). Each holds the read-only query that produced the question's reference answer; the
-pooled-study questions (2006–2008) have a second statement with the per-study breakdown.
+question's `sql` field). Each starts with the read-only query that produced the question's reference answer
+(`-- Q<id>:`). The statements after it, each headed `-- Baseline for Q<id>:`, compute the numbers that the
+question's "Must not" rubric names: what an answer over the wrong cohort or at the wrong level would say (the
+whole study, the whole cancer type, one filter only, patient instead of sample level, or each pooled study on its
+own). Q2019 has no baseline statement: the sample count its rubric names comes from the reference query.
 
 Computed on **2026-10-01** against ClickHouse database `cbioportal_public_librechat_blue`. The data refreshes
 daily, so numbers can drift; re-run before trusting an old reference and update `expected_answer`, `notes` and
@@ -26,4 +29,7 @@ Conventions, the same as the `top_mutated_genes_in_study` / `gene_mutation_frequ
   `LIVER`) are joined through the sample's patient.
 - **Patient level**: a patient is profiled if any of their subset samples is, and mutated if any of those has the
   mutation.
+- **Top genes**: ranked by frequency. The view ranks by count, and for these questions both orders give the
+  same top genes.
+- **Liver metastasis (Q2023)**: patients with a known `LIVER` status (Yes or No).
 - **Co-occurrence**: samples profiled for both genes; the odds ratio is `(both × neither) / (only A × only B)`.
