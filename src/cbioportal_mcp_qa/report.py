@@ -442,6 +442,17 @@ QUESTION_SETS = {
         "breaking results down, accepting an offered option, answering a clarifying question, pushing back "
         "on a correct number, asking for significance or citations, and follow-ups in other languages.",
     },
+    "input/questions-subset.yaml": {
+        "title": "Subset questions",
+        "short": "Statistics over a subset of samples or patients that per-study precomputed tables don't cover. "
+        "Scores are not comparable with the main benchmark.",
+        "purpose": "The main set leans on per-study statistics (top genes in a study, a gene's frequency in a "
+        "study), which precomputed tables and per-study tools answer directly. Here the cohort is a clinical "
+        "subset of a study (sample type, sex, smoking, stage, MSI, receptor status, OncoTree code) or a pooled "
+        "set of studies, so the agent must write the SQL and must not answer with the whole-study number. "
+        "Covers subset frequencies, pooled studies, subset comparisons, co-occurrence, top genes, patient vs "
+        "sample level, clinical counts in mutation-defined groups and multi-turn narrowing.",
+    },
 }
 SOURCE_URL = "https://github.com/cBioPortal/cbioportal-mcp-qa/blob/main/"
 
