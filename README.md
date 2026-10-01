@@ -367,6 +367,21 @@ The Agents API runner sends the history as prior messages. `claude -p` takes a s
 claude-code runner quotes the history ahead of the new message. The judge sees the whole conversation.
 Assistant turns are written by hand, not generated, and must be correct: the follow-up is graded, not them.
 
+### Subset questions
+
+`input/questions-subset.yaml` (ids 2001+) asks for statistics over a *subset* of a study: a clinical subgroup
+(sample type, sex, smoking, stage, MSI, HR/HER2, OncoTree code), a pooled set of studies, or a mutation-defined
+group. The main set leans on per-study statistics, which precomputed tables and per-study tools answer directly;
+these questions measure whether the agent writes the right SQL instead, and doesn't answer with the
+whole-study number. Like the multi-turn set, it is its own test set with its own pass rates:
+
+```bash
+uv run cbioportal-mcp-qa run --runner claude-code --questions-file input/questions-subset.yaml
+```
+
+Each question's `sql` field names the query in `input/subset-sql/` that computed its reference, with the
+database and date (see [its README](input/subset-sql/README.md)).
+
 ## Development
 
 ```bash
