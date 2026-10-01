@@ -7,6 +7,7 @@ import click
 from .agent import AgentClient
 from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
 from .claude_code import ClaudeCodeClient, find_connector, prompt_parity
+from .claude_judge import ClaudeCodeJudge
 from .compare import compare as compare_runs
 from .compare import write_compare
 from .config import MODELS, TARGETS, load_settings
@@ -18,7 +19,7 @@ from .dataset import (
     load_questions,
     parse_selection,
 )
-from .grade import Judge
+from .grade import BaseJudge, Judge, JudgeStopped
 from .persist import write_text
 from .redact import describe_error, redact
 from .report import write_index, write_report
@@ -79,6 +80,11 @@ def claude_code_options(f):
         help="claude-code runner on a beta target: fail unless the database MCP is beta's (DATABASE_MCP_URL at "
         "beta's service, or DATABASE_MCP_ENV=beta for a port-forward or local image) instead of warning.",
     )(f)
+    return claude_code_session_options(f)
+
+
+def claude_code_session_options(f):
+    """How `claude` sessions bill and which settings they load: the claude-code runner's and judge's."""
     f = click.option(
         "--claude-code-user-settings",
         is_flag=True,
@@ -100,6 +106,28 @@ def claude_code_options(f):
         help="Let claude-code sessions use ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL, a "
         "cloud provider (CLAUDE_CODE_USE_*) or an apiKeyHelper, billed per token. By default those are "
         "removed or refused so answers bill the subscription login.",
+    )(f)
+    return f
+
+
+JUDGE_RUNNERS = ["bedrock", "claude-code"]
+
+
+def judge_options(f):
+    f = click.option(
+        "--judge-model",
+        default=None,
+        help="Judge model: a model key (sonnet-4.6), Bedrock id or Claude Code id. Default: JUDGE_MODEL "
+        "(Sonnet 4.6 on Bedrock), or the same model through Claude Code.",
+    )(f)
+    f = click.option(
+        "--judge-runner",
+        type=click.Choice(JUDGE_RUNNERS),
+        default="bedrock",
+        show_default=True,
+        help="bedrock: the Bedrock judge at temperature 0 (bills AWS). claude-code: the same prompt through "
+        "`claude -p` on the Claude subscription, no tools; grades are recorded as claude-code:<model>, can't be "
+        "at temperature 0, and aren't comparable with Bedrock grades. Takes the --claude-code-* billing options.",
     )(f)
     return f
 
@@ -201,6 +229,66 @@ def _judge(settings) -> Judge:
     return Judge(settings.judge_model, settings.aws_region, settings.aws_profile)
 
 
+def _make_judge(
+    settings,
+    judge_runner: str,
+    judge_model: str | None,
+    allow_api_billing: bool = False,
+    user_settings: bool = False,
+    trust_org_policy: bool = False,
+) -> BaseJudge:
+    if judge_runner == "claude-code":
+        try:
+            return ClaudeCodeJudge(
+                judge_model or settings.judge_model,
+                allow_api_billing=allow_api_billing,
+                isolate_settings=not user_settings,
+                trust_org_policy=trust_org_policy,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise click.ClickException(f"claude-code judge: {redact(str(exc))}") from exc
+    if not judge_model:
+        return _judge(settings)
+    return Judge(_bedrock_judge_model(settings, judge_model), settings.aws_region, settings.aws_profile)
+
+
+def _bedrock_judge_model(settings, judge_model: str | None) -> str:
+    if not judge_model:
+        return settings.judge_model
+    model = MODELS[judge_model].bedrock_id if judge_model in MODELS else judge_model
+    if not model:
+        raise click.BadParameter(f"{judge_model} has no Bedrock id", param_hint="--judge-model")
+    return model
+
+
+def _grade(bench: Run, judge: BaseJudge, concurrency: int, command: str) -> None:
+    """Grade, and on a stop (the subscription's usage limit, per-token billing) write the report and say how to
+    resume."""
+    try:
+        grade_answers(bench, judge, concurrency)
+    except JudgeStopped as exc:
+        click.echo(f"Report: {write_report(bench)}")
+        raise click.ClickException(
+            f"grading stopped: {exc}. The grades so far are saved; once it is resolved (a usage limit resets), "
+            f"continue with `{command}`."
+        ) from exc
+    finally:
+        if close := getattr(judge, "close", None):
+            close()
+
+
+def _grade_command(bench: Run, judge_runner: str, judge_model: str | None, trust_org_policy: bool) -> str:
+    """The `grade` command that continues grading this run with the same judge."""
+    cmd = f"cbioportal-mcp-qa grade {bench.data['run_id']}"
+    if judge_runner != "bedrock":
+        cmd += f" --judge-runner {judge_runner}"
+    if judge_model:
+        cmd += f" --judge-model {judge_model}"
+    if judge_runner == "claude-code" and trust_org_policy:
+        cmd += " --claude-code-trust-org-policy"
+    return cmd
+
+
 @click.group()
 def cli() -> None:
     """Benchmark cBioPortalChat by asking the deployed agent the questions in input/questions.yaml."""
@@ -273,6 +361,10 @@ def ask(
 @click.option("--concurrency", type=int, default=2, show_default=True, help="Parallel requests to the agent.")
 @click.option("--resume", default=None, help="Run id to continue (re-asks only missing/failed answers).")
 @click.option("--no-grade", is_flag=True, help="Only collect answers and traces.")
+@judge_options
+@click.option(
+    "--judge-concurrency", type=int, default=1, show_default=True, help="Answers graded in parallel."
+)
 @click.option(
     "--render/--no-render",
     default=True,
@@ -291,6 +383,9 @@ def run(
     concurrency,
     resume,
     no_grade,
+    judge_runner,
+    judge_model,
+    judge_concurrency,
     render,
     screenshots,
     runner,
@@ -322,7 +417,17 @@ def run(
             agent_error = describe_error(exc)
     prompt = agent["instructions"] if agent and runner == "claude-code" else None
     mcp_env = _check_database_mcp(settings, target, runner, require_beta_mcp)
-    # Before the run exists: the claude-code runner refuses to start on per-token billing.
+    # Before the run exists: the claude-code judge, like the runner, refuses to start on per-token billing.
+    judge = None
+    if not no_grade and judge_runner == "claude-code":
+        judge = _make_judge(
+            settings,
+            judge_runner,
+            judge_model,
+            claude_code_allow_api_billing,
+            claude_code_user_settings,
+            claude_code_trust_org_policy,
+        )
     client = _client(
         settings,
         target,
@@ -365,7 +470,8 @@ def run(
             extra["claude_code"] = client.describe() | {
                 "prompt": prompt_parity(prompt, settings.database_mcp_url)
             }
-        bench = Run.create(target, models, repeats, settings.judge_model, str(questions_file), runner, extra)
+        judge_id = judge.model if judge else _bedrock_judge_model(settings, judge_model)
+        bench = Run.create(target, models, repeats, judge_id, str(questions_file), runner, extra)
         if agent:
             # A record of the prompt this run tested (the benchmark itself always reads the live agent).
             write_text(bench.dir / "agent-prompt.md", agent["instructions"])
@@ -405,7 +511,13 @@ def run(
         rendered = render_navigation_links(bench, settings.chromium_path, screenshots=screenshots)
         click.echo(f"Rendered {rendered} navigation links")
     if not no_grade:
-        grade_answers(bench, _judge(settings))
+        judge = judge or _make_judge(settings, judge_runner, judge_model)
+        _grade(
+            bench,
+            judge,
+            judge_concurrency,
+            _grade_command(bench, judge_runner, judge_model, claude_code_trust_org_policy),
+        )
     click.echo(f"Report: {write_report(bench)}")
 
 
@@ -439,9 +551,31 @@ def traces(run_id: str) -> None:
     help="Update each question's references (expected answer, links, notes, track) from the current questions "
     "file, then regrade (implies --regrade). The question text and history stay as they were asked.",
 )
-def grade(run_id: str, regrade: bool, refresh_questions: bool) -> None:
-    """Grade answers that don't have a grade yet."""
+@judge_options
+@click.option("--concurrency", type=int, default=1, show_default=True, help="Answers graded in parallel.")
+@claude_code_session_options
+def grade(
+    run_id: str,
+    regrade: bool,
+    refresh_questions: bool,
+    judge_runner: str,
+    judge_model: str | None,
+    concurrency: int,
+    claude_code_allow_api_billing: bool,
+    claude_code_trust_org_policy: bool,
+    claude_code_user_settings: bool,
+) -> None:
+    """Grade answers that don't have a grade yet (and answers the judge left ungraded)."""
     bench = Run.load(run_id)
+    # Before any grade is discarded: the claude-code judge refuses to start on per-token billing.
+    judge = _make_judge(
+        load_settings(),
+        judge_runner,
+        judge_model,
+        claude_code_allow_api_billing,
+        claude_code_user_settings,
+        claude_code_trust_org_policy,
+    )
     if refresh_questions:
         current = {q.id: asdict(q) for q in load_questions(Path(bench.data["questions_file"]))}
         reworded = set()
@@ -465,7 +599,12 @@ def grade(run_id: str, regrade: bool, refresh_questions: bool) -> None:
         for rec in bench.records.values():
             rec.pop("grade", None)
         bench.save()
-    grade_answers(bench, _judge(load_settings()))
+    _grade(
+        bench,
+        judge,
+        concurrency,
+        _grade_command(bench, judge_runner, judge_model, claude_code_trust_org_policy),
+    )
     click.echo(f"Report: {write_report(bench)}")
 
 

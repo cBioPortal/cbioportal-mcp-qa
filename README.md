@@ -17,7 +17,7 @@ For every question × model (× repeat):
 - **Execution trace** from Langfuse, matched by response id: number of LLM calls, every tool call, and
   tool errors (e.g. navigator schema errors).
 - **Grade**, pass/fail: an LLM judge (default Sonnet 4.6 on Bedrock, deliberately not one of the models under
-  test) checks the answer against the reference answer, expected links and the `notes` rubric, using the
+  test; or through the local Claude Code subscription with `--judge-runner claude-code`) checks the answer against the reference answer, expected links and the `notes` rubric, using the
   criterion for the question's track (below). It also records whether the answer *declined*, so the report
   can separate precision (right when it answers) from coverage (how often it answers). The judge also sees the
   answer's tool calls (inputs and truncated results; guide text left out), so statistics the agent actually
@@ -70,7 +70,8 @@ cp .env.example .env   # then fill it in
 - `LIBRECHAT_API_KEY`: create under **Settings → Agent API Keys** on beta.chat.cbioportal.org. Beta and prod
   share a database, so the key works on both. Runs are billed to that account's token balance.
 - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`: for tool-call stats (optional; runs work without).
-- AWS credentials for the judge: `AWS_PROFILE` with Bedrock access (e.g. `cdsi-imagine-490004633549`).
+- AWS credentials for the judge: `AWS_PROFILE` with Bedrock access (e.g. `cdsi-imagine-490004633549`). Not
+  needed with `--judge-runner claude-code` ([below](#grading-with-claude-code---judge-runner-claude-code)).
 
 Choosing the model per request requires cbioportal/librechat `v0.8.7-custom-v3` or later on the target, where
 the Agents API accepts a `spec` (modelSpec name) alongside the agent id.
@@ -183,7 +184,8 @@ Claude Code (`claude -p`) instead of the deployed agent:
   tools are disabled and extended thinking is off, matching the deployment.
 - **Models:** the same Haiku 4.5 / Sonnet 5.
 - **Cost:** runs on the Claude subscription of the Claude home it's started with, so point
-  `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock.
+  `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock,
+  and with `--judge-runner claude-code` it doesn't either.
   If the subscription's usage limit is hit (or the connector's login expires), the run stops asking, skips
   grading, and prints the `--resume` command to continue once the limit resets.
 
@@ -253,6 +255,46 @@ loaded, so `effortLevel`, hooks, enabled plugins and an `apiKeyHelper` in `~/.cl
 the benchmark. Managed settings still apply. The login and the claude.ai connectors aren't settings, so the
 connector path keeps working; if the connector ever fails to load, the runner stops with an error rather
 than answering without the database. `--claude-code-user-settings` loads the user settings again.
+
+### Grading with Claude Code (`--judge-runner claude-code`)
+
+`run` and `grade` take `--judge-runner claude-code` to grade on the local Claude subscription instead of
+Bedrock, so a benchmark costs no Bedrock credit. To grade an existing run (e.g. one collected with
+`--no-grade`) locally:
+
+```bash
+uv run cbioportal-mcp-qa grade <run-id> --judge-runner claude-code --claude-code-trust-org-policy
+```
+
+(`--claude-code-trust-org-policy` is needed on a Team/Enterprise login, e.g. an MSK claude.ai organization; a
+Pro or Max login doesn't need it.) `--concurrency N` grades N answers in parallel (default 1); `run` takes
+`--judge-concurrency`. `--judge-model` picks the judge for either runner: a model key (`sonnet-4.6`), a Bedrock
+id or a Claude Code id. By default the claude-code judge is the Bedrock judge's model (`JUDGE_MODEL`, Sonnet
+4.6) through Claude Code, i.e. `claude-sonnet-4-6`.
+
+- **Same prompt and grade.** Each answer goes to `claude -p` with the Bedrock judge's prompt and rubric on
+  stdin, the same JSON schema as structured output (`--json-schema`), and produces the same grade fields.
+- **No tools.** Built-in tools are off (`--tools ""`), and so are MCP servers: `--strict-mcp-config` with an
+  empty config, and `ENABLE_CLAUDEAI_MCP_SERVERS=false` for the claude.ai connectors. If a session reports any
+  tool other than the structured-output one, grading stops.
+- **Same billing safeguards as the runner** ([above](#billing-guard)): billing variables are removed, the
+  billing guard and plan check run before the first grading call, a session whose `apiKeySource` names a
+  key or token stops grading, and user settings are excluded (`--claude-code-user-settings` and
+  `--claude-code-allow-api-billing` work as for the runner). It runs in an empty temp directory.
+- **Failures.** A reply that isn't valid JSON or doesn't match the schema is retried once; if it fails again
+  the answer is left ungraded (`judge_error` in `run.json` says why) and the next `grade` tries it again. On
+  the subscription's usage limit, grading stops cleanly: grades so far are saved, the report is written, and
+  the `grade` command to resume once the limit resets is printed.
+- **Judge identity.** Each grade records its judge as `claude-code:<model>` (e.g.
+  `claude-code:claude-sonnet-4-6`), so `compare` refuses to mix them with Bedrock grades (`us.anthropic.…`),
+  and a run graded by both shows up as mixed. Judge cost isn't estimated: nothing is billed per token.
+
+**Less deterministic than Bedrock.** Claude Code can't set the temperature, so the claude-code judge can't
+grade at temperature 0 like the Bedrock judge, and regrading the same answer can flip a borderline verdict.
+Grade the before and after runs of a comparison with the same judge (both `claude-code:<model>`, or both
+Bedrock), and expect a little more noise than with Bedrock. Claude Code grades are **not comparable** with
+the Bedrock-graded 09-23 run (20260923-1919) or any other Bedrock-graded run; regrade that run with
+`--judge-runner claude-code --regrade` if you need it as a baseline.
 
 ### MCP servers, and benchmarking beta
 

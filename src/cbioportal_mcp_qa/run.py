@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +14,7 @@ from tqdm import tqdm
 from .agent import AgentClient
 from .claude_code import ClaudeCodeClient
 from .dataset import DEFINITION_FIELDS, Question, asked_question
-from .grade import Judge, StudyValidator, cbio_links, tool_log
+from .grade import BaseJudge, JudgeOutputError, StudyValidator, cbio_links, tool_log
 from .persist import write_json
 from .render import render_links
 from .traces import Langfuse
@@ -139,9 +141,13 @@ def attach_traces(run: Run, langfuse: Langfuse) -> int:
     return attached
 
 
-def grade_answers(run: Run, judge: Judge) -> None:
+def grade_answers(run: Run, judge: BaseJudge, concurrency: int = 1) -> None:
     """Grade answers without a grade. Each grade records its judge model and a snapshot of the question it was
-    graded against (`graded`), so `compare` checks what was actually graded."""
+    graded against (`graded`), so `compare` checks what was actually graded.
+
+    A verdict the judge got wrong twice (invalid JSON, not the schema) leaves the answer ungraded, with
+    `judge_error` saying why; the next `grade` tries it again. A JudgeStopped (e.g. the subscription's usage
+    limit) stops grading: the grades so far are saved and it is raised once the answers in flight finish."""
     # Grades from before per-turn judges were all made by the run's judge.
     for rec in run.records.values():
         if rec.get("grade") and "judge_model" not in rec["grade"]:
@@ -150,19 +156,48 @@ def grade_answers(run: Run, judge: Judge) -> None:
     pending = [
         rec for rec in run.records.values() if rec["reply"].get("status") == 200 and not rec.get("grade")
     ]
-    for rec in tqdm(pending, desc="grading", unit="ans"):
+    lock = threading.Lock()
+    # The first JudgeStopped or unexpected error (e.g. Bedrock credentials) stops the answers not started yet.
+    stopped: list[Exception] = []
+    bar = tqdm(total=len(pending), desc="grading", unit="ans")
+
+    def one(rec: dict) -> None:
+        if stopped:
+            return
         q = Question.from_dict(rec["question"])
-        grade = judge.grade(
-            q, rec["reply"]["answer"], studies, run.data.get("renders", {}), tool_log(rec, run.dir)
-        ).to_dict()
-        rec["grade"] = grade | {
-            "judge_model": judge.model,
-            "graded": {f: rec["question"].get(f) for f in DEFINITION_FIELDS},
-        }
+        try:
+            grade = judge.grade(
+                q, rec["reply"]["answer"], studies, run.data.get("renders", {}), tool_log(rec, run.dir)
+            ).to_dict()
+        except JudgeOutputError as exc:
+            with lock:
+                rec["judge_error"] = {"judge_model": judge.model, "error": str(exc)}
+                run.save()
+                bar.update(1)
+                bar.write(f"[{rec['model']}] Q{q.id} left ungraded: {str(exc)[:200]}")
+            return
+        except Exception as exc:  # noqa: BLE001 - re-raised after the answers in flight
+            stopped.append(exc)
+            return
+        with lock:
+            rec.pop("judge_error", None)
+            rec["grade"] = grade | {
+                "judge_model": judge.model,
+                "graded": {f: rec["question"].get(f) for f in DEFINITION_FIELDS},
+            }
+            record_judges(run)
+            run.save()
+            bar.update(1)
+
+    try:
+        with ThreadPoolExecutor(max(1, concurrency)) as pool:
+            list(pool.map(one, pending))
+    finally:
+        bar.close()
         record_judges(run)
         run.save()
-    record_judges(run)
-    run.save()
+    if stopped:
+        raise stopped[0]
 
 
 def record_judges(run: Run) -> None:
