@@ -2,6 +2,7 @@
 
 import json
 import re
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -187,6 +188,7 @@ class StudyValidator:
         self.url = url
         self._known: set[str] | None = None
         self._loaded = False
+        self._lock = threading.Lock()  # answers can be graded concurrently
 
     def _load(self) -> None:
         self._loaded = True
@@ -198,8 +200,9 @@ class StudyValidator:
             self._known = None
 
     def exists(self, study_id: str) -> bool:
-        if not self._loaded:
-            self._load()
+        with self._lock:
+            if not self._loaded:
+                self._load()
         return self._known is None or study_id in self._known
 
 
@@ -207,10 +210,64 @@ def invalid_studies(links: list[str], studies: StudyValidator) -> list[str]:
     return sorted({s for url in links for s in study_ids(url) if not studies.exists(s)})
 
 
-class Judge:
-    def __init__(self, model: str, aws_region: str, aws_profile: str | None):
-        self.model = model
-        self.client = AnthropicBedrock(aws_region=aws_region, aws_profile=aws_profile)
+class JudgeOutputError(Exception):
+    """The judge's reply wasn't a grade (invalid JSON, or not the schema). The answer is left ungraded."""
+
+
+class JudgeStopped(Exception):
+    """No more answers can be graded now (e.g. the Claude subscription's usage limit): stop, and resume later."""
+
+
+def parse_verdict(result) -> dict:
+    """The judge's verdict, checked against JUDGE_SCHEMA."""
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError as exc:
+            raise JudgeOutputError(f"not JSON: {result[:200]!r}") from exc
+    props = JUDGE_SCHEMA["properties"]
+    types = {"string": str, "boolean": bool}
+    if (
+        not isinstance(result, dict)
+        or set(result) != set(props)
+        or any(not isinstance(result[k], types[v["type"]]) for k, v in props.items())
+    ):
+        raise JudgeOutputError(f"not the judge schema: {json.dumps(result)[:200]}")
+    return result
+
+
+def judge_prompt(
+    q: Question, answer: str, links: list[str], renders: dict[str, dict] | None, tool_log: str
+) -> str:
+    return JUDGE_PROMPT.format(
+        track=q.track.replace("_", " "),
+        criterion=TRACK_CRITERIA[q.track],
+        conversation=(
+            "The QUESTION is a follow-up; judge the ANSWER as the reply to it in this conversation:\n<conversation_so_far>\n"
+            + "\n".join(f"<{t['role']}>{t['content']}</{t['role']}>" for t in q.history)
+            + "\n</conversation_so_far>\n"
+            if q.history
+            else ""
+        ),
+        question=q.question,
+        study=q.study,
+        expected_answer=q.expected_answer or "(none)",
+        expected_links="\n".join(q.expected_links) or "(none)",
+        notes=q.notes or "(none)",
+        answer=answer,
+        tool_log=tool_log or "(not recorded)",
+        decoded_links="\n\n".join(
+            f"{url}\n{describe_link(url)}{rendered_text((renders or {}).get(url))}" for url in links
+        )
+        or "(none)",
+    )
+
+
+class BaseJudge:
+    """Grades one answer. Subclasses call the model: `verdict(prompt)` returns the schema's fields and the
+    judge's input and output tokens. `model` is the judge id each grade records."""
+
+    model: str
 
     def grade(
         self,
@@ -230,28 +287,31 @@ class Judge:
             return Grade(passed=False, declined=False, rationale="Empty answer.", **base)
         if not q.has_reference:
             return Grade(passed=None, declined=False, rationale="No reference for this question.", **base)
-        prompt = JUDGE_PROMPT.format(
-            track=q.track.replace("_", " "),
-            criterion=TRACK_CRITERIA[q.track],
-            conversation=(
-                "The QUESTION is a follow-up; judge the ANSWER as the reply to it in this conversation:\n<conversation_so_far>\n"
-                + "\n".join(f"<{t['role']}>{t['content']}</{t['role']}>" for t in q.history)
-                + "\n</conversation_so_far>\n"
-                if q.history
-                else ""
-            ),
-            question=q.question,
-            study=q.study,
-            expected_answer=q.expected_answer or "(none)",
-            expected_links="\n".join(q.expected_links) or "(none)",
-            notes=q.notes or "(none)",
-            answer=answer,
-            tool_log=tool_log or "(not recorded)",
-            decoded_links="\n\n".join(
-                f"{url}\n{describe_link(url)}{rendered_text((renders or {}).get(url))}" for url in links
-            )
-            or "(none)",
+        result, input_tokens, output_tokens = self.verdict(judge_prompt(q, answer, links, renders, tool_log))
+        return Grade(
+            passed=result["passed"],
+            declined=result["declined"],
+            rationale=result["rationale"],
+            judge_input_tokens=input_tokens,
+            judge_output_tokens=output_tokens,
+            **base,
         )
+
+    def verdict(self, prompt: str) -> tuple[dict, int, int]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class Judge(BaseJudge):
+    """The Bedrock judge, at temperature 0."""
+
+    def __init__(self, model: str, aws_region: str, aws_profile: str | None):
+        self.model = model
+        self.client = AnthropicBedrock(aws_region=aws_region, aws_profile=aws_profile)
+
+    def verdict(self, prompt: str) -> tuple[dict, int, int]:
         response = self.client.messages.create(
             model=self.model,
             max_tokens=1024,
@@ -260,11 +320,4 @@ class Judge:
             output_config={"format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
         )
         result = json.loads(next(b.text for b in response.content if b.type == "text"))
-        return Grade(
-            passed=result["passed"],
-            declined=result["declined"],
-            rationale=result["rationale"],
-            judge_input_tokens=response.usage.input_tokens,
-            judge_output_tokens=response.usage.output_tokens,
-            **base,
-        )
+        return result, response.usage.input_tokens, response.usage.output_tokens
