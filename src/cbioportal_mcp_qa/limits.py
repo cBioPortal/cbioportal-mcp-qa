@@ -2,7 +2,8 @@
 
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from datetime import time as dt_time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import click
@@ -27,7 +28,11 @@ def _now() -> datetime:
 
 
 def reset_time(message: str, now: datetime) -> datetime | None:
-    """When a usage-limit message says the limit resets, as the next such time after `now` (aware), or None."""
+    """When a usage-limit message says the limit resets, as the next such time after `now` (aware), or None.
+
+    Instants are compared in UTC: aware datetimes in one zone subtract by wall clock, which is off by the
+    shift across a DST change. A wall time that happens twice (fall back) is taken as the later one, so the
+    wait never ends before the reset."""
     m = RESET.search(message)
     if not m:
         return None
@@ -35,19 +40,24 @@ def reset_time(message: str, now: datetime) -> datetime | None:
     if not 1 <= hour <= 12 or minute > 59:
         return None
     hour = hour % 12 + (12 if m[3].lower() == "p" else 0)
+    zone = None
     if m[4]:
         try:
             zone = ZoneInfo(m[4].strip())
         except (ZoneInfoNotFoundError, ValueError):
             return None
-        local = now.astimezone(zone)
-    else:
-        local = now.astimezone()
-    reset = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if reset <= local:
-        if local - reset < JUST_PASSED:
+
+    def at(day) -> datetime:
+        """That wall time on `day`, in the named zone or else local time (with its DST rules)."""
+        wall = datetime.combine(day, dt_time(hour, minute, fold=1))
+        return wall.replace(tzinfo=zone) if zone else wall.astimezone()
+
+    reset = at(now.astimezone(zone).date())
+    if reset.astimezone(UTC) <= now.astimezone(UTC):
+        if now.astimezone(UTC) - reset.astimezone(UTC) < JUST_PASSED:
             return None
-        reset += timedelta(days=1)
+        # The same wall time tomorrow (not 24 hours on: a DST change in between moves it).
+        reset = at(reset.date() + timedelta(days=1))
     return reset
 
 
@@ -62,8 +72,12 @@ class LimitWaiter:
     def wait(self, message: str) -> bool:
         now = _now()
         reset = reset_time(message, now)
-        seconds = (reset - now).total_seconds() + MARGIN_S if reset else self.backoff_s
-        until = now + timedelta(seconds=seconds)
+        seconds = (
+            (reset.astimezone(UTC) - now.astimezone(UTC)).total_seconds() + MARGIN_S
+            if reset
+            else self.backoff_s
+        )
+        until = (now.astimezone(UTC) + timedelta(seconds=seconds)).astimezone(now.tzinfo)
         if seconds > self.left:
             click.echo(
                 f"Usage limit: waiting until {until:%Y-%m-%d %H:%M %Z} would pass --max-wait "

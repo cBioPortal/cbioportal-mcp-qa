@@ -255,8 +255,6 @@ class ClaudeCodeJudge(BaseJudge):
     def verdict(self, prompt: str) -> tuple[dict, int, int]:
         problem = ""
         for _ in range(ATTEMPTS):
-            if self.stopped:
-                raise JudgeStopped(self.stopped)
             try:
                 return self._call(prompt)
             except JudgeOutputError as exc:
@@ -264,18 +262,27 @@ class ClaudeCodeJudge(BaseJudge):
         raise JudgeOutputError(f"{problem} (after {ATTEMPTS} attempts)")
 
     def _call(self, prompt: str) -> tuple[dict, int, int]:
-        try:
-            out = subprocess.run(
-                judge_args(self.claude_model, self.mcp_config_path, self.settings),
-                input=prompt,
+        args = judge_args(self.claude_model, self.mcp_config_path, self.settings)
+        # The stop check and the launch are one step: no judge call starts once another thread recorded a stop.
+        with self._lock:
+            if self.stopped:
+                raise JudgeStopped(self.stopped)
+            proc = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 cwd=self._workdir.name,  # empty: no project CLAUDE.md
                 env=self.env,
-                capture_output=True,
                 text=True,
-                timeout=self.timeout_s,
             )
+        try:
+            stdout, stderr = proc.communicate(prompt, timeout=self.timeout_s)
         except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            proc.communicate()
             raise JudgeOutputError(f"timed out after {self.timeout_s:.0f}s") from exc
+        out = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
         lines = out.stdout.splitlines()
         if not self.allow_api_billing and bills_per_token(source := api_key_source(lines)):
             raise self._stop(api_billing_error(source))

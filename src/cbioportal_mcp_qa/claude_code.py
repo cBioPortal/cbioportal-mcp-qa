@@ -760,6 +760,10 @@ class ClaudeCodeClient:
         self.usage_limit: str | None = None
         self.api_billing: str | None = None
         self.plugins_error: str | None = None
+        # Every stop, in the order they happened: (kind, message). The first is the run's reason.
+        self.stops: list[tuple[str, str]] = []
+        # The error of every reply that was a stop, so each reply is classified by its own content.
+        self._stop_errors: set[str] = set()
         self.timeout_s = timeout_s
         self.retries = retries
         self.allow_api_billing = allow_api_billing
@@ -814,18 +818,32 @@ class ClaudeCodeClient:
         return f"claude.ai connector {self.setup.connector!r} needs you to sign in again"
 
     def stop_reason(self) -> str | None:
-        """Why no more questions can be asked now (an expired connector login, the usage limit, per-token
-        billing, a plugin), or None."""
-        if self.signin_expired:
-            return self.signin_message()
-        return self.usage_limit or self.api_billing or self.plugins_error
+        """Why no more questions can be asked now (the first stop: an expired connector login, the usage limit,
+        per-token billing, a plugin), or None."""
+        return self.stops[0][1] if self.stops else None
 
     def is_stop(self, reply: AgentReply) -> bool:
-        """Whether a reply is a stop rather than an answer: the run's stop itself, or another session's usage
-        limit. It isn't recorded, so `--resume` asks the question again."""
-        return bool(reply.error) and (
-            reply.error == self.stop_reason() or bool(USAGE_LIMIT.search(reply.error))
-        )
+        """Whether a reply is a stop rather than an answer, by its own content: whichever stop it hit, even if
+        another session's stop came first. It isn't recorded, so `--resume` asks the question again."""
+        return bool(reply.error) and reply.error in self._stop_errors
+
+    def clear_usage_limit(self) -> None:
+        """After waiting for the limit to reset (`--wait-on-limit`): ask again."""
+        self.usage_limit = None
+        self.stops = [s for s in self.stops if s[0] != "usage_limit"]
+
+    def _stop(self, kind: str, message: str, reply: AgentReply) -> AgentReply:
+        """Record a stop of this kind (the first message of each kind is kept) and make the reply that stop."""
+        if kind == "signin":
+            self.signin_expired = True
+        elif getattr(self, kind) is None:
+            setattr(self, kind, message)
+        if kind not in {k for k, _ in self.stops}:
+            self.stops.append((kind, message))
+        self._stop_errors.add(message)
+        reply.status = None
+        reply.error = message
+        return reply
 
     async def ask(self, question: str, model: str, history: tuple[dict, ...] = ()) -> AgentReply:
         question = conversation_prompt(question, history)
@@ -879,10 +897,7 @@ class ClaudeCodeClient:
         reply = parse_stream(lines, started, time.monotonic() - t0)
         if not self.allow_api_billing and bills_per_token(source := api_key_source(lines)):
             # Stop asking: every later session would bill the same way.
-            self.api_billing = api_billing_error(source)
-            reply.status = None
-            reply.error = self.api_billing
-            return reply
+            return self._stop("api_billing", api_billing_error(source), reply)
         plugins = session_plugins(lines)
         if reply.trace is not None:
             reply.trace["plugins"] = plugins
@@ -892,18 +907,11 @@ class ClaudeCodeClient:
             problem := plugins_problem(plugins, self.allow_plugins)
         ):
             # Stop asking: the preflight said there would be none, so every later session would have them too.
-            self.plugins_error = problem
-            reply.status = None
-            reply.error = problem
-            return reply
+            return self._stop("plugins_error", problem, reply)
         if reply.error and USAGE_LIMIT.search(reply.error):
-            self.usage_limit = reply.error
-            return reply
+            return self._stop("usage_limit", reply.error, reply)
         if self.setup.connector and connector_needs_signin(lines, self.setup.connector):
-            self.signin_expired = True
-            reply.status = None
-            reply.error = self.signin_message()
-            return reply
+            return self._stop("signin", self.signin_message(), reply)
         if self.setup.connector and connector_tool_prefix(self.setup.connector) not in (
             loaded_servers(lines) or set()
         ):

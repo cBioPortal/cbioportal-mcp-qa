@@ -88,7 +88,9 @@ uv run cbioportal-mcp-qa run --models haiku,sonnet
 # A subset, three repeats each to measure consistency
 uv run cbioportal-mcp-qa run --questions 1-10 --repeats 3
 
-# Continue an interrupted run (re-asks only missing or failed answers)
+# Continue an interrupted run (re-asks only missing or failed answers). It keeps the run's --questions,
+# --questions-file, --no-grade, judge, concurrency, rendering and --wait-on-limit unless you give them again;
+# the --claude-code-* opt-ins must be given again.
 uv run cbioportal-mcp-qa run --resume 20260923-1800
 
 # Re-attach traces (Langfuse ingestion can lag), regrade, or re-render
@@ -196,13 +198,25 @@ A stop (the usage limit, per-token billing, a plugin, an expired connector login
 
 - answers already in flight finish and are saved as usual (an ordinary failure among them too);
 - no queued answer starts a `claude` session, and none gets a record in `run.json`;
-- the reply that is the stop (e.g. `You've hit your session limit`) isn't recorded either, nor is another
-  session's limit reply in flight at the same time.
+- a reply that is itself a stop isn't recorded either, judged by its own content: the limit reply
+  (`You've hit your session limit`), and a reply in flight that hit a different stop (say a plugin) after it.
+  The first stop is the reason given; any others are listed after it.
 
-So `run.json` has no junk failures, and `run --resume <run>` (printed with the `--claude-code-*` options you
-used) asks exactly the answers that are missing or failed. Grading works the same way (see
+So `run.json` has no junk failures, and `run --resume <run>` asks exactly the answers that are missing or failed.
+The printed command keeps every option the run was started with that isn't a default (`--questions`,
+`--no-grade`, `--questions-file`, judge options, `--concurrency`, `--wait-on-limit`, the `--claude-code-*`
+opt-ins, …). `--resume` also restores the run's own options from `run.json` (`options`), except the
+`--claude-code-*` and `--judge-allow-managed-customizations` opt-ins: those guards must be given again.
+
+`run.json` records the questions the run means to ask (`planned_questions`, added to when a resume selects
+more). The report counts a planned turn with no record as a failed request ("not asked"), and `compare` counts
+it as missing, so a stopped run shows as incomplete exactly as it would with failure records. Runs from before
+`planned_questions` are reported from their records, as before.
+
+Grading works the same way (see
 [Grading with Claude Code](#grading-with-claude-code---judge-runner-claude-code)): in-flight grades are saved,
-nothing ungraded gets a `judge_error` from a limit.
+nothing ungraded gets a `judge_error` from a limit, and no judge call starts once a stop is recorded (the stop
+check and the launch are one locked step).
 
 `run` and `grade` take `--wait-on-limit` to wait the usage limit out in the same process instead of stopping:
 
@@ -213,7 +227,8 @@ uv run cbioportal-mcp-qa grade 20261002-0306 --judge-runner claude-code --wait-o
 
 - **When.** The reset time is read from the message: `resets 9:50pm (Pacific/Honolulu)`, `resets 3:40am (UTC)`,
   `resets 3pm` (no zone: the machine's local time). It is the next such time (tomorrow's if today's has
-  passed), plus a minute. A message with no time of day (`resets Oct 3`, `resets Mon`), an unknown zone, or a
+  passed), plus a minute. The wait is elapsed time, so it is right across a DST change; a time that happens
+  twice (the fall-back hour) is taken as the later one. A message with no time of day (`resets Oct 3`, `resets Mon`), an unknown zone, or a
   time that passed less than an hour ago (the limit is about to clear) waits a fixed 15 minutes instead.
 - **How long.** `--max-wait` (minutes, default 360) caps the waiting in all, across answering and grading; a
   wait that would go past it stops as without the flag, with the `--resume` command.

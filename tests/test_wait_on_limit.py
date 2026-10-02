@@ -97,7 +97,9 @@ def test_run_waits_for_the_reset_then_answers_the_rest(monkeypatch, results_dir,
 
     monkeypatch.setattr(limits.time, "sleep", sleep)
     fake = FakeClaude(monkeypatch, script)
-    out = cli_run(fake, "--questions", "1-6", "--concurrency", "1", "--wait-on-limit")
+    out = cli_run(
+        fake, "--questions", "1-6", "--concurrency", "1", "--no-grade", "--no-render", "--wait-on-limit"
+    )
     assert out.exit_code == 0, out.output
     assert frozen == [50 * 60 + limits.MARGIN_S]
     assert "waiting 51 min, until 2026-10-01 21:51 HST" in out.output
@@ -109,7 +111,10 @@ def test_run_waits_for_the_reset_then_answers_the_rest(monkeypatch, results_dir,
 
 def test_run_stops_when_the_wait_would_pass_max_wait(monkeypatch, results_dir, cli_run, frozen):  # noqa: F811
     fake = FakeClaude(monkeypatch, lambda q, n: (limited(), 0.0) if n == 2 else (answered(), 0.0))
-    out = cli_run(fake, "--questions", "1-4", "--concurrency", "1", "--wait-on-limit", "--max-wait", "30")
+    out = cli_run(
+        fake, "--questions", "1-4", "--concurrency", "1", "--no-grade", "--no-render", "--wait-on-limit",
+        "--max-wait", "30",
+    )  # fmt: skip
     assert out.exit_code == 1, out.output
     assert frozen == []
     assert "would pass --max-wait" in out.output and "--resume" in out.output
@@ -135,3 +140,43 @@ def test_grade_without_the_flag_still_stops(fake_claude, ungraded, frozen):  # n
     assert result.exit_code == 1 and "grading stopped" in result.output
     assert frozen == []
     assert not any("judge_error" in r for r in Run.load(str(ungraded.dir)).records.values())
+
+
+NY = ZoneInfo("America/New_York")
+
+
+@pytest.mark.parametrize(
+    "now, message, hours",
+    [
+        # Spring forward (2026-03-08 2am EST → 3am EDT): 23:00 to 3am is 3 hours, not the wall clock's 4.
+        (datetime(2026, 3, 7, 23, 0, tzinfo=NY), "resets 3am (America/New_York)", 3),
+        # Fall back (2026-11-01 2am EDT → 1am EST): 00:30 EDT to 2am EST is 2.5 hours, not 1.5.
+        (datetime(2026, 11, 1, 0, 30, tzinfo=NY), "resets 2am (America/New_York)", 2.5),
+        # 1:30am happens twice that night: the later one, so it never wakes before the reset.
+        (datetime(2026, 11, 1, 0, 30, tzinfo=NY), "resets 1:30am (America/New_York)", 2),
+    ],
+)
+def test_waits_across_a_dst_change_are_elapsed_time(frozen, monkeypatch, now, message, hours):
+    monkeypatch.setattr(limits, "_now", lambda: now)
+    assert LimitWaiter(10 * 3600).wait(f"You've hit your limit · {message}")
+    assert frozen == [hours * 3600 + limits.MARGIN_S]
+
+
+def test_a_local_reset_time_across_a_dst_change_is_elapsed_time(frozen, monkeypatch):
+    import time
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        monkeypatch.setattr(limits, "_now", lambda: datetime(2026, 3, 7, 23, 0, tzinfo=NY))
+        assert LimitWaiter(10 * 3600).wait("You've hit your limit · resets 3am")
+        assert frozen == [3 * 3600 + limits.MARGIN_S]
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf"])
+def test_max_wait_must_be_finite(value):
+    out = CliRunner().invoke(cli_mod.cli, ["grade", "x", "--wait-on-limit", "--max-wait", value])
+    assert out.exit_code == 2 and "finite" in out.output

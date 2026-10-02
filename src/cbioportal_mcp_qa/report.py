@@ -285,7 +285,8 @@ def summarize(run: Run) -> dict:
     judge_tokens = Counter()
     renders = run.data.get("renders", {})
 
-    for rec in run.records.values():
+    # Planned turns a stop left unasked count as failed requests, as their failure records did.
+    for rec in [*run.records.values(), *run.missing_records()]:
         s = stats[rec["model"]]
         q = rec["question"]
         outcome = outcome_of(rec)

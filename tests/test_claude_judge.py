@@ -589,3 +589,59 @@ def test_claude_code_model_resolution():
     assert claude_code_model("claude-opus-5-5") == "claude-opus-5-5"
     with pytest.raises(ValueError):
         claude_code_model("router")
+
+
+def test_no_judge_call_starts_after_another_thread_records_a_stop(fake_claude, results_dir, monkeypatch):
+    """Thread B passes its stop check while A's call is about to hit the limit. B is held right after reading
+    `stopped` until A records the stop (or 1s passes): no call may launch with a stop already recorded."""
+    import subprocess
+    import threading
+
+    fake_claude.set_rules([{"match": "LIMITED", "out": LIMIT}])
+    a_stopped = threading.Event()
+    b_checked = threading.Event()
+
+    class Racy(ClaudeCodeJudge):
+        @property
+        def stopped(self):
+            value = self.__dict__.get("_stopped")
+            if threading.current_thread().name == "B" and value is None and not b_checked.is_set():
+                b_checked.set()
+                a_stopped.wait(1.0)  # in the window between the check and the launch
+            return value
+
+        @stopped.setter
+        def stopped(self, value):
+            self.__dict__["_stopped"] = value
+            if value:
+                a_stopped.set()
+
+    judge = Racy(JUDGE)
+    launched_with_stop = []
+    real_popen = subprocess.Popen
+
+    class Popen(real_popen):
+        def __init__(self, args, *a, **k):
+            if args and os.path.basename(str(args[0])) == "claude":
+                launched_with_stop.append(judge.__dict__.get("_stopped"))
+            super().__init__(args, *a, **k)
+
+    monkeypatch.setattr(subprocess, "Popen", Popen)
+    results = {}
+
+    def ask(name, prompt):
+        try:
+            results[name] = judge.verdict(prompt)
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertions
+            results[name] = exc
+
+    b = threading.Thread(target=ask, args=("B", "OK"), name="B")
+    b.start()
+    assert b_checked.wait(2.0)
+    a = threading.Thread(target=ask, args=("A", "LIMITED"), name="A")
+    a.start()
+    a.join(5)
+    b.join(5)
+    judge.close()
+    assert isinstance(results["A"], JudgeStopped)
+    assert launched_with_stop and all(s is None for s in launched_with_stop), launched_with_stop

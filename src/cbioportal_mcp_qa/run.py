@@ -86,6 +86,38 @@ class Run:
     def save(self) -> None:
         write_json(self.path, self.data, indent=1)
 
+    def plan(self, questions: list[Question]) -> None:
+        """Add questions to the ones the run means to ask (`planned_questions`): a stop leaves answers it didn't
+        ask unrecorded, and the report and `compare` count them as missing from this."""
+        planned = {q["id"]: q for q in self.data.get("planned_questions") or []}
+        for q in questions:
+            planned.setdefault(q.id, asdict(q))
+        self.data["planned_questions"] = [planned[k] for k in sorted(planned)]
+
+    def planned_questions(self) -> dict[int, dict]:
+        """The questions the run means to ask, by id (none for runs from before `planned_questions`)."""
+        return {q["id"]: q for q in self.data.get("planned_questions") or []}
+
+    def missing_records(self) -> list[dict]:
+        """A placeholder for every planned turn (question × model × repeat) with no record: a failed reply
+        saying it wasn't asked, so the report counts it like a failure."""
+        return [
+            {
+                "question": q,
+                "model": model,
+                "repeat": r,
+                "missing": True,
+                "reply": {"answer": "", "status": None, "error": NOT_ASKED, "latency_s": None},
+            }
+            for qid, q in self.planned_questions().items()
+            for model in self.data["models"]
+            for r in range(1, self.data["repeats"] + 1)
+            if record_key(qid, model, r) not in self.records
+        ]
+
+
+NOT_ASKED = "not asked: the run stopped before this answer (`run --resume` asks it)"
+
 
 async def collect_answers(
     run: Run,
@@ -131,7 +163,8 @@ async def collect_answers(
 
     await asyncio.gather(*(one(*item) for item in todo))
     if unasked:
-        bar.write(f"Stopped: {stop_reason()[:200]}. {unasked} answers left unasked (not recorded).")
+        others = "".join(f"; also {m[:200]}" for _, m in client.stops[1:])
+        bar.write(f"Stopped: {stop_reason()[:200]}{others}. {unasked} answers left unasked (not recorded).")
     bar.close()
     return unasked
 

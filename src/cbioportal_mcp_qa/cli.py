@@ -1,9 +1,11 @@
 import asyncio
+import math
 import shlex
 from dataclasses import asdict
 from pathlib import Path
 
 import click
+from click.core import ParameterSource
 
 from .agent import AgentClient
 from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
@@ -160,6 +162,7 @@ def wait_options(f):
     f = click.option(
         "--max-wait",
         type=click.FloatRange(min=0),
+        callback=_finite,
         default=360.0,
         show_default=True,
         help="With --wait-on-limit: minutes of waiting in all; a wait that would go past it stops instead.",
@@ -172,6 +175,12 @@ def wait_options(f):
         "on, instead of stopping with the --resume command.",
     )(f)
     return f
+
+
+def _finite(ctx, param, value):
+    if value is not None and not math.isfinite(value):
+        raise click.BadParameter("must be a finite number of minutes")
+    return value
 
 
 def _waiter(wait_on_limit: bool, max_wait: float) -> LimitWaiter | None:
@@ -457,7 +466,13 @@ def ask(
     "--repeats", type=int, default=1, show_default=True, help="Times to ask each question per model."
 )
 @click.option("--concurrency", type=int, default=2, show_default=True, help="Parallel requests to the agent.")
-@click.option("--resume", default=None, help="Run id to continue (re-asks only missing/failed answers).")
+@click.option(
+    "--resume",
+    default=None,
+    help="Run id to continue (re-asks only missing/failed answers). Options of the run that you don't give again "
+    "(--questions, --questions-file, --no-grade, the judge, concurrency, rendering, --wait-on-limit) are the "
+    "run's; the --claude-code-* opt-ins must be given again.",
+)
 @click.option("--no-grade", is_flag=True, help="Only collect answers and traces.")
 @judge_options
 @click.option(
@@ -499,11 +514,34 @@ def run(
 ) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
+    ctx = click.get_current_context()
+    opts = dict(ctx.params)
+    if resume:
+        bench = Run.load(resume)
+        # What to ask and how to grade stay the run's unless given again (runs from before `options`: defaults).
+        stored = bench.data.get("options") or {}
+        for name in RESTORED_ON_RESUME:
+            if name in stored and ctx.get_parameter_source(name) is ParameterSource.DEFAULT:
+                opts[name] = stored[name]
+        opts["questions_file"] = Path(opts["questions_file"])
+        (
+            selection,
+            questions_file,
+            no_grade,
+            judge_runner,
+            judge_model,
+            judge_concurrency,
+            concurrency,
+            render,
+            screenshots,
+            require_beta_mcp,
+            wait_on_limit,
+            max_wait,
+        ) = (opts[name] for name in RESTORED_ON_RESUME)
     questions = parse_selection(selection, load_questions(questions_file))
     if not questions:
         raise click.UsageError("no questions selected")
     if resume:
-        bench = Run.load(resume)
         target = bench.data["target"]
         runner = bench.data.get("runner", "agents-api")
     else:
@@ -580,6 +618,13 @@ def run(
         if agent:
             # A record of the prompt this run tested (the benchmark itself always reads the live agent).
             write_text(bench.dir / "agent-prompt.md", agent["instructions"])
+    # What the run means to ask (the report and `compare` count unasked turns as missing), and the options
+    # `--resume` keeps.
+    bench.plan(questions)
+    bench.data["options"] = {
+        name: str(opts[name]) if name == "questions_file" else opts[name] for name in RESTORED_ON_RESUME
+    }
+    bench.save()
     click.echo(
         f"Run {bench.data['run_id']} ({runner}): {len(questions)} questions × {bench.data['models']} × "
         f"{bench.data['repeats']} against {TARGETS[target].agent_id} ({target})"
@@ -595,47 +640,21 @@ def run(
             while True:
                 await collect_answers(bench, questions, client, concurrency)
                 # Only a usage limit resets by itself; the other stops need you.
-                limit = getattr(client, "usage_limit", None)
-                if not (limit and client.stop_reason() == limit and waiter and waiter.wait(limit)):
+                stops = getattr(client, "stops", [])
+                if not (
+                    waiter
+                    and stops
+                    and all(kind == "usage_limit" for kind, _ in stops)
+                    and waiter.wait(stops[0][1])
+                ):
                     break
-                client.usage_limit = None
+                client.clear_usage_limit()
         finally:
             await client.aclose()
 
     asyncio.run(go())
-    # Answers left unasked by a stop have no record; this asks exactly them (and any that failed).
-    resume_cmd = " ".join(
-        ["cbioportal-mcp-qa", "run", "--resume", bench.data["run_id"]]
-        + [
-            flag
-            for flag, on in (
-                ("--claude-code-trust-org-policy", claude_code_trust_org_policy),
-                ("--claude-code-allow-api-billing", claude_code_allow_api_billing),
-                ("--claude-code-user-settings", claude_code_user_settings),
-            )
-            if on
-        ]
-    )
-    if getattr(client, "signin_expired", False):
-        raise click.ClickException(
-            f"{client.signin_message()}: authenticate it (claude.ai → Settings → Connectors, or `/mcp` in "
-            f"`claude` with the same CLAUDE_CONFIG_DIR), then continue with `{resume_cmd}`. Stopped before "
-            f"grading."
-        )
-    if getattr(client, "api_billing", None):
-        raise click.ClickException(f"{client.api_billing}. Stopped before grading.")
-    if getattr(client, "plugins_error", None):
-        raise click.ClickException(
-            f"Stopped: {client.plugins_error}. The answer it stopped on, and any not yet asked, aren't recorded; "
-            f"answers so far are saved. Turn the plugin off (or add --claude-code-allow-plugins to run "
-            f"with it, recorded in run.json), then continue with `{resume_cmd}`. Stopped before grading."
-        )
-    if getattr(client, "usage_limit", None):
-        raise click.ClickException(
-            f"Claude subscription limit: {client.usage_limit}. Once it resets, continue with "
-            f"`{resume_cmd}` (same CLAUDE_CONFIG_DIR), or add --wait-on-limit to wait for it. "
-            f"Stopped before grading."
-        )
+    if stops := getattr(client, "stops", []):
+        raise click.ClickException(_stop_message(client, stops, _resume_command(ctx, opts, bench)))
     if runner == "agents-api":
         wait_for_ingestion()
         click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")
@@ -661,6 +680,71 @@ def run(
             waiter,
         )
     click.echo(f"Report: {write_report(bench)}")
+
+
+# `run` options `--resume` takes from the run when they aren't given again. The --claude-code-* opt-ins (billing,
+# org policy, plugins, user settings) and --judge-allow-managed-customizations are guards: never restored.
+RESTORED_ON_RESUME = (
+    "selection",
+    "questions_file",
+    "no_grade",
+    "judge_runner",
+    "judge_model",
+    "judge_concurrency",
+    "concurrency",
+    "render",
+    "screenshots",
+    "require_beta_mcp",
+    "wait_on_limit",
+    "max_wait",
+)
+# Fixed by the run itself on --resume.
+NOT_IN_RESUME = {"target", "models_arg", "repeats", "runner", "resume"}
+
+
+def _resume_command(ctx: click.Context, opts: dict, bench: Run) -> str:
+    """The `run --resume` command that continues this run with every option it ran with that isn't a default."""
+    cmd = ["cbioportal-mcp-qa", "run", "--resume", bench.data["run_id"]]
+    for param in ctx.command.params:
+        if not isinstance(param, click.Option) or param.name in NOT_IN_RESUME:
+            continue
+        value = opts[param.name]
+        if param.name == "questions_file":
+            value, default = str(value), str(param.default)
+        else:
+            default = param.default
+        if value == default or value is None:
+            continue
+        if param.is_flag:
+            cmd.append(param.opts[0] if value else param.secondary_opts[0])
+        else:
+            cmd += [param.opts[0], str(value)]
+    return shlex.join(cmd)
+
+
+def _stop_message(client, stops: list[tuple[str, str]], resume_cmd: str) -> str:
+    """Why the run stopped (its first stop, with any others after it) and how to continue."""
+    kind, reason = stops[0]
+    if kind == "signin":
+        head = (
+            f"{reason}: authenticate it (claude.ai → Settings → Connectors, or `/mcp` in `claude` with the same "
+            f"CLAUDE_CONFIG_DIR), then continue with `{resume_cmd}`."
+        )
+    elif kind == "api_billing":
+        head = f"{reason}. Once it bills the subscription again, continue with `{resume_cmd}`."
+    elif kind == "plugins_error":
+        head = (
+            f"Stopped: {reason}. The answer it stopped on, and any not yet asked, aren't recorded; answers so "
+            f"far are saved. Turn the plugin off (or add --claude-code-allow-plugins to run with it, recorded in "
+            f"run.json), then continue with `{resume_cmd}`."
+        )
+    else:
+        head = (
+            f"Claude subscription limit: {reason}. Once it resets, continue with `{resume_cmd}` (same "
+            f"CLAUDE_CONFIG_DIR), or add --wait-on-limit to wait for it."
+        )
+    others = "".join(f" Also stopped: {message}." for _, message in stops[1:])
+    return f"{head}{others} Stopped before grading."
 
 
 @cli.command("render")
