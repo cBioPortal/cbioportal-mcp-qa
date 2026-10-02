@@ -48,7 +48,9 @@ sys.exit(out.get("exit", 0))
 
 
 def _init(source="none", tools=("StructuredOutput",)) -> str:
-    return json.dumps({"type": "system", "subtype": "init", "tools": list(tools), "apiKeySource": source})
+    return json.dumps(
+        {"type": "system", "subtype": "init", "tools": list(tools), "apiKeySource": source, "plugins": []}
+    )
 
 
 def _result(**fields) -> str:
@@ -119,8 +121,9 @@ def test_success_records_the_bedrock_grade_fields_and_the_judge_id(fake_claude, 
     # The same fields as a Bedrock grade.
     assert set(g) == {
         "passed", "declined", "rationale", "number_match", "links", "invalid_studies",
-        "judge_input_tokens", "judge_output_tokens", "judge_model", "graded",
+        "judge_input_tokens", "judge_output_tokens", "judge_model", "graded", "judge_plugins",
     }  # fmt: skip
+    assert g["judge_plugins"] == []  # what the session's init event listed
     assert all(outcome_of(r) == "pass" for r in run.records.values())
 
 
@@ -147,6 +150,7 @@ def test_the_judge_session_has_no_tools_no_mcp_and_the_same_prompt(fake_claude, 
     assert json.loads(argv[argv.index("--settings") + 1]) == {
         "disableAllHooks": True,
         "autoMemoryEnabled": False,
+        "enabledPlugins": {f"{name}@builtin": False for name in claude_code.BUILTIN_PLUGINS},
     }
     assert call["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
     # The Bedrock judge's prompt and rubric, on stdin.
@@ -515,20 +519,6 @@ def test_the_opt_in_grades_with_managed_customizations_and_is_recorded(fake_clau
                         "subtype": "init",
                         "tools": ["StructuredOutput"],
                         "apiKeySource": "none",
-                        "plugins": [{"name": "p", "path": "/x"}],
-                    }
-                )
-            ],
-            "plugins ['p']",
-        ),
-        (
-            [
-                json.dumps(
-                    {
-                        "type": "system",
-                        "subtype": "init",
-                        "tools": ["StructuredOutput"],
-                        "apiKeySource": "none",
                         "mcp_servers": [{"name": "org", "status": "connected"}],
                     }
                 )
@@ -538,7 +528,7 @@ def test_the_opt_in_grades_with_managed_customizations_and_is_recorded(fake_clau
         ([_init(tools=("StructuredOutput", "Agent"))], "tools ['Agent']"),
     ],
 )
-def test_a_session_showing_hooks_plugins_or_servers_stops_grading(fake_claude, ungraded, events, found):
+def test_a_session_showing_hooks_or_servers_stops_grading(fake_claude, ungraded, events, found):
     fake_claude.set({"lines": [*events, GOOD["lines"][1]]})
     with pytest.raises(JudgeStopped, match="must have none") as stopped:
         grade_answers(ungraded, ClaudeCodeJudge(JUDGE))

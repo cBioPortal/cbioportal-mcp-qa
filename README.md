@@ -257,6 +257,38 @@ the benchmark. Managed settings still apply. The login and the claude.ai connect
 connector path keeps working; if the connector ever fails to load, the runner stops with an error rather
 than answering without the database. `--claude-code-user-settings` loads the user settings again.
 
+### Built-in plugins
+
+`claude` 2.1.287 ships plugins inside the binary (`<name>@builtin` in a session's init event). They load in every
+session, even with `--setting-sources ""` and `--safe-mode`, and they are not the claude.ai org-synced plugins
+(`~/.claude/plugins/synced/` holds only a marketplace index). On a Pro login a `claude -p` session loads
+`cc-plugin-agents-md` (loads `AGENTS.md` as project instructions), `cc-plugin-telemetry` (lets plugins log
+analytics events) and `cc-plugin-plugin-authoring` (a skill on writing plugins). On a Team or Enterprise login,
+or on a machine with managed settings, it also seats `cc-plugin-sec-default` outermost. That plugin keeps the
+organization's hooks, prompt content and tool policy out of reach of user plugins and adds no policy of its own.
+Only managed `prependPlugins` can unseat it. `--bare` would skip plugins but never reads the subscription login.
+
+So both the runner and the claude-code judge:
+
+- pass `--settings '{"enabledPlugins": {"<id>@builtin": false, ...}}'` for every built-in plugin, which turns
+  all of them off except a seated `cc-plugin-sec-default`;
+- run a **preflight** before the first model call (the connector probe included). This is a `claude -p` on a
+  model that doesn't exist, so the session prints its init event and then fails with `model_not_found`
+  without generating or billing anything. The preflight must prove that: its result has to be the
+  `model_not_found` error for that model, with zero tokens, no model usage and `total_cost_usd` 0 (or absent).
+  Anything else refuses to start. A plugin it still finds is added to `enabledPlugins: false` and checked
+  again;
+- **refuse to start** if a plugin still loads, unless `--claude-code-allow-plugins` is passed (recorded in
+  `run.json` as `allow_plugins`, with `plugins` and `disabled_plugins`, under `claude_code` and
+  `claude_code_judge`);
+- record the plugins each session loaded: `trace.plugins` on every answer and `judge_plugins` on every grade.
+  A grade made without a judge session (empty answer, no reference) has `judge_plugins: null` and a
+  `judge_plugins_note` saying so. A session that loads a plugin the preflight didn't find stops the
+  run, the connector probe or the grading. So does an answering or judging session that doesn't report its
+  plugins (no init event, or one without a plugin list), even with `--claude-code-allow-plugins`. A stopped
+  run prints the `run --resume` command; the answer it stopped on, and any not yet asked, are marked failed
+  and asked again on resume.
+
 ### Grading with Claude Code (`--judge-runner claude-code`)
 
 `run` and `grade` take `--judge-runner claude-code` to grade on the local Claude subscription instead of
@@ -301,7 +333,8 @@ id or a Claude Code id. By default the claude-code judge is the Bedrock judge's 
   `outputStyle`, on any of those managed files, and on a file it can't read. `--judge-allow-managed-customizations`
   grades anyway: it prints what the sessions inherit and records it under `claude_code_judge` in `run.json`,
   with the judge's auth mode, plan and opt-ins. As a backstop, grading stops if a session's stream shows a hook
-  running (`hook_started` / `hook_response`), a plugin, an MCP server, or any tool besides `StructuredOutput`.
+  running (`hook_started` / `hook_response`), an MCP server, or any tool besides `StructuredOutput`. Plugins
+  are handled as described in [Built-in plugins](#built-in-plugins).
   **Residual risk:** as for the runner, server-managed settings that a Team or Enterprise organization delivers
   when a `claude -p` session starts aren't cached, so they can't be read beforehand. `--claude-code-trust-org-policy`
   trusts that policy not to add hooks or instructions to the judge, as it trusts it not to bill per token; the
@@ -314,7 +347,7 @@ id or a Claude Code id. By default the claude-code judge is the Bedrock judge's 
   `usage limit reached`, or a rate limit that names its reset. Grades so far are saved, the report is written,
   and the `grade` command to resume once the limit resets is printed. That command keeps the run as you named it
   (id or path) and the judge options you used (`--judge-model`, `--concurrency`, `--claude-code-trust-org-policy`,
-  `--claude-code-allow-api-billing`, `--judge-allow-managed-customizations`).
+  `--claude-code-allow-api-billing`, `--judge-allow-managed-customizations`, `--claude-code-allow-plugins`).
 - **Judge identity.** Each grade records its judge as `claude-code:<model>` (e.g.
   `claude-code:claude-sonnet-4-6`), so `compare` refuses to mix them with Bedrock grades (`us.anthropic.…`),
   and a run graded by both shows up as mixed. Judge cost isn't estimated: nothing is billed per token.

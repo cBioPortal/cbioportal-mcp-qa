@@ -26,7 +26,7 @@ class ModelCalls:
             if cmd[:3] == ["claude", "auth", "status"]:
                 return SimpleNamespace(stdout=json.dumps(status), stderr="", returncode=0)
             self.calls.append(cmd)
-            init = {"type": "system", "subtype": "init", "apiKeySource": "none"}
+            init = {"type": "system", "subtype": "init", "apiKeySource": "none", "plugins": []}
             init["tools"] = ["mcp__claude_ai_cBioPortal_MCP__read_guide"]
             return SimpleNamespace(stdout=json.dumps(init), stderr="", returncode=0)
 

@@ -112,9 +112,18 @@ class Grade:
     invalid_studies: list[str] = field(default_factory=list)
     judge_input_tokens: int = 0
     judge_output_tokens: int = 0
+    # The plugins the claude-code judge's session loaded. None with a note when the grade needed no judge session;
+    # both left out for the Bedrock judge.
+    judge_plugins: list[str] | None = None
+    judge_plugins_note: str | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        out = asdict(self)
+        if out["judge_plugins_note"] is None:
+            del out["judge_plugins_note"]
+            if out["judge_plugins"] is None:
+                del out["judge_plugins"]
+        return out
 
 
 def _to_float(raw: str) -> float | None:
@@ -268,6 +277,8 @@ class BaseJudge:
     judge's input and output tokens. `model` is the judge id each grade records."""
 
     model: str
+    # True for a judge whose grades record the plugins its session loaded (the claude-code judge).
+    records_plugins = False
 
     def grade(
         self,
@@ -283,10 +294,13 @@ class BaseJudge:
             links=links,
             invalid_studies=invalid_studies(links, studies),
         )
+        if self.records_plugins:
+            base["judge_plugins_note"] = "no judge session: graded without the judge"
         if not answer.strip():
             return Grade(passed=False, declined=False, rationale="Empty answer.", **base)
         if not q.has_reference:
             return Grade(passed=None, declined=False, rationale="No reference for this question.", **base)
+        base.pop("judge_plugins_note", None)
         result, input_tokens, output_tokens = self.verdict(judge_prompt(q, answer, links, renders, tool_log))
         return Grade(
             passed=result["passed"],
@@ -294,6 +308,7 @@ class BaseJudge:
             rationale=result["rationale"],
             judge_input_tokens=input_tokens,
             judge_output_tokens=output_tokens,
+            judge_plugins=result.get("plugins"),
             **base,
         )
 

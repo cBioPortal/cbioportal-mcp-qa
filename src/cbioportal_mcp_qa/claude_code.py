@@ -278,12 +278,16 @@ def tool_setup(
     env: dict,
     isolate_settings: bool = True,
     allow_api_billing: bool = False,
+    settings: dict | None = None,
+    allow_plugins: bool = False,
 ) -> ToolSetup:
     if not connector:
         return ToolSetup({"cbioportal-database": database_url, NAVIGATOR_SERVER: navigator_url})
     setup = ToolSetup({NAVIGATOR_SERVER: navigator_url}, connector)
     wanted = connector_tool_prefix(connector)
-    loaded = probe_mcp_servers(setup, workdir, env, isolate_settings, allow_api_billing)
+    loaded = probe_mcp_servers(
+        setup, workdir, env, isolate_settings, allow_api_billing, settings, allow_plugins
+    )
     if wanted not in loaded:
         raise RuntimeError(
             f"claude.ai connector {connector!r} did not load for this Claude home — it may need you to sign in "
@@ -304,6 +308,163 @@ def loaded_servers(lines: list[str]) -> set[str] | None:
     return None
 
 
+# Plugins built into the claude binary (2.1.287): they load in every session, even with no settings sources, and
+# report as `<name>@builtin` in the init event. agents-md loads AGENTS.md as project instructions, telemetry lets
+# plugins log analytics events, plugin-authoring is a skill, the rest are interactive UI (tips, diff, mermaid,
+# ...). All but cc-plugin-sec-default turn off with `enabledPlugins: {"<id>": false}` in --settings; sec-default
+# (seated for Team and Enterprise logins and on machines with managed settings) only turns off by managed
+# policy. The preflight finds any other plugin a session would load.
+BUILTIN_PLUGINS = (
+    "cc-plugin-sec-default",
+    "cc-plugin-agents-md",
+    "cc-plugin-telemetry",
+    "cc-plugin-plugin-authoring",
+    "cc-plugin-mods-guide",
+    "cc-plugin-tips",
+    "cc-plugin-mermaid",
+    "cc-plugin-responsive-mode",
+    "cc-plugin-diff",
+    "cc-plugin-you-should-know",
+    "cc-plugin-claude-test",
+)
+# A model no account has: the preflight session emits its init event (plugins, apiKeySource) and then fails with
+# model_not_found before anything is generated or billed.
+PREFLIGHT_MODEL = "claude-mcp-qa-preflight-no-such-model"
+
+
+def no_plugins_settings(extra: list[str] = ()) -> dict:
+    """--settings that turn off the built-in plugins and `extra` (plugin ids a preflight found)."""
+    ids = [f"{name}@builtin" for name in BUILTIN_PLUGINS] + list(extra)
+    return {"enabledPlugins": dict.fromkeys(ids, False)}
+
+
+def stream_events(lines: list[str]) -> list[dict]:
+    """The stream-json events in `lines`, skipping anything that isn't a JSON object."""
+    events = []
+    for line in lines:
+        if line.strip().startswith("{"):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+    return events
+
+
+def init_event(lines: list[str]) -> dict | None:
+    return next((e for e in stream_events(lines) if e.get("subtype") == "init"), None)
+
+
+def session_plugins(lines: list[str]) -> list[str] | None:
+    """The plugins a session loaded (`name@marketplace`), from its stream-json init event. None when there is no
+    init event or it has no plugin list: the session's plugins are unknown, and callers refuse it."""
+    plugins = (init_event(lines) or {}).get("plugins")
+    if not isinstance(plugins, list):
+        return None
+    return [str(p.get("source") or p.get("name")) if isinstance(p, dict) else str(p) for p in plugins]
+
+
+def preflight_problem(lines: list[str]) -> str | None:
+    """Why the preflight session might have reached a model, or None if it provably ended before generation:
+    a model_not_found error for PREFLIGHT_MODEL, no tokens in or out, and nothing billed."""
+    events = stream_events(lines)
+    result = next((e for e in reversed(events) if e.get("type") == "result"), None)
+    if result is None:
+        return "no result"
+    model_not_found = any(e.get("error") == "model_not_found" for e in events if e.get("type") == "assistant")
+    if not (result.get("is_error") and PREFLIGHT_MODEL in str(result.get("result")) and model_not_found):
+        return f"it didn't fail on the missing model: {redact(str(result.get('result')))[:300]!r}"
+    usage = result.get("usage") or {}
+    if tokens := {k: v for k, v in usage.items() if k.endswith("_tokens") and v}:
+        return f"it used tokens {tokens}"
+    if result.get("modelUsage"):
+        return f"it used models {sorted(result['modelUsage'])}"
+    if result.get("total_cost_usd", 0) != 0:
+        return f"it cost ${result['total_cost_usd']}"
+    return None
+
+
+def plugins_problem(
+    plugins: list[str] | None, allow_plugins: bool, what: str = "claude session"
+) -> str | None:
+    """Why a session's plugins stop the run, or None. A session that didn't report its plugins always stops:
+    what it loaded is unknown, and an accepted answer or grade must record it."""
+    if plugins is None:
+        return (
+            f"the {what} didn't report its plugins (no init event with a plugin list), so what it loaded is "
+            "unknown; it is refused even with --claude-code-allow-plugins"
+        )
+    if plugins and not allow_plugins:
+        return plugins_error(plugins, what)
+    return None
+
+
+def preflight_plugins(
+    env: Mapping[str, str], workdir: str, settings: dict, isolate_settings: bool
+) -> list[str]:
+    """The plugins a session with these settings loads, from a session on PREFLIGHT_MODEL: no model call."""
+    config = os.path.join(workdir, "preflight-mcp.json")
+    write_private_json(config, {"mcpServers": {}})
+    cmd = ["claude", "-p", "Reply OK.", "--model", PREFLIGHT_MODEL, "--tools", "", "--strict-mcp-config"]
+    cmd += ["--mcp-config", config, "--output-format", "stream-json", "--verbose", "--no-session-persistence"]
+    cmd += ["--settings", json.dumps(settings), *setting_sources_args(isolate_settings)]
+    try:
+        out = subprocess.run(
+            cmd,
+            cwd=workdir,
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not start claude to check its plugins: {exc}") from exc
+    lines = out.stdout.splitlines()
+    plugins = session_plugins(lines)
+    if plugins is None:
+        raise RuntimeError(f"could not start claude to check its plugins: {redact(out.stderr)[-500:]}")
+    if problem := preflight_problem(lines):
+        raise RuntimeError(
+            f"the plugin preflight did not end before generation: {problem}. It must fail on the missing model "
+            f"{PREFLIGHT_MODEL!r} with no tokens and no cost; refusing to start"
+        )
+    return plugins
+
+
+def plugin_guard(
+    env: Mapping[str, str],
+    workdir: str,
+    isolate_settings: bool,
+    allow_plugins: bool,
+    base: dict | None = None,
+) -> tuple[dict, list[str]]:
+    """The --settings for every session (`base` plus every plugin turned off that can be) and the plugins the
+    sessions still load. A plugin the first preflight finds is turned off and checked again; whatever stays
+    can't be turned off from a session and is refused unless plugins are allowed."""
+    settings = (base or {}) | no_plugins_settings()
+    found = preflight_plugins(env, workdir, settings, isolate_settings)
+    if new := [p for p in found if p not in settings["enabledPlugins"]]:
+        settings = (base or {}) | no_plugins_settings(new)
+        found = preflight_plugins(env, workdir, settings, isolate_settings)
+    if found and not allow_plugins:
+        raise RuntimeError(
+            f"claude sessions would load plugins that can't be turned off from a session: {', '.join(found)} "
+            "(cc-plugin-sec-default is seated for Team and Enterprise logins and on machines with managed "
+            "settings). Use a Pro or Max login, or pass --claude-code-allow-plugins to run with them (recorded "
+            "in run.json)"
+        )
+    return settings, found
+
+
+def plugins_error(plugins: list[str], what: str = "claude session") -> str:
+    return (
+        f"the {what} loaded plugins {plugins} that the preflight didn't find; pass "
+        "--claude-code-allow-plugins to allow them"
+    )
+
+
 def setting_sources_args(isolate_settings: bool) -> list[str]:
     """No user, project or local settings: ~/.claude's effortLevel, hooks, plugins and apiKeyHelper stay out of
     benchmark sessions (managed settings still apply). The login and claude.ai connectors aren't settings."""
@@ -318,7 +479,13 @@ def api_billing_error(source: str | None) -> str:
 
 
 def probe_mcp_servers(
-    setup: ToolSetup, workdir: str, env: dict, isolate_settings: bool = True, allow_api_billing: bool = False
+    setup: ToolSetup,
+    workdir: str,
+    env: dict,
+    isolate_settings: bool = True,
+    allow_api_billing: bool = False,
+    settings: dict | None = None,
+    allow_plugins: bool = False,
 ) -> set[str]:
     """The MCP servers a Claude Code session loads, read from the stream-json init event of a trivial call."""
     config = os.path.join(workdir, "probe-mcp.json")
@@ -335,7 +502,11 @@ def probe_mcp_servers(
         "stream-json",
     ]
     cmd += ["--verbose", "--no-session-persistence", "--model", MODELS["haiku"].claude_code_id]
-    cmd += setting_sources_args(isolate_settings)
+    cmd += [
+        "--settings",
+        json.dumps(settings or no_plugins_settings()),
+        *setting_sources_args(isolate_settings),
+    ]
     # claude.ai connectors load only some of the time in headless mode, so retry until one shows up.
     seen: set[str] = set()
     for _ in range(PROBE_ATTEMPTS):
@@ -348,6 +519,8 @@ def probe_mcp_servers(
             raise RuntimeError(f"could not start claude to probe MCP servers: {redact(out.stderr)[-500:]}")
         if not allow_api_billing and bills_per_token(source := api_key_source(lines)):
             raise RuntimeError(api_billing_error(source))
+        if problem := plugins_problem(session_plugins(lines), allow_plugins, "connector probe session"):
+            raise RuntimeError(problem)
         seen |= servers
         if any(name.startswith("claude_ai_") for name in servers):
             break
@@ -361,6 +534,7 @@ def claude_args(
     setup: ToolSetup,
     mcp_config_path: str,
     isolate_settings: bool = True,
+    settings: dict | None = None,
 ) -> list[str]:
     args = [
         "claude",
@@ -380,6 +554,8 @@ def claude_args(
         "stream-json",
         "--verbose",
         "--no-session-persistence",
+        "--settings",
+        json.dumps(settings or no_plugins_settings()),
         *setting_sources_args(isolate_settings),
     ]
     if setup.connector is None:
@@ -576,12 +752,14 @@ class ClaudeCodeClient:
         allow_api_billing: bool = False,
         isolate_settings: bool = True,
         trust_org_policy: bool = False,
+        allow_plugins: bool = False,
     ):
         self.system_prompt = system_prompt
         self.transcript_dir = transcript_dir
         self.signin_expired = False
         self.usage_limit: str | None = None
         self.api_billing: str | None = None
+        self.plugins_error: str | None = None
         self.timeout_s = timeout_s
         self.retries = retries
         self.allow_api_billing = allow_api_billing
@@ -590,6 +768,16 @@ class ClaudeCodeClient:
         self.trust_org_policy = trust_org_policy
         self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
+        self.allow_plugins = allow_plugins
+        # Before the first model call (the connector probe included): plugins are turned off, and one that can't
+        # be is refused unless allowed.
+        try:
+            self.settings, self.plugins = plugin_guard(
+                self.env, self._workdir.name, isolate_settings, allow_plugins
+            )
+        except BaseException:
+            self._workdir.cleanup()
+            raise
         self.setup = tool_setup(
             database_url,
             navigator_url,
@@ -598,6 +786,8 @@ class ClaudeCodeClient:
             self.env,
             isolate_settings,
             allow_api_billing,
+            self.settings,
+            allow_plugins,
         )
         self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
         write_private_json(self.mcp_config_path, self.setup.mcp_config())
@@ -615,6 +805,9 @@ class ClaudeCodeClient:
             "trust_org_policy": self.trust_org_policy,
             "stripped_env": self.stripped_env,
             "setting_sources": "managed only" if self.isolate_settings else "user, project, local",
+            "allow_plugins": self.allow_plugins,
+            "plugins": self.plugins,
+            "disabled_plugins": sorted(self.settings["enabledPlugins"]),
         }
 
     def signin_message(self) -> str:
@@ -627,12 +820,12 @@ class ClaudeCodeClient:
         while True:
             if self.signin_expired:
                 return AgentReply("", None, None, self.signin_message(), 0.0, started)
-            if self.usage_limit or self.api_billing:
-                return AgentReply("", None, None, self.usage_limit or self.api_billing, 0.0, started)
+            if stop := self.usage_limit or self.api_billing or self.plugins_error:
+                return AgentReply("", None, None, stop, 0.0, started)
             reply = await self._run(question, model, started)
             if reply.error is None:
                 return reply
-            if self.signin_expired or self.usage_limit or self.api_billing:
+            if self.signin_expired or self.usage_limit or self.api_billing or self.plugins_error:
                 return reply
             if "did not load in this session" in reply.error:
                 # The attempt never had the database tools; retry it without using up a regular retry.
@@ -650,7 +843,13 @@ class ClaudeCodeClient:
         # An empty working directory keeps project CLAUDE.md files out of the context.
         proc = await asyncio.create_subprocess_exec(
             *claude_args(
-                question, model, self.system_prompt, self.setup, self.mcp_config_path, self.isolate_settings
+                question,
+                model,
+                self.system_prompt,
+                self.setup,
+                self.mcp_config_path,
+                self.isolate_settings,
+                self.settings,
             ),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -673,6 +872,19 @@ class ClaudeCodeClient:
             self.api_billing = api_billing_error(source)
             reply.status = None
             reply.error = self.api_billing
+            return reply
+        plugins = session_plugins(lines)
+        if reply.trace is not None:
+            reply.trace["plugins"] = plugins
+        # A session that failed before its init event is an ordinary failure; an answer is only accepted with its
+        # plugins known.
+        if (plugins is not None or reply.error is None) and (
+            problem := plugins_problem(plugins, self.allow_plugins)
+        ):
+            # Stop asking: the preflight said there would be none, so every later session would have them too.
+            self.plugins_error = problem
+            reply.status = None
+            reply.error = problem
             return reply
         if reply.error and USAGE_LIMIT.search(reply.error):
             self.usage_limit = reply.error

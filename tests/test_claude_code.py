@@ -48,7 +48,7 @@ def _tool_result(use_id: str, is_error: bool, content: str) -> dict:
 
 
 STREAM = _events(
-    {"type": "system", "subtype": "init", "model": "claude-haiku-4-5-20251001"},
+    {"type": "system", "subtype": "init", "model": "claude-haiku-4-5-20251001", "plugins": []},
     _tool_use("m1", "t1", "mcp__cbioportal-database__read_guide"),
     _tool_result("t1", False, "# Clinical Data Query Guide"),
     _tool_use("m2", "t2", "mcp__cbioportal-database__clickhouse_run_select_query"),
@@ -257,11 +257,17 @@ def test_answers_without_the_connector_are_retried(monkeypatch):
         "PROMPT", "unused", "https://nav/mcp", database_connector="claude.ai cBioPortal MCP"
     )
     with_connector = _events(
-        {"type": "system", "subtype": "init", "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide"]},
+        {
+            "type": "system",
+            "subtype": "init",
+            "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide"],
+            "plugins": [],
+        },
         *[json.loads(line) for line in STREAM[1:]],
     )
     without = _events(
-        {"type": "system", "subtype": "init", "tools": []}, *[json.loads(line) for line in STREAM[1:]]
+        {"type": "system", "subtype": "init", "tools": [], "plugins": []},
+        *[json.loads(line) for line in STREAM[1:]],
     )
     outputs = iter([without, without, with_connector])
 
@@ -305,7 +311,12 @@ def test_find_connector_matches_by_url_not_name(monkeypatch):
 def test_expired_connector_login_is_detected():
     connector = "claude.ai cBioPortal MCP"
     from_init = _events(
-        {"type": "system", "subtype": "init", "mcp_servers": [{"name": connector, "status": "needs-auth"}]}
+        {
+            "type": "system",
+            "subtype": "init",
+            "mcp_servers": [{"name": connector, "status": "needs-auth"}],
+            "plugins": [],
+        }
     )
     from_tool = _events(
         _tool_result(
@@ -325,7 +336,12 @@ def test_client_stops_asking_after_an_expired_login(monkeypatch):
     client = ClaudeCodeClient("PROMPT", "unused", "https://nav/mcp", database_connector=connector)
     calls = []
     expired = _events(
-        {"type": "system", "subtype": "init", "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide"]},
+        {
+            "type": "system",
+            "subtype": "init",
+            "tools": ["mcp__claude_ai_cBioPortal_MCP__read_guide"],
+            "plugins": [],
+        },
         _tool_result("t1", True, f'MCP server "{connector}" needs you to sign in again.'),
         {"type": "result", "subtype": "success", "result": "partial"},
     )
