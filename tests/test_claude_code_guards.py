@@ -36,7 +36,9 @@ BILLING_ENV = {
 
 
 def _init(source: str | None, tools=()) -> str:
-    return json.dumps({"type": "system", "subtype": "init", "tools": list(tools), "apiKeySource": source})
+    return json.dumps(
+        {"type": "system", "subtype": "init", "tools": list(tools), "apiKeySource": source, "plugins": []}
+    )
 
 
 # --- 1. Billing guard -------------------------------------------------------------------------------------

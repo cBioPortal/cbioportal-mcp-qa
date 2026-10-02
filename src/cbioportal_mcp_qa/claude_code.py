@@ -279,12 +279,15 @@ def tool_setup(
     isolate_settings: bool = True,
     allow_api_billing: bool = False,
     settings: dict | None = None,
+    allow_plugins: bool = False,
 ) -> ToolSetup:
     if not connector:
         return ToolSetup({"cbioportal-database": database_url, NAVIGATOR_SERVER: navigator_url})
     setup = ToolSetup({NAVIGATOR_SERVER: navigator_url}, connector)
     wanted = connector_tool_prefix(connector)
-    loaded = probe_mcp_servers(setup, workdir, env, isolate_settings, allow_api_billing, settings)
+    loaded = probe_mcp_servers(
+        setup, workdir, env, isolate_settings, allow_api_billing, settings, allow_plugins
+    )
     if wanted not in loaded:
         raise RuntimeError(
             f"claude.ai connector {connector!r} did not load for this Claude home — it may need you to sign in "
@@ -335,24 +338,66 @@ def no_plugins_settings(extra: list[str] = ()) -> dict:
     return {"enabledPlugins": dict.fromkeys(ids, False)}
 
 
-def init_event(lines: list[str]) -> dict | None:
+def stream_events(lines: list[str]) -> list[dict]:
+    """The stream-json events in `lines`, skipping anything that isn't a JSON object."""
+    events = []
     for line in lines:
-        if line.startswith("{") and '"init"' in line:
-            event = json.loads(line)
-            if event.get("subtype") == "init":
-                return event
-    return None
+        if line.strip().startswith("{"):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+    return events
+
+
+def init_event(lines: list[str]) -> dict | None:
+    return next((e for e in stream_events(lines) if e.get("subtype") == "init"), None)
 
 
 def session_plugins(lines: list[str]) -> list[str] | None:
-    """The plugins a session loaded (`name@marketplace`), from its stream-json init event (None if absent)."""
-    init = init_event(lines)
-    if init is None:
+    """The plugins a session loaded (`name@marketplace`), from its stream-json init event. None when there is no
+    init event or it has no plugin list: the session's plugins are unknown, and callers refuse it."""
+    plugins = (init_event(lines) or {}).get("plugins")
+    if not isinstance(plugins, list):
         return None
-    return [
-        str(p.get("source") or p.get("name")) if isinstance(p, dict) else str(p)
-        for p in init.get("plugins") or []
-    ]
+    return [str(p.get("source") or p.get("name")) if isinstance(p, dict) else str(p) for p in plugins]
+
+
+def preflight_problem(lines: list[str]) -> str | None:
+    """Why the preflight session might have reached a model, or None if it provably ended before generation:
+    a model_not_found error for PREFLIGHT_MODEL, no tokens in or out, and nothing billed."""
+    events = stream_events(lines)
+    result = next((e for e in reversed(events) if e.get("type") == "result"), None)
+    if result is None:
+        return "no result"
+    model_not_found = any(e.get("error") == "model_not_found" for e in events if e.get("type") == "assistant")
+    if not (result.get("is_error") and PREFLIGHT_MODEL in str(result.get("result")) and model_not_found):
+        return f"it didn't fail on the missing model: {redact(str(result.get('result')))[:300]!r}"
+    usage = result.get("usage") or {}
+    if tokens := {k: v for k, v in usage.items() if k.endswith("_tokens") and v}:
+        return f"it used tokens {tokens}"
+    if result.get("modelUsage"):
+        return f"it used models {sorted(result['modelUsage'])}"
+    if result.get("total_cost_usd", 0) != 0:
+        return f"it cost ${result['total_cost_usd']}"
+    return None
+
+
+def plugins_problem(
+    plugins: list[str] | None, allow_plugins: bool, what: str = "claude session"
+) -> str | None:
+    """Why a session's plugins stop the run, or None. A session that didn't report its plugins always stops:
+    what it loaded is unknown, and an accepted answer or grade must record it."""
+    if plugins is None:
+        return (
+            f"the {what} didn't report its plugins (no init event with a plugin list), so what it loaded is "
+            "unknown; it is refused even with --claude-code-allow-plugins"
+        )
+    if plugins and not allow_plugins:
+        return plugins_error(plugins, what)
+    return None
 
 
 def preflight_plugins(
@@ -376,9 +421,15 @@ def preflight_plugins(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"could not start claude to check its plugins: {exc}") from exc
-    plugins = session_plugins(out.stdout.splitlines())
+    lines = out.stdout.splitlines()
+    plugins = session_plugins(lines)
     if plugins is None:
         raise RuntimeError(f"could not start claude to check its plugins: {redact(out.stderr)[-500:]}")
+    if problem := preflight_problem(lines):
+        raise RuntimeError(
+            f"the plugin preflight did not end before generation: {problem}. It must fail on the missing model "
+            f"{PREFLIGHT_MODEL!r} with no tokens and no cost; refusing to start"
+        )
     return plugins
 
 
@@ -407,9 +458,9 @@ def plugin_guard(
     return settings, found
 
 
-def plugins_error(plugins: list[str]) -> str:
+def plugins_error(plugins: list[str], what: str = "claude session") -> str:
     return (
-        f"the claude session loaded plugins {plugins} that the preflight didn't find; pass "
+        f"the {what} loaded plugins {plugins} that the preflight didn't find; pass "
         "--claude-code-allow-plugins to allow them"
     )
 
@@ -434,6 +485,7 @@ def probe_mcp_servers(
     isolate_settings: bool = True,
     allow_api_billing: bool = False,
     settings: dict | None = None,
+    allow_plugins: bool = False,
 ) -> set[str]:
     """The MCP servers a Claude Code session loads, read from the stream-json init event of a trivial call."""
     config = os.path.join(workdir, "probe-mcp.json")
@@ -467,6 +519,8 @@ def probe_mcp_servers(
             raise RuntimeError(f"could not start claude to probe MCP servers: {redact(out.stderr)[-500:]}")
         if not allow_api_billing and bills_per_token(source := api_key_source(lines)):
             raise RuntimeError(api_billing_error(source))
+        if problem := plugins_problem(session_plugins(lines), allow_plugins, "connector probe session"):
+            raise RuntimeError(problem)
         seen |= servers
         if any(name.startswith("claude_ai_") for name in servers):
             break
@@ -733,6 +787,7 @@ class ClaudeCodeClient:
             isolate_settings,
             allow_api_billing,
             self.settings,
+            allow_plugins,
         )
         self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
         write_private_json(self.mcp_config_path, self.setup.mcp_config())
@@ -821,11 +876,15 @@ class ClaudeCodeClient:
         plugins = session_plugins(lines)
         if reply.trace is not None:
             reply.trace["plugins"] = plugins
-        if plugins and not self.allow_plugins:
+        # A session that failed before its init event is an ordinary failure; an answer is only accepted with its
+        # plugins known.
+        if (plugins is not None or reply.error is None) and (
+            problem := plugins_problem(plugins, self.allow_plugins)
+        ):
             # Stop asking: the preflight said there would be none, so every later session would have them too.
-            self.plugins_error = plugins_error(plugins)
+            self.plugins_error = problem
             reply.status = None
-            reply.error = self.plugins_error
+            reply.error = problem
             return reply
         if reply.error and USAGE_LIMIT.search(reply.error):
             self.usage_limit = reply.error

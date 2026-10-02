@@ -567,7 +567,23 @@ def run(
     if getattr(client, "api_billing", None):
         raise click.ClickException(f"{client.api_billing}. Stopped before grading.")
     if getattr(client, "plugins_error", None):
-        raise click.ClickException(f"{client.plugins_error}. Stopped before grading.")
+        resume_cmd = " ".join(
+            ["cbioportal-mcp-qa", "run", "--resume", bench.data["run_id"]]
+            + [
+                flag
+                for flag, on in (
+                    ("--claude-code-trust-org-policy", claude_code_trust_org_policy),
+                    ("--claude-code-allow-api-billing", claude_code_allow_api_billing),
+                    ("--claude-code-user-settings", claude_code_user_settings),
+                )
+                if on
+            ]
+        )
+        raise click.ClickException(
+            f"Stopped: {client.plugins_error}. The answer it stopped on, and any not yet asked, are marked "
+            f"failed; answers so far are saved. Turn the plugin off (or add --claude-code-allow-plugins to run "
+            f"with it, recorded in run.json), then continue with `{resume_cmd}`. Stopped before grading."
+        )
     if getattr(client, "usage_limit", None):
         raise click.ClickException(
             f"Claude subscription limit: {client.usage_limit}. Once it resets, continue with "

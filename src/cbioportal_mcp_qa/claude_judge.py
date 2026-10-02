@@ -26,7 +26,7 @@ from .claude_code import (
     bills_per_token,
     check_billing,
     plugin_guard,
-    plugins_error,
+    plugins_problem,
     session_env,
     session_plugins,
     setting_sources_args,
@@ -184,6 +184,8 @@ def session_customizations(events: list[dict]) -> list[str]:
 
 
 class ClaudeCodeJudge(BaseJudge):
+    records_plugins = True
+
     def __init__(
         self,
         model: str,
@@ -287,8 +289,8 @@ class ClaudeCodeJudge(BaseJudge):
         if (found := session_customizations(events)) and not self.allow_managed_customizations:
             raise self._stop(f"the judge session had {'; '.join(found)}; it must have none")
         plugins = session_plugins(lines)
-        if plugins and not self.allow_plugins:
-            raise self._stop(plugins_error(plugins))
+        if plugins and (problem := plugins_problem(plugins, self.allow_plugins, "judge session")):
+            raise self._stop(problem)
         result = next((e for e in reversed(events) if e.get("type") == "result"), None)
         verdict = (result or {}).get("structured_output")
         if result is None or result.get("is_error") or verdict is None:
@@ -302,6 +304,9 @@ class ClaudeCodeJudge(BaseJudge):
         if result is None or result.get("is_error"):
             raise JudgeOutputError(f"claude failed: {error[:300]} (exit {out.returncode}: {stderr[-300:]})")
         verdict = parse_verdict(verdict if verdict is not None else (result.get("result") or ""))
+        if plugins is None:
+            # A verdict whose session didn't report its plugins isn't recorded (fail closed).
+            raise self._stop(plugins_problem(None, self.allow_plugins, "judge session"))
         usage = result.get("usage") or {}
         input_tokens = sum(
             usage.get(k) or 0

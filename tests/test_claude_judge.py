@@ -48,7 +48,9 @@ sys.exit(out.get("exit", 0))
 
 
 def _init(source="none", tools=("StructuredOutput",)) -> str:
-    return json.dumps({"type": "system", "subtype": "init", "tools": list(tools), "apiKeySource": source})
+    return json.dumps(
+        {"type": "system", "subtype": "init", "tools": list(tools), "apiKeySource": source, "plugins": []}
+    )
 
 
 def _result(**fields) -> str:

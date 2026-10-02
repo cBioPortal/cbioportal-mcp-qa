@@ -274,13 +274,20 @@ So both the runner and the claude-code judge:
   all of them off except a seated `cc-plugin-sec-default`;
 - run a **preflight** before the first model call (the connector probe included). This is a `claude -p` on a
   model that doesn't exist, so the session prints its init event and then fails with `model_not_found`
-  without generating or billing anything. A plugin it still finds is added to `enabledPlugins: false` and
-  checked again;
+  without generating or billing anything. The preflight must prove that: its result has to be the
+  `model_not_found` error for that model, with zero tokens, no model usage and `total_cost_usd` 0 (or absent).
+  Anything else refuses to start. A plugin it still finds is added to `enabledPlugins: false` and checked
+  again;
 - **refuse to start** if a plugin still loads, unless `--claude-code-allow-plugins` is passed (recorded in
   `run.json` as `allow_plugins`, with `plugins` and `disabled_plugins`, under `claude_code` and
   `claude_code_judge`);
 - record the plugins each session loaded: `trace.plugins` on every answer and `judge_plugins` on every grade.
-  A session that loads a plugin the preflight didn't find stops the run or the grading.
+  A grade made without a judge session (empty answer, no reference) has `judge_plugins: null` and a
+  `judge_plugins_note` saying so. A session that loads a plugin the preflight didn't find stops the
+  run, the connector probe or the grading. So does an answering or judging session that doesn't report its
+  plugins (no init event, or one without a plugin list), even with `--claude-code-allow-plugins`. A stopped
+  run prints the `run --resume` command; the answer it stopped on, and any not yet asked, are marked failed
+  and asked again on resume.
 
 ### Grading with Claude Code (`--judge-runner claude-code`)
 

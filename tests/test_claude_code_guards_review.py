@@ -26,7 +26,7 @@ class ModelCalls:
             if cmd[:3] == ["claude", "auth", "status"]:
                 return SimpleNamespace(stdout=json.dumps(self.auth), stderr="", returncode=0)
             self.calls.append(cmd)
-            init = {"type": "system", "subtype": "init", "apiKeySource": "none"}
+            init = {"type": "system", "subtype": "init", "apiKeySource": "none", "plugins": []}
             init["tools"] = ["mcp__claude_ai_cBioPortal_MCP__read_guide"]
             return SimpleNamespace(stdout=json.dumps(init), stderr="", returncode=0)
 
@@ -221,7 +221,7 @@ def test_the_opt_in_allows_unconfirmed_auth_and_billing_settings(monkeypatch, tm
 def test_a_session_with_a_token_or_helper_api_key_source_stops_the_run(monkeypatch, source):
     client = ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp")
     lines = [
-        json.dumps({"type": "system", "subtype": "init", "apiKeySource": source}),
+        json.dumps({"type": "system", "subtype": "init", "apiKeySource": source, "plugins": []}),
         json.dumps({"type": "result", "subtype": "success", "result": "x"}),
     ]
     calls = []
