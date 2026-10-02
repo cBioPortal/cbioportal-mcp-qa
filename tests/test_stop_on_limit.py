@@ -60,7 +60,8 @@ class FakeClaude:
         monkeypatch.setattr("cbioportal_mcp_qa.claude_code.probe_mcp_servers", lambda *a: set())
 
     def client(self) -> ClaudeCodeClient:
-        return ClaudeCodeClient("PROMPT", "http://db/mcp", "https://nav/mcp")
+        # No retries: a failure is recorded at once (the retry itself waits 10s).
+        return ClaudeCodeClient("PROMPT", "http://db/mcp", "https://nav/mcp", retries=0)
 
 
 QUESTIONS = [Question.from_dict(_question(q)) for q in range(1, 11)]
@@ -357,3 +358,77 @@ def test_compare_warns_about_each_runs_own_plan_even_outside_the_overlap(results
     )
     # Only shared questions are scored.
     assert sorted(q["id"] for q in result["questions"]) == [1, 2]
+
+
+def _questions_file(tmp_path, ids, name="questions.yaml"):
+    """A questions file with these ids of the real one (their text is what the fake `claude` sees)."""
+    import yaml
+
+    from cbioportal_mcp_qa.dataset import DEFAULT_QUESTIONS
+
+    rows = [q for q in yaml.safe_load(DEFAULT_QUESTIONS.read_text()) if q["id"] in ids]
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump(rows, sort_keys=False))
+    return path, {q["id"]: q["question"] for q in rows}
+
+
+BOOM = [_init(), json.dumps({"type": "result", "is_error": True, "result": "boom"})]
+
+
+def test_a_recorded_failure_is_retried_by_every_later_resume(monkeypatch, results_dir, cli_run, tmp_path):
+    """Q1 answers, Q2 fails (`boom`, recorded), Q3 hits the limit, Q4 never starts. A resume with
+    --questions 5-6 asks Q2 too (it is still failing, so that resume exits 1, naming Q2); the next bare resume
+    asks Q2 alone, and once it answers the run is complete."""
+    qfile, text = _questions_file(tmp_path, range(1, 7))
+    state = {"q2": BOOM}
+
+    def script(question, n):
+        if question == text[2]:
+            return state["q2"], 0.0
+        if question == text[3] and n < 10 and not state.get("reset"):
+            state["reset"] = True
+            return limited(), 0.0
+        return answered(), 0.0
+
+    common = ["--questions-file", str(qfile), "--concurrency", "1", "--no-grade", "--no-render"]
+    fake = FakeClaude(monkeypatch, script)
+    out = cli_run(fake, "--questions", "1-4", *common)
+    assert out.exit_code == 1, out.output
+    run_id = _only_run(results_dir).data["run_id"]
+    recs = {r["question"]["id"]: r["reply"]["status"] for r in Run.load(run_id).records.values()}
+    assert recs == {1: 200, 2: None}
+
+    fake = FakeClaude(monkeypatch, script)
+    out = cli_run(fake, "--resume", run_id, "--questions", "5-6")
+    assert out.exit_code == 1, out.output
+    assert "1 planned questions have answers that failed (Q2)" in out.output and "--resume" in out.output
+    assert {text[q] for q in (2, 3, 4, 5, 6)} == set(fake.asked)
+
+    state["q2"] = answered()
+    fake = FakeClaude(monkeypatch, script)
+    out = cli_run(fake, "--resume", run_id)
+    assert out.exit_code == 0, out.output
+    assert fake.asked == [text[2]]
+    run = Run.load(run_id)
+    assert sorted(run.records) == sorted(record_key(q, "haiku", 1) for q in range(1, 7))
+    assert run.unfinished() == {}
+
+
+def test_a_failed_question_removed_from_the_file_is_retried_as_planned(
+    monkeypatch, results_dir, cli_run, tmp_path
+):
+    qfile, text = _questions_file(tmp_path, (1, 2))
+    state = {"q2": BOOM}
+    script = lambda question, n: (state["q2"], 0.0) if question == text[2] else (answered(), 0.0)  # noqa: E731
+    fake = FakeClaude(monkeypatch, script)
+    out = cli_run(fake, "--questions-file", str(qfile), "--no-grade", "--no-render")
+    assert out.exit_code == 1 and "(Q2)" in out.output, out.output
+    run_id = _only_run(results_dir).data["run_id"]
+
+    _questions_file(tmp_path, (1,))  # Q2 is no longer in the file
+    state["q2"] = answered()
+    fake = FakeClaude(monkeypatch, script)
+    out = cli_run(fake, "--resume", run_id)
+    assert out.exit_code == 0, out.output
+    assert fake.asked == [text[2]]  # its saved definition
+    assert Run.load(run_id).records[record_key(2, "haiku", 1)]["reply"]["status"] == 200

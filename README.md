@@ -209,8 +209,11 @@ opt-ins, …). `--resume` also restores the run's own options from `run.json` (`
 `--claude-code-*` and `--judge-allow-managed-customizations` opt-ins: those guards must be given again.
 
 `run.json` records the questions the run means to ask (`planned_questions`, added to when a resume selects
-more). Every resume asks the planned answers that are still missing as well as its own selection, so a narrower
-`--questions` on one resume never strands them, and a run never ends successfully with planned answers missing.
+more). Every resume asks the planned answers that are still missing or failed (anything but HTTP 200, the rule
+`--resume` always used) as well as its own selection, so a narrower `--questions` on one resume never strands
+them; a planned question since removed from the questions file is asked as it was planned. A run never exits 0
+while a planned answer is missing or failed: it still grades and writes the report, then exits 1 naming the
+questions and printing the `--resume` command.
 The report counts a planned turn with no record as a failed request ("not asked"), and `compare` counts it as
 missing, so a stopped run shows as incomplete exactly as it would with failure records. `compare` checks each
 run against its own plan, so it warns about an incomplete run even when the missing questions are ones the

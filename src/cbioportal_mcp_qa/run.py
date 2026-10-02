@@ -26,6 +26,11 @@ def record_key(question_id: int, model: str, repeat: int) -> str:
     return f"{question_id}:{model}:{repeat}"
 
 
+def answered(rec: dict | None) -> bool:
+    """Whether a turn has its answer (HTTP 200). Anything else (no record, a failure) is asked again."""
+    return (rec or {}).get("reply", {}).get("status") == 200
+
+
 class Run:
     def __init__(self, path: Path, data: dict):
         self.path = path
@@ -115,6 +120,19 @@ class Run:
             if record_key(qid, model, r) not in self.records
         ]
 
+    def unfinished(self) -> dict[int, dict]:
+        """The planned questions with a turn not answered yet (no record, or a failure `--resume` retries), by
+        id, as they were planned."""
+        return {
+            qid: q
+            for qid, q in self.planned_questions().items()
+            if not all(
+                answered(self.records.get(record_key(qid, model, r)))
+                for model in self.data["models"]
+                for r in range(1, self.data["repeats"] + 1)
+            )
+        }
+
 
 NOT_ASKED = "not asked: the run stopped before this answer (`run --resume` asks it)"
 
@@ -135,7 +153,7 @@ async def collect_answers(
         for q in questions
         for r in range(1, run.data["repeats"] + 1)
         for model in run.data["models"]
-        if (run.records.get(record_key(q.id, model, r)) or {}).get("reply", {}).get("status") != 200
+        if not answered(run.records.get(record_key(q.id, model, r)))
     ]
     sem = asyncio.Semaphore(concurrency)
     bar = tqdm(total=len(todo), desc="answers", unit="ans")

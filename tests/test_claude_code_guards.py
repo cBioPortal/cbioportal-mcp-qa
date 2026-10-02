@@ -440,7 +440,7 @@ def test_run_records_the_new_fields_through_the_persist_path(monkeypatch, result
 
     async def no_answers(bench, questions, client, concurrency):
         kwargs["transcripts"] = client.transcript_dir
-        _record_failures(bench, questions)
+        _record_answers(bench, questions)
 
     monkeypatch.setattr(cli, "collect_answers", no_answers)
     result = CliRunner().invoke(
@@ -482,15 +482,15 @@ def test_run_records_the_new_fields_through_the_persist_path(monkeypatch, result
             assert value not in text
 
 
-def _record_failures(bench, questions):
-    """What collect_answers leaves when every answer fails: a failure record per planned turn."""
+def _record_answers(bench, questions):
+    """What collect_answers leaves when every answer succeeds: an answer per planned turn."""
     from dataclasses import asdict
 
     from cbioportal_mcp_qa.run import record_key
 
     for q in questions:
         for model in bench.data["models"]:
-            reply = {"answer": "", "status": None, "error": "stub", "latency_s": 0.0, "started_at": 0.0}
+            reply = {"answer": "x", "status": 200, "error": None, "latency_s": 0.0, "started_at": 0.0}
             bench.records[record_key(q.id, model, 1)] = {
                 "question": asdict(q),
                 "model": model,

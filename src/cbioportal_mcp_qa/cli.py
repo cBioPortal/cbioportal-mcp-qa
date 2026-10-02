@@ -542,14 +542,14 @@ def run(
     available = load_questions(questions_file)
     questions = parse_selection(selection, available)
     if resume:
-        # Also every question the run planned (an earlier selection) whose answers are still missing, so no
-        # resume strands them: from the questions file when it still has them, else as they were planned.
+        # Also every question the run planned (an earlier selection) with a turn not answered yet (missing, or a
+        # failure), so no resume strands them: from the questions file when it still has them, else as they were
+        # planned.
         by_id = {q.id: q for q in available}
         selected = {q.id for q in questions}
-        missing = {r["question"]["id"]: r["question"] for r in bench.missing_records()}
         questions += [
             by_id.get(qid) or Question.from_dict(q)
-            for qid, q in sorted(missing.items())
+            for qid, q in sorted(bench.unfinished().items())
             if qid not in selected
         ]
     if not questions:
@@ -698,6 +698,13 @@ def run(
             waiter,
         )
     click.echo(f"Report: {write_report(bench)}")
+    if unfinished := bench.unfinished():
+        # Graded and reported, but not a finished run: its failed answers are asked again on resume.
+        ids = ", ".join(f"Q{qid}" for qid in sorted(unfinished))
+        raise click.ClickException(
+            f"{len(unfinished)} planned questions have answers that failed ({ids}); ask them again with "
+            f"`{_resume_command(ctx, opts, bench)}`."
+        )
 
 
 # `run` options `--resume` takes from the run when they aren't given again. The --claude-code-* opt-ins (billing,
