@@ -3,11 +3,13 @@
 Same prompt, rubric and grade fields as the Bedrock judge, with the claude-code runner's safeguards: billing
 variables removed, the billing guard run before the first call (and the session's apiKeySource checked after
 each), user settings always left out, an empty working directory, and no tools at all (no built-ins, no MCP
-servers, no claude.ai connectors). Its own hooks and auto memory are off, but managed (policy) hooks, managed
-CLAUDE.md and managed plugins or MCP servers can't be turned off from a session: the judge refuses to start
-while the managed settings it can read carry any of them, and stops if a session shows hooks, plugins or
-MCP servers anyway. Claude Code can't set the temperature, so its grades vary more than Bedrock's
-temperature-0 ones; each grade records the judge as `claude-code:<model>` so `compare` keeps them apart.
+servers, no claude.ai connectors). Its own hooks, auto memory and Claude Code's built-in plugins are off, but
+managed (policy) hooks, managed CLAUDE.md and managed plugins or MCP servers can't be turned off from a session:
+the judge refuses to start while the managed settings it can read carry any of them, or while a preflight
+session (no model call) still loads a plugin, and stops if a session shows hooks, plugins or MCP servers
+anyway. Each grade records the plugins its session loaded. Claude Code can't set the temperature, so its
+grades vary more than Bedrock's temperature-0 ones; each grade records the judge as `claude-code:<model>` so
+`compare` keeps them apart.
 """
 
 import json
@@ -23,7 +25,10 @@ from .claude_code import (
     api_key_source,
     bills_per_token,
     check_billing,
+    plugin_guard,
+    plugins_error,
     session_env,
+    session_plugins,
     setting_sources_args,
     settings_files,
 )
@@ -56,7 +61,7 @@ def claude_code_model(model: str) -> str:
 JUDGE_SETTINGS = {"disableAllHooks": True, "autoMemoryEnabled": False}
 
 
-def judge_args(model: str, mcp_config_path: str) -> list[str]:
+def judge_args(model: str, mcp_config_path: str, settings: dict | None = None) -> list[str]:
     """`claude -p` with the prompt on stdin, no tools, MCP servers, skills, hooks or user settings, and the verdict
     as structured output."""
     return [
@@ -79,7 +84,7 @@ def judge_args(model: str, mcp_config_path: str) -> list[str]:
         "--no-session-persistence",
         "--disable-slash-commands",
         "--settings",
-        json.dumps(JUDGE_SETTINGS),
+        json.dumps(settings or JUDGE_SETTINGS),
         *setting_sources_args(True),
     ]
 
@@ -157,12 +162,12 @@ HOOK_EVENTS = {"hook_started", "hook_progress", "hook_response"}
 
 def session_customizations(events: list[dict]) -> list[str]:
     """What the session had besides the structured-output tool, from its stream: other tools (built-in or MCP),
-    MCP servers, plugins (and plugin errors), and hooks that ran (SessionStart and Setup hooks always stream)."""
+    MCP servers, plugin errors, and hooks that ran (SessionStart and Setup hooks always stream)."""
     found = []
     init = next((e for e in events if e.get("type") == "system" and e.get("subtype") == "init"), {})
     if tools := sorted(t for t in init.get("tools") or [] if t != STRUCTURED_OUTPUT_TOOL):
         found.append(f"tools {tools}")
-    for key in ("mcp_servers", "plugins", "plugin_errors"):
+    for key in ("mcp_servers", "plugin_errors"):  # plugins: see plugin_guard
         if init.get(key):
             names = [x.get("name") or x.get("plugin") if isinstance(x, dict) else x for x in init[key]]
             found.append(f"{key} {names}")
@@ -185,6 +190,7 @@ class ClaudeCodeJudge(BaseJudge):
         allow_api_billing: bool = False,
         trust_org_policy: bool = False,
         allow_managed_customizations: bool = False,
+        allow_plugins: bool = False,
         timeout_s: float = 300.0,
     ):
         self.claude_model = claude_code_model(model)
@@ -206,6 +212,14 @@ class ClaudeCodeJudge(BaseJudge):
                 "run.json)"
             )
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-judge-")
+        self.allow_plugins = allow_plugins
+        try:
+            self.settings, self.plugins = plugin_guard(
+                self.env, self._workdir.name, True, allow_plugins, JUDGE_SETTINGS
+            )
+        except BaseException:
+            self._workdir.cleanup()
+            raise
         self.mcp_config_path = os.path.join(self._workdir.name, "no-mcp.json")
         write_private_json(self.mcp_config_path, {"mcpServers": {}})
         self.stopped: str | None = None
@@ -224,6 +238,9 @@ class ClaudeCodeJudge(BaseJudge):
             "trust_org_policy": self.trust_org_policy,
             "allow_managed_customizations": self.allow_managed_customizations,
             "managed_customizations": self.managed_customizations,
+            "allow_plugins": self.allow_plugins,
+            "plugins": self.plugins,
+            "disabled_plugins": sorted(self.settings["enabledPlugins"]),
             "stripped_env": self.stripped_env,
             "setting_sources": "managed only",
         }
@@ -247,7 +264,7 @@ class ClaudeCodeJudge(BaseJudge):
     def _call(self, prompt: str) -> tuple[dict, int, int]:
         try:
             out = subprocess.run(
-                judge_args(self.claude_model, self.mcp_config_path),
+                judge_args(self.claude_model, self.mcp_config_path, self.settings),
                 input=prompt,
                 cwd=self._workdir.name,  # empty: no project CLAUDE.md
                 env=self.env,
@@ -269,6 +286,9 @@ class ClaudeCodeJudge(BaseJudge):
                     pass
         if (found := session_customizations(events)) and not self.allow_managed_customizations:
             raise self._stop(f"the judge session had {'; '.join(found)}; it must have none")
+        plugins = session_plugins(lines)
+        if plugins and not self.allow_plugins:
+            raise self._stop(plugins_error(plugins))
         result = next((e for e in reversed(events) if e.get("type") == "result"), None)
         verdict = (result or {}).get("structured_output")
         if result is None or result.get("is_error") or verdict is None:
@@ -287,4 +307,5 @@ class ClaudeCodeJudge(BaseJudge):
             usage.get(k) or 0
             for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
         )
-        return verdict, input_tokens, usage.get("output_tokens") or 0
+        # Recorded on the grade (BaseJudge.grade): which plugins this verdict's session loaded.
+        return verdict | {"plugins": plugins}, input_tokens, usage.get("output_tokens") or 0

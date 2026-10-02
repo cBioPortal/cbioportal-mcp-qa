@@ -112,9 +112,14 @@ class Grade:
     invalid_studies: list[str] = field(default_factory=list)
     judge_input_tokens: int = 0
     judge_output_tokens: int = 0
+    # The plugins the claude-code judge's session loaded (None for the Bedrock judge, and then left out).
+    judge_plugins: list[str] | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        out = asdict(self)
+        if out["judge_plugins"] is None:
+            del out["judge_plugins"]
+        return out
 
 
 def _to_float(raw: str) -> float | None:
@@ -294,6 +299,7 @@ class BaseJudge:
             rationale=result["rationale"],
             judge_input_tokens=input_tokens,
             judge_output_tokens=output_tokens,
+            judge_plugins=result.get("plugins"),
             **base,
         )
 

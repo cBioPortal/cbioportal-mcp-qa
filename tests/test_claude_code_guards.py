@@ -173,6 +173,9 @@ def test_client_strips_billing_env_and_records_the_auth_mode(monkeypatch):
             "trust_org_policy": False,
             "stripped_env": sorted(BILLING_ENV),
             "setting_sources": "managed only",
+            "allow_plugins": False,
+            "plugins": [],
+            "disabled_plugins": sorted(f"{name}@builtin" for name in claude_code.BUILTIN_PLUGINS),
         }
     finally:
         asyncio.run(client.aclose())

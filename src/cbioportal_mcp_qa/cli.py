@@ -97,7 +97,15 @@ def claude_code_session_options(f):
 
 
 def claude_code_billing_options(f):
-    """How `claude` sessions bill: the claude-code runner's and judge's."""
+    """How `claude` sessions bill and which plugins they may load: the claude-code runner's and judge's."""
+    f = click.option(
+        "--claude-code-allow-plugins",
+        is_flag=True,
+        help="Run claude-code sessions (runner and judge) even though they load plugins that can't be turned "
+        "off from a session, e.g. Claude Code's cc-plugin-sec-default on Team and Enterprise logins. By default "
+        "every plugin that can be is turned off, a preflight (no model call) checks what is left, and any "
+        "plugin is refused. Recorded in run.json; each answer and grade records its session's plugins.",
+    )(f)
     f = click.option(
         "--claude-code-trust-org-policy",
         is_flag=True,
@@ -221,6 +229,7 @@ def _client(
     allow_api_billing: bool = False,
     user_settings: bool = False,
     trust_org_policy: bool = False,
+    allow_plugins: bool = False,
 ):
     if runner == "claude-code":
         try:
@@ -233,6 +242,7 @@ def _client(
                 allow_api_billing=allow_api_billing,
                 isolate_settings=not user_settings,
                 trust_org_policy=trust_org_policy,
+                allow_plugins=allow_plugins,
             )
         except RuntimeError as exc:
             raise click.ClickException(redact(str(exc))) from exc
@@ -250,6 +260,7 @@ def _make_judge(
     allow_api_billing: bool = False,
     trust_org_policy: bool = False,
     allow_managed_customizations: bool = False,
+    allow_plugins: bool = False,
 ) -> BaseJudge:
     if judge_runner == "claude-code":
         try:
@@ -258,6 +269,7 @@ def _make_judge(
                 allow_api_billing=allow_api_billing,
                 trust_org_policy=trust_org_policy,
                 allow_managed_customizations=allow_managed_customizations,
+                allow_plugins=allow_plugins,
             )
         except (RuntimeError, ValueError) as exc:
             raise click.ClickException(f"claude-code judge: {redact(str(exc))}") from exc
@@ -266,6 +278,10 @@ def _make_judge(
                 "Warning: --judge-allow-managed-customizations: the judge sessions inherit these managed "
                 f"customizations: {', '.join(judge.managed_customizations)}",
                 err=True,
+            )
+        if judge.plugins:
+            click.echo(
+                f"Warning: --claude-code-allow-plugins: the judge sessions load {judge.plugins}", err=True
             )
         return judge
     if not judge_model:
@@ -309,6 +325,7 @@ def _grade_command(
     trust_org_policy: bool = False,
     allow_api_billing: bool = False,
     allow_managed_customizations: bool = False,
+    allow_plugins: bool = False,
 ) -> str:
     """The `grade` command that continues grading this run (as it was named: id or path) with the same judge."""
     cmd = ["uv", "run", "cbioportal-mcp-qa", "grade", run]
@@ -325,6 +342,7 @@ def _grade_command(
                 ("--claude-code-trust-org-policy", trust_org_policy),
                 ("--claude-code-allow-api-billing", allow_api_billing),
                 ("--judge-allow-managed-customizations", allow_managed_customizations),
+                ("--claude-code-allow-plugins", allow_plugins),
             )
             if on
         ]
@@ -348,6 +366,7 @@ def ask(
     model: str | None,
     runner: str,
     claude_code_allow_api_billing: bool,
+    claude_code_allow_plugins: bool,
     claude_code_trust_org_policy: bool,
     claude_code_user_settings: bool,
     require_beta_mcp: bool,
@@ -365,6 +384,7 @@ def ask(
             allow_api_billing=claude_code_allow_api_billing,
             user_settings=claude_code_user_settings,
             trust_org_policy=claude_code_trust_org_policy,
+            allow_plugins=claude_code_allow_plugins,
         )
         try:
             return await client.ask(question, model)
@@ -380,6 +400,8 @@ def ask(
         f"write {reply.cache_write_tokens}) · completion {reply.completion_tokens} · id {reply.response_id}",
         err=True,
     )
+    if reply.trace is not None and "plugins" in reply.trace:
+        click.echo(f"--- plugins loaded: {reply.trace['plugins']}", err=True)
 
 
 @cli.command()
@@ -433,6 +455,7 @@ def run(
     screenshots,
     runner,
     claude_code_allow_api_billing,
+    claude_code_allow_plugins,
     claude_code_trust_org_policy,
     claude_code_user_settings,
     require_beta_mcp,
@@ -470,6 +493,7 @@ def run(
             claude_code_allow_api_billing,
             claude_code_trust_org_policy,
             judge_allow_managed_customizations,
+            claude_code_allow_plugins,
         )
     client = _client(
         settings,
@@ -479,6 +503,7 @@ def run(
         allow_api_billing=claude_code_allow_api_billing,
         user_settings=claude_code_user_settings,
         trust_org_policy=claude_code_trust_org_policy,
+        allow_plugins=claude_code_allow_plugins,
     )
     if resume:
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
@@ -541,6 +566,8 @@ def run(
         )
     if getattr(client, "api_billing", None):
         raise click.ClickException(f"{client.api_billing}. Stopped before grading.")
+    if getattr(client, "plugins_error", None):
+        raise click.ClickException(f"{client.plugins_error}. Stopped before grading.")
     if getattr(client, "usage_limit", None):
         raise click.ClickException(
             f"Claude subscription limit: {client.usage_limit}. Once it resets, continue with "
@@ -567,6 +594,7 @@ def run(
                 claude_code_trust_org_policy,
                 claude_code_allow_api_billing,
                 judge_allow_managed_customizations,
+                claude_code_allow_plugins,
             ),
         )
     click.echo(f"Report: {write_report(bench)}")
@@ -614,6 +642,7 @@ def grade(
     judge_allow_managed_customizations: bool,
     concurrency: int,
     claude_code_allow_api_billing: bool,
+    claude_code_allow_plugins: bool,
     claude_code_trust_org_policy: bool,
 ) -> None:
     """Grade answers that don't have a grade yet (and answers the judge left ungraded)."""
@@ -626,6 +655,7 @@ def grade(
         claude_code_allow_api_billing,
         claude_code_trust_org_policy,
         judge_allow_managed_customizations,
+        claude_code_allow_plugins,
     )
     if refresh_questions:
         current = {q.id: asdict(q) for q in load_questions(Path(bench.data["questions_file"]))}
@@ -662,6 +692,7 @@ def grade(
             claude_code_trust_org_policy,
             claude_code_allow_api_billing,
             judge_allow_managed_customizations,
+            claude_code_allow_plugins,
         ),
     )
     click.echo(f"Report: {write_report(bench)}")
