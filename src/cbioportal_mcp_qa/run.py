@@ -92,7 +92,12 @@ async def collect_answers(
     questions: list[Question],
     client: "AgentClient | ClaudeCodeClient",
     concurrency: int,
-) -> None:
+) -> int:
+    """Ask the questions without an answer yet (status 200). Returns how many were left unasked by a stop.
+
+    A stop (the claude-code client's `stop_reason`: the subscription's usage limit, per-token billing, a plugin,
+    an expired connector login) ends the batch: answers in flight finish and are saved, no queued answer starts a
+    session, and neither those nor the reply that is the stop get a record, so `--resume` asks exactly them."""
     todo = [
         (q, model, r)
         for q in questions
@@ -102,10 +107,19 @@ async def collect_answers(
     ]
     sem = asyncio.Semaphore(concurrency)
     bar = tqdm(total=len(todo), desc="answers", unit="ans")
+    stop_reason = getattr(client, "stop_reason", lambda: None)  # only the claude-code client stops
+    unasked = 0
 
     async def one(q: Question, model: str, repeat: int) -> None:
+        nonlocal unasked
         async with sem:
+            if stop_reason():
+                unasked += 1
+                return
             reply = await client.ask(q.question, model, q.history)
+        if stop_reason() and client.is_stop(reply):
+            unasked += 1
+            return
         rec = {"question": asdict(q), "model": model, "repeat": repeat, "reply": asdict(reply)}
         if trace := rec["reply"].pop("trace"):
             rec["trace"] = trace
@@ -116,7 +130,10 @@ async def collect_answers(
             bar.write(f"[{model}] Q{q.id} failed: {reply.status} {reply.error[:200]}")
 
     await asyncio.gather(*(one(*item) for item in todo))
+    if unasked:
+        bar.write(f"Stopped: {stop_reason()[:200]}. {unasked} answers left unasked (not recorded).")
     bar.close()
+    return unasked
 
 
 def attach_traces(run: Run, langfuse: Langfuse) -> int:

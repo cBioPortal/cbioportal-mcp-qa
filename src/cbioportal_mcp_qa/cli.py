@@ -7,7 +7,7 @@ import click
 
 from .agent import AgentClient
 from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
-from .claude_code import ClaudeCodeClient, find_connector, prompt_parity
+from .claude_code import USAGE_LIMIT, ClaudeCodeClient, find_connector, prompt_parity
 from .claude_judge import ClaudeCodeJudge
 from .compare import compare as compare_runs
 from .compare import write_compare
@@ -21,6 +21,7 @@ from .dataset import (
     parse_selection,
 )
 from .grade import BaseJudge, Judge, JudgeStopped
+from .limits import LimitWaiter
 from .persist import write_text
 from .redact import describe_error, redact
 from .report import write_index, write_report
@@ -152,6 +153,29 @@ def judge_options(f):
         "CLAUDE.md, plugins or MCP servers that a session can't turn off. Recorded in run.json.",
     )(f)
     return f
+
+
+def wait_options(f):
+    """`--wait-on-limit`: wait out the Claude subscription's usage limit instead of stopping."""
+    f = click.option(
+        "--max-wait",
+        type=click.FloatRange(min=0),
+        default=360.0,
+        show_default=True,
+        help="With --wait-on-limit: minutes of waiting in all; a wait that would go past it stops instead.",
+    )(f)
+    f = click.option(
+        "--wait-on-limit",
+        is_flag=True,
+        help="On the Claude subscription's usage limit (claude-code runner or judge), sleep until it resets (the "
+        "time in the message, e.g. 'resets 9:50pm (Pacific/Honolulu)', or 15 min when there is none) and carry "
+        "on, instead of stopping with the --resume command.",
+    )(f)
+    return f
+
+
+def _waiter(wait_on_limit: bool, max_wait: float) -> LimitWaiter | None:
+    return LimitWaiter(max_wait * 60) if wait_on_limit else None
 
 
 screenshots_option = click.option(
@@ -298,14 +322,24 @@ def _bedrock_judge_model(settings, judge_model: str | None) -> str:
     return model
 
 
-def _grade(bench: Run, judge: BaseJudge, concurrency: int, command: str) -> None:
+def _grade(
+    bench: Run, judge: BaseJudge, concurrency: int, command: str, waiter: LimitWaiter | None = None
+) -> None:
     """Grade, and on a stop (the subscription's usage limit, per-token billing) write the report and say how to
-    resume."""
+    resume. With a waiter, a usage limit is waited out and grading carries on."""
     if describe := getattr(judge, "describe", None):
         bench.data["claude_code_judge"] = describe()
         bench.save()
     try:
-        grade_answers(bench, judge, concurrency)
+        while True:
+            try:
+                grade_answers(bench, judge, concurrency)
+                break
+            except JudgeStopped as exc:
+                if waiter and USAGE_LIMIT.search(str(exc)) and waiter.wait(str(exc)):
+                    judge.stopped = None
+                    continue
+                raise
     except JudgeStopped as exc:
         click.echo(f"Report: {write_report(bench)}")
         raise click.ClickException(
@@ -438,6 +472,7 @@ def ask(
 @screenshots_option
 @runner_option
 @claude_code_options
+@wait_options
 def run(
     target,
     models_arg,
@@ -459,6 +494,8 @@ def run(
     claude_code_trust_org_policy,
     claude_code_user_settings,
     require_beta_mcp,
+    wait_on_limit,
+    max_wait,
 ) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
@@ -551,43 +588,52 @@ def run(
     if runner == "claude-code":
         client.transcript_dir = bench.dir / "transcripts"
 
+    waiter = _waiter(wait_on_limit, max_wait)
+
     async def go():
         try:
-            await collect_answers(bench, questions, client, concurrency)
+            while True:
+                await collect_answers(bench, questions, client, concurrency)
+                # Only a usage limit resets by itself; the other stops need you.
+                limit = getattr(client, "usage_limit", None)
+                if not (limit and client.stop_reason() == limit and waiter and waiter.wait(limit)):
+                    break
+                client.usage_limit = None
         finally:
             await client.aclose()
 
     asyncio.run(go())
+    # Answers left unasked by a stop have no record; this asks exactly them (and any that failed).
+    resume_cmd = " ".join(
+        ["cbioportal-mcp-qa", "run", "--resume", bench.data["run_id"]]
+        + [
+            flag
+            for flag, on in (
+                ("--claude-code-trust-org-policy", claude_code_trust_org_policy),
+                ("--claude-code-allow-api-billing", claude_code_allow_api_billing),
+                ("--claude-code-user-settings", claude_code_user_settings),
+            )
+            if on
+        ]
+    )
     if getattr(client, "signin_expired", False):
         raise click.ClickException(
             f"{client.signin_message()}: authenticate it (claude.ai → Settings → Connectors, or `/mcp` in "
-            f"`claude` with the same CLAUDE_CONFIG_DIR), then continue with "
-            f"`cbioportal-mcp-qa run --resume {bench.data['run_id']}`. Stopped before grading."
+            f"`claude` with the same CLAUDE_CONFIG_DIR), then continue with `{resume_cmd}`. Stopped before "
+            f"grading."
         )
     if getattr(client, "api_billing", None):
         raise click.ClickException(f"{client.api_billing}. Stopped before grading.")
     if getattr(client, "plugins_error", None):
-        resume_cmd = " ".join(
-            ["cbioportal-mcp-qa", "run", "--resume", bench.data["run_id"]]
-            + [
-                flag
-                for flag, on in (
-                    ("--claude-code-trust-org-policy", claude_code_trust_org_policy),
-                    ("--claude-code-allow-api-billing", claude_code_allow_api_billing),
-                    ("--claude-code-user-settings", claude_code_user_settings),
-                )
-                if on
-            ]
-        )
         raise click.ClickException(
-            f"Stopped: {client.plugins_error}. The answer it stopped on, and any not yet asked, are marked "
-            f"failed; answers so far are saved. Turn the plugin off (or add --claude-code-allow-plugins to run "
+            f"Stopped: {client.plugins_error}. The answer it stopped on, and any not yet asked, aren't recorded; "
+            f"answers so far are saved. Turn the plugin off (or add --claude-code-allow-plugins to run "
             f"with it, recorded in run.json), then continue with `{resume_cmd}`. Stopped before grading."
         )
     if getattr(client, "usage_limit", None):
         raise click.ClickException(
             f"Claude subscription limit: {client.usage_limit}. Once it resets, continue with "
-            f"`cbioportal-mcp-qa run --resume {bench.data['run_id']}` (same CLAUDE_CONFIG_DIR). "
+            f"`{resume_cmd}` (same CLAUDE_CONFIG_DIR), or add --wait-on-limit to wait for it. "
             f"Stopped before grading."
         )
     if runner == "agents-api":
@@ -612,6 +658,7 @@ def run(
                 judge_allow_managed_customizations,
                 claude_code_allow_plugins,
             ),
+            waiter,
         )
     click.echo(f"Report: {write_report(bench)}")
 
@@ -649,6 +696,7 @@ def traces(run_id: str) -> None:
 @judge_options
 @click.option("--concurrency", type=int, default=1, show_default=True, help="Answers graded in parallel.")
 @claude_code_billing_options
+@wait_options
 def grade(
     run_id: str,
     regrade: bool,
@@ -660,6 +708,8 @@ def grade(
     claude_code_allow_api_billing: bool,
     claude_code_allow_plugins: bool,
     claude_code_trust_org_policy: bool,
+    wait_on_limit: bool,
+    max_wait: float,
 ) -> None:
     """Grade answers that don't have a grade yet (and answers the judge left ungraded)."""
     bench = Run.load(run_id)
@@ -710,6 +760,7 @@ def grade(
             judge_allow_managed_customizations,
             claude_code_allow_plugins,
         ),
+        _waiter(wait_on_limit, max_wait),
     )
     click.echo(f"Report: {write_report(bench)}")
 

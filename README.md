@@ -190,6 +190,36 @@ Claude Code (`claude -p`) instead of the deployed agent:
   `usage limit reached`), or the connector's login expires, the run stops asking, skips
   grading, and prints the `--resume` command to continue once the limit resets.
 
+### Stopping on the usage limit, and `--wait-on-limit`
+
+A stop (the usage limit, per-token billing, a plugin, an expired connector login) ends the batch at once:
+
+- answers already in flight finish and are saved as usual (an ordinary failure among them too);
+- no queued answer starts a `claude` session, and none gets a record in `run.json`;
+- the reply that is the stop (e.g. `You've hit your session limit`) isn't recorded either, nor is another
+  session's limit reply in flight at the same time.
+
+So `run.json` has no junk failures, and `run --resume <run>` (printed with the `--claude-code-*` options you
+used) asks exactly the answers that are missing or failed. Grading works the same way (see
+[Grading with Claude Code](#grading-with-claude-code---judge-runner-claude-code)): in-flight grades are saved,
+nothing ungraded gets a `judge_error` from a limit.
+
+`run` and `grade` take `--wait-on-limit` to wait the usage limit out in the same process instead of stopping:
+
+```bash
+uv run cbioportal-mcp-qa run --runner claude-code --wait-on-limit --max-wait 300
+uv run cbioportal-mcp-qa grade 20261002-0306 --judge-runner claude-code --wait-on-limit
+```
+
+- **When.** The reset time is read from the message: `resets 9:50pm (Pacific/Honolulu)`, `resets 3:40am (UTC)`,
+  `resets 3pm` (no zone: the machine's local time). It is the next such time (tomorrow's if today's has
+  passed), plus a minute. A message with no time of day (`resets Oct 3`, `resets Mon`), an unknown zone, or a
+  time that passed less than an hour ago (the limit is about to clear) waits a fixed 15 minutes instead.
+- **How long.** `--max-wait` (minutes, default 360) caps the waiting in all, across answering and grading; a
+  wait that would go past it stops as without the flag, with the `--resume` command.
+- It prints what it waits for and until when (`waiting 51 min, until 2026-10-01 21:51 HST`); Ctrl-C stops it,
+  and `--resume` continues later. Only the usage limit is waited out: the other stops need you.
+
 ```bash
 uv run cbioportal-mcp-qa run --runner claude-code --questions 1-20
 uv run cbioportal-mcp-qa ask "what is the median age in os target gdc" --runner claude-code
@@ -286,8 +316,8 @@ So both the runner and the claude-code judge:
   `judge_plugins_note` saying so. A session that loads a plugin the preflight didn't find stops the
   run, the connector probe or the grading. So does an answering or judging session that doesn't report its
   plugins (no init event, or one without a plugin list), even with `--claude-code-allow-plugins`. A stopped
-  run prints the `run --resume` command; the answer it stopped on, and any not yet asked, are marked failed
-  and asked again on resume.
+  run prints the `run --resume` command; the answer it stopped on, and any not yet asked, aren't recorded,
+  so resume asks them.
 
 ### Grading with Claude Code (`--judge-runner claude-code`)
 
@@ -347,7 +377,9 @@ id or a Claude Code id. By default the claude-code judge is the Bedrock judge's 
   `usage limit reached`, or a rate limit that names its reset. Grades so far are saved, the report is written,
   and the `grade` command to resume once the limit resets is printed. That command keeps the run as you named it
   (id or path) and the judge options you used (`--judge-model`, `--concurrency`, `--claude-code-trust-org-policy`,
-  `--claude-code-allow-api-billing`, `--judge-allow-managed-customizations`, `--claude-code-allow-plugins`).
+  `--claude-code-allow-api-billing`, `--judge-allow-managed-customizations`, `--claude-code-allow-plugins`). With
+  `--wait-on-limit` it waits for the reset instead and carries on
+  ([above](#stopping-on-the-usage-limit-and---wait-on-limit)).
 - **Judge identity.** Each grade records its judge as `claude-code:<model>` (e.g.
   `claude-code:claude-sonnet-4-6`), so `compare` refuses to mix them with Bedrock grades (`us.anthropic.…`),
   and a run graded by both shows up as mixed. Judge cost isn't estimated: nothing is billed per token.

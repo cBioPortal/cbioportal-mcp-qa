@@ -813,19 +813,29 @@ class ClaudeCodeClient:
     def signin_message(self) -> str:
         return f"claude.ai connector {self.setup.connector!r} needs you to sign in again"
 
+    def stop_reason(self) -> str | None:
+        """Why no more questions can be asked now (an expired connector login, the usage limit, per-token
+        billing, a plugin), or None."""
+        if self.signin_expired:
+            return self.signin_message()
+        return self.usage_limit or self.api_billing or self.plugins_error
+
+    def is_stop(self, reply: AgentReply) -> bool:
+        """Whether a reply is a stop rather than an answer: the run's stop itself, or another session's usage
+        limit. It isn't recorded, so `--resume` asks the question again."""
+        return bool(reply.error) and (
+            reply.error == self.stop_reason() or bool(USAGE_LIMIT.search(reply.error))
+        )
+
     async def ask(self, question: str, model: str, history: tuple[dict, ...] = ()) -> AgentReply:
         question = conversation_prompt(question, history)
         started = time.time()
         retries = connector_misses = 0
         while True:
-            if self.signin_expired:
-                return AgentReply("", None, None, self.signin_message(), 0.0, started)
-            if stop := self.usage_limit or self.api_billing or self.plugins_error:
+            if stop := self.stop_reason():
                 return AgentReply("", None, None, stop, 0.0, started)
             reply = await self._run(question, model, started)
-            if reply.error is None:
-                return reply
-            if self.signin_expired or self.usage_limit or self.api_billing or self.plugins_error:
+            if reply.error is None or self.stop_reason():
                 return reply
             if "did not load in this session" in reply.error:
                 # The attempt never had the database tools; retry it without using up a regular retry.
