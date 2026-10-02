@@ -88,7 +88,9 @@ uv run cbioportal-mcp-qa run --models haiku,sonnet
 # A subset, three repeats each to measure consistency
 uv run cbioportal-mcp-qa run --questions 1-10 --repeats 3
 
-# Continue an interrupted run (re-asks only missing or failed answers)
+# Continue an interrupted run (re-asks only missing or failed answers). It keeps the run's --questions,
+# --questions-file, --no-grade, judge, concurrency, rendering and --wait-on-limit unless you give them again;
+# the --claude-code-* opt-ins must be given again.
 uv run cbioportal-mcp-qa run --resume 20260923-1800
 
 # Re-attach traces (Langfuse ingestion can lag), regrade, or re-render
@@ -190,6 +192,56 @@ Claude Code (`claude -p`) instead of the deployed agent:
   `usage limit reached`), or the connector's login expires, the run stops asking, skips
   grading, and prints the `--resume` command to continue once the limit resets.
 
+### Stopping on the usage limit, and `--wait-on-limit`
+
+A stop (the usage limit, per-token billing, a plugin, an expired connector login) ends the batch at once:
+
+- answers already in flight finish and are saved as usual (an ordinary failure among them too);
+- no queued answer starts a `claude` session, and none gets a record in `run.json`;
+- a reply that is itself a stop isn't recorded either, judged by its own content: the limit reply
+  (`You've hit your session limit`), and a reply in flight that hit a different stop (say a plugin) after it.
+  The first stop is the reason given; any others are listed after it.
+
+So `run.json` has no junk failures, and `run --resume <run>` asks exactly the answers that are missing or failed.
+The printed command keeps every option the run was started with that isn't a default (`--questions`,
+`--no-grade`, `--questions-file`, judge options, `--concurrency`, `--wait-on-limit`, the `--claude-code-*`
+opt-ins, …). `--resume` also restores the run's own options from `run.json` (`options`), except the
+`--claude-code-*` and `--judge-allow-managed-customizations` opt-ins: those guards must be given again.
+
+`run.json` records the questions the run means to ask (`planned_questions`, added to when a resume selects
+more). Every resume asks the planned answers that are still missing or failed (anything but HTTP 200, the rule
+`--resume` always used) as well as its own selection, so a narrower `--questions` on one resume never strands
+them; a planned question since removed from the questions file is asked as it was planned. A run never exits 0
+while a planned answer is missing or failed: it still grades and writes the report, then exits 1 naming the
+questions and printing the `--resume` command.
+The report counts a planned turn with no record as a failed request ("not asked"), and `compare` counts it as
+missing, so a stopped run shows as incomplete exactly as it would with failure records. `compare` checks each
+run against its own plan, so it warns about an incomplete run even when the missing questions are ones the
+other run didn't ask (and so aren't scored). Runs from before `planned_questions` are reported from their
+records, as before.
+
+Grading works the same way (see
+[Grading with Claude Code](#grading-with-claude-code---judge-runner-claude-code)): in-flight grades are saved,
+nothing ungraded gets a `judge_error` from a limit, and no judge call starts once a stop is recorded (the stop
+check and the launch are one locked step).
+
+`run` and `grade` take `--wait-on-limit` to wait the usage limit out in the same process instead of stopping:
+
+```bash
+uv run cbioportal-mcp-qa run --runner claude-code --wait-on-limit --max-wait 300
+uv run cbioportal-mcp-qa grade 20261002-0306 --judge-runner claude-code --wait-on-limit
+```
+
+- **When.** The reset time is read from the message: `resets 9:50pm (Pacific/Honolulu)`, `resets 3:40am (UTC)`,
+  `resets 3pm` (no zone: the machine's local time). It is the next such time (tomorrow's if today's has
+  passed), plus a minute. The wait is elapsed time, so it is right across a DST change; a time that happens
+  twice (the fall-back hour) is taken as the later one. A message with no time of day (`resets Oct 3`, `resets Mon`), an unknown zone, or a
+  time that passed less than an hour ago (the limit is about to clear) waits a fixed 15 minutes instead.
+- **How long.** `--max-wait` (minutes, default 360) caps the waiting in all, across answering and grading; a
+  wait that would go past it stops as without the flag, with the `--resume` command.
+- It prints what it waits for and until when (`waiting 51 min, until 2026-10-01 21:51 HST`); Ctrl-C stops it,
+  and `--resume` continues later. Only the usage limit is waited out: the other stops need you.
+
 ```bash
 uv run cbioportal-mcp-qa run --runner claude-code --questions 1-20
 uv run cbioportal-mcp-qa ask "what is the median age in os target gdc" --runner claude-code
@@ -286,8 +338,8 @@ So both the runner and the claude-code judge:
   `judge_plugins_note` saying so. A session that loads a plugin the preflight didn't find stops the
   run, the connector probe or the grading. So does an answering or judging session that doesn't report its
   plugins (no init event, or one without a plugin list), even with `--claude-code-allow-plugins`. A stopped
-  run prints the `run --resume` command; the answer it stopped on, and any not yet asked, are marked failed
-  and asked again on resume.
+  run prints the `run --resume` command; the answer it stopped on, and any not yet asked, aren't recorded,
+  so resume asks them.
 
 ### Grading with Claude Code (`--judge-runner claude-code`)
 
@@ -347,7 +399,9 @@ id or a Claude Code id. By default the claude-code judge is the Bedrock judge's 
   `usage limit reached`, or a rate limit that names its reset. Grades so far are saved, the report is written,
   and the `grade` command to resume once the limit resets is printed. That command keeps the run as you named it
   (id or path) and the judge options you used (`--judge-model`, `--concurrency`, `--claude-code-trust-org-policy`,
-  `--claude-code-allow-api-billing`, `--judge-allow-managed-customizations`, `--claude-code-allow-plugins`).
+  `--claude-code-allow-api-billing`, `--judge-allow-managed-customizations`, `--claude-code-allow-plugins`). With
+  `--wait-on-limit` it waits for the reset instead and carries on
+  ([above](#stopping-on-the-usage-limit-and---wait-on-limit)).
 - **Judge identity.** Each grade records its judge as `claude-code:<model>` (e.g.
   `claude-code:claude-sonnet-4-6`), so `compare` refuses to mix them with Bedrock grades (`us.anthropic.…`),
   and a run graded by both shows up as mixed. Judge cost isn't estimated: nothing is billed per token.

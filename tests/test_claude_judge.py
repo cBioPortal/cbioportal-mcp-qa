@@ -589,3 +589,146 @@ def test_claude_code_model_resolution():
     assert claude_code_model("claude-opus-5-5") == "claude-opus-5-5"
     with pytest.raises(ValueError):
         claude_code_model("router")
+
+
+def test_no_judge_call_starts_after_another_thread_records_a_stop(fake_claude, results_dir, monkeypatch):
+    """Thread B passes its stop check, and is held in the window before its launch until thread A has made
+    progress: either A recorded its usage-limit stop (B must then not launch) or A is blocked on the judge's lock
+    (the check and the launch are one step, so A's call and stop wait for B's launch). No timing: the hold ends on
+    one of those two events, and the test asserts which."""
+    import subprocess
+    import threading
+
+    fake_claude.set_rules([{"match": "LIMITED", "out": LIMIT}])
+    b_checked, a_progressed = threading.Event(), threading.Event()
+    a_blocked = threading.Event()
+
+    class SpyLock:
+        """The judge's lock, noting when thread A has to wait for it."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if not self._lock.acquire(blocking=False):
+                if threading.current_thread().name == "A":
+                    a_blocked.set()
+                    a_progressed.set()
+                self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+
+    class Racy(ClaudeCodeJudge):
+        @property
+        def stopped(self):
+            value = self.__dict__.get("_stopped")
+            if threading.current_thread().name == "B" and value is None and not b_checked.is_set():
+                b_checked.set()
+                # In the window between the check and the launch, until A has done something.
+                assert a_progressed.wait(10), "A never ran"
+                return value
+            return value
+
+        @stopped.setter
+        def stopped(self, value):
+            self.__dict__["_stopped"] = value
+            if value:
+                a_progressed.set()
+
+    judge = Racy(JUDGE)
+    judge._lock = SpyLock()
+    launched_with_stop = []
+    real_popen = subprocess.Popen
+
+    class Popen(real_popen):
+        def __init__(self, args, *a, **k):
+            if args and os.path.basename(str(args[0])) == "claude":
+                launched_with_stop.append(judge.__dict__.get("_stopped"))
+            super().__init__(args, *a, **k)
+
+    monkeypatch.setattr(subprocess, "Popen", Popen)
+    results = {}
+
+    def ask(name, prompt):
+        try:
+            results[name] = judge.verdict(prompt)
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertions
+            results[name] = exc
+
+    b = threading.Thread(target=ask, args=("B", "OK"), name="B")
+    b.start()
+    assert b_checked.wait(10)
+    a = threading.Thread(target=ask, args=("A", "LIMITED"), name="A")
+    a.start()
+    a.join(10)
+    b.join(10)
+    judge.close()
+    assert isinstance(results["A"], JudgeStopped)
+    assert len(launched_with_stop) == 2 and all(s is None for s in launched_with_stop), launched_with_stop
+    assert a_blocked.is_set()  # the gate held A off while B was between its check and its launch
+
+
+def test_a_judge_call_reaching_the_launch_after_a_stop_is_rejected(fake_claude, results_dir, monkeypatch):
+    """Thread B is held just before the launch gate until thread A has recorded its usage-limit stop; B must then
+    be rejected with that stop and never launch `claude`."""
+    import subprocess
+    import threading
+
+    fake_claude.set_rules([{"match": "LIMITED", "out": LIMIT}])
+    b_at_gate, a_stopped = threading.Event(), threading.Event()
+
+    class HoldB:
+        """The judge's lock; thread B waits at it until A's stop is recorded (A takes it to record the stop)."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "B" and not b_at_gate.is_set():
+                b_at_gate.set()
+                assert a_stopped.wait(10), "A never recorded its stop"
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+
+    class Watched(ClaudeCodeJudge):
+        def _stop(self, reason):
+            stop = super()._stop(reason)
+            a_stopped.set()
+            return stop
+
+    judge = Watched(JUDGE)
+    judge._lock = HoldB()
+    launches = []
+    real_popen = subprocess.Popen
+
+    class Popen(real_popen):
+        def __init__(self, args, *a, **k):
+            if args and os.path.basename(str(args[0])) == "claude":
+                launches.append(threading.current_thread().name)
+            super().__init__(args, *a, **k)
+
+    monkeypatch.setattr(subprocess, "Popen", Popen)
+    results = {}
+
+    def ask(name, prompt):
+        try:
+            results[name] = judge.verdict(prompt)
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertions
+            results[name] = exc
+
+    b = threading.Thread(target=ask, args=("B", "OK"), name="B")
+    b.start()
+    assert b_at_gate.wait(10)
+    a = threading.Thread(target=ask, args=("A", "LIMITED"), name="A")
+    a.start()
+    a.join(10)
+    b.join(10)
+    judge.close()
+    assert isinstance(results["A"], JudgeStopped) and isinstance(results["B"], JudgeStopped)
+    assert "hit your session limit" in str(results["B"])
+    assert launches == ["A"]  # B never launched

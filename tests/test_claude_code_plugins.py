@@ -385,5 +385,5 @@ def test_a_plugin_stop_prints_the_resume_command(fake_claude, results_dir, monke
     )  # fmt: skip
     assert out.exit_code != 0, out.output
     assert "late@builtin" in out.output and "Stopped before grading" in out.output
-    assert "marked failed" in out.output
+    assert "aren't recorded" in out.output
     assert "--resume" in out.output and "--claude-code-trust-org-policy" in out.output

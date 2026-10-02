@@ -282,7 +282,8 @@ def pick_model(run: Run, model: str | None) -> str:
 
 
 def _by_question(run: Run, model: str) -> dict[int, list[dict]]:
-    out: dict[int, list[dict]] = {}
+    """Each question's records; a planned question nothing was recorded for has none (all its turns missing)."""
+    out: dict[int, list[dict]] = {qid: [] for qid in run.planned_questions()}
     for rec in run.records.values():
         if rec["model"] == model:
             out.setdefault(rec["question"]["id"], []).append(rec)
@@ -298,9 +299,15 @@ def definition(rec: dict) -> str:
     return json.dumps(definition_fields(graded or asked_question(rec)), sort_keys=True, ensure_ascii=False)
 
 
-def definition_mismatch(recs_a: list[dict], recs_b: list[dict]) -> list[str]:
-    """Which definition fields differ for one question, between runs or between one run's repeats."""
-    defs = {side: {definition(r) for r in recs} for side, recs in (("A", recs_a), ("B", recs_b))}
+def definition_mismatch(
+    recs_a: list[dict], recs_b: list[dict], planned_a: dict | None = None, planned_b: dict | None = None
+) -> list[str]:
+    """Which definition fields differ for one question, between runs or between one run's repeats. A side with
+    no records is compared as it was planned."""
+    defs = {
+        side: {definition(r) for r in recs} or {definition({"question": planned})}
+        for side, recs, planned in (("A", recs_a, planned_a), ("B", recs_b, planned_b))
+    }
     out = [f"differs between {side}'s repeats" for side, d in defs.items() if len(d) > 1]
     a, b = (json.loads(sorted(defs[s])[0]) for s in ("A", "B"))
     out += [f for f in DEFINITION_FIELDS if a[f] != b[f]]
@@ -402,11 +409,19 @@ def compare(
     qa, qb = _by_question(run_a, model_a), _by_question(run_b, model_b)
     rep_a, rep_b = run_a.data.get("repeats", 1), run_b.data.get("repeats", 1)
     common = sorted(qa.keys() & qb.keys())
+    planned_a, planned_b = run_a.planned_questions(), run_b.planned_questions()
+
+    def question_of(recs: list[dict], planned: dict, qid: int) -> dict:
+        return recs[0]["question"] if recs else planned[qid]
 
     judges_a = judges(run_a, [r for q in common for r in qa[q]])
     judges_b = judges(run_b, [r for q in common for r in qb[q]])
     setup_problems = _run_setup_mismatch(run_a, run_b, judges_a, judges_b)
-    mismatched = {qid: m for qid in common if (m := definition_mismatch(qa[qid], qb[qid]))}
+    mismatched = {
+        qid: m
+        for qid in common
+        if (m := definition_mismatch(qa[qid], qb[qid], planned_a.get(qid), planned_b.get(qid)))
+    }
     if (setup_problems or mismatched) and not allow_mismatch:
         lines = list(setup_problems)
         if mismatched:
@@ -431,7 +446,7 @@ def compare(
     by_track: dict[str, dict[str, Pool]] = {}
     questions = []
     for qid in common:
-        question_a, question = qa[qid][0]["question"], qb[qid][0]["question"]
+        question_a, question = question_of(qa[qid], planned_a, qid), question_of(qb[qid], planned_b, qid)
         for side, recs, expected, q in (("a", qa[qid], rep_a, question_a), ("b", qb[qid], rep_b, question)):
             for pools in (
                 totals,
@@ -459,7 +474,13 @@ def compare(
     # Regressions first, then improvements, each by size; unchanged last, in question order.
     questions.sort(key=lambda q: ({"worse": 0, "better": 1, "same": 2}[q["verdict"]], -abs(q["delta"] or 0)))
     verdicts = Counter(q["verdict"] for q in questions)
-    warnings += _warn_incomplete("A", run_a, totals["a"]) + _warn_incomplete("B", run_b, totals["b"])
+    # Each run's completeness against its own plan (every question it planned or recorded), not only the shared
+    # questions: a run that stopped before the questions the other didn't ask is still incomplete.
+    own = {"a": Pool(), "b": Pool()}
+    for side, by_q, planned, expected in (("a", qa, planned_a, rep_a), ("b", qb, planned_b, rep_b)):
+        for qid, recs in by_q.items():
+            own[side].add(recs, expected, question_of(recs, planned, qid))
+    warnings += _warn_incomplete("A", run_a, own["a"]) + _warn_incomplete("B", run_b, own["b"])
 
     metrics = []
     for m in METRICS:

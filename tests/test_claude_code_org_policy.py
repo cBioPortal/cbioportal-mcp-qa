@@ -144,8 +144,8 @@ def test_run_json_records_the_account_type_and_opt_ins(monkeypatch, results_dir)
     monkeypatch.setattr(claude_code, "server_instructions", lambda url: "SERVER")
     monkeypatch.setattr(cli, "write_report", lambda bench: bench.dir / "report.html")
 
-    async def no_answers(*args):
-        return None
+    async def no_answers(bench, questions, client, concurrency):
+        _record_answers(bench, questions)
 
     monkeypatch.setattr(cli, "collect_answers", no_answers)
     result = CliRunner().invoke(
@@ -159,3 +159,20 @@ def test_run_json_records_the_account_type_and_opt_ins(monkeypatch, results_dir)
     assert recorded["account_type"] == "team"
     assert recorded["trust_org_policy"] is True and recorded["allow_api_billing"] is False
     assert "org-123" not in run_json.read_text() and "someone@example.org" not in run_json.read_text()
+
+
+def _record_answers(bench, questions):
+    """What collect_answers leaves when every answer succeeds: an answer per planned turn."""
+    from dataclasses import asdict
+
+    from cbioportal_mcp_qa.run import record_key
+
+    for q in questions:
+        for model in bench.data["models"]:
+            reply = {"answer": "x", "status": 200, "error": None, "latency_s": 0.0, "started_at": 0.0}
+            bench.records[record_key(q.id, model, 1)] = {
+                "question": asdict(q),
+                "model": model,
+                "repeat": 1,
+                "reply": reply,
+            }

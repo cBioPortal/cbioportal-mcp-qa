@@ -26,6 +26,11 @@ def record_key(question_id: int, model: str, repeat: int) -> str:
     return f"{question_id}:{model}:{repeat}"
 
 
+def answered(rec: dict | None) -> bool:
+    """Whether a turn has its answer (HTTP 200). Anything else (no record, a failure) is asked again."""
+    return (rec or {}).get("reply", {}).get("status") == 200
+
+
 class Run:
     def __init__(self, path: Path, data: dict):
         self.path = path
@@ -86,26 +91,85 @@ class Run:
     def save(self) -> None:
         write_json(self.path, self.data, indent=1)
 
+    def plan(self, questions: list[Question]) -> None:
+        """Add questions to the ones the run means to ask (`planned_questions`): a stop leaves answers it didn't
+        ask unrecorded, and the report and `compare` count them as missing from this."""
+        planned = {q["id"]: q for q in self.data.get("planned_questions") or []}
+        for q in questions:
+            planned.setdefault(q.id, asdict(q))
+        self.data["planned_questions"] = [planned[k] for k in sorted(planned)]
+
+    def planned_questions(self) -> dict[int, dict]:
+        """The questions the run means to ask, by id (none for runs from before `planned_questions`)."""
+        return {q["id"]: q for q in self.data.get("planned_questions") or []}
+
+    def missing_records(self) -> list[dict]:
+        """A placeholder for every planned turn (question × model × repeat) with no record: a failed reply
+        saying it wasn't asked, so the report counts it like a failure."""
+        return [
+            {
+                "question": q,
+                "model": model,
+                "repeat": r,
+                "missing": True,
+                "reply": {"answer": "", "status": None, "error": NOT_ASKED, "latency_s": None},
+            }
+            for qid, q in self.planned_questions().items()
+            for model in self.data["models"]
+            for r in range(1, self.data["repeats"] + 1)
+            if record_key(qid, model, r) not in self.records
+        ]
+
+    def unfinished(self) -> dict[int, dict]:
+        """The planned questions with a turn not answered yet (no record, or a failure `--resume` retries), by
+        id, as they were planned."""
+        return {
+            qid: q
+            for qid, q in self.planned_questions().items()
+            if not all(
+                answered(self.records.get(record_key(qid, model, r)))
+                for model in self.data["models"]
+                for r in range(1, self.data["repeats"] + 1)
+            )
+        }
+
+
+NOT_ASKED = "not asked: the run stopped before this answer (`run --resume` asks it)"
+
 
 async def collect_answers(
     run: Run,
     questions: list[Question],
     client: "AgentClient | ClaudeCodeClient",
     concurrency: int,
-) -> None:
+) -> int:
+    """Ask the questions without an answer yet (status 200). Returns how many were left unasked by a stop.
+
+    A stop (the claude-code client's `stop_reason`: the subscription's usage limit, per-token billing, a plugin,
+    an expired connector login) ends the batch: answers in flight finish and are saved, no queued answer starts a
+    session, and neither those nor the reply that is the stop get a record, so `--resume` asks exactly them."""
     todo = [
         (q, model, r)
         for q in questions
         for r in range(1, run.data["repeats"] + 1)
         for model in run.data["models"]
-        if (run.records.get(record_key(q.id, model, r)) or {}).get("reply", {}).get("status") != 200
+        if not answered(run.records.get(record_key(q.id, model, r)))
     ]
     sem = asyncio.Semaphore(concurrency)
     bar = tqdm(total=len(todo), desc="answers", unit="ans")
+    stop_reason = getattr(client, "stop_reason", lambda: None)  # only the claude-code client stops
+    unasked = 0
 
     async def one(q: Question, model: str, repeat: int) -> None:
+        nonlocal unasked
         async with sem:
+            if stop_reason():
+                unasked += 1
+                return
             reply = await client.ask(q.question, model, q.history)
+        if stop_reason() and client.is_stop(reply):
+            unasked += 1
+            return
         rec = {"question": asdict(q), "model": model, "repeat": repeat, "reply": asdict(reply)}
         if trace := rec["reply"].pop("trace"):
             rec["trace"] = trace
@@ -116,7 +180,11 @@ async def collect_answers(
             bar.write(f"[{model}] Q{q.id} failed: {reply.status} {reply.error[:200]}")
 
     await asyncio.gather(*(one(*item) for item in todo))
+    if unasked:
+        others = "".join(f"; also {m[:200]}" for _, m in client.stops[1:])
+        bar.write(f"Stopped: {stop_reason()[:200]}{others}. {unasked} answers left unasked (not recorded).")
     bar.close()
+    return unasked
 
 
 def attach_traces(run: Run, langfuse: Langfuse) -> int:
