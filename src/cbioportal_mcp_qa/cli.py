@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 from dataclasses import asdict
 from pathlib import Path
 
@@ -84,13 +85,19 @@ def claude_code_options(f):
 
 
 def claude_code_session_options(f):
-    """How `claude` sessions bill and which settings they load: the claude-code runner's and judge's."""
+    """How the claude-code runner's sessions bill and which settings they load."""
     f = click.option(
         "--claude-code-user-settings",
         is_flag=True,
-        help="Load the Claude home's user settings (and project/local ones) in claude-code sessions. By default "
-        "only managed settings apply, so effortLevel, hooks and plugins from ~/.claude stay out.",
+        help="Load the Claude home's user settings (and project/local ones) in claude-code runner sessions. By "
+        "default only managed settings apply, so effortLevel, hooks and plugins from ~/.claude stay out. Never "
+        "applies to the claude-code judge.",
     )(f)
+    return claude_code_billing_options(f)
+
+
+def claude_code_billing_options(f):
+    """How `claude` sessions bill: the claude-code runner's and judge's."""
     f = click.option(
         "--claude-code-trust-org-policy",
         is_flag=True,
@@ -127,7 +134,14 @@ def judge_options(f):
         show_default=True,
         help="bedrock: the Bedrock judge at temperature 0 (bills AWS). claude-code: the same prompt through "
         "`claude -p` on the Claude subscription, no tools; grades are recorded as claude-code:<model>, can't be "
-        "at temperature 0, and aren't comparable with Bedrock grades. Takes the --claude-code-* billing options.",
+        "at temperature 0, and aren't comparable with Bedrock grades. Takes the --claude-code-trust-org-policy "
+        "and --claude-code-allow-api-billing options; user settings are never loaded.",
+    )(f)
+    f = click.option(
+        "--judge-allow-managed-customizations",
+        is_flag=True,
+        help="claude-code judge: grade even though managed (policy) settings give its sessions hooks, a managed "
+        "CLAUDE.md, plugins or MCP servers that a session can't turn off. Recorded in run.json.",
     )(f)
     return f
 
@@ -234,19 +248,26 @@ def _make_judge(
     judge_runner: str,
     judge_model: str | None,
     allow_api_billing: bool = False,
-    user_settings: bool = False,
     trust_org_policy: bool = False,
+    allow_managed_customizations: bool = False,
 ) -> BaseJudge:
     if judge_runner == "claude-code":
         try:
-            return ClaudeCodeJudge(
+            judge = ClaudeCodeJudge(
                 judge_model or settings.judge_model,
                 allow_api_billing=allow_api_billing,
-                isolate_settings=not user_settings,
                 trust_org_policy=trust_org_policy,
+                allow_managed_customizations=allow_managed_customizations,
             )
         except (RuntimeError, ValueError) as exc:
             raise click.ClickException(f"claude-code judge: {redact(str(exc))}") from exc
+        if judge.managed_customizations:
+            click.echo(
+                "Warning: --judge-allow-managed-customizations: the judge sessions inherit these managed "
+                f"customizations: {', '.join(judge.managed_customizations)}",
+                err=True,
+            )
+        return judge
     if not judge_model:
         return _judge(settings)
     return Judge(_bedrock_judge_model(settings, judge_model), settings.aws_region, settings.aws_profile)
@@ -264,6 +285,9 @@ def _bedrock_judge_model(settings, judge_model: str | None) -> str:
 def _grade(bench: Run, judge: BaseJudge, concurrency: int, command: str) -> None:
     """Grade, and on a stop (the subscription's usage limit, per-token billing) write the report and say how to
     resume."""
+    if describe := getattr(judge, "describe", None):
+        bench.data["claude_code_judge"] = describe()
+        bench.save()
     try:
         grade_answers(bench, judge, concurrency)
     except JudgeStopped as exc:
@@ -277,16 +301,34 @@ def _grade(bench: Run, judge: BaseJudge, concurrency: int, command: str) -> None
             close()
 
 
-def _grade_command(bench: Run, judge_runner: str, judge_model: str | None, trust_org_policy: bool) -> str:
-    """The `grade` command that continues grading this run with the same judge."""
-    cmd = f"cbioportal-mcp-qa grade {bench.data['run_id']}"
+def _grade_command(
+    run: str,
+    judge_runner: str,
+    judge_model: str | None,
+    concurrency: int,
+    trust_org_policy: bool = False,
+    allow_api_billing: bool = False,
+    allow_managed_customizations: bool = False,
+) -> str:
+    """The `grade` command that continues grading this run (as it was named: id or path) with the same judge."""
+    cmd = ["uv", "run", "cbioportal-mcp-qa", "grade", run]
     if judge_runner != "bedrock":
-        cmd += f" --judge-runner {judge_runner}"
+        cmd += ["--judge-runner", judge_runner]
     if judge_model:
-        cmd += f" --judge-model {judge_model}"
-    if judge_runner == "claude-code" and trust_org_policy:
-        cmd += " --claude-code-trust-org-policy"
-    return cmd
+        cmd += ["--judge-model", judge_model]
+    if concurrency != 1:
+        cmd += ["--concurrency", str(concurrency)]
+    if judge_runner == "claude-code":
+        cmd += [
+            flag
+            for flag, on in (
+                ("--claude-code-trust-org-policy", trust_org_policy),
+                ("--claude-code-allow-api-billing", allow_api_billing),
+                ("--judge-allow-managed-customizations", allow_managed_customizations),
+            )
+            if on
+        ]
+    return shlex.join(cmd)
 
 
 @click.group()
@@ -385,6 +427,7 @@ def run(
     no_grade,
     judge_runner,
     judge_model,
+    judge_allow_managed_customizations,
     judge_concurrency,
     render,
     screenshots,
@@ -425,8 +468,8 @@ def run(
             judge_runner,
             judge_model,
             claude_code_allow_api_billing,
-            claude_code_user_settings,
             claude_code_trust_org_policy,
+            judge_allow_managed_customizations,
         )
     client = _client(
         settings,
@@ -516,7 +559,15 @@ def run(
             bench,
             judge,
             judge_concurrency,
-            _grade_command(bench, judge_runner, judge_model, claude_code_trust_org_policy),
+            _grade_command(
+                resume or bench.data["run_id"],
+                judge_runner,
+                judge_model,
+                judge_concurrency,
+                claude_code_trust_org_policy,
+                claude_code_allow_api_billing,
+                judge_allow_managed_customizations,
+            ),
         )
     click.echo(f"Report: {write_report(bench)}")
 
@@ -553,17 +604,17 @@ def traces(run_id: str) -> None:
 )
 @judge_options
 @click.option("--concurrency", type=int, default=1, show_default=True, help="Answers graded in parallel.")
-@claude_code_session_options
+@claude_code_billing_options
 def grade(
     run_id: str,
     regrade: bool,
     refresh_questions: bool,
     judge_runner: str,
     judge_model: str | None,
+    judge_allow_managed_customizations: bool,
     concurrency: int,
     claude_code_allow_api_billing: bool,
     claude_code_trust_org_policy: bool,
-    claude_code_user_settings: bool,
 ) -> None:
     """Grade answers that don't have a grade yet (and answers the judge left ungraded)."""
     bench = Run.load(run_id)
@@ -573,8 +624,8 @@ def grade(
         judge_runner,
         judge_model,
         claude_code_allow_api_billing,
-        claude_code_user_settings,
         claude_code_trust_org_policy,
+        judge_allow_managed_customizations,
     )
     if refresh_questions:
         current = {q.id: asdict(q) for q in load_questions(Path(bench.data["questions_file"]))}
@@ -603,7 +654,15 @@ def grade(
         bench,
         judge,
         concurrency,
-        _grade_command(bench, judge_runner, judge_model, claude_code_trust_org_policy),
+        _grade_command(
+            run_id,
+            judge_runner,
+            judge_model,
+            concurrency,
+            claude_code_trust_org_policy,
+            claude_code_allow_api_billing,
+            judge_allow_managed_customizations,
+        ),
     )
     click.echo(f"Report: {write_report(bench)}")
 

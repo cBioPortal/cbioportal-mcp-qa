@@ -2,8 +2,11 @@
 
 Same prompt, rubric and grade fields as the Bedrock judge, with the claude-code runner's safeguards: billing
 variables removed, the billing guard run before the first call (and the session's apiKeySource checked after
-each), user settings left out, an empty working directory, and no tools at all (no built-ins, no MCP servers,
-no claude.ai connectors). Claude Code can't set the temperature, so its grades vary more than Bedrock's
+each), user settings always left out, an empty working directory, and no tools at all (no built-ins, no MCP
+servers, no claude.ai connectors). Its own hooks and auto memory are off, but managed (policy) hooks, managed
+CLAUDE.md and managed plugins or MCP servers can't be turned off from a session: the judge refuses to start
+while the managed settings it can read carry any of them, and stops if a session shows hooks, plugins or
+MCP servers anyway. Claude Code can't set the temperature, so its grades vary more than Bedrock's
 temperature-0 ones; each grade records the judge as `claude-code:<model>` so `compare` keeps them apart.
 """
 
@@ -13,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 
+from . import claude_code
 from .claude_code import (
     USAGE_LIMIT,
     api_billing_error,
@@ -21,6 +25,7 @@ from .claude_code import (
     check_billing,
     session_env,
     setting_sources_args,
+    settings_files,
 )
 from .config import MODELS, _model_family
 from .grade import JUDGE_SCHEMA, BaseJudge, JudgeOutputError, JudgeStopped, parse_verdict
@@ -46,8 +51,14 @@ def claude_code_model(model: str) -> str:
     return _model_family(model)
 
 
-def judge_args(model: str, mcp_config_path: str, isolate_settings: bool = True) -> list[str]:
-    """`claude -p` with the prompt on stdin, no tools and no MCP servers, and the verdict as structured output."""
+# Turns off the hooks of every settings source a session can override (managed hooks stay: see
+# managed_customizations) and auto memory.
+JUDGE_SETTINGS = {"disableAllHooks": True, "autoMemoryEnabled": False}
+
+
+def judge_args(model: str, mcp_config_path: str) -> list[str]:
+    """`claude -p` with the prompt on stdin, no tools, MCP servers, skills, hooks or user settings, and the verdict
+    as structured output."""
     return [
         "claude",
         "-p",
@@ -66,24 +77,105 @@ def judge_args(model: str, mcp_config_path: str, isolate_settings: bool = True) 
         "stream-json",
         "--verbose",
         "--no-session-persistence",
-        *setting_sources_args(isolate_settings),
+        "--disable-slash-commands",
+        "--settings",
+        json.dumps(JUDGE_SETTINGS),
+        *setting_sources_args(True),
     ]
 
 
 def judge_env(base, allow_api_billing: bool) -> tuple[dict, list[str]]:
-    """The runner's session environment, with the claude.ai connectors off too."""
+    """The runner's session environment, with the claude.ai connectors and auto memory off too."""
     env, stripped = session_env(base, allow_api_billing)
-    return env | {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}, stripped
+    return env | {"ENABLE_CLAUDEAI_MCP_SERVERS": "false", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}, stripped
+
+
+# Managed files besides the settings (https://code.claude.com/docs/en/memory, /managed-mcp): the managed
+# CLAUDE.md, managed MCP servers, and a managed .claude directory (rules, skills, agents), in each managed dir.
+MANAGED_FILES = ("CLAUDE.md", "managed-mcp.json", ".claude")
+
+
+def _present(value) -> bool:
+    """Whether a setting configures anything: `{"SessionStart": []}` or `{"plugin@market": false}` doesn't."""
+    if isinstance(value, dict):
+        return any(_present(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_present(v) for v in value)
+    return bool(value)
+
+
+# Managed settings that put instructions, tools or servers in a session.
+MANAGED_CONTEXT_KEYS = ("claudeMd", "enabledPlugins", "mcpServers", "agent", "outputStyle")
+
+
+def _settings_dicts(obj):
+    """The settings objects in a settings document (the server-managed cache wraps them), not descending into
+    `hooks`, whose matcher objects have a `hooks` key of their own."""
+    if isinstance(obj, dict):
+        yield obj
+        for key, value in obj.items():
+            if key != "hooks":
+                yield from _settings_dicts(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _settings_dicts(value)
+
+
+def managed_customizations(env) -> list[str]:
+    """`file: what` for each managed customization a judge session would inherit and can't switch off: managed
+    hooks (unless the managed settings disable all hooks), managed CLAUDE.md (file or `claudeMd`), plugins,
+    MCP servers, an agent or output style. Read from every managed source the runner's billing guard reads (the
+    managed settings files and drop-ins, the MDM profile, the cached server-managed settings) plus the managed
+    CLAUDE.md, MCP and .claude paths. `allowManagedHooksOnly` is listed with them. An unreadable file counts."""
+    found, docs = [], []
+    for path in settings_files(env, isolate_settings=True):
+        try:
+            raw = path.read_bytes()
+            doc = claude_code.plistlib.loads(raw) if path.suffix == ".plist" else json.loads(raw)
+        except (OSError, ValueError, claude_code.plistlib.InvalidFileException):
+            found.append(f"{path}: unreadable")
+            continue
+        docs += [(path, settings) for settings in _settings_dicts(doc)]
+    # Only a managed `disableAllHooks: true` turns managed hooks off; any managed `false` could override it.
+    flags = [settings["disableAllHooks"] for _, settings in docs if "disableAllHooks" in settings]
+    hooks_off = bool(flags) and all(flag is True for flag in flags)
+    for path, settings in docs:
+        if not hooks_off:
+            found += [f"{path}: {k}" for k in ("hooks", "allowManagedHooksOnly") if _present(settings.get(k))]
+        found += [f"{path}: {k}" for k in MANAGED_CONTEXT_KEYS if _present(settings.get(k))]
+    for directory in claude_code.MANAGED_SETTINGS_DIRS:
+        found += [f"{directory / name}" for name in MANAGED_FILES if (directory / name).exists()]
+    return list(dict.fromkeys(found))
 
 
 # What --json-schema adds to the session to return the verdict; it does nothing else.
 STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
 
 
-def session_tools(events: list[dict]) -> list[str]:
-    """Tools (built-in or MCP) the session had besides the structured-output one, from its init event."""
+HOOK_EVENTS = {"hook_started", "hook_progress", "hook_response"}
+
+
+def session_customizations(events: list[dict]) -> list[str]:
+    """What the session had besides the structured-output tool, from its stream: other tools (built-in or MCP),
+    MCP servers, plugins (and plugin errors), and hooks that ran (SessionStart and Setup hooks always stream)."""
+    found = []
     init = next((e for e in events if e.get("type") == "system" and e.get("subtype") == "init"), {})
-    return sorted(t for t in init.get("tools") or [] if t != STRUCTURED_OUTPUT_TOOL)
+    if tools := sorted(t for t in init.get("tools") or [] if t != STRUCTURED_OUTPUT_TOOL):
+        found.append(f"tools {tools}")
+    for key in ("mcp_servers", "plugins", "plugin_errors"):
+        if init.get(key):
+            names = [x.get("name") or x.get("plugin") if isinstance(x, dict) else x for x in init[key]]
+            found.append(f"{key} {names}")
+    hooks = sorted(
+        {
+            str(e.get("hook_event") or e.get("hook_name") or e.get("subtype"))
+            for e in events
+            if e.get("type") == "system" and e.get("subtype") in HOOK_EVENTS
+        }
+    )
+    if hooks:
+        found.append(f"hooks {hooks}")
+    return found
 
 
 class ClaudeCodeJudge(BaseJudge):
@@ -91,18 +183,28 @@ class ClaudeCodeJudge(BaseJudge):
         self,
         model: str,
         allow_api_billing: bool = False,
-        isolate_settings: bool = True,
         trust_org_policy: bool = False,
+        allow_managed_customizations: bool = False,
         timeout_s: float = 300.0,
     ):
         self.claude_model = claude_code_model(model)
         self.model = JUDGE_ID_PREFIX + self.claude_model
         self.allow_api_billing = allow_api_billing
-        self.isolate_settings = isolate_settings
+        self.trust_org_policy = trust_org_policy
+        self.allow_managed_customizations = allow_managed_customizations
         self.timeout_s = timeout_s
         self.env, self.stripped_env = judge_env(os.environ, allow_api_billing)
-        # Refuses per-token billing (and unchecked org policies) before any grading call.
-        self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
+        # Before any grading call: per-token billing (and unchecked org policies) are refused, user settings are
+        # never loaded, and so is a managed customization that could put context or tools in front of the judge.
+        self.auth = check_billing(self.env, True, allow_api_billing, trust_org_policy)
+        self.managed_customizations = managed_customizations(self.env)
+        if self.managed_customizations and not allow_managed_customizations:
+            raise RuntimeError(
+                "managed settings would give the judge sessions hooks, instructions, plugins or MCP servers that "
+                f"a session can't turn off: {', '.join(self.managed_customizations)}. Grade with the Bedrock "
+                "judge, or pass --judge-allow-managed-customizations to grade with them anyway (recorded in "
+                "run.json)"
+            )
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-judge-")
         self.mcp_config_path = os.path.join(self._workdir.name, "no-mcp.json")
         write_private_json(self.mcp_config_path, {"mcpServers": {}})
@@ -111,6 +213,20 @@ class ClaudeCodeJudge(BaseJudge):
 
     def close(self) -> None:
         self._workdir.cleanup()
+
+    def describe(self) -> dict:
+        """How the judge sessions run, for run.json (names only, no values)."""
+        return {
+            "judge_model": self.model,
+            "auth_mode": self.auth["mode"],
+            "account_type": self.auth.get("subscription_type"),
+            "allow_api_billing": self.allow_api_billing,
+            "trust_org_policy": self.trust_org_policy,
+            "allow_managed_customizations": self.allow_managed_customizations,
+            "managed_customizations": self.managed_customizations,
+            "stripped_env": self.stripped_env,
+            "setting_sources": "managed only",
+        }
 
     def _stop(self, reason: str) -> JudgeStopped:
         with self._lock:
@@ -131,7 +247,7 @@ class ClaudeCodeJudge(BaseJudge):
     def _call(self, prompt: str) -> tuple[dict, int, int]:
         try:
             out = subprocess.run(
-                judge_args(self.claude_model, self.mcp_config_path, self.isolate_settings),
+                judge_args(self.claude_model, self.mcp_config_path),
                 input=prompt,
                 cwd=self._workdir.name,  # empty: no project CLAUDE.md
                 env=self.env,
@@ -151,16 +267,20 @@ class ClaudeCodeJudge(BaseJudge):
                     events.append(json.loads(line))
                 except ValueError:
                     pass
-        if tools := session_tools(events):
-            raise self._stop(f"the judge session had tools {tools}; it must have none")
+        if (found := session_customizations(events)) and not self.allow_managed_customizations:
+            raise self._stop(f"the judge session had {'; '.join(found)}; it must have none")
         result = next((e for e in reversed(events) if e.get("type") == "result"), None)
-        if result is None or result.get("is_error"):
+        verdict = (result or {}).get("structured_output")
+        if result is None or result.get("is_error") or verdict is None:
+            # Checked before any retry: a limit stops on the call that hit it.
             error = redact(str((result or {}).get("result") or (result or {}).get("subtype") or "no result"))
             stderr = redact(out.stderr or "")
             if USAGE_LIMIT.search(error) or USAGE_LIMIT.search(stderr):
-                raise self._stop(f"Claude subscription limit: {error[:300]}")
+                raise self._stop(
+                    f"Claude subscription limit: {(error if USAGE_LIMIT.search(error) else stderr)[:300]}"
+                )
+        if result is None or result.get("is_error"):
             raise JudgeOutputError(f"claude failed: {error[:300]} (exit {out.returncode}: {stderr[-300:]})")
-        verdict = result.get("structured_output")
         verdict = parse_verdict(verdict if verdict is not None else (result.get("result") or ""))
         usage = result.get("usage") or {}
         input_tokens = sum(

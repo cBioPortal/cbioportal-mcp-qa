@@ -186,7 +186,8 @@ Claude Code (`claude -p`) instead of the deployed agent:
 - **Cost:** runs on the Claude subscription of the Claude home it's started with, so point
   `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock,
   and with `--judge-runner claude-code` it doesn't either.
-  If the subscription's usage limit is hit (or the connector's login expires), the run stops asking, skips
+  If the subscription's usage limit is hit (`You've hit your limit`, `hit your session / weekly limit`,
+  `usage limit reached`), or the connector's login expires, the run stops asking, skips
   grading, and prints the `--resume` command to continue once the limit resets.
 
 ```bash
@@ -275,16 +276,45 @@ id or a Claude Code id. By default the claude-code judge is the Bedrock judge's 
 - **Same prompt and grade.** Each answer goes to `claude -p` with the Bedrock judge's prompt and rubric on
   stdin, the same JSON schema as structured output (`--json-schema`), and produces the same grade fields.
 - **No tools.** Built-in tools are off (`--tools ""`), and so are MCP servers: `--strict-mcp-config` with an
-  empty config, and `ENABLE_CLAUDEAI_MCP_SERVERS=false` for the claude.ai connectors. If a session reports any
-  tool other than the structured-output one, grading stops.
+  empty config, and `ENABLE_CLAUDEAI_MCP_SERVERS=false` for the claude.ai connectors. Skills are off
+  (`--disable-slash-commands`), as are auto memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`) and the hooks of every
+  settings source a session can override (`--settings '{"disableAllHooks": true, "autoMemoryEnabled": false}'`).
 - **Same billing safeguards as the runner** ([above](#billing-guard)): billing variables are removed, the
-  billing guard and plan check run before the first grading call, a session whose `apiKeySource` names a
-  key or token stops grading, and user settings are excluded (`--claude-code-user-settings` and
-  `--claude-code-allow-api-billing` work as for the runner). It runs in an empty temp directory.
+  billing guard and plan check run before the first grading call, and a session whose `apiKeySource` names a
+  key or token stops grading. `--claude-code-trust-org-policy` and `--claude-code-allow-api-billing` work as
+  for the runner. User settings are **never** loaded (`--setting-sources ""`): `--claude-code-user-settings`
+  only applies to the runner (`grade` doesn't take it). It runs in an empty temp directory.
+- **Managed customizations refuse the judge.** Managed (policy) settings still apply with
+  `--setting-sources ""`, and a session can't turn them off: managed hooks (a `SessionStart` hook can add
+  context, an agent hook can run tools that aren't in the session's tool list) run even with
+  `disableAllHooks` set outside managed settings; a managed `CLAUDE.md` can't be excluded; managed plugins and
+  MCP servers load. `--bare` would skip them, but bare mode never reads the subscription login. So before the
+  first call, the judge reads every managed source the runner's billing guard reads:
+  - the managed settings files and drop-ins (`managed-settings.json`, `managed-settings.d/*.json` in
+    `/Library/Application Support/ClaudeCode/` or `/etc/claude-code/`);
+  - the MDM profile (`/Library/Managed Preferences/[<user>/]com.anthropic.claudecode.plist`);
+  - the cached server-managed settings (`$CLAUDE_CONFIG_DIR/remote-settings.json`);
+  - the managed `CLAUDE.md`, `managed-mcp.json` and `.claude/` in those directories.
+
+  It refuses to grade if any of them sets `hooks` or `allowManagedHooksOnly`, unless managed settings set
+  `disableAllHooks: true`. It also refuses on `claudeMd`, `enabledPlugins`, `mcpServers`, `agent` or
+  `outputStyle`, on any of those managed files, and on a file it can't read. `--judge-allow-managed-customizations`
+  grades anyway: it prints what the sessions inherit and records it under `claude_code_judge` in `run.json`,
+  with the judge's auth mode, plan and opt-ins. As a backstop, grading stops if a session's stream shows a hook
+  running (`hook_started` / `hook_response`), a plugin, an MCP server, or any tool besides `StructuredOutput`.
+  **Residual risk:** as for the runner, server-managed settings that a Team or Enterprise organization delivers
+  when a `claude -p` session starts aren't cached, so they can't be read beforehand. `--claude-code-trust-org-policy`
+  trusts that policy not to add hooks or instructions to the judge, as it trusts it not to bill per token; the
+  stream backstop catches hooks that run at session start, plugins and servers, but not a remotely delivered
+  `claudeMd`.
 - **Failures.** A reply that isn't valid JSON or doesn't match the schema is retried once; if it fails again
-  the answer is left ungraded (`judge_error` in `run.json` says why) and the next `grade` tries it again. On
-  the subscription's usage limit, grading stops cleanly: grades so far are saved, the report is written, and
-  the `grade` command to resume once the limit resets is printed.
+  the answer is left ungraded (`judge_error` in `run.json` says why) and the next `grade` tries it again. The
+  subscription's usage limit stops grading on the call that hit it, with no retry. It is recognized by the same
+  pattern the runner uses: `You've hit your limit`, `hit your session / weekly / 5-hour / … limit`,
+  `usage limit reached`, or a rate limit that names its reset. Grades so far are saved, the report is written,
+  and the `grade` command to resume once the limit resets is printed. That command keeps the run as you named it
+  (id or path) and the judge options you used (`--judge-model`, `--concurrency`, `--claude-code-trust-org-policy`,
+  `--claude-code-allow-api-billing`, `--judge-allow-managed-customizations`).
 - **Judge identity.** Each grade records its judge as `claude-code:<model>` (e.g.
   `claude-code:claude-sonnet-4-6`), so `compare` refuses to mix them with Bedrock grades (`us.anthropic.…`),
   and a run graded by both shows up as mixed. Judge cost isn't estimated: nothing is billed per token.

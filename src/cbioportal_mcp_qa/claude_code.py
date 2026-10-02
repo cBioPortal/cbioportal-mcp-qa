@@ -424,7 +424,16 @@ def connector_needs_signin(lines: list[str], connector: str) -> bool:
     return False
 
 
-USAGE_LIMIT = re.compile(r"hit your \w+ limit|usage limit reached", re.IGNORECASE)
+# The Claude subscription's usage limit, as `claude -p` reports it (shared by the runner and the judge):
+# "You've hit your limit · resets 5pm" (2.1.287), "hit your session / weekly / 5-hour / Opus limit",
+# "usage limit reached", and a rate limit that names its reset. A plain transient 429 has no reset time.
+USAGE_LIMIT = re.compile(
+    r"hit your (?:[\w-]+ ){0,3}limit"
+    r"|usage limit"
+    r"|\b(?:session|weekly|daily|5-hour|five-hour) limit\b.{0,40}\b(?:reached|exceeded|resets?)\b"
+    r"|rate limit\b.{0,80}\bresets?\b|\bresets?\b.{0,80}\brate limit",
+    re.IGNORECASE,
+)
 
 
 def tool_result_text(content) -> str:
