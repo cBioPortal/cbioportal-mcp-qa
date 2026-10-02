@@ -592,14 +592,33 @@ def test_claude_code_model_resolution():
 
 
 def test_no_judge_call_starts_after_another_thread_records_a_stop(fake_claude, results_dir, monkeypatch):
-    """Thread B passes its stop check while A's call is about to hit the limit. B is held right after reading
-    `stopped` until A records the stop (or 1s passes): no call may launch with a stop already recorded."""
+    """Thread B passes its stop check, and is held in the window before its launch until thread A has made
+    progress: either A recorded its usage-limit stop (B must then not launch) or A is blocked on the judge's lock
+    (the check and the launch are one step, so A's call and stop wait for B's launch). No timing: the hold ends on
+    one of those two events, and the test asserts which."""
     import subprocess
     import threading
 
     fake_claude.set_rules([{"match": "LIMITED", "out": LIMIT}])
-    a_stopped = threading.Event()
-    b_checked = threading.Event()
+    b_checked, a_progressed = threading.Event(), threading.Event()
+    a_blocked = threading.Event()
+
+    class SpyLock:
+        """The judge's lock, noting when thread A has to wait for it."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if not self._lock.acquire(blocking=False):
+                if threading.current_thread().name == "A":
+                    a_blocked.set()
+                    a_progressed.set()
+                self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
 
     class Racy(ClaudeCodeJudge):
         @property
@@ -607,16 +626,19 @@ def test_no_judge_call_starts_after_another_thread_records_a_stop(fake_claude, r
             value = self.__dict__.get("_stopped")
             if threading.current_thread().name == "B" and value is None and not b_checked.is_set():
                 b_checked.set()
-                a_stopped.wait(1.0)  # in the window between the check and the launch
+                # In the window between the check and the launch, until A has done something.
+                assert a_progressed.wait(10), "A never ran"
+                return value
             return value
 
         @stopped.setter
         def stopped(self, value):
             self.__dict__["_stopped"] = value
             if value:
-                a_stopped.set()
+                a_progressed.set()
 
     judge = Racy(JUDGE)
+    judge._lock = SpyLock()
     launched_with_stop = []
     real_popen = subprocess.Popen
 
@@ -637,11 +659,12 @@ def test_no_judge_call_starts_after_another_thread_records_a_stop(fake_claude, r
 
     b = threading.Thread(target=ask, args=("B", "OK"), name="B")
     b.start()
-    assert b_checked.wait(2.0)
+    assert b_checked.wait(10)
     a = threading.Thread(target=ask, args=("A", "LIMITED"), name="A")
     a.start()
-    a.join(5)
-    b.join(5)
+    a.join(10)
+    b.join(10)
     judge.close()
     assert isinstance(results["A"], JudgeStopped)
-    assert launched_with_stop and all(s is None for s in launched_with_stop), launched_with_stop
+    assert len(launched_with_stop) == 2 and all(s is None for s in launched_with_stop), launched_with_stop
+    assert a_blocked.is_set()  # the gate held A off while B was between its check and its launch

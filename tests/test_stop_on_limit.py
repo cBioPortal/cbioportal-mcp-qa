@@ -297,3 +297,63 @@ def test_runs_without_planned_questions_report_as_before(results_dir):
     old = _run("old", "haiku", 1, [_rec(1, "haiku", 1)])
     assert "planned_questions" not in old.data and old.missing_records() == []
     assert summarize(old)["n_questions"] == 1
+
+
+def test_a_later_resume_asks_every_planned_answer_still_missing(monkeypatch, results_dir, cli_run):
+    """Stop after Q1 of 1-4, resume with --questions 5-6: that resume also asks Q2-Q4, so a bare resume after it
+    has nothing left and the run is complete (no planned answer stranded by the narrower selection)."""
+    fake = FakeClaude(monkeypatch, lambda q, n: (limited(), 0.0) if n == 2 else (answered(), 0.0))
+    out = cli_run(fake, "--questions", "1-4", "--concurrency", "1", "--no-grade", "--no-render")
+    assert out.exit_code == 1, out.output
+    run_id = _only_run(results_dir).data["run_id"]
+
+    fake = FakeClaude(monkeypatch, lambda q, n: (answered(), 0.0))
+    out = cli_run(fake, "--resume", run_id, "--questions", "5-6")
+    assert out.exit_code == 0, out.output
+    assert len(fake.asked) == 5  # Q2-Q4 as well as Q5-Q6
+    run = Run.load(run_id)
+    assert sorted(r["question"]["id"] for r in run.records.values()) == [1, 2, 3, 4, 5, 6]
+    assert [q["id"] for q in run.data["planned_questions"]] == [1, 2, 3, 4, 5, 6]
+    assert run.missing_records() == []
+
+    fake = FakeClaude(monkeypatch, lambda q, n: (answered(), 0.0))
+    out = cli_run(fake, "--resume", run_id)
+    assert out.exit_code == 0, out.output
+    assert fake.asked == []
+
+
+def test_a_run_never_succeeds_with_planned_answers_missing(monkeypatch, results_dir, cli_run):
+    """Defence in depth: if answering returns without a stop and planned answers have no record, the run fails
+    with the resume command instead of grading or exiting 0."""
+
+    async def nothing(bench, questions, client, concurrency):
+        return 0
+
+    monkeypatch.setattr(cli_mod, "collect_answers", nothing)
+    fake = FakeClaude(monkeypatch, lambda q, n: (answered(), 0.0))
+    out = cli_run(fake, "--questions", "1-2", "--no-render")
+    assert out.exit_code == 1, out.output
+    assert "2 planned answers are still missing" in out.output and "--resume" in out.output
+
+
+def test_compare_warns_about_each_runs_own_plan_even_outside_the_overlap(results_dir):
+    """A plans Q1-Q4 and recorded Q1-Q2; B planned and recorded Q1-Q2. Only Q1-Q2 are compared, but A is still
+    incomplete against its own plan (2 missing questions = 2 missing turns), so compare says so."""
+    from test_review_fixes import _rec
+
+    from cbioportal_mcp_qa.compare import compare
+
+    a = _run("A", "haiku", 1, [_rec(q, "haiku", 1) for q in (1, 2)])
+    a.data["planned_questions"] = [_question(q) for q in (1, 2, 3, 4)]
+    a.save()
+    b = _run("B", "haiku", 1, [_rec(q, "haiku", 1) for q in (1, 2)])
+    b.data["planned_questions"] = [_question(q) for q in (1, 2)]
+    b.save()
+    result = compare(Run.load("A"), Run.load("B"), "haiku", "haiku")
+    assert result["only_a"] == [3, 4]
+    (warning,) = [w for w in result["warnings"] if "is incomplete" in w]
+    assert (
+        warning.startswith("A (A) is incomplete: 2 of 4 expected turns completed") and "2 missing" in warning
+    )
+    # Only shared questions are scored.
+    assert sorted(q["id"] for q in result["questions"]) == [1, 2]

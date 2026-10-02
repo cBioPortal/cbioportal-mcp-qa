@@ -209,9 +209,13 @@ opt-ins, …). `--resume` also restores the run's own options from `run.json` (`
 `--claude-code-*` and `--judge-allow-managed-customizations` opt-ins: those guards must be given again.
 
 `run.json` records the questions the run means to ask (`planned_questions`, added to when a resume selects
-more). The report counts a planned turn with no record as a failed request ("not asked"), and `compare` counts
-it as missing, so a stopped run shows as incomplete exactly as it would with failure records. Runs from before
-`planned_questions` are reported from their records, as before.
+more). Every resume asks the planned answers that are still missing as well as its own selection, so a narrower
+`--questions` on one resume never strands them, and a run never ends successfully with planned answers missing.
+The report counts a planned turn with no record as a failed request ("not asked"), and `compare` counts it as
+missing, so a stopped run shows as incomplete exactly as it would with failure records. `compare` checks each
+run against its own plan, so it warns about an incomplete run even when the missing questions are ones the
+other run didn't ask (and so aren't scored). Runs from before `planned_questions` are reported from their
+records, as before.
 
 Grading works the same way (see
 [Grading with Claude Code](#grading-with-claude-code---judge-runner-claude-code)): in-flight grades are saved,

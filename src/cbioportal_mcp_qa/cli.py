@@ -18,6 +18,7 @@ from .dataset import (
     ASKED_FIELDS,
     DEFAULT_QUESTIONS,
     REFERENCE_FIELDS,
+    Question,
     definition_fields,
     load_questions,
     parse_selection,
@@ -538,7 +539,19 @@ def run(
             wait_on_limit,
             max_wait,
         ) = (opts[name] for name in RESTORED_ON_RESUME)
-    questions = parse_selection(selection, load_questions(questions_file))
+    available = load_questions(questions_file)
+    questions = parse_selection(selection, available)
+    if resume:
+        # Also every question the run planned (an earlier selection) whose answers are still missing, so no
+        # resume strands them: from the questions file when it still has them, else as they were planned.
+        by_id = {q.id: q for q in available}
+        selected = {q.id for q in questions}
+        missing = {r["question"]["id"]: r["question"] for r in bench.missing_records()}
+        questions += [
+            by_id.get(qid) or Question.from_dict(q)
+            for qid, q in sorted(missing.items())
+            if qid not in selected
+        ]
     if not questions:
         raise click.UsageError("no questions selected")
     if resume:
@@ -655,6 +668,11 @@ def run(
     asyncio.run(go())
     if stops := getattr(client, "stops", []):
         raise click.ClickException(_stop_message(client, stops, _resume_command(ctx, opts, bench)))
+    if unasked := bench.missing_records():
+        # Only a stop leaves planned answers unasked; anything else is a bug, and never a successful run.
+        raise click.ClickException(
+            f"{len(unasked)} planned answers are still missing; continue with `{_resume_command(ctx, opts, bench)}`."
+        )
     if runner == "agents-api":
         wait_for_ingestion()
         click.echo(f"Attached {attach_traces(bench, _langfuse(settings))} traces")

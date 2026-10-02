@@ -474,7 +474,13 @@ def compare(
     # Regressions first, then improvements, each by size; unchanged last, in question order.
     questions.sort(key=lambda q: ({"worse": 0, "better": 1, "same": 2}[q["verdict"]], -abs(q["delta"] or 0)))
     verdicts = Counter(q["verdict"] for q in questions)
-    warnings += _warn_incomplete("A", run_a, totals["a"]) + _warn_incomplete("B", run_b, totals["b"])
+    # Each run's completeness against its own plan (every question it planned or recorded), not only the shared
+    # questions: a run that stopped before the questions the other didn't ask is still incomplete.
+    own = {"a": Pool(), "b": Pool()}
+    for side, by_q, planned, expected in (("a", qa, planned_a, rep_a), ("b", qb, planned_b, rep_b)):
+        for qid, recs in by_q.items():
+            own[side].add(recs, expected, question_of(recs, planned, qid))
+    warnings += _warn_incomplete("A", run_a, own["a"]) + _warn_incomplete("B", run_b, own["b"])
 
     metrics = []
     for m in METRICS:
