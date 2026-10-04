@@ -398,7 +398,7 @@ def test_index_lists_checks_apart_from_runs(tmp_path, monkeypatch):
         (tmp_path / name / "check.json").write_text(json.dumps(check))
     html = report_mod.write_index().read_text()
     checks = html[html.index('<h2 id="checks">') :]
-    assert 'href="#checks">Database checks<' in html
+    assert 'href="#checks">Comparisons and checks<' in html
     assert checks.index("db-latency-20260102/report.html") < checks.index("db-latency-20260101/report.html")
     assert "DB latency check" in checks
 
