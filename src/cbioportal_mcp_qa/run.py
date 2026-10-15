@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,16 @@ def record_key(question_id: int, model: str, repeat: int) -> str:
 def answered(rec: dict | None) -> bool:
     """Whether a turn has its answer (HTTP 200). Anything else (no record, a failure) is asked again."""
     return (rec or {}).get("reply", {}).get("status") == 200
+
+
+RUN_ID = re.compile(r"(\d{8}-\d{4})(?:-(\d+))?")
+
+
+def run_order(name: str) -> tuple[str, int]:
+    """Sort key for run ids in start order: `20261015-0338` before `20261015-0338-2` before `-10`."""
+    if m := RUN_ID.fullmatch(name):
+        return m.group(1), int(m.group(2) or 1)
+    return name, 0
 
 
 class Run:
@@ -62,6 +73,8 @@ class Run:
                 break
             except FileExistsError:
                 continue
+        else:
+            raise RuntimeError(f"no free run id for {stamp} in {RESULTS_DIR}")
         path = RESULTS_DIR / run_id / "run.json"
         data = {
             "run_id": run_id,

@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-from .persist import write_secret_json
+from .persist import secret_file_lock, write_secret_json
 from .redact import add_secret
 
 DEFAULT_FILE = ".mcp-oauth.json"
@@ -59,7 +59,7 @@ def _code_from(pasted: str, state: str) -> str:
     query = parse_qs(urlparse(pasted).query)
     if "error" in query:
         raise RuntimeError(f"login failed: {query['error'][0]} {query.get('error_description', [''])[0]}")
-    if query.get("state", [state])[0] != state:
+    if query.get("state", [None])[0] != state:
         raise RuntimeError("login failed: the pasted URL is from another login attempt (state mismatch)")
     if "code" not in query:
         raise RuntimeError("no ?code= in the pasted URL")
@@ -131,6 +131,8 @@ def login(resource_url: str, ask=input, say=print, path: Path | None = None) -> 
 
 
 def _tokens(payload: dict, previous: dict | None = None) -> dict:
+    if not payload.get("access_token"):
+        raise RuntimeError("the token endpoint answered without an access token: run `mcp-login` again")
     return {
         "access_token": payload["access_token"],
         # A refresh response may omit the refresh token: the old one stays valid.
@@ -141,7 +143,9 @@ def _tokens(payload: dict, previous: dict | None = None) -> dict:
 
 class OAuthTokens:
     """The access token for one MCP endpoint from the token file, renewed with the refresh token when it is about
-    to expire or the server rejected it. Thread-safe; renewals are written back to the file."""
+    to expire or the server rejected it. Safe across threads and processes: a renewal happens under a file lock,
+    after re-reading the file, so a token another process already renewed (and its rotated refresh token) is used
+    rather than renewed again. Renewals are written back to the file."""
 
     def __init__(self, resource_url: str, path: Path | None = None):
         self.path = path or token_file()
@@ -162,10 +166,24 @@ class OAuthTokens:
         for key in ("access_token", "refresh_token", "client_secret"):
             add_secret(self.data.get(key))
 
+    def _expiring(self) -> bool:
+        return time.time() > self.data["expires_at"] - EXPIRY_MARGIN_S
+
     def get(self, renew: bool = False) -> str:
         with self._lock:
-            if renew or time.time() > self.data["expires_at"] - EXPIRY_MARGIN_S:
-                self._refresh()
+            if not (renew or self._expiring()):
+                return self.data["access_token"]
+            rejected = self.data["access_token"]
+            with secret_file_lock(self.path):
+                stored = json.loads(self.path.read_text())
+                if (
+                    stored.get("access_token") != rejected
+                    and stored.get("expires_at", 0) > self.data["expires_at"]
+                ):
+                    self.data = stored
+                    self._mask()
+                if self.data["access_token"] == rejected and (renew or self._expiring()):
+                    self._refresh()
             return self.data["access_token"]
 
     def _refresh(self) -> None:

@@ -482,10 +482,12 @@ the tool-calling loop itself:
 - **Records:** answer, latency, tokens (summed over the LLM calls), every tool call with its input and result, and a
   transcript under `transcripts/`, in the claude-code runner's shapes, so reports, `compare` and the judge work
   unchanged. Models are priced at $0. `run.json` records the endpoint, the served model name, the server (Ollama
-  version), its context window and the tool list (`openai`).
+  version), each model's context window and the tool list (`openai`); a `--resume` against another endpoint is
+  warned about and recorded in `openai_resumes`, and each answer's trace has the window it ran with.
 - **Models:** `--models llama3.1-8b` or `qwen3.8-27b` (`config.MODELS`, `openai_id`). Set `OPENAI_BASE_URL`
   (default `http://127.0.0.1:11434/v1`), `OPENAI_API_KEY` if the server wants one, and `OPENAI_SERVED_MODEL` when
-  the server knows the model by another name (e.g. an Ollama model derived to pin `num_ctx`).
+  the server knows the model by another name (e.g. an Ollama model derived to pin `num_ctx`); with it, a run takes
+  one model.
 - **Thinking:** `--reasoning-effort none` turns a thinking model's reasoning off, as the deployed agent runs;
   without it the request leaves the server's default. Inline `<think>` blocks are dropped from the answer.
 
@@ -497,7 +499,9 @@ uv run cbioportal-mcp-qa mcp-login
 
 It prints a URL to open in a browser. After the login the browser is sent to `http://127.0.0.1:8976/callback?...`,
 which needn't load: paste that URL back. The tokens go in `.mcp-oauth.json` (owner-only, gitignored,
-`MCP_OAUTH_FILE` to move it) and are refreshed as needed. With `DATABASE_MCP_URL` (a port-forward) no login is used.
+`MCP_OAUTH_FILE` to move it) and are refreshed as needed, under a file lock so several runs can share the login.
+If the server still refuses a renewed token, the answer fails (and `--resume` asks it again after a new
+`mcp-login`) rather than reach the model as a tool error. With `DATABASE_MCP_URL` (a port-forward) no login is used.
 
 ```bash
 uv run cbioportal-mcp-qa run --runner openai --models qwen3.8-27b --reasoning-effort none \
@@ -509,7 +513,8 @@ uv run cbioportal-mcp-qa grade <run> --judge-runner claude-code
 before any guide or query result. Ollama's `/v1` endpoint silently cuts a prompt that doesn't fit its `num_ctx`,
 from the start (the system prompt first), and reports the cut count. The runner fails such an answer ("prompt
 truncated by the server") rather than grade an answer to a prompt it never saw: give the server a window of 64k or
-more. `--concurrency` should not exceed the server's parallel slots (`OLLAMA_NUM_PARALLEL`).
+more. A tool loop can outgrow the window too: Ollama then drops the oldest messages, the question with them, and
+the answer fails with "prompt exceeded the context window"; ask those again with a larger window (`--resume`). `--concurrency` should not exceed the server's parallel slots (`OLLAMA_NUM_PARALLEL`).
 
 ## Adding questions
 

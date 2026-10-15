@@ -66,13 +66,19 @@ class MCPSession:
 
 
 class MCPToolError(Exception):
-    """A tool call the server answered with a JSON-RPC error (unknown tool, invalid arguments)."""
+    """A tool call the server answered with a JSON-RPC error (unknown tool, invalid arguments), or with something
+    that isn't a JSON-RPC response."""
+
+
+class MCPAuthError(RuntimeError):
+    """The server still refuses the request after the token was renewed: the login needs fixing, not the model."""
 
 
 class AsyncMCPSession:
     """An MCP streamable-HTTP client for an agent loop: list the tools, call them. `token` returns the bearer
     token for each request (an object with `get(force=False)`, e.g. `OAuthTokens`; None for a server without
-    auth). A session the server forgot (404) is opened again; on a 401 the token is renewed once."""
+    auth). A session the server forgot (404) is opened again, once for all the requests that found it gone; on a
+    401 the token is renewed once, and a refusal after that raises MCPAuthError."""
 
     def __init__(self, url: str, headers: dict | None = None, token=None, timeout_s: float = 300.0):
         self.url = url
@@ -89,54 +95,75 @@ class AsyncMCPSession:
         self.server_info: dict = {}
         self.instructions: str | None = None
         self._id = 0
+        self._reopen = asyncio.Lock()
+        # Bumped each time the session is opened, so requests that failed on the same lost session reopen it once.
+        self._generation = 0
 
     async def aclose(self) -> None:
         await self.http.aclose()
 
-    async def _post(self, method: str, params: dict | None = None, notify: bool = False) -> dict:
+    async def _post(
+        self, method: str, params: dict | None = None, notify: bool = False, session_id: str | None = None
+    ) -> httpx.Response:
         body: dict = {"jsonrpc": "2.0", "method": method, "params": params or {}}
         if not notify:
             self._id += 1
             body["id"] = self._id
-        resp = await self._send(body)
+        resp = await self._send(body, session_id)
         if resp.status_code == 401 and self.token:
-            resp = await self._send(body, renew=True)
+            resp = await self._send(body, session_id, renew=True)
+        if resp.status_code in (401, 403) and self.token:
+            raise MCPAuthError(
+                f"{self.url} refused the request (HTTP {resp.status_code}) after renewing the login: "
+                "run `cbioportal-mcp-qa mcp-login` again"
+            )
         resp.raise_for_status()
-        self.session_id = resp.headers.get("mcp-session-id", self.session_id)
-        return {} if notify else _message(resp)
+        return resp
 
-    async def _send(self, body: dict, renew: bool = False) -> httpx.Response:
-        headers = {"mcp-session-id": self.session_id} if self.session_id else {}
+    async def _send(self, body: dict, session_id: str | None, renew: bool = False) -> httpx.Response:
+        headers = {"mcp-session-id": session_id} if session_id else {}
         if self.token:
             token = await asyncio.to_thread(self.token.get, renew)
             headers["Authorization"] = f"Bearer {token}"
         return await self.http.post(self.url, json=body, headers=headers)
 
+    @staticmethod
+    def _parse(resp: httpx.Response) -> dict:
+        try:
+            return _message(resp)
+        except ValueError as exc:
+            raise MCPToolError(
+                f"the server's reply isn't JSON-RPC (HTTP {resp.status_code}, "
+                f"{resp.headers.get('content-type') or 'no content type'})"
+            ) from exc
+
     async def initialize(self) -> dict:
-        self.session_id = None
-        result = (
-            await self._post(
-                "initialize",
-                {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "cbioportal-mcp-qa", "version": "0"},
-                },
-            )
-        ).get("result", {})
-        await self._post("notifications/initialized", notify=True)
+        init = {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "cbioportal-mcp-qa", "version": "0"},
+        }
+        resp = await self._post("initialize", init)
+        session_id = resp.headers.get("mcp-session-id")
+        result = self._parse(resp).get("result", {})
+        await self._post("notifications/initialized", notify=True, session_id=session_id)
+        self.session_id = session_id
+        self._generation += 1
         self.server_info = result.get("serverInfo", {})
         self.instructions = result.get("instructions") or None
         return self.server_info
 
     async def _request(self, method: str, params: dict) -> dict:
+        generation = self._generation
         try:
-            return await self._post(method, params)
+            return self._parse(await self._post(method, params, session_id=self.session_id))
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 404 or not self.session_id:
                 raise
-        await self.initialize()
-        return await self._post(method, params)
+        async with self._reopen:
+            if self._generation == generation:
+                await self.initialize()
+        return self._parse(await self._post(method, params, session_id=self.session_id))
 
     async def list_tools(self) -> list[dict]:
         tools, cursor = [], None

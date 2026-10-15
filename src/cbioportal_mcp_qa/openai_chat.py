@@ -125,7 +125,8 @@ class OpenAIChatClient:
         self.system_prompt = system_prompt
         self.server_instructions: dict[str, str | None] = {}
         self.server_info: dict[str, dict] = {}
-        self.context_window: int | None = None
+        # Each served model's context window (num_ctx), when the server is Ollama.
+        self.context_windows: dict[str, int | None] = {}
         self.backend: dict = {}
 
     async def start(self) -> None:
@@ -140,34 +141,47 @@ class OpenAIChatClient:
         )
         self.backend = await self._ollama_info()
 
+    @property
+    def _root(self) -> str:
+        return self.base_url.removesuffix("/v1")
+
     async def _ollama_info(self) -> dict:
-        """Ollama's version and the served model's context window, when the server is Ollama (best effort)."""
-        root = self.base_url.removesuffix("/v1")
-        info: dict = {}
+        """Ollama's version, when the server is Ollama (best effort)."""
         try:
-            version = await self.http.get(f"{root}/api/version")
-            if version.status_code != 200:
-                return info
-            info["ollama"] = version.json().get("version")
-            shown = await self.http.post(f"{root}/api/show", json={"model": self.served_model or ""})
-            if shown.status_code == 200 and self.served_model:
-                params = shown.json().get("parameters") or ""
-                if m := re.search(r"^num_ctx\s+(\d+)", params, re.MULTILINE):
-                    self.context_window = int(m.group(1))
+            version = await self.http.get(f"{self._root}/api/version")
+            if version.status_code == 200:
+                return {"ollama": version.json().get("version")}
         except (httpx.HTTPError, ValueError):
             pass
-        return info
+        return {}
+
+    async def context_window(self, model: str) -> int | None:
+        """The served model's context window (Ollama's num_ctx; None for other servers or when unknown)."""
+        name = self.model_name(model)
+        if name not in self.context_windows:
+            window = None
+            if self.backend.get("ollama"):
+                try:
+                    shown = await self.http.post(f"{self._root}/api/show", json={"model": name})
+                    params = (shown.json().get("parameters") or "") if shown.status_code == 200 else ""
+                    if m := re.search(r"^num_ctx\s+(\d+)", params, re.MULTILINE):
+                        window = int(m.group(1))
+                except (httpx.HTTPError, ValueError):
+                    pass
+            self.context_windows[name] = window
+        return self.context_windows[name]
 
     def model_name(self, model: str) -> str:
         return self.served_model or MODELS[model].openai_id
 
     def describe(self) -> dict:
         host = urlparse(self.base_url)
+        port = f":{host.port}" if host.port else ""
         return {
-            "base_url": f"{host.scheme}://{host.hostname}:{host.port or ''}{host.path}",
+            "base_url": f"{host.scheme}://{host.hostname}{port}{host.path}",
             "served_model": self.served_model,
             "backend": self.backend,
-            "context_window": self.context_window,
+            "context_windows": dict(self.context_windows),
             "reasoning_effort": self.reasoning_effort,
             "max_tool_rounds": self.max_tool_rounds,
             "tools": {name: f"{server}:{tool}" for name, (server, tool) in self.route.items()},
@@ -213,7 +227,7 @@ class OpenAIChatClient:
             answer, status, error = "", None, f"timed out after {self.timeout_s:.0f}s"
         except _RequestFailed as exc:
             answer, status, error = "", exc.status, exc.message  # the endpoint's HTTP status, if it answered
-        except (httpx.HTTPError, MCPToolError, RuntimeError) as exc:
+        except Exception as exc:  # noqa: BLE001 - any failure is this answer's, never the whole run's
             answer, status, error = "", None, describe_error(exc, 2000)
         latency = time.monotonic() - t0
         trace = TraceStats(
@@ -225,7 +239,7 @@ class OpenAIChatClient:
             tool_rounds=state["tool_rounds"],
         ).to_dict()
         trace["max_prompt_tokens"] = state["max_prompt"]
-        trace["context_window"] = self.context_window
+        trace["context_window"] = self.context_windows.get(self.model_name(model))
         if self.transcript_dir is not None:
             self.transcript_dir.mkdir(parents=True, exist_ok=True)
             name = hashlib.sha1(f"{model}:{question}:{started}".encode()).hexdigest()[:12] + ".txt"
@@ -267,7 +281,13 @@ class OpenAIChatClient:
             messages.append(
                 {"role": "assistant", "content": message.get("content") or "", "tool_calls": calls}
             )
-            results = await asyncio.gather(*(self._call(c, state) for c in calls))
+            tasks = [asyncio.ensure_future(self._call(c, state)) for c in calls]
+            try:
+                results = await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                raise
             for call, result in zip(calls, results, strict=True):
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result})
 
@@ -277,6 +297,7 @@ class OpenAIChatClient:
             body["tools"] = self.tools
         if self.reasoning_effort:
             body["reasoning_effort"] = self.reasoning_effort
+        window = await self.context_window(model)
         for attempt in range(self.retries + 1):
             try:
                 resp = await self.http.post("/chat/completions", json=body)
@@ -284,19 +305,25 @@ class OpenAIChatClient:
                 failure = _RequestFailed(None, describe_error(exc, 2000))
             else:
                 if resp.status_code == 200:
-                    break
-                if CONTEXT_OVERFLOW in resp.text:
+                    try:
+                        data = resp.json()
+                        break
+                    except ValueError:
+                        failure = _RequestFailed(
+                            None, f"the chat endpoint answered 200 without JSON: {redact(resp.text)[:300]!r}"
+                        )
+                elif CONTEXT_OVERFLOW in resp.text:
                     raise RuntimeError(
                         "prompt exceeded the context window: the server dropped the oldest messages, the question "
-                        f"among them ({self.context_window or '?'} tokens; raise num_ctx)"
+                        f"among them ({window or '?'} tokens; raise num_ctx)"
                     )
-                failure = _RequestFailed(resp.status_code, redact(resp.text)[:2000])
-                if resp.status_code not in RETRYABLE_STATUS:
-                    raise failure
+                else:
+                    failure = _RequestFailed(resp.status_code, redact(resp.text)[:2000])
+                    if resp.status_code not in RETRYABLE_STATUS:
+                        raise failure
             if attempt == self.retries:
                 raise failure
             await asyncio.sleep(10 * (attempt + 1))
-        data = resp.json()
         state["llm_calls"] += 1
         usage = data.get("usage") or {}
         prompt = usage.get("prompt_tokens") or 0
@@ -309,12 +336,13 @@ class OpenAIChatClient:
         sent = len(json.dumps(messages, ensure_ascii=False))
         if messages[-1]["role"] == "user":
             sent += len(json.dumps(body.get("tools", [])))
-        if prompt * MAX_CHARS_PER_TOKEN < sent or (self.context_window and prompt >= self.context_window):
+        # A server that reports no prompt tokens can't be checked.
+        if prompt and (prompt * MAX_CHARS_PER_TOKEN < sent or (window and prompt >= window)):
             # Ollama silently drops the oldest tokens (the system prompt first) to fit its window, and reports
             # the truncated count: an answer to what's left isn't comparable.
             raise RuntimeError(
                 f"prompt truncated by the server: {sent} characters sent, {prompt} prompt tokens counted"
-                + (f", window {self.context_window}" if self.context_window else "")
+                + (f", window {window}" if window else "")
                 + " (raise num_ctx)"
             )
         return (data.get("choices") or [{}])[0].get("message") or {}

@@ -1,15 +1,21 @@
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 
+import click
 import httpx
 import pytest
 
 from cbioportal_mcp_qa import mcp_oauth
-from cbioportal_mcp_qa.cli import _models
+from cbioportal_mcp_qa.cli import _check_runner_options, _models, _record_openai_setup
+from cbioportal_mcp_qa.mcp_http import AsyncMCPSession, MCPAuthError, MCPToolError
 from cbioportal_mcp_qa.mcp_oauth import OAuthTokens, _code_from
 from cbioportal_mcp_qa.openai_chat import OpenAIChatClient, answer_text, openai_tools
+from cbioportal_mcp_qa.persist import write_secret_json
+from cbioportal_mcp_qa.redact import add_secret
 from cbioportal_mcp_qa.report import record_cost
+from cbioportal_mcp_qa.run import run_order
 
 
 class FakeMCP:
@@ -274,3 +280,268 @@ def test_runs_started_in_the_same_minute_get_their_own_directory(tmp_path, monke
     b = run_mod.Run.create("beta", ["haiku"], 1, "j", "q.yaml")
     assert b.data["run_id"] == a.data["run_id"] + "-2"
     assert a.path.parent != b.path.parent and a.path.is_file() and b.path.is_file()
+
+
+def test_a_non_json_reply_fails_the_answer_not_the_run(tmp_path):
+    client = _client(tmp_path, [], [])
+    client.retries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/version"):
+            return httpx.Response(404)
+        return httpx.Response(200, text="<html>proxy error</html>")
+
+    client.http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+
+    async def go():
+        await client.start()
+        return await client.ask("q", "llama3.1-8b")
+
+    reply = asyncio.run(go())
+    assert reply.status is None and "without JSON" in reply.error
+
+
+def test_a_reply_without_usage_is_not_called_truncated(tmp_path):
+    reply_body = {"choices": [{"message": {"content": "Fine."}, "finish_reason": "stop"}]}
+    client = _client(tmp_path, [reply_body], [])
+    client.agent_prompt = "x" * 10_000
+
+    async def go():
+        await client.start()
+        return await client.ask("q", "llama3.1-8b")
+
+    reply = asyncio.run(go())
+    assert reply.error is None and reply.answer == "Fine."
+
+
+def test_context_window_is_read_for_each_model(tmp_path):
+    shown = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/version"):
+            return httpx.Response(200, json={"version": "0.35.1"})
+        if request.url.path.endswith("/api/show"):
+            shown.append(json.loads(request.content)["model"])
+            return httpx.Response(200, json={"parameters": "num_ctx                        32768"})
+        return httpx.Response(200, json=_completion({"content": "cut"}, prompt_tokens=32_768))
+
+    client = _client(tmp_path, [], [])
+    client.served_model = None
+    client.http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+
+    async def go():
+        await client.start()
+        return await client.ask("q", "llama3.1-8b")
+
+    reply = asyncio.run(go())
+    assert shown == ["llama3.1:8b"]
+    assert "window 32768" in reply.error and reply.trace["context_window"] == 32768
+    assert client.describe()["context_windows"] == {"llama3.1:8b": 32768}
+
+
+def test_a_refused_login_fails_the_answer(tmp_path):
+    class Refused(FakeMCP):
+        async def call_tool(self, name, args):
+            raise MCPAuthError("https://db refused the request (HTTP 401) after renewing the login")
+
+    call = {"id": "c", "function": {"name": "clickhouse_run_select_query", "arguments": "{}"}}
+    client = _client(tmp_path, [_completion({"content": "", "tool_calls": [call]})], [])
+    client.servers["cbioportal-database"] = Refused(
+        [_tool("clickhouse_run_select_query")], {}, instructions="SERVER INSTRUCTIONS"
+    )
+
+    async def go():
+        await client.start()
+        return await client.ask("q", "llama3.1-8b")
+
+    reply = asyncio.run(go())
+    assert reply.status is None and "after renewing the login" in reply.error
+
+
+class _Token:
+    def __init__(self):
+        self.renewals = 0
+
+    def get(self, renew=False):
+        self.renewals += renew
+        return f"token-{self.renewals}"
+
+
+def _mcp_server(state):
+    """A streamable-HTTP MCP server that forgets its session when `state["restart"]` is set."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if state.get("status"):
+            return httpx.Response(state["status"])
+        body = json.loads(request.content)
+        sid = request.headers.get("mcp-session-id")
+        if body["method"] == "initialize":
+            state["inits"] = state.get("inits", 0) + 1
+            state["session"] = f"s{state['inits']}"
+            return httpx.Response(200, json={"result": {}}, headers={"mcp-session-id": state["session"]})
+        if not sid:
+            return httpx.Response(400)
+        if sid != state["session"]:
+            return httpx.Response(404)
+        if body["method"].startswith("notifications/"):
+            return httpx.Response(202)
+        if state.get("html"):
+            return httpx.Response(200, text="<html>gateway</html>", headers={"content-type": "text/html"})
+        return httpx.Response(200, json={"result": {"content": [{"type": "text", "text": "ok"}]}})
+
+    return handler
+
+
+def _session(state, token=None):
+    mcp = AsyncMCPSession("http://db/mcp", token=token)
+    mcp.http = httpx.AsyncClient(transport=httpx.MockTransport(_mcp_server(state)))
+    return mcp
+
+
+def test_a_lost_session_is_reopened_once_for_concurrent_calls():
+    state = {}
+    mcp = _session(state)
+
+    async def go():
+        await mcp.initialize()
+        state["session"] = "gone"
+        return await asyncio.gather(*(mcp.call_tool("t", {}) for _ in range(3)))
+
+    assert asyncio.run(go()) == [("ok", False)] * 3
+    assert state["inits"] == 2
+
+
+def test_mcp_refusing_a_renewed_token_raises_auth_error():
+    state, token = {}, _Token()
+    mcp = _session(state, token)
+
+    async def go():
+        await mcp.initialize()
+        state["status"] = 401
+        await mcp.call_tool("t", {})
+
+    with pytest.raises(MCPAuthError, match="mcp-login"):
+        asyncio.run(go())
+    assert token.renewals == 1
+
+
+def test_a_non_json_mcp_reply_is_a_tool_error():
+    state = {}
+    mcp = _session(state)
+
+    async def go():
+        await mcp.initialize()
+        state["html"] = True
+        await mcp.call_tool("t", {})
+
+    with pytest.raises(MCPToolError, match="isn't JSON-RPC"):
+        asyncio.run(go())
+
+
+def test_tokens_in_tool_results_are_masked_in_transcripts(tmp_path):
+    add_secret("access-token-6f1d2c9a8b7e")
+    call = {"id": "c", "function": {"name": "read_guide", "arguments": "{}"}}
+    client = _client(
+        tmp_path,
+        [_completion({"content": "", "tool_calls": [call]}), _completion({"content": "Done."})],
+        [],
+    )
+    client.servers["cbioportal-database"].results["read_guide"] = ("echo access-token-6f1d2c9a8b7e", False)
+
+    async def go():
+        await client.start()
+        return await client.ask("q", "llama3.1-8b")
+
+    reply = asyncio.run(go())
+    assert "access-token-6f1d2c9a8b7e" not in (tmp_path / reply.trace["url"]).read_text()
+    assert "access-token-6f1d2c9a8b7e" not in json.dumps(reply.trace)
+
+
+def test_secret_files_are_private_and_never_under_results(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "secret.json").with_name("secret.json.tmp").write_text("left over")
+    write_secret_json(tmp_path / "secret.json", {"a": 1})
+    assert (tmp_path / "secret.json").stat().st_mode & 0o777 == 0o600
+    with pytest.raises(ValueError, match="never go under results"):
+        write_secret_json(tmp_path / "results" / "x.json", {})
+
+
+def _token_file(path, access, expires_at):
+    path.write_text(
+        json.dumps(
+            {
+                "resource": "https://mcp.example/db/mcp",
+                "token_endpoint": "https://mcp.example/token",
+                "client_id": "cid",
+                "access_token": access,
+                "refresh_token": "refresh-1",
+                "expires_at": expires_at,
+            }
+        )
+    )
+
+
+def test_processes_sharing_the_token_file_renew_once(tmp_path, monkeypatch):
+    path = tmp_path / "oauth.json"
+    _token_file(path, "old-access-token-1", time.time() - 10)
+    posted = []
+
+    def fake_post(url, data, timeout):
+        posted.append(data["refresh_token"])
+        return httpx.Response(
+            200, json={"access_token": "new-access-token-2", "refresh_token": "refresh-2", "expires_in": 3600}
+        )
+
+    monkeypatch.setattr(mcp_oauth.httpx, "post", fake_post)
+    a = OAuthTokens("https://mcp.example/db/mcp", path)
+    b = OAuthTokens("https://mcp.example/db/mcp", path)
+    assert a.get() == "new-access-token-2"
+    # b still holds the old token and the rotated-away refresh token: it takes a's renewal instead of renewing.
+    assert b.get() == "new-access-token-2"
+    assert b.get(renew=False) == "new-access-token-2" and posted == ["refresh-1"]
+    # A token the server rejected is renewed with the current refresh token.
+    assert b.get(renew=True) == "new-access-token-2" and posted == ["refresh-1", "refresh-2"]
+
+
+def test_a_refresh_without_an_access_token_says_so(tmp_path, monkeypatch):
+    path = tmp_path / "oauth.json"
+    _token_file(path, "old-access-token-1", time.time() - 10)
+    monkeypatch.setattr(mcp_oauth.httpx, "post", lambda url, data, timeout: httpx.Response(200, json={}))
+    with pytest.raises(RuntimeError, match="without an access token"):
+        OAuthTokens("https://mcp.example/db/mcp", path).get()
+
+
+def test_a_pasted_url_must_carry_the_state():
+    with pytest.raises(RuntimeError, match="state mismatch"):
+        _code_from("http://127.0.0.1:8976/callback?code=abc123", "s1")
+
+
+def test_run_ids_sort_in_start_order():
+    names = ["20261015-0338-10", "20261015-0338", "20261015-0339", "20261015-0338-2"]
+    assert sorted(names, key=run_order) == [
+        "20261015-0338",
+        "20261015-0338-2",
+        "20261015-0338-10",
+        "20261015-0339",
+    ]
+
+
+def test_options_a_runner_would_ignore_are_refused():
+    settings = SimpleNamespace(openai_served_model=None)
+    with pytest.raises(click.UsageError, match="system-prompt-file needs"):
+        _check_runner_options(settings, "agents-api", ["haiku"], "prompt.md")
+    _check_runner_options(settings, "openai", ["llama3.1-8b", "qwen3.8-27b"], "prompt.md")
+    settings.openai_served_model = "qwen3.8-c64k-t8:27b"
+    with pytest.raises(click.UsageError, match="every model"):
+        _check_runner_options(settings, "openai", ["llama3.1-8b", "qwen3.8-27b"], None)
+    _check_runner_options(settings, "openai", ["qwen3.8-27b"], None)
+
+
+def test_a_resume_keeps_the_runs_endpoint_and_records_its_own(capsys):
+    bench = SimpleNamespace(data={})
+    first = {"base_url": "http://127.0.0.1:1/v1", "served_model": "q-c64k:27b", "backend": {}}
+    _record_openai_setup(bench, first)
+    _record_openai_setup(bench, first | {"served_model": "q-c128k:27b"})
+    assert bench.data["openai"] == first
+    assert bench.data["openai_resumes"][0]["served_model"] == "q-c128k:27b"
+    assert "differs from the run's (served_model)" in capsys.readouterr().err

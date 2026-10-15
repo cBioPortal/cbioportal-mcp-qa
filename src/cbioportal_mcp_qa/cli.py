@@ -294,6 +294,36 @@ def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) 
     return env
 
 
+def _check_runner_options(settings, runner: str, models: list[str], system_prompt_file) -> None:
+    """Options that only some runners use, refused where they would be recorded but not used."""
+    if system_prompt_file and runner not in LOCAL_RUNNERS:
+        raise click.UsageError(
+            f"--system-prompt-file needs --runner claude-code or openai: the {runner} runner asks the deployed "
+            "agent, which uses its own instructions"
+        )
+    if runner == "openai" and settings.openai_served_model and len(models) > 1:
+        raise click.UsageError(
+            f"OPENAI_SERVED_MODEL={settings.openai_served_model} would answer for every model in {models}: "
+            "run one model per run, or unset it to use each model's own name on the server"
+        )
+
+
+# What a resumed openai run must match to stay one configuration.
+OPENAI_SETUP_KEYS = ("base_url", "served_model", "backend", "reasoning_effort", "max_tool_rounds", "tools")
+
+
+def _record_openai_setup(bench, described: dict) -> None:
+    """The endpoint the run was started with stays its `openai` record; a resume against a different one is
+    warned about and kept in `openai_resumes`."""
+    first = bench.data.get("openai")
+    if not first:
+        bench.data["openai"] = described
+        return
+    if diff := [k for k in OPENAI_SETUP_KEYS if first.get(k) != described.get(k)]:
+        click.echo(f"Warning: this resume's endpoint differs from the run's ({', '.join(diff)})", err=True)
+    bench.data.setdefault("openai_resumes", []).append(described)
+
+
 def _client(
     settings,
     target: str,
@@ -507,6 +537,7 @@ def ask(
     """Ask the deployed agent a single question."""
     settings = load_settings()
     model = _models(model, target, runner)[0]
+    _check_runner_options(settings, runner, [model], system_prompt_file)
     _check_database_mcp(settings, target, runner, require_beta_mcp)
 
     async def go():
@@ -662,6 +693,7 @@ def run(
         runner = bench.data.get("runner", "agents-api")
     else:
         models = _models(models_arg, target, runner)
+    _check_runner_options(settings, runner, bench.data["models"] if resume else models, system_prompt_file)
     agent = None
     if system_prompt_file:
         agent = {"instructions": system_prompt_file.read_text(), "source": str(system_prompt_file)}
@@ -768,7 +800,7 @@ def run(
         try:
             if runner == "openai":
                 await client.start()
-                bench.data["openai"] = client.describe()
+                _record_openai_setup(bench, client.describe())
                 bench.save()
             while True:
                 await collect_answers(bench, questions, client, concurrency)
