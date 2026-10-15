@@ -55,6 +55,8 @@ MODELS = {
     ),
     # Claude Code runner only (no Bedrock id configured); Claude API list price, same as Sonnet 5.
     "sonnet-5.5": Model("sonnet-5.5", "Sonnet 5.5", None, Price(2.0, 10.0, 2.5, 0.20), "claude-sonnet-5-5"),
+    # Claude Code runner only; Claude API list price for prompts up to 100k tokens (longer prompts cost 5x).
+    "haiku-5.5": Model("haiku-5.5", "Haiku 5.5", None, Price(0.10, 0.50, 0.125, 0.01), "claude-haiku-5-5"),
     "sonnet-4.6": Model(
         "sonnet-4.6",
         "Sonnet 4.6",

@@ -480,7 +480,10 @@ def mcp_login(url: str | None) -> None:
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
 @click.option(
     "--model",
-    type=click.Choice(MODEL_CHOICES + [k for k, m in MODELS.items() if m.openai_id]),
+    type=click.Choice(
+        MODEL_CHOICES
+        + [k for k, m in MODELS.items() if k not in MODEL_CHOICES and (m.openai_id or m.claude_code_id)]
+    ),
     default=None,
     help="Default: the target's first.",
 )
