@@ -1,0 +1,436 @@
+Q (haiku-5.5): can you show me a study with longitudinal data and a patient that has multiple samples over time?
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_event_data_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"clinical_event_id","type":"Int64"},{"name":"patient_id","type":"Nullable(Int64)"},{"name":"patient_stable_id","type":"String"},{"name":"start_date","type":"Nullable(Int64)"},{"name":"stop_date","type":"Nullable(Int64)"},{"name":"event_type","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"}]}
+
+◀ result
+{"columns":[{"name":"patient_unique_id","type":"String"},{"name":"key","type":"String"},{"name":"value","type":"String"},{"name":"start_date","type":"Int32"},{"name":"stop_date","type":"Int32"},{"name":"event_type","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, event_type, count() AS events, uniqExact(patient_id) AS patients
+FROM clinical_event_derived
+WHERE lower(event_type) IN ('sample acquisition', 'specimen', 'sequencing', 'status', 'diagnosis', 'treatment')
+GROUP BY cancer_study_identifier, event_type
+HAVING lower(event_type) IN ('sample acquisition', 'specimen')
+ORDER BY patients DESC
+LIMIT 50"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, event_type, count() AS events, uniqExact(patient_unique_id) AS patients
+FROM clinical_event_data_derived
+GROUP BY cancer_study_identifier, event_type
+ORDER BY patients DESC
+LIMIT 100"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_chord_2024","event_type":"Sample acquisition","events":25040,"patients":24950},{"cancer_study_identifier":"mycf_msk_2026","event_type":"Sample acquisition","events":3362,"patients":3341},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":1081,"patients":1080},{"cancer_study_identifier":"cll_broad_2022","event_type":"Sample Acquisition","events":1009,"patients":1009},{"cancer_study_identifier":"pancan_hcmi_2025","event_type":"Specimen","events":665,"patients":637},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":588,"patients":588},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":525,"patients":525},{"cancer_study_identifier":"hnsc_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":519,"patients":519},{"cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":508,"patients":508},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":503,"patients":503},{"cancer_study_identifier":"thca_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":499,"patients":498},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":492,"patients":492},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":485,"patients":485},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":478,"patients":478},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":436,"patients":434},{"cancer_study_identifier":"stad_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":434,"patients":434},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":410,"patients":410},{"cancer_study_identifier":"lihc_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":372,"patients":372},{"cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":295,"patients":295},{"cancer_study_identifier":"kirp_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":279,"patients":279},{"cancer_study_identifier":"sarc_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":255,"patients":255},{"cancer_study_identifier":"brca_mbcproject_2022","event_type":"SPECIMEN","events":317,"patients":239},{"cancer_study_identifier":"rms_msk_2026","event_type":"Sample acquisition","events":282,"patients":220},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":184,"patients":184},{"cancer_study_identifier":"esca_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":179,"patients":179},{"cancer_study_identifier":"pcpg_tcga_pan_can_atlas_ … (2688 more chars)
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_met_2021","event_type":"STATUS","events":25669,"patients":25669},{"cancer_study_identifier":"msk_met_2021","event_type":"SEQUENCING","events":25517,"patients":25517},{"cancer_study_identifier":"msk_met_2021","event_type":"SURGERY","events":24953,"patients":24953},{"cancer_study_identifier":"msk_chord_2024","event_type":"Sequencing","events":25040,"patients":24950},{"cancer_study_identifier":"msk_chord_2024","event_type":"Sample acquisition","events":50080,"patients":24950},{"cancer_study_identifier":"msk_chord_2024","event_type":"Diagnosis","events":11193642,"patients":24947},{"cancer_study_identifier":"msk_chord_2024","event_type":"Treatment","events":666685,"patients":24028},{"cancer_study_identifier":"msk_met_2021","event_type":"DIAGNOSIS","events":251746,"patients":21841},{"cancer_study_identifier":"msk_chord_2024","event_type":"Surgery","events":76301,"patients":21530},{"cancer_study_identifier":"msk_chord_2024","event_type":"Lab_Test","events":1442217,"patients":16611},{"cancer_study_identifier":"msk_chord_2024","event_type":"Pathology","events":44756,"patients":12413},{"cancer_study_identifier":"mycf_msk_2026","event_type":"Sequencing","events":3439,"patients":3416},{"cancer_study_identifier":"mycf_msk_2026","event_type":"STATUS","events":13258,"patients":3397},{"cancer_study_identifier":"mycf_msk_2026","event_type":"Diagnosis","events":872230,"patients":3355},{"cancer_study_identifier":"mycf_msk_2026","event_type":"Sample acquisition","events":3362,"patients":3341},{"cancer_study_identifier":"mycf_msk_2026","event_type":"TREATMENT","events":125108,"patients":3288},{"cancer_study_identifier":"mycf_msk_2026","event_type":"Measurements","events":367937,"patients":3216},{"cancer_study_identifier":"mycf_msk_2026","event_type":"DIAGNOSIS","events":255327,"patients":3081},{"cancer_study_identifier":"mycf_msk_2026","event_type":"PROCEDURES","events":43838,"patients":2827},{"cancer_study_identifier":"mycf_msk_2026","event_type":"LAB_TEST","events":648049,"patients":2755},{"cancer_study_identifier":"pancan_pcawg_2020","event_type":"STATUS","events":2237,"patients":2237},{"cancer_study_identifier":"aml_target_gdc","event_type":"Diagnosis","events":6536,"patients":2189},{"cancer_study_identifier":"bll_target_gdc","event_type":"Diagnosis","events":4753,"patients":1587},{"cancer_study_identifier":"nsclc_ctdx_msk_2022","event_type":"STATUS","events":1745,"patients":1127},{"cancer_study_identifier":"nbl_target_gdc","event_type":"Diagnosis","events":3358,"patients":1120},{"cancer_study_identifier":"brca_tcga_gdc","event_type":"Diagnosis","events":5937,"patients":1097},{"cancer_study_identifier":"mycf_msk_2026","event_type":"PATHOLOGY","events":4998,"patients":1086},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","event_type":"STATUS","events":10390,"patients":1083},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","event_type":"Sample Acquisition","events":8648,"patients":1080},{"cancer_study_iden … (7559 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT key, count() AS n, uniqExact(patient_unique_id) AS patients, any(value) AS example
+FROM clinical_event_data_derived
+WHERE cancer_study_identifier = 'msk_chord_2024' AND event_type = 'Sample acquisition'
+GROUP BY key ORDER BY n DESC"
+}
+
+◀ result
+{"rows":[{"key":"SEQ_DATE","n":25040,"patients":24950,"example":"0"},{"key":"SAMPLE_ID","n":25040,"patients":24950,"example":"P-0000012-T03-IM3"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, count() AS multi_sample_patients
+FROM (
+  SELECT cancer_study_identifier, patient_unique_id, uniqExact(sample_unique_id) AS n_samples
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier IN ('msk_chord_2024','msk_met_2021','mycf_msk_2026','brca_aurora_2023','rms_msk_2026','prad_idhmut_msk_2025')
+    AND sample_unique_id != ''
+  GROUP BY cancer_study_identifier, patient_unique_id
+  HAVING n_samples >= 2
+)
+GROUP BY cancer_study_identifier"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"rms_msk_2026","multi_sample_patients":48},{"cancer_study_identifier":"mycf_msk_2026","multi_sample_patients":23},{"cancer_study_identifier":"msk_chord_2024","multi_sample_patients":90},{"cancer_study_identifier":"brca_aurora_2023","multi_sample_patients":51},{"cancer_study_identifier":"prad_idhmut_msk_2025","multi_sample_patients":4}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, count() AS sample_events, countIf(start_date != 0) AS nonzero_start_dates, uniqExactIf(patient_id, start_date != 0) AS patients_with_dates
+FROM clinical_event_derived
+WHERE lower(event_type) IN ('sample acquisition', 'specimen', 'biopsy')
+  AND cancer_study_identifier IN ('msk_chord_2024','msk_met_2021','mycf_msk_2026','brca_aurora_2023','rms_msk_2026','prad_idhmut_msk_2025','ptad_msk_2024','alk_msk_2026','asclc_msk_2024','pog570_bcgsc_2020','brca_mbcproject_2022','mpcproject_broad_2021','glioma_msk_2018','pancan_hcmi_2025','lung_msk_pdx','cll_broad_2022')
+GROUP BY cancer_study_identifier
+ORDER BY nonzero_start_dates DESC"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_chord_2024","sample_events":25040,"nonzero_start_dates":19729,"patients_with_dates":19659},{"cancer_study_identifier":"mycf_msk_2026","sample_events":3362,"nonzero_start_dates":3359,"patients_with_dates":3338},{"cancer_study_identifier":"pog570_bcgsc_2020","sample_events":570,"nonzero_start_dates":466,"patients_with_dates":466},{"cancer_study_identifier":"pancan_hcmi_2025","sample_events":665,"nonzero_start_dates":462,"patients_with_dates":445},{"cancer_study_identifier":"lung_msk_pdx","sample_events":318,"nonzero_start_dates":291,"patients_with_dates":166},{"cancer_study_identifier":"rms_msk_2026","sample_events":282,"nonzero_start_dates":281,"patients_with_dates":220},{"cancer_study_identifier":"brca_mbcproject_2022","sample_events":317,"nonzero_start_dates":242,"patients_with_dates":200},{"cancer_study_identifier":"brca_aurora_2023","sample_events":148,"nonzero_start_dates":144,"patients_with_dates":51},{"cancer_study_identifier":"prad_idhmut_msk_2025","sample_events":90,"nonzero_start_dates":85,"patients_with_dates":84},{"cancer_study_identifier":"glioma_msk_2018","sample_events":91,"nonzero_start_dates":77,"patients_with_dates":42},{"cancer_study_identifier":"mpcproject_broad_2021","sample_events":75,"nonzero_start_dates":68,"patients_with_dates":50},{"cancer_study_identifier":"ptad_msk_2024","sample_events":124,"nonzero_start_dates":65,"patients_with_dates":37},{"cancer_study_identifier":"alk_msk_2026","sample_events":52,"nonzero_start_dates":52,"patients_with_dates":46},{"cancer_study_identifier":"asclc_msk_2024","sample_events":40,"nonzero_start_dates":36,"patients_with_dates":19},{"cancer_study_identifier":"cll_broad_2022","sample_events":1009,"nonzero_start_dates":0,"patients_with_dates":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT patient_unique_id, uniqExact(value) AS n_samples, groupArray(start_date) AS dates
+FROM clinical_event_data_derived
+WHERE cancer_study_identifier = 'msk_chord_2024' AND event_type = 'Sample acquisition' AND key = 'SAMPLE_ID'
+  AND patient_unique_id IN (
+    SELECT patient_unique_id FROM clinical_event_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND event_type = 'Sample acquisition' AND key = 'SAMPLE_ID'
+    GROUP BY patient_unique_id HAVING uniqExact(value) >= 3)
+  AND start_date != 0
+GROUP BY patient_unique_id
+HAVING uniqExact(start_date) >= 3
+ORDER BY n_samples DESC
+LIMIT 20"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT patient_unique_id, key, value, start_date, stop_date, event_type
+FROM clinical_event_data_derived
+WHERE cancer_study_identifier = 'msk_chord_2024' AND event_type = 'Sample acquisition'
+  AND patient_unique_id IN (
+    SELECT patient_unique_id FROM clinical_event_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND event_type = 'Sample acquisition' AND key = 'SAMPLE_ID'
+    GROUP BY patient_unique_id HAVING uniqExact(value) >= 3 LIMIT 3)
+ORDER BY patient_unique_id, start_date, key
+LIMIT 60"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT patient_unique_id, key, value, start_date, stop_date
+FROM clinical_event_data_derived
+WHERE cancer_study_identifier = 'msk_chord_2024' AND event_type = 'Sample acquisition'
+  AND patient_unique_id IN (
+    SELECT patient_unique_id FROM clinical_event_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND event_type = 'Sample acquisition' AND key = 'SAMPLE_ID'
+    GROUP BY patient_unique_id HAVING uniqExact(value) >= 2 LIMIT 3)
+ORDER BY patient_unique_id, start_date, key
+LIMIT 60"
+}
+
+◀ result
+{"rows":[{"patient_unique_id":"msk_chord_2024_P-0014996","key":"SAMPLE_ID","value":"P-0014996-T01-IM6","start_date":-397,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0014996","key":"SEQ_DATE","value":"0","start_date":-397,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0014996","key":"SAMPLE_ID","value":"P-0014996-T02-IM6","start_date":0,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0014996","key":"SEQ_DATE","value":"55","start_date":0,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0020057","key":"SAMPLE_ID","value":"P-0020057-T02-IM6","start_date":-3415,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0020057","key":"SEQ_DATE","value":"652","start_date":-3415,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0020057","key":"SAMPLE_ID","value":"P-0020057-T01-IM6","start_date":0,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0020057","key":"SEQ_DATE","value":"0","start_date":0,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0070191","key":"SAMPLE_ID","value":"P-0070191-T01-IM7","start_date":-9,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0070191","key":"SEQ_DATE","value":"0","start_date":-9,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0070191","key":"SAMPLE_ID","value":"P-0070191-T02-IM7","start_date":1,"stop_date":0},{"patient_unique_id":"msk_chord_2024_P-0070191","key":"SEQ_DATE","value":"12","start_date":1,"stop_date":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH multi AS (
+  SELECT patient_unique_id FROM clinical_event_data_derived
+  WHERE cancer_study_identifier IN ('rms_msk_2026','mycf_msk_2026','brca_aurora_2023') AND event_type ILIKE 'sample acquisition' AND key = 'SAMPLE_ID'
+  GROUP BY patient_unique_id HAVING uniqExact(value) >= 2
+)
+SELECT cancer_study_identifier, patient_unique_id, key, value, start_date
+FROM clinical_event_data_derived
+WHERE cancer_study_identifier IN ('rms_msk_2026','mycf_msk_2026','brca_aurora_2023') AND event_type ILIKE 'sample acquisition'
+  AND key IN ('SAMPLE_ID')
+  AND patient_unique_id IN (SELECT patient_unique_id FROM multi)
+ORDER BY cancer_study_identifier, patient_unique_id, start_date
+LIMIT 200"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0001677","key":"SAMPLE_ID","value":"P-0001677-T01-IM3","start_date":-78},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0001677","key":"SAMPLE_ID","value":"P-0001677-T02-IM7","start_date":2933},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0005467","key":"SAMPLE_ID","value":"P-0005467-T01-IM5","start_date":-17},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0005467","key":"SAMPLE_ID","value":"P-0005467-T02-IM6","start_date":1250},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0006113","key":"SAMPLE_ID","value":"P-0006113-T01-IM5","start_date":-58},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0006113","key":"SAMPLE_ID","value":"P-0006113-T02-IM6","start_date":739},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0012824","key":"SAMPLE_ID","value":"P-0012824-T01-IM5","start_date":-62},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0012824","key":"SAMPLE_ID","value":"P-0012824-T04-IM7","start_date":1778},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0017418","key":"SAMPLE_ID","value":"P-0017418-T01-IM6","start_date":-24},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0017418","key":"SAMPLE_ID","value":"P-0017418-T02-IM6","start_date":157},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0039467","key":"SAMPLE_ID","value":"P-0039467-T02-IM6","start_date":-1457},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0039467","key":"SAMPLE_ID","value":"P-0039467-T01-IM6","start_date":-37},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0041409","key":"SAMPLE_ID","value":"P-0041409-T01-IM6","start_date":-31},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0041409","key":"SAMPLE_ID","value":"P-0041409-T05-IM7","start_date":733},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0044470","key":"SAMPLE_ID","value":"P-0044470-T01-IM6","start_date":-16},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0044470","key":"SAMPLE_ID","value":"P-0044470-T04-IM6","start_date":42},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0046262","key":"SAMPLE_ID","value":"P-0046262-T01-IM6","start_date":-361},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0046262","key":"SAMPLE_ID","value":"P-0046262-T02-IM6","start_date":-30},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P-0048889","key":"SAMPLE_ID","value":"P-0048889-T01-IM6","start_date":-39},{"cancer_study_identifier":"mycf_msk_2026","patient_unique_id":"mycf_msk_2026_P … (12497 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT sample_unique_id, attribute_name, attribute_value
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'rms_msk_2026' AND patient_unique_id = 'rms_msk_2026_P-0067414'
+  AND attribute_name IN ('SAMPLE_TYPE','CANCER_TYPE_DETAILED','ONCOTREE_CODE','SAMPLE_CLASS','SEQ_ASSAY_ID','CANCER_TYPE')
+ORDER BY sample_unique_id, attribute_name"
+}
+
+◀ result
+{"rows":[{"sample_unique_id":"rms_msk_2026_P-0067414-T02-IM7","attribute_name":"CANCER_TYPE","attribute_value":"Soft Tissue Sarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T02-IM7","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Alveolar Rhabdomyosarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T02-IM7","attribute_name":"ONCOTREE_CODE","attribute_value":"ARMS"},{"sample_unique_id":"rms_msk_2026_P-0067414-T02-IM7","attribute_name":"SAMPLE_CLASS","attribute_value":"Tumor"},{"sample_unique_id":"rms_msk_2026_P-0067414-T02-IM7","attribute_name":"SAMPLE_TYPE","attribute_value":"Primary"},{"sample_unique_id":"rms_msk_2026_P-0067414-T03-IM7","attribute_name":"CANCER_TYPE","attribute_value":"Soft Tissue Sarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T03-IM7","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Alveolar Rhabdomyosarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T03-IM7","attribute_name":"ONCOTREE_CODE","attribute_value":"ARMS"},{"sample_unique_id":"rms_msk_2026_P-0067414-T03-IM7","attribute_name":"SAMPLE_CLASS","attribute_value":"Tumor"},{"sample_unique_id":"rms_msk_2026_P-0067414-T03-IM7","attribute_name":"SAMPLE_TYPE","attribute_value":"Primary"},{"sample_unique_id":"rms_msk_2026_P-0067414-T04-IM7","attribute_name":"CANCER_TYPE","attribute_value":"Soft Tissue Sarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T04-IM7","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Alveolar Rhabdomyosarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T04-IM7","attribute_name":"ONCOTREE_CODE","attribute_value":"ARMS"},{"sample_unique_id":"rms_msk_2026_P-0067414-T04-IM7","attribute_name":"SAMPLE_CLASS","attribute_value":"Tumor"},{"sample_unique_id":"rms_msk_2026_P-0067414-T04-IM7","attribute_name":"SAMPLE_TYPE","attribute_value":"Metastasis"},{"sample_unique_id":"rms_msk_2026_P-0067414-T05-IM7","attribute_name":"CANCER_TYPE","attribute_value":"Soft Tissue Sarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T05-IM7","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Alveolar Rhabdomyosarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T05-IM7","attribute_name":"ONCOTREE_CODE","attribute_value":"ARMS"},{"sample_unique_id":"rms_msk_2026_P-0067414-T05-IM7","attribute_name":"SAMPLE_CLASS","attribute_value":"Tumor"},{"sample_unique_id":"rms_msk_2026_P-0067414-T05-IM7","attribute_name":"SAMPLE_TYPE","attribute_value":"Metastasis"},{"sample_unique_id":"rms_msk_2026_P-0067414-T06-IM7","attribute_name":"CANCER_TYPE","attribute_value":"Soft Tissue Sarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T06-IM7","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Alveolar Rhabdomyosarcoma"},{"sample_unique_id":"rms_msk_2026_P-0067414-T06-IM7","attribute_name":"ONCOTREE_CODE","attribute_value":"ARMS"},{"sample_unique_id":"rms_msk_2026_P-0067414-T06-IM7","attribute_name":"SAMPLE_CLASS","attribute_value":"Tumor"},{"sample_unique_id":"rms_msk_2026_P-0067414-T06-IM7","attribute_name":"SAMPLE_TYPE","att … (1239 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cs.cancer_study_identifier, cs.name, cs.sample_count, cs.type_of_cancer_id, cs.mutation_sample_count, cs.cna_sample_count
+FROM cancer_study cs
+WHERE cs.cancer_study_identifier IN ('rms_msk_2026')"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"rms_msk_2026","name":"ecDNA in Rhabdomyosarcoma (MSK, 2026)","sample_count":286,"type_of_cancer_id":"rms","mutation_sample_count":286,"cna_sample_count":286}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT event_type, key, value, start_date, stop_date
+FROM clinical_event_data_derived
+WHERE cancer_study_identifier = 'rms_msk_2026' AND patient_unique_id = 'rms_msk_2026_P-0067414'
+ORDER BY start_date, event_type, key
+LIMIT 60"
+}
+
+◀ result
+{"rows":[{"event_type":"Diagnosis","key":"PROGRESSION","value":"No","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"PROGRESSION_PROBABILITY","value":"0.124","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"RADIOLOGY_PROCEDURE_NAME","value":"FR MR LOWER EXTREMITY - CD","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"RADIOLOGY_PROCEDURE_NAME","value":"FR MR LOWER EXTREMITY - CD","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"SOURCE","value":"Radiology Reports (NLP)","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"SOURCE","value":"Radiology Reports (NLP)","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"SOURCE_SPECIFIC","value":"MR","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"SOURCE_SPECIFIC","value":"MR","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"STYLE_COLOR","value":"#2AA02B","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"STYLE_COLOR","value":"#D62727","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"SUBTYPE","value":"Progression","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"SUBTYPE","value":"Tumor Sites","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"TUMOR_SITE","value":"Bone","start_date":-47,"stop_date":0},{"event_type":"Diagnosis","key":"CLINICAL_GROUP","value":"2","start_date":-42,"stop_date":0},{"event_type":"Diagnosis","key":"DX_DESCRIPTION","value":"ALVEOLAR RHABDOMYOSARCOMA | CONN, LOWER LIMB (M8920/3 | C492)","start_date":-42,"stop_date":0},{"event_type":"Diagnosis","key":"DX_LATERALITY","value":"Right: origin of primary","start_date":-42,"stop_date":0},{"event_type":"Diagnosis","key":"PATH_GROUP","value":"2","start_date":-42,"stop_date":0},{"event_type":"Diagnosis","key":"SOURCE","value":"Tumor Registry","start_date":-42,"stop_date":0},{"event_type":"Diagnosis","key":"STAGE_CDM_DERIVED","value":"Stage 1-3","start_date":-42,"stop_date":0},{"event_type":"Diagnosis","key":"STAGE_CDM_DERIVED_GRANULAR","value":"2.0","start_date":-42,"stop_date":0},{"event_type":"Diagnosis","key":"SUBTYPE","value":"Primary","start_date":-42,"stop_date":0},{"event_type":"Diagnosis","key":"SUMMARY","value":"Localized","start_date":-42,"stop_date":0},{"event_type":"STATUS","key":"SOURCE","value":"First Consult","start_date":-33,"stop_date":0},{"event_type":"STATUS","key":"SUBTYPE","value":"Follow-Up","start_date":-33,"stop_date":0},{"event_type":"Measurements","key":"RESULT","value":"19.099999999999998","start_date":-29,"stop_date":0},{"event_type":"Measurements","key":"SOURCE","value":"Electronic Health Records","start_date":-29,"stop_date":0},{"event_type":"Measurements","key":"TEST","value":"BMI","start_date":-29,"stop_date":0},{"event_type":"TREATMENT","key":"INFERRED_TX_PROB","value":"0.09","start_date":-29,"stop_date":0},{"event_type":"TREATMENT","key":"PRIOR_MED_TO_MSK","value":"No prior medications","start_date":-29,"stop_date":0},{"event_typ … (3219 more chars)
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "rms_msk_2026"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"rms_msk_2026","name":"ecDNA in Rhabdomyosarcoma (MSK, 2026)","sampleCount":286,"studyViewUrl":"https://www.cbioportal.org/study?id=rms_msk_2026","metadata":{"clinicalAttributeIds":["ARCHER","BIOBANK_BIOFLUID_STATUS","BIOBANK_TISSUE_STATUS","CANCER_TYPE","CANCER_TYPE_DETAILED","ETHNICITY","FRACTION_GENOME_ALTERED","GCAP_CLASS","GENDER","GENE_PANEL","INSTITUTE","METASTATIC_SITE","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_PATIENT_ID","PARTA_CONSENTED_12_245","PARTC_CONSENTED_12_245","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","TIME_OF_FU","TUMOR_PURITY","VITAL_STATUS"],"molecularProfileIds":["rms_msk_2026_gistic","rms_msk_2026_mutations","rms_msk_2026_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ navigate_to_patient_view
+{
+ "studyIds": [
+  "rms_msk_2026"
+ ],
+ "patientId": "P-0067414",
+ "tab": "summary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/patient/summary?studyId=rms_msk_2026&caseId=P-0067414","url":"https://www.cbioportal.org/patient/summary?studyId=rms_msk_2026&caseId=P-0067414","data":{"patientUrls":[{"studyId":"rms_msk_2026","studyName":"ecDNA in Rhabdomyosarcoma (MSK, 2026)","url":"https://www.cbioportal.org/patient/summary?studyId=rms_msk_2026&caseId=P-0067414"}],"patientId":"P-0067414","tab":"summary","hasMultipleUrls":false,"pageDescription":"Patient overview including patient history timeline (if available) and tables of mutations, structural variants, and copy number alterations."}}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "rms_msk_2026"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=rms_msk_2026","url":"https://www.cbioportal.org/study/summary?id=rms_msk_2026","data":{"studyIds":["rms_msk_2026"],"studies":[{"studyId":"rms_msk_2026","name":"ecDNA in Rhabdomyosarcoma (MSK, 2026)","sampleCount":286}],"tab":"summary","hasFilters":false,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+I found one: the **ecDNA in Rhabdomyosarcoma (MSK, 2026)** study (`rms_msk_2026`, 286 samples). Patient **P-0067414** has seven samples collected over about four and a half years.
+
+| Sample | Type | Day offset* |
+|---|---|---|
+| T02 | Primary | -26 |
+| T03 | Primary | 78 |
+| T04 | Metastasis | 433 |
+| T05 | Metastasis | 982 |
+| T06 | Metastasis | 1080 |
+| T07 | Metastasis | 1351 |
+| T10 | Metastasis | 1582 |
+
+*Day offsets are relative to a study reference point, not calendar dates. The database doesn't record what that reference is, so I've reported them as offsets only. Diagnosis-related events for this patient fall at about -42 to -47 days.
+
+This study has 48 patients with two or more samples. Other studies with multi-sample patients and sample dates include `brca_aurora_2023` (51 patients) and `mycf_msk_2026` (23). `msk_chord_2024` has 90 such patients, but its sample dates are less consistent, so I didn't use it.
+
+Links:
+- [View patient P-0067414 (timeline and summary)](https://www.cbioportal.org/patient/summary?studyId=rms_msk_2026&caseId=P-0067414)
+- [View the study summary](https://www.cbioportal.org/study/summary?id=rms_msk_2026)

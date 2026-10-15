@@ -1,0 +1,263 @@
+Q (haiku-5.5): How does PTEN alteration (mutations or homozygous deletions) affect pAKT protein levels in lung squamous cell carcinoma?
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 1",
+ "max_rows": 1
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "lung squamous"
+}
+
+◀ result
+{"rows":[{"1":1}]}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"lusc_tcga","name":"Lung Squamous Cell Carcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"lusc","sample_count":511,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga"},{"cancer_study_identifier":"lusc_tcga_gdc","name":"Lung Squamous Cell Carcinoma (TCGA GDC, 2025)","type_of_cancer_id":"lusc","sample_count":503,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_gdc"},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","name":"Lung Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"lusc","sample_count":487,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lusc_tcga_pub","name":"Lung Squamous Cell Carcinoma (TCGA, Nature 2012)","type_of_cancer_id":"lusc","sample_count":178,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_tcga_pub"},{"cancer_study_identifier":"lusc_cptac_gdc","name":"Lung Squamous Cell Carcinoma (CPTAC GDC, 2025)","type_of_cancer_id":"lusc","sample_count":110,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_cptac_gdc"},{"cancer_study_identifier":"lusc_cptac_2021","name":"Lung Squamous Cell Carcinoma (CPTAC, Cell 2021)","type_of_cancer_id":"lusc","sample_count":80,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lusc_cptac_2021"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, count(DISTINCT hugo_gene_symbol) AS genes, count(DISTINCT sample_unique_id) AS samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier IN ('lusc_tcga_pan_can_atlas_2018','lusc_tcga_gdc','lusc_cptac_2021','lusc_cptac_gdc','lusc_tcga_pub','lusc_tcga')
+  AND (profile_type ILIKE '%prot%' OR profile_type ILIKE '%rppa%' OR profile_type ILIKE '%phos%')
+GROUP BY cancer_study_identifier, profile_type
+ORDER BY cancer_study_identifier, profile_type",
+ "max_rows": 100
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT hugo_gene_symbol, profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier IN ('lusc_cptac_2021','lusc_tcga_pan_can_atlas_2018','lusc_cptac_gdc')
+  AND hugo_gene_symbol ILIKE 'AKT%'
+ORDER BY hugo_gene_symbol, profile_type",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"lusc_cptac_2021","profile_type":"protein_quantification","genes":11093,"samples":108},{"cancer_study_identifier":"lusc_cptac_2021","profile_type":"protein_quantification_zscores","genes":3115,"samples":108},{"cancer_study_identifier":"lusc_tcga","profile_type":"rppa","genes":234,"samples":328},{"cancer_study_identifier":"lusc_tcga","profile_type":"rppa_Zscores","genes":233,"samples":328},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","profile_type":"rppa","genes":209,"samples":317},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","profile_type":"rppa_Zscores","genes":209,"samples":317}]}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"AKT1","profile_type":"cna"},{"hugo_gene_symbol":"AKT1","profile_type":"gistic"},{"hugo_gene_symbol":"AKT1","profile_type":"log2CNA"},{"hugo_gene_symbol":"AKT1","profile_type":"methylation_epic"},{"hugo_gene_symbol":"AKT1","profile_type":"mrna_seq_fpkm"},{"hugo_gene_symbol":"AKT1","profile_type":"mrna_seq_fpkm_Zscores"},{"hugo_gene_symbol":"AKT1","profile_type":"mrna_seq_read_counts_Zscores"},{"hugo_gene_symbol":"AKT1","profile_type":"mrna_seq_tpm"},{"hugo_gene_symbol":"AKT1","profile_type":"mrna_seq_tpm_Zscores"},{"hugo_gene_symbol":"AKT1","profile_type":"protein_quantification"},{"hugo_gene_symbol":"AKT1","profile_type":"rna_seq_mrna"},{"hugo_gene_symbol":"AKT1","profile_type":"rna_seq_v2_mrna"},{"hugo_gene_symbol":"AKT1","profile_type":"rna_seq_v2_mrna_median_Zscores"},{"hugo_gene_symbol":"AKT1","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"hugo_gene_symbol":"AKT1","profile_type":"rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores"},{"hugo_gene_symbol":"AKT1","profile_type":"rppa"},{"hugo_gene_symbol":"AKT1","profile_type":"rppa_Zscores"},{"hugo_gene_symbol":"AKT1S1","profile_type":"cna"},{"hugo_gene_symbol":"AKT1S1","profile_type":"gistic"},{"hugo_gene_symbol":"AKT1S1","profile_type":"log2CNA"},{"hugo_gene_symbol":"AKT1S1","profile_type":"methylation_epic"},{"hugo_gene_symbol":"AKT1S1","profile_type":"mrna_seq_fpkm"},{"hugo_gene_symbol":"AKT1S1","profile_type":"mrna_seq_fpkm_Zscores"},{"hugo_gene_symbol":"AKT1S1","profile_type":"mrna_seq_read_counts_Zscores"},{"hugo_gene_symbol":"AKT1S1","profile_type":"mrna_seq_tpm"},{"hugo_gene_symbol":"AKT1S1","profile_type":"mrna_seq_tpm_Zscores"},{"hugo_gene_symbol":"AKT1S1","profile_type":"protein_quantification"},{"hugo_gene_symbol":"AKT1S1","profile_type":"rna_seq_mrna"},{"hugo_gene_symbol":"AKT1S1","profile_type":"rna_seq_v2_mrna"},{"hugo_gene_symbol":"AKT1S1","profile_type":"rna_seq_v2_mrna_median_Zscores"},{"hugo_gene_symbol":"AKT1S1","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"hugo_gene_symbol":"AKT1S1","profile_type":"rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores"},{"hugo_gene_symbol":"AKT1S1_PT246","profile_type":"rppa"},{"hugo_gene_symbol":"AKT1S1_PT246","profile_type":"rppa_Zscores"},{"hugo_gene_symbol":"AKT1_PS473","profile_type":"rppa"},{"hugo_gene_symbol":"AKT1_PS473","profile_type":"rppa_Zscores"},{"hugo_gene_symbol":"AKT1_PT308","profile_type":"rppa"},{"hugo_gene_symbol":"AKT1_PT308","profile_type":"rppa_Zscores"},{"hugo_gene_symbol":"AKT2","profile_type":"cna"},{"hugo_gene_symbol":"AKT2","profile_type":"gistic"},{"hugo_gene_symbol":"AKT2","profile_type":"log2CNA"},{"hugo_gene_symbol":"AKT2","profile_type":"methylation_epic"},{"hugo_gene_symbol":"AKT2","profile_type":"mrna_seq_fpkm"},{"hugo_gene_symbol":"AKT2","profile_type":"mrna_seq_fpkm_Zscores"},{"hugo_gene_symbol":"AKT2","profile_type":"mrna_seq_read_counts_Zscores"},{"hugo_gene_symbol":"AKT2","profile_type":"mrna_seq_tpm"},{"hugo_gene_symbol":"AKT2","profile_typ … (3728 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+◀ result
+{"columns":[{"name":"mutation_event_id","type":"Int64","comment":"References mutation_event.mutation_event_id."},{"name":"genetic_profile_id","type":"Int64","comment":"References genetic_profile.genetic_profile_id."},{"name":"sample_id","type":"Int64","comment":"References sample.internal_id."},{"name":"entrez_gene_id","type":"Int64","comment":"References gene.entrez_gene_id."},{"name":"center","type":"Nullable(String)","comment":"Center where sequencing was performed."},{"name":"sequencer","type":"Nullable(String)","comment":"Sequencing platform used."},{"name":"mutation_status","type":"Nullable(String)","comment":"Mutation status: Germline,\n    Somatic,\n    or LOH."},{"name":"validation_status","type":"Nullable(String)","comment":"Validation status."},{"name":"tumor_seq_allele1","type":"Nullable(String)","comment":"Tumor allele 1 sequence."},{"name":"tumor_seq_allele2","type":"Nullable(String)","comment":"Tumor allele 2 sequence."},{"name":"matched_norm_sample_barcode","type":"Nullable(String)","comment":"Matched normal sample barcode."},{"name":"match_norm_seq_allele1","type":"Nullable(String)","comment":"Matched normal allele 1 sequence."},{"name":"match_norm_seq_allele2","type":"Nullable(String)","comment":"Matched normal allele 2 sequence."},{"name":"tumor_validation_allele1","type":"Nullable(String)","comment":"Tumor validation allele 1 sequence."},{"name":"tumor_validation_allele2","type":"Nullable(String)","comment":"Tumor validation allele 2 sequence."},{"name":"match_norm_validation_allele1","type":"Nullable(String)","comment":"Matched normal validation allele 1."},{"name":"match_norm_validation_allele2","type":"Nullable(String)","comment":"Matched normal validation allele 2."},{"name":"verification_status","type":"Nullable(String)","comment":"Verification status."},{"name":"sequencing_phase","type":"Nullable(String)","comment":"Sequencing phase."},{"name":"sequence_source","type":"String","comment":"Source of sequencing data."},{"name":"validation_method","type":"Nullable(String)","comment":"Validation method used."},{"name":"score","type":"Nullable(String)","comment":"Score or quality metric."},{"name":"bam_file","type":"Nullable(String)","comment":"Associated BAM file."},{"name":"tumor_alt_count","type":"Nullable(Int64)","comment":"Tumor alternate allele count."},{"name":"tumor_ref_count","type":"Nullable(Int64)","comment":"Tumor reference allele count."},{"name":"normal_alt_count","type":"Nullable(Int64)","comment":"Normal alternate allele count."},{"name":"normal_ref_count","type":"Nullable(Int64)","comment":"Normal reference allele count."},{"name":"amino_acid_change","type":"Nullable(String)","comment":"Amino acid change from mutation."},{"name":"annotation_json","type":"Nullable(String)","comment":"JSON-formatted annotations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH rppa AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rppa'
+      AND hugo_gene_symbol = 'AKT1_PS473'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+mut AS (
+    SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PTEN' AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+),
+del AS (
+    SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lusc_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'PTEN' AND variant_type = 'cna' AND cna_alteration = -2
+),
+grp AS (
+    SELECT r.sample_unique_id, r.v,
+      multiIf(
+        r.sample_unique_id IN (SELECT sample_unique_id FROM mut) AND r.sample_unique_id IN (SELECT sample_unique_id FROM del), 'PTEN mutant + HOMDEL',
+        r.sample_unique_id IN (SELECT sample_unique_id FROM mut), 'PTEN mutant',
+        r.sample_unique_id IN (SELECT sample_unique_id FROM del), 'PTEN HOMDEL',
+        'PTEN no mutation / no deep deletion') AS pten_status
+    FROM rppa r
+)
+SELECT pten_status,
+       count() AS samples,
+       round(avg(v), 3) AS mean_AKT1_pS473,
+       round(quantile(0.5)(v), 3) AS median_AKT1_pS473,
+       round(quantile(0.25)(v), 3) AS q1,
+       round(quantile(0.75)(v), 3) AS q3
+FROM grp
+GROUP BY pten_status
+ORDER BY pten_status",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"pten_status":"PTEN HOMDEL","samples":34,"mean_AKT1_pS473":-0.138,"median_AKT1_pS473":-0.139,"q1":-0.83,"q3":0.583},{"pten_status":"PTEN mutant","samples":33,"mean_AKT1_pS473":-0.088,"median_AKT1_pS473":-0.205,"q1":-0.774,"q3":0.282},{"pten_status":"PTEN no mutation / no deep deletion","samples":250,"mean_AKT1_pS473":-0.785,"median_AKT1_pS473":-0.88,"q1":-1.346,"q3":-0.408}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH rppa AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'lusc_tcga' AND profile_type = 'rppa'
+      AND hugo_gene_symbol = 'AKT1_PS473'
+      AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+mut AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lusc_tcga' AND hugo_gene_symbol = 'PTEN' AND variant_type = 'mutation' AND mutation_status != 'UNCALLED'),
+del AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'lusc_tcga' AND hugo_gene_symbol = 'PTEN' AND variant_type = 'cna' AND cna_alteration = -2),
+grp AS (
+    SELECT r.v, multiIf(
+        r.sample_unique_id IN (SELECT sample_unique_id FROM mut) AND r.sample_unique_id IN (SELECT sample_unique_id FROM del), 'PTEN mutant + HOMDEL',
+        r.sample_unique_id IN (SELECT sample_unique_id FROM mut), 'PTEN mutant',
+        r.sample_unique_id IN (SELECT sample_unique_id FROM del), 'PTEN HOMDEL',
+        'PTEN no mutation / no deep deletion') AS pten_status
+    FROM rppa r)
+SELECT pten_status, count() AS samples, round(quantile(0.5)(v), 3) AS median_AKT1_pS473
+FROM grp GROUP BY pten_status ORDER BY pten_status",
+ "max_rows": 20
+}
+
+◀ result
+{"rows":[{"pten_status":"PTEN HOMDEL","samples":34,"median_AKT1_pS473":0.619},{"pten_status":"PTEN mutant","samples":8,"median_AKT1_pS473":0.92},{"pten_status":"PTEN no mutation / no deep deletion","samples":286,"median_AKT1_pS473":-0.092}]}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "lusc_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "PTEN",
+  "AKT1_PS473"
+ ],
+ "tab": "plots",
+ "plotsHorzSelection": {
+  "selectedGeneOption": "PTEN",
+  "dataType": "mutations"
+ },
+ "plotsVertSelection": {
+  "selectedGeneOption": "AKT1_PS473",
+  "dataType": "RPPA"
+ }
+}
+
+◀ result
+{"success":false,"error":"No valid genes found","details":{"providedGenes":["PTEN","AKT1_PS473"]}}
+
+═ answer (success)
+**Short answer:** In TCGA lung squamous cell carcinoma, tumors with PTEN somatic mutations or PTEN homozygous deletions have higher phospho-AKT (pAKT, Ser473) protein levels than tumors with intact PTEN. The difference is large in the PanCancer Atlas cohort. I did not run a significance test, so this is descriptive only.
+
+**PanCancer Atlas LUSC (`lusc_tcga_pan_can_atlas_2018`), AKT1_PS473 by RPPA, samples with protein data (n = 317 of 487)**
+
+| PTEN status | Samples (% of 317) | Median pAKT (S473) | Mean | IQR (Q1–Q3) |
+|---|---|---|---|---|
+| No mutation and no deep deletion | 250 (78.9%) | −0.88 | −0.79 | −1.35 to −0.41 |
+| PTEN mutant | 33 (10.4%) | −0.21 | −0.09 | −0.77 to 0.28 |
+| PTEN homozygous deletion | 34 (10.7%) | −0.14 | −0.14 | −0.83 to 0.58 |
+
+No sample carried both a mutation and a deletion. The values are the study's RPPA protein levels, which are relative and not on an absolute scale.
+
+**Cross-check in the older Firehose LUSC study (`lusc_tcga`)**
+
+- No PTEN alteration: 286 samples, median −0.09
+- PTEN mutant: 8 samples, median 0.92
+- PTEN homozygous deletion: 34 samples, median 0.62
+
+The direction is the same: altered tumors have higher pAKT than unaltered ones. The absolute values differ between the two RPPA batches, so compare within a study rather than across them. The mutant group is small here (8 samples), so treat that estimate as unstable.
+
+**Caveats**
+- The readout is AKT1 phosphorylated at Ser473 by RPPA, an antibody-based measurement. It is not total AKT and not a mass-spectrometry phosphosite.
+- The CPTAC LUSC studies have protein data but no equivalent pAKT readout that I could find, so they could not be used.
+
+You can explore the cohort in the [lusc_tcga_pan_can_atlas_2018 study page](https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018). Use its Plots tab to plot PTEN alteration against the AKT1_PS473 protein level. My attempt to build a direct Plots link failed because the gene symbol was not accepted, so that link is not included.

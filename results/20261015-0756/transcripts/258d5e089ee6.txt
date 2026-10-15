@@ -1,0 +1,338 @@
+Q (haiku-5.5): Are there studies that were not processed using polyA enrichment in order to explore lncRNA-related questions?
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_id, display_name, description, cancer_study_identifier FROM clinical_attribute_meta WHERE lower(attribute_id) LIKE '%poly%' OR lower(attribute_id) LIKE '%library%' OR lower(attribute_id) LIKE '%ribo%' OR lower(attribute_id) LIKE '%rna_%' OR lower(attribute_id) LIKE '%capture%' OR lower(display_name) LIKE '%poly%' OR lower(display_name) LIKE '%library%' OR lower(display_name) LIKE '%ribo%' OR lower(description) LIKE '%poly%a%' OR lower(description) LIKE '%ribodepl%' OR lower(description) LIKE '%total rna%'",
+ "max_rows": 200
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `attribute_id` in scope SELECT attribute_id, display_name, description, cancer_study_identifier FROM clinical_attribute_meta WHERE (lower(attribute_id) LIKE '%poly%') OR (lower(attribute_id) LIKE '%library%') OR (lower(attribute_id) LIKE '%ribo%') OR (lower(attribute_id) LIKE '%rna_%') OR (lower(attribute_id) LIKE '%capture%') OR (lower(display_name) LIKE '%poly%') OR (lower(display_name) LIKE '%library%') OR (lower(display_name) LIKE '%ribo%') OR (lower(description) LIKE '%poly%a%') OR (lower(description) LIKE '%ribodepl%') OR (lower(description) LIKE '%total rna%'). (UNKNOWN_IDENTIFIER) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, description FROM cancer_study WHERE lower(description) LIKE '%polya%' OR lower(description) LIKE '%poly-a%' OR lower(description) LIKE '%poly a%' OR lower(description) LIKE '%ribodeplet%' OR lower(description) LIKE '%ribo-deplet%' OR lower(description) LIKE '%total rna%' OR lower(description) LIKE '%lncrna%' OR lower(name) LIKE '%lncrna%'",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_attribute_meta"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"attr_id","type":"String"},{"name":"display_name","type":"String"},{"name":"description","type":"String"},{"name":"datatype","type":"String"},{"name":"patient_attribute","type":"Int32"},{"name":"priority","type":"String"},{"name":"cancer_study_id","type":"Int64"}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attr_id, display_name, description, cancer_study_id FROM clinical_attribute_meta WHERE lower(attr_id) LIKE '%poly%' OR lower(attr_id) LIKE '%library%' OR lower(attr_id) LIKE '%ribo%' OR lower(attr_id) LIKE '%capture%' OR lower(attr_id) LIKE '%rna%' OR lower(display_name) LIKE '%poly%' OR lower(display_name) LIKE '%library%' OR lower(display_name) LIKE '%ribo%' OR lower(description) LIKE '%poly%' OR lower(description) LIKE '%ribodepl%' OR lower(description) LIKE '%total rna%' OR lower(description) LIKE '%lncrna%' ORDER BY attr_id",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[{"attr_id":"ALTERNATE_THERAPY","display_name":"Alternative Therapy Given","description":"Alternative Therapy Given","cancer_study_id":15},{"attr_id":"ALTERNATE_THERAPY_OTHER","display_name":"Other Alternative Therapy Given","description":"Other Alternative Therapy Given","cancer_study_id":15},{"attr_id":"ALTERNATE_THERAPY_OTHER","display_name":"Other Alternative Therapy Given","description":"Other Alternative Therapy Given","cancer_study_id":230},{"attr_id":"ALTERNATIVE_DX_BINARY","display_name":"Alternative Diagnosis Binary","description":"Alternativa Diagnosis Binary(Yes/No)","cancer_study_id":136},{"attr_id":"AR_CAPTURE_SCORE","display_name":"AR Score (Capture)","description":"AR Score (Capture)","cancer_study_id":537},{"attr_id":"AR_MRNA","display_name":"AR mRNA","description":"AR mRNA","cancer_study_id":515},{"attr_id":"AR_POLYA_SCORE","display_name":"AR Score (PolyA)","description":"AR Score (PolyA)","cancer_study_id":537},{"attr_id":"AVE_RNA_PURITY","display_name":"Average RNA Purity","description":"Average RNA Purity","cancer_study_id":515},{"attr_id":"BASELINE_EXTERNAL_HER2_IHC_FISH","display_name":"Baseline external HER2 IHC/FISH","description":"Baseline external HER2 IHC/FISH","cancer_study_id":133},{"attr_id":"BASELINE_INTERNAL_HER2_IHC_FISH","display_name":"Baseline internal HER2 IHC/FISH","description":"Baseline internal HER2 IHC/FISH","cancer_study_id":133},{"attr_id":"CAPTURE_ARV7_SRPM","display_name":"Capture ARV7 SRPM spliced reads per million","description":"Capture ARV7 SRPM spliced reads per million","cancer_study_id":537},{"attr_id":"CAPTURE_BAIT_SET","display_name":"Capture Bait Set","description":"Bait Set used in capture","cancer_study_id":96},{"attr_id":"COLONIC_POLYPS","display_name":"Colonic Polyps","description":"Colonic Polyps(Yes/No)","cancer_study_id":136},{"attr_id":"DNP_COUNT","display_name":"DNP Count","description":"Count of  di-nucleotide polymorphisms (DNP) using WES mutation calls","cancer_study_id":545},{"attr_id":"DNP_COUNT_GG_TO_TT_OR_CC_TO_AA","display_name":"DNP Count Gg->Tt Or Cc->Aa","description":"Count of GG -> TT or CC -> AA di-nucleotide polymorphisms (DNP) using WES mutation calls","cancer_study_id":545},{"attr_id":"DNP_GG_TO_TT_OR_CC_TO_AA_COUNT_WGS","display_name":"Dnp Gg->Tt Or Cc->Aa Count","description":"Count of GG -> TT or CC -> AA di-nucleotide polymorphisms (DNP) using WGS mutation calls","cancer_study_id":544},{"attr_id":"EPIDURNALMASS_METS","display_name":"Epidurnal Mass Metastasis","description":"Epidurnal Mass Metastasis(Yes/No)","cancer_study_id":136},{"attr_id":"EXOME_CAPTURE","display_name":"Exome Capture","description":"Exome Capture","cancer_study_id":94},{"attr_id":"EXTERNAL_PATIENT_ID","display_name":"External Patient ID","description":"External Patient Identifier","cancer_study_id":43},{"attr_id":"FUSION_BY_RNA_PCR","display_name":"Fusion By RNA PCR","description":"Fusion By RNA PCR","cancer_study_id":126},{"attr_id":"HAS_RNASEQ","display_name":"Has RNASeq","descript … (11066 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, attribute_value, count() AS n, uniqExact(cancer_study_identifier) AS studies FROM clinical_data_derived WHERE lower(attribute_name) LIKE '%poly%' OR lower(attribute_name) LIKE '%librar%' OR lower(attribute_name) LIKE '%ribo%' OR lower(attribute_name) LIKE '%capture%' OR lower(attribute_name) LIKE '%rna%' OR lower(attribute_name) LIKE '%prep%' OR lower(attribute_name) LIKE '%selection%' GROUP BY attribute_name, attribute_value ORDER BY attribute_name, n DESC LIMIT 200",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[{"attribute_name":"ALLELE_SELECTION","n":1179,"studies":1},{"attribute_name":"ALLELE_SELECTION","attribute_value":"Balanced","n":676,"studies":1},{"attribute_name":"ALLELE_SELECTION","attribute_value":"Selection for Mutant Allele","n":449,"studies":1},{"attribute_name":"ALLELE_SELECTION","attribute_value":"Selection for WT allele","n":32,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","n":1261,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy","n":126,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"CHEMOTHERAPY","n":80,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy; XRT","n":21,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"CHEMOTHERAPY; RADIATION (NOS); Transplant","n":11,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy; Stem Cell Transplant; XRT","n":8,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"CHEMOTHERAPY; Transplant","n":8,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy; Stem Cell Transplant","n":8,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy; Radiation (NOS); Transplant","n":6,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Transplant","n":5,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"CHEMOTHERAPY; OTHER THERAPY","n":3,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy; Transplant","n":3,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"CHEMOTHERAPY; RADIATION (NOS)","n":2,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"CHEMOTHERAPY; Transplant; OTHER THERAPY","n":2,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Stem Cell Transplant","n":1,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy; XRT; Other","n":1,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Stem Cell Transplant; Chemotherapy","n":1,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy; Radiation (NOS)","n":1,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Transplant; Other","n":1,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"Chemotherapy; Chemotherapy; XRT","n":1,"studies":1},{"attribute_name":"ALTERNATE_THERAPY","attribute_value":"SURGERY","n":1,"studies":1},{"attribute_name":"ALTERNATE_THERAPY_OTHER","n":1559,"studies":2},{"attribute_name":"ALTERNATE_THERAPY_OTHER","attribute_value":"vaccine","n":2,"studies":1},{"attribute_name":"ALTERNATE_THERAPY_OTHER","attribute_value":"MLN8237","n":2,"studies":1},{"attribute_name":"ALTERNATE_THERAPY_OTHER","attribute_value":"Patient following AALL0232 therapy","n":1,"studies":1},{"attribute_name":"ALTERNATE_THERAPY_OTHER","attribute_value":"Maintenance therapy was extended 6 months from initial end of therapy in  … (15500 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, sample_count, rna_seq_sample_count, mrna_expression_sample_count FROM cancer_study WHERE lower(description) LIKE '%poly%' OR lower(name) LIKE '%poly%' OR lower(description) LIKE '%capture%' OR lower(description) LIKE '%ribo%' OR lower(description) LIKE '%total rna%' OR lower(description) LIKE '%lncrna%' OR lower(description) LIKE '%long non%' OR lower(description) LIKE '%noncoding%' OR lower(description) LIKE '%non-coding%' OR lower(description) LIKE '%whole transcriptome%' ORDER BY cancer_study_identifier",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"ccle_genentech_2014","name":"Cancer Cell Line Encyclopedia (Genentech, Nat biotech 2014)","sample_count":675,"rna_seq_sample_count":0,"mrna_expression_sample_count":675},{"cancer_study_identifier":"crc_hta11_htan_2021","name":"Pre-cancer Colorectal Polyps (HTAN Vanderbilt, Cell 2021)","sample_count":61,"rna_seq_sample_count":0,"mrna_expression_sample_count":55},{"cancer_study_identifier":"crc_sysucc_2022","name":"Colorectal Cancer- ChangKang Project (SYSUCC, Nat Commun 2022)","sample_count":1015,"rna_seq_sample_count":0,"mrna_expression_sample_count":0},{"cancer_study_identifier":"egc_trap_msk_2020","name":"Esophageal Cancer-TRAP Project (MSK, Lancet Oncol 2020)","sample_count":68,"rna_seq_sample_count":0,"mrna_expression_sample_count":0},{"cancer_study_identifier":"lipo_msk_2026","name":"Liposarcoma (MSK, 2026)","sample_count":277,"rna_seq_sample_count":0,"mrna_expression_sample_count":0},{"cancer_study_identifier":"lung_smc_2016","name":"Lung Cancer (SMC, Cancer Research 2016)","sample_count":22,"rna_seq_sample_count":0,"mrna_expression_sample_count":21}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, attribute_value, count() AS n, uniqExact(cancer_study_identifier) AS studies FROM clinical_data_derived WHERE lower(attribute_value) LIKE '%poly%a%' OR lower(attribute_value) LIKE '%poly-a%' OR lower(attribute_value) LIKE '%ribodepl%' OR lower(attribute_value) LIKE '%ribo-dep%' OR lower(attribute_value) LIKE '%total rna%' OR lower(attribute_value) LIKE '%capture%' OR lower(attribute_value) LIKE '%lncrna%' GROUP BY attribute_name, attribute_value ORDER BY n DESC LIMIT 100",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Polycythemia Vera","n":78,"studies":2},{"attribute_name":"CLONALITY","attribute_value":"polyclonal","n":70,"studies":1},{"attribute_name":"GENE_PANEL","attribute_value":"Custom capture","n":65,"studies":1},{"attribute_name":"DETAILED_CANCER_TYPE","attribute_value":"Polycythemia Vera","n":40,"studies":1},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Polycythemia vera","n":23,"studies":1},{"attribute_name":"HISTOLOGY","attribute_value":"Polycythemia vera","n":23,"studies":1},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Polymorphous Low-Grade Neuroepithelial Tumor of the Young","n":10,"studies":1},{"attribute_name":"HISTOLOGY_TIER4","attribute_value":"Polycythemia vera","n":9,"studies":1},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Polycythaemia Vera Myelofibrosis","n":4,"studies":2},{"attribute_name":"DETAILED_CANCER_TYPE","attribute_value":"Polycythaemia Vera Myelofibrosis","n":3,"studies":1},{"attribute_name":"CHARACTERISTICS","attribute_value":"polypoid; monolayer","n":2,"studies":1},{"attribute_name":"CHARACTERISTICS","attribute_value":"Elongated polygonal","n":1,"studies":1},{"attribute_name":"CHARACTERISTICS","attribute_value":"lymphoblastoid, round to polygonal cells growing in clusters in suspention","n":1,"studies":1},{"attribute_name":"CHARACTERISTICS","attribute_value":"Round cells to occasionally polynucleated, single cells in suspension, few adherent","n":1,"studies":1},{"attribute_name":"PRIOR_TREATMENT","attribute_value":"Hydrea for polycythemia vera","n":1,"studies":1},{"attribute_name":"CHARACTERISTICS","attribute_value":"single cells in suspention, round or polymorphic cells, very few are giant cells","n":1,"studies":1},{"attribute_name":"CHARACTERISTICS","attribute_value":"Adherent polygonal and fusiform","n":1,"studies":1},{"attribute_name":"METHOD_OF_INITIAL_SAMPLE_PROCUREMENT_OTHER","attribute_value":"polyp removal","n":1,"studies":1},{"attribute_name":"CHARACTERISTICS","attribute_value":"epithelial- like polygonal or round and flat cells (sometimes spindle- form, very heterogenous) growing in monolayers","n":1,"studies":1},{"attribute_name":"VARIANT_SUMMARY","attribute_value":"EP300 (p.P318A (possible germline polymorphism); MAF 41%)|FAM5C (p.R353C (possible germline polymorphism); MAF 44%)|NOTCH2 (p.E366V; MAF 65%)|PHF6 (p.T12fs*23 (5 bp insertion with frame-shift); MAF 40%)|PTPN11 (p.D61V (confirmed somatic); MAF 39%) (Solid ","n":1,"studies":1},{"attribute_name":"SURFACE_ANTIGENS","attribute_value":"normocytic, normochromic, mild anisopoikilocytosis, no sig. polychromasia. Leukocyte number-decreased,leukocyte morph-within normal limits.","n":1,"studies":1},{"attribute_name":"OTHER_SYMPTOMS","attribute_value":"Recurrent Bleeding From Gastric Polyp, Noted On Routine Egd/Colo Screening (Gerd, Hx Gastric Polyp Since 2013)","n":1,"studies":1},{"attribute_name":"OTHER_SYMPTOMS","attribute_value":"Fatigue, Thirst, Pol … (3906 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, description, rna_seq_sample_count, mrna_expression_sample_count FROM cancer_study WHERE lower(description) LIKE '%library%' OR lower(description) LIKE '%selection%' OR lower(description) LIKE '%transcriptome%' OR lower(name) LIKE '%capture%' OR cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study WHERE cancer_study_id = 537) OR lower(description) LIKE '%rna-seq%' AND lower(description) LIKE '%total%' ORDER BY cancer_study_identifier",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"coad_silu_2022","name":"Colon Cancer (Sidra-LUMC AC-ICAM, Nat Med 2023)","description":"Whole exome and transcriptome sequencing of 348 Colon Cancers and their matched normals from Sidra-LUMC AC-ICAM.","rna_seq_sample_count":0,"mrna_expression_sample_count":348},{"cancer_study_identifier":"luad_oncosg_2020","name":"Lung Adenocarcinoma (OncoSG, Nat Genet 2020)","description":"Whole-exome and transcriptome sequencing of 305 east asian lung adenocarcinomas with matched normals. Courtesy of <a href=\"https://src.gisapps.org/OncoSG/\">OncoSG</a>. Lung Cancer Consortium Singapore (LCCS).","rna_seq_sample_count":181,"mrna_expression_sample_count":169},{"cancer_study_identifier":"lung_smc_2016","name":"Lung Cancer (SMC, Cancer Research 2016)","description":"Whole exome and whole transcriptome sequencing of primary and multiple metastatic lymph node samples from 6 lung cancer patients with their matched normals.","rna_seq_sample_count":0,"mrna_expression_sample_count":21},{"cancer_study_identifier":"mel_tsam_liang_2017","name":"Acral Melanoma (TGEN, Genome Res 2017)","description":"Whole exome sequencing and transcriptome analysis of 34 Acral Melanoma patients (33 with matched normals).","rna_seq_sample_count":0,"mrna_expression_sample_count":36},{"cancer_study_identifier":"metastatic_solid_tumors_mich_2017","name":"Metastatic Solid Cancers (UMich, Nature 2017)","description":"Whole-exome and -transcriptome sequencing of 500 adult patients with metastatic solid tumor/primary normal pairs of diverse lineage and biopsy site.","rna_seq_sample_count":0,"mrna_expression_sample_count":0},{"cancer_study_identifier":"pog570_bcgsc_2020","name":"Pan-cancer Analysis of Advanced and Metastatic Tumors (BCGSC, Nature Cancer 2020)","description":"Whole-genome and transcriptome sequencing of 570 advanced and metastatic cancers and their matched normals.","rna_seq_sample_count":0,"mrna_expression_sample_count":570},{"cancer_study_identifier":"prad_eururol_2017","name":"Prostate Adenocarcinoma (SMMU, Eur Urol 2017)","description":"Whole-genome and transcriptome sequencing of 65 Prostate Adenocarcinoma  tumor/normal pairs.","rna_seq_sample_count":0,"mrna_expression_sample_count":65},{"cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","description":"Whole exome sequencing of 444 castrate resistant prostate cancer tumor/normal pairs. SU2C-PCF Dream Team: Precision Therapy for Advanced Prostate Cancer.","rna_seq_sample_count":0,"mrna_expression_sample_count":328},{"cancer_study_identifier":"prostate_dkfz_2018","name":"Prostate Cancer (DKFZ, Cancer Cell 2018)","description":"Whole genome and transcriptome sequencing of tumor/normal pairs from 292 prostate cancer patients.","rna_seq_sample_count":0,"mrna_expression_sample_count":118}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attr_id, display_name, description, cancer_study_id FROM clinical_attribute_meta WHERE cancer_study_id IN (537, 515, 22, 547) ORDER BY cancer_study_id, attr_id",
+ "max_rows": 300
+}
+
+◀ result
+{"rows":[{"attr_id":"AGE_RESECTED","display_name":"Age (tumor resected)","description":"Patient age when the tumor was resected","cancer_study_id":22},{"attr_id":"CANCER_TYPE","display_name":"Cancer Type","description":"Cancer Type","cancer_study_id":22},{"attr_id":"CANCER_TYPE_DETAILED","display_name":"Cancer Type Detailed","description":"Cancer Type Detailed","cancer_study_id":22},{"attr_id":"GENE_PANEL","display_name":"Gene Panel","description":"Gene Panel","cancer_study_id":22},{"attr_id":"GORLIN_SPORADIC","display_name":"Gorlin Sporadic","description":"Gorlin Sporadic","cancer_study_id":22},{"attr_id":"HISTOLOGICAL_SUBTYPE","display_name":"Tumor Other Histologic Subtype","description":"Text to describe a tumor's histologic subtype or mixed diagnosis that is different from previously specified options.","cancer_study_id":22},{"attr_id":"MULTIPLE_TUMORS","display_name":"Multiple Tumors","description":"Patients that have more than one tumor","cancer_study_id":22},{"attr_id":"MUTATION_COUNT","display_name":"Mutation Count","description":"Mutation Count","cancer_study_id":22},{"attr_id":"ONCOTREE_CODE","display_name":"Oncotree Code","description":"Oncotree Code","cancer_study_id":22},{"attr_id":"POPULATION","display_name":"Population","description":"Population","cancer_study_id":22},{"attr_id":"RNA","display_name":"RNA","description":"RNA was extracted for this sample: NA=not available, paired: tumor and normal skin RNA available, unpaired: only tumor RNA available.","cancer_study_id":22},{"attr_id":"SAMPLE_COUNT","display_name":"Number of Samples Per Patient","description":"Number of Samples Per Patient","cancer_study_id":22},{"attr_id":"SCNA_ANALYSIS","display_name":"SCNA Analysis","description":"SCNA Analysis","cancer_study_id":22},{"attr_id":"SOMATIC_STATUS","display_name":"Somatic Status","description":"Somatic Status","cancer_study_id":22},{"attr_id":"TMB_NONSYNONYMOUS","display_name":"TMB (nonsynonymous)","description":"TMB (nonsynonymous)","cancer_study_id":22},{"attr_id":"TUMOR_NUMBER","display_name":"Tumor Number","description":"Tumor number","cancer_study_id":22},{"attr_id":"VISMO_STATUS","display_name":"Vismo Status","description":"Vismo Status","cancer_study_id":22},{"attr_id":"ABSOLUTE_EXTRACT_PLOIDY","display_name":"Absolute Extract Ploidy","description":"Absolute extract ploidy.","cancer_study_id":515},{"attr_id":"ABSOLUTE_EXTRACT_PURITY","display_name":"Absolute Extract Purity","description":"Absolute extract purity.","cancer_study_id":515},{"attr_id":"ABSOLUTE_GENOME_DOUBLINGS","display_name":"Absolute Genome Doublings","description":"Absolute Genome Doublings","cancer_study_id":515},{"attr_id":"AGE","display_name":"Diagnosis Age","description":"Age at which a condition or disease was first diagnosed.","cancer_study_id":515},{"attr_id":"AKT1_MUTATION","display_name":"AKT1 Mutation","description":"AKT1 Mutation","cancer_study_id":515},{"attr_id":"AR_MRNA","display_name":"AR mRNA","description":"AR mRNA","cancer_study_id":515},{"a … (18441 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cs.cancer_study_identifier, cs.name, cs.sample_count, cs.mrna_expression_sample_count, cs.rna_seq_sample_count, a.attribute_name, countIf(a.attribute_value != '') AS non_empty, uniqExact(a.sample_unique_id) AS samples FROM clinical_data_derived a JOIN cancer_study cs ON cs.cancer_study_identifier = a.cancer_study_identifier WHERE a.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study WHERE cancer_study_id = 537) AND a.attribute_name IN ('AR_POLYA_SCORE','AR_CAPTURE_SCORE','POLYA_ARV7_SRPM','CAPTURE_ARV7_SRPM','NEPC_POLYA_SCORE','NEPC_CAPTURE_SCORE') GROUP BY cs.cancer_study_identifier, cs.name, cs.sample_count, cs.mrna_expression_sample_count, cs.rna_seq_sample_count, a.attribute_name",
+ "max_rows": 50
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, description FROM cancer_study WHERE cancer_study_id = 537"
+}
+
+◀ result
+{"rows":[{"cs.cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sample_count":444,"mrna_expression_sample_count":328,"rna_seq_sample_count":0,"attribute_name":"CAPTURE_ARV7_SRPM","non_empty":212,"samples":444},{"cs.cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sample_count":444,"mrna_expression_sample_count":328,"rna_seq_sample_count":0,"attribute_name":"POLYA_ARV7_SRPM","non_empty":270,"samples":444},{"cs.cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sample_count":444,"mrna_expression_sample_count":328,"rna_seq_sample_count":0,"attribute_name":"AR_CAPTURE_SCORE","non_empty":209,"samples":444},{"cs.cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sample_count":444,"mrna_expression_sample_count":328,"rna_seq_sample_count":0,"attribute_name":"NEPC_POLYA_SCORE","non_empty":264,"samples":444},{"cs.cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sample_count":444,"mrna_expression_sample_count":328,"rna_seq_sample_count":0,"attribute_name":"NEPC_CAPTURE_SCORE","non_empty":208,"samples":444},{"cs.cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sample_count":444,"mrna_expression_sample_count":328,"rna_seq_sample_count":0,"attribute_name":"AR_POLYA_SCORE","non_empty":265,"samples":444}]}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","description":"Whole exome sequencing of 444 castrate resistant prostate cancer tumor/normal pairs. SU2C-PCF Dream Team: Precision Therapy for Advanced Prostate Cancer."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT display_name, description, resource_type FROM resource_definition WHERE lower(display_name) LIKE '%rna%' OR lower(description) LIKE '%poly%' OR lower(display_name) LIKE '%seq%' OR lower(description) LIKE '%library%' OR lower(description) LIKE '%transcript%'",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, hugo_gene_symbol, profile_type, uniqExact(sample_unique_id) AS samples_with_value FROM genetic_alteration_derived WHERE hugo_gene_symbol IN ('MALAT1','NEAT1','XIST','MIR155HG') AND profile_type IN ('rna_seq_v2_mrna','mrna','mrna_seq_v2_rsem','mrna_seq_cpm','mrna_seq_fpkm','mrna_U133') AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL AND cancer_study_identifier IN ('prad_su2c_2019','prostate_dkfz_2018','pog570_bcgsc_2020','coad_silu_2022','luad_oncosg_2020','mel_tsam_liang_2017','crc_hta11_htan_2021','ccle_genentech_2014') GROUP BY cancer_study_identifier, hugo_gene_symbol, profile_type ORDER BY cancer_study_identifier, hugo_gene_symbol",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, uniqExact(hugo_gene_symbol) AS genes, uniqExact(sample_unique_id) AS samples, countIf(hugo_gene_symbol IN ('MALAT1','NEAT1','XIST')) AS lncrna_rows FROM genetic_alteration_derived WHERE cancer_study_identifier IN ('prad_su2c_2019','prostate_dkfz_2018','pog570_bcgsc_2020','coad_silu_2022','luad_oncosg_2020','mel_tsam_liang_2017') GROUP BY cancer_study_identifier, profile_type ORDER BY cancer_study_identifier, profile_type",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"coad_silu_2022","profile_type":"gistic","genes":23662,"samples":281,"lncrna_rows":843},{"cancer_study_identifier":"coad_silu_2022","profile_type":"rna_seq_mrna","genes":18339,"samples":348,"lncrna_rows":696},{"cancer_study_identifier":"coad_silu_2022","profile_type":"rna_seq_mrna_median_Zscores","genes":18010,"samples":348,"lncrna_rows":696},{"cancer_study_identifier":"luad_oncosg_2020","profile_type":"gistic","genes":21893,"samples":302,"lncrna_rows":604},{"cancer_study_identifier":"luad_oncosg_2020","profile_type":"rna_seq_v2_mrna_median_Zscores","genes":17262,"samples":169,"lncrna_rows":0},{"cancer_study_identifier":"luad_oncosg_2020","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","genes":18761,"samples":169,"lncrna_rows":0},{"cancer_study_identifier":"mel_tsam_liang_2017","profile_type":"cna","genes":15127,"samples":38,"lncrna_rows":0},{"cancer_study_identifier":"mel_tsam_liang_2017","profile_type":"rna_seq_mrna","genes":23238,"samples":36,"lncrna_rows":108},{"cancer_study_identifier":"mel_tsam_liang_2017","profile_type":"rna_seq_mrna_median_Zscores","genes":14473,"samples":36,"lncrna_rows":0},{"cancer_study_identifier":"mel_tsam_liang_2017","profile_type":"rna_seq_mrna_median_all_sample_Zscores","genes":22034,"samples":36,"lncrna_rows":108},{"cancer_study_identifier":"pog570_bcgsc_2020","profile_type":"gistic","genes":19302,"samples":570,"lncrna_rows":0},{"cancer_study_identifier":"pog570_bcgsc_2020","profile_type":"rna_seq_mrna","genes":38168,"samples":570,"lncrna_rows":1710},{"cancer_study_identifier":"pog570_bcgsc_2020","profile_type":"rna_seq_mrna_median_all_sample_Zscores","genes":36806,"samples":570,"lncrna_rows":1710},{"cancer_study_identifier":"prad_su2c_2019","profile_type":"gistic","genes":20659,"samples":444,"lncrna_rows":1332},{"cancer_study_identifier":"prad_su2c_2019","profile_type":"mrna_seq_fpkm_capture","genes":19102,"samples":208,"lncrna_rows":0},{"cancer_study_identifier":"prad_su2c_2019","profile_type":"mrna_seq_fpkm_capture_Zscores","genes":18483,"samples":208,"lncrna_rows":0},{"cancer_study_identifier":"prad_su2c_2019","profile_type":"mrna_seq_fpkm_capture_all_sample_Zscores","genes":18978,"samples":208,"lncrna_rows":0},{"cancer_study_identifier":"prad_su2c_2019","profile_type":"mrna_seq_fpkm_polya","genes":19102,"samples":266,"lncrna_rows":0},{"cancer_study_identifier":"prad_su2c_2019","profile_type":"mrna_seq_fpkm_polya_Zscores","genes":18519,"samples":266,"lncrna_rows":0},{"cancer_study_identifier":"prad_su2c_2019","profile_type":"mrna_seq_fpkm_polya_all_sample_Zscores","genes":19015,"samples":266,"lncrna_rows":0},{"cancer_study_identifier":"prostate_dkfz_2018","profile_type":"rna_seq_mrna","genes":18993,"samples":118,"lncrna_rows":0},{"cancer_study_identifier":"prostate_dkfz_2018","profile_type":"rna_seq_mrna_median_all_sample_Zscores","genes":18644,"samples":118,"lncrna_rows":0}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "prad_su2c_2019",
+  "pog570_bcgsc_2020",
+  "coad_silu_2022",
+  "mel_tsam_liang_2017"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 4 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":4,"studiesWithMetadata":[{"studyId":"prad_su2c_2019","name":"Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, PNAS 2019)","sampleCount":444,"studyViewUrl":"https://www.cbioportal.org/study?id=prad_su2c_2019","metadata":{"clinicalAttributeIds":["ABI_ENZA_EXPOSURE_STATUS","AGE_AT_DIAGNOSIS","AGE_AT_PROCUREMENT","AR_CAPTURE_SCORE","AR_POLYA_SCORE","AR_SCORE","CANCER_TYPE","CANCER_TYPE_DETAILED","CAPTURE_ARV7_SRPM","CHEMO_REGIMEN_CATEGORY","ETS_FUSION_DETAILS","ETS_FUSION_SEQ","FRACTION_GENOME_ALTERED","GLEASON_SCORE","MUTATION_COUNT","NEPC_CAPTURE_SCORE","NEPC_POLYA_SCORE","NEPC_SCORE","NEUROENDOCRINE_FEATURES","OFF_ARSI","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_SAMPLE_ID","PATHOLOGY_CLASSIFICATION","POLYA_ARV7_SRPM","PSA","RACE","RAF1_BRAF_STATUS","SAMPLE_COUNT","SEX","SOMATIC_STATUS","TAXANE_EXPOSURE_STATUS","TISSUE_SITE","TISSUE_SOURCE_SITE","TMB_NONSYNONYMOUS","UNIQUE_PAPER_SAMPLES"],"molecularProfileIds":["prad_su2c_2019_gistic","prad_su2c_2019_mrna_seq_fpkm_capture","prad_su2c_2019_mrna_seq_fpkm_capture_Zscores","prad_su2c_2019_mrna_seq_fpkm_capture_all_sample_Zscores","prad_su2c_2019_mrna_seq_fpkm_polya","prad_su2c_2019_mrna_seq_fpkm_polya_Zscores","prad_su2c_2019_mrna_seq_fpkm_polya_all_sample_Zscores","prad_su2c_2019_mutations","prad_su2c_2019_structural_variants"],"heatmapProfileIds":["prad_su2c_2019_mrna_seq_fpkm_capture_Zscores","prad_su2c_2019_mrna_seq_fpkm_capture_all_sample_Zscores","prad_su2c_2019_mrna_seq_fpkm_polya_Zscores","prad_su2c_2019_mrna_seq_fpkm_polya_all_sample_Zscores"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations","mrna"]}},{"studyId":"pog570_bcgsc_2020","name":"Pan-cancer Analysis of Advanced and Metastatic Tumors (BCGSC, Nature Cancer 2020)","sampleCount":570,"studyViewUrl":"https://www.cbioportal.org/study?id=pog570_bcgsc_2020","metadata":{"clinicalAttributeIds":["AGE","ANALYSIS_COHORT","BIOPSY_COHORT","BIOPSY_SITE","CANCER_TYPE","CANCER_TYPE_DETAILED","GENDER","HRD_SCORE","ICI","ICI_BEST_RESPONSE","ICI_DURABLE_CLINICAL_BENEFIT","ICI_MUTATION_CATEGORY","MSI_SCORE","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","PRIMARY_SITE","SAMPLE_COUNT","SAMPLE_TYPE","SOMATIC_STATUS","TMB_NONSYNONYMOUS","TREATED_WITH_ICI","TREATMENT_CATEGORY","TUMOR_CONTENT","T_CELLS_CD4_MEMORY_ACTIVATED","T_CELLS_CD4_MEMORY_RESTING","T_CELLS_CD4_NAIVE","T_CELLS_CD8","T_CELLS_FOLLICULAR_HELPER","T_CELLS_GAMMA_DELTA","T_CELLS_REGULATORY_TREGS"],"molecularProfileIds":["pog570_bcgsc_2020_gistic","pog570_bcgsc_2020_mutations","pog570_bcgsc_2020_rna_seq_mrna","pog570_bcgsc_2020_rna_seq_mrna_median_all_sample_Zscores","pog570_bcgsc_2020_structural_variants"],"genericAssayProfiles":["pog570_bcgsc_2020_immune_cell_signature"],"heatmap … (2885 more chars)
+
+═ answer (success)
+**Short answer:** The database doesn't record library-prep method (polyA selection vs. total RNA or ribodepletion) for most studies, so I can't produce a reliable list of non-polyA studies. The one study with an explicit polyA/non-polyA split is SU2C prostate.
+
+**What the data shows**
+
+- **[Metastatic Prostate Adenocarcinoma (SU2C/PCF Dream Team, 2019)](https://www.cbioportal.org/study?id=prad_su2c_2019)** (`prad_su2c_2019`, 444 samples) has two separate RNA expression profiles:
+  - **polyA:** `mrna_seq_fpkm_polya`, 266 samples
+  - **capture:** `mrna_seq_fpkm_capture`, 208 samples
+
+  The capture profile is the non-polyA one. Some samples appear in both, so the two sets overlap but are not identical. Neither profile contains MALAT1, NEAT1 or XIST, so this study is not useful for lncRNA questions regardless of library type.
+
+- **Other RNA-seq studies with no recorded prep method:** I checked whether three common lncRNAs (MALAT1, NEAT1, XIST) have values in each study's expression matrix. They do in:
+  - [Pan-cancer Analysis of Advanced and Metastatic Tumors (BCGSC, 2020)](https://www.cbioportal.org/study?id=pog570_bcgsc_2020) (`pog570_bcgsc_2020`, 570 samples)
+  - [Colon Cancer (Sidra-LUMC, 2023)](https://www.cbioportal.org/study?id=coad_silu_2022) (`coad_silu_2022`, 348 samples)
+  - [Acral Melanoma (TGEN, 2017)](https://www.cbioportal.org/study?id=mel_tsam_liang_2017) (`mel_tsam_liang_2017`, 36 samples)
+
+  Presence of these genes doesn't show how the library was made, so the library type for these studies still needs to be checked against the original papers or GEO metadata. Note that MALAT1 and NEAT1 are nuclear-retained, so their levels can depend on the library protocol. That is general background knowledge, not something this database records.
+
+- **Ruled out for lncRNA work:** the Prostate DKFZ (2018) and OncoSG lung (2020) expression matrices show no MALAT1, NEAT1 or XIST values.
+
+**Suggested next steps**
+
+- For lncRNA analyses, start with `pog570_bcgsc_2020`, `coad_silu_2022` and `mel_tsam_liang_2017`, which do carry lncRNA values, and confirm their library protocols externally.
+- If you specifically need a polyA vs. non-polyA comparison, `prad_su2c_2019` is the only study here with both within one cohort, but it has no lncRNA values.

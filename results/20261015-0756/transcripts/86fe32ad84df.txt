@@ -1,0 +1,318 @@
+Q (haiku-5.5): calculate median expression of ceacam5, itgb6, muc2, tpgb and muc1 mRNA in pancreatic cancer
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+▶ clickhouse_list_tables
+{}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ search_oncotree
+{
+ "search_term": "pancreatic"
+}
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+◀ result
+{"tables":[{"name":"allele_specific_copy_number"},{"name":"alteration_driver_annotation"},{"name":"cancer_study"},{"name":"cancer_study_query_preferences"},{"name":"cancer_study_tags"},{"name":"cbioportal_sequence_state"},{"name":"clinical_attribute_counts"},{"name":"clinical_attribute_meta"},{"name":"clinical_data_derived"},{"name":"clinical_event"},{"name":"clinical_event_data"},{"name":"clinical_event_data_derived"},{"name":"clinical_event_derived"},{"name":"clinical_patient"},{"name":"clinical_sample"},{"name":"cna_event"},{"name":"cna_panel_gene_coverage"},{"name":"cna_wes_coverage"},{"name":"co_altered_genes_in_study"},{"name":"copy_number_seg"},{"name":"copy_number_seg_file"},{"name":"gene"},{"name":"gene_alias"},{"name":"gene_alteration_frequency_by_cancer_type"},{"name":"gene_cna_distribution_in_study"},{"name":"gene_mutation_frequency_by_cancer_type"},{"name":"gene_mutation_frequency_in_studies"},{"name":"gene_mutation_frequency_in_study"},{"name":"gene_mutation_variants_in_study"},{"name":"gene_pair_coexpression"},{"name":"gene_panel"},{"name":"gene_panel_list"},{"name":"gene_panel_to_gene_derived"},{"name":"generic_assay_data_derived"},{"name":"generic_assay_meta_derived"},{"name":"generic_assay_profile_entity_derived"},{"name":"generic_entity_properties"},{"name":"geneset"},{"name":"geneset_gene"},{"name":"geneset_hierarchy_leaf"},{"name":"geneset_hierarchy_node"},{"name":"genetic_alteration"},{"name":"genetic_alteration_derived"},{"name":"genetic_entity"},{"name":"genetic_profile"},{"name":"genetic_profile_link"},{"name":"genetic_profile_samples"},{"name":"genomic_event_derived"},{"name":"gistic"},{"name":"gistic_to_gene"},{"name":"info"},{"name":"mut_sig"},{"name":"mutation"},{"name":"mutation_count_by_keyword"},{"name":"mutation_derived"},{"name":"mutation_event"},{"name":"mutation_panel_gene_coverage"},{"name":"mutation_wes_coverage"},{"name":"patient"},{"name":"reference_genome"},{"name":"reference_genome_gene"},{"name":"resource_definition"},{"name":"resource_patient"},{"name":"resource_sample"},{"name":"resource_study"},{"name":"sample"},{"name":"sample_cna_event"},{"name":"sample_derived"},{"name":"sample_list"},{"name":"sample_list_list"},{"name":"sample_profile"},{"name":"sample_to_gene_panel_derived"},{"name":"structural_variant"},{"name":"sv_panel_gene_coverage"},{"name":"sv_wes_coverage"},{"name":"top_cna_genes_in_study"},{"name":"top_mutated_genes_in_cohort"},{"name":"top_mutated_genes_in_study"},{"name":"top_sv_genes_in_study"},{"name":"treatment_counts_in_study"},{"name":"treatment_regimens_in_study"},{"name":"type_of_cancer"}]}
+
+◀ result
+{"result":[{"code":"PAAD","name":"Pancreatic Adenocarcinoma","score":60,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PAAD"},{"code":"PANEC","name":"Pancreatic Neuroendocrine Carcinoma","score":60,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PANEC"},{"code":"PANET","name":"Pancreatic Neuroendocrine Tumor","score":60,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PANET"},{"code":"IOPN","name":"Intraductal Oncocytic Papillary Neoplasm","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PACT > IOPN"},{"code":"IPMN","name":"Intraductal Papillary Mucinous Neoplasm","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PACT > IPMN"},{"code":"ITPN","name":"Intraductal Tubulopapillary Neoplasm","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PACT > ITPN"},{"code":"MCN","name":"Mucinous Cystic Neoplasm","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PACT > MCN"},{"code":"OSGCT","name":"Osteoclastic Giant Cell Tumor","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > UCP > OSGCT"},{"code":"PAAC","name":"Acinar Cell Carcinoma of the Pancreas","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PAAC"},{"code":"PAASC","name":"Adenosquamous Carcinoma of the Pancreas","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PAASC"},{"code":"PACT","name":"Cystic Tumor of the Pancreas","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PACT"},{"code":"PANCREAS","name":"Pancreas","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS"},{"code":"PB","name":"Pancreatoblastoma","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PB"},{"code":"PSC","name":"Serous Cystadenoma of the Pancreas","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > PACT > PSC"},{"code":"SPN","name":"Solid Pseudopapillary Neoplasm of the Pancreas","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > SPN"},{"code":"UCP","name":"Undifferentiated Carcinoma of the Pancreas","score":45,"mainType":"Pancreatic Cancer","tissue":"Pancreas","hierarchy":"PANCREAS > UCP"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, type_of_cancer_id, sample_count, mrna_expression_sample_count, rna_seq_sample_count, mrna_microarray_sample_count FROM cancer_study WHERE type_of_cancer_id IN ('paad','panec','panet','iopn','ipmn','itpn','mcn','osgct','paac','paasc','pact','pancreas','pb','psc','spn','ucp') AND mrna_expression_sample_count > 0 ORDER BY sample_count DESC"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"paad_qcmg_uq_2016","name":"Pancreatic Adenocarcinoma (QCMG, Nature 2016)","type_of_cancer_id":"paad","sample_count":456,"mrna_expression_sample_count":96,"rna_seq_sample_count":96,"mrna_microarray_sample_count":0},{"cancer_study_identifier":"paad_tcga","name":"Pancreatic Adenocarcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"paad","sample_count":186,"mrna_expression_sample_count":179,"rna_seq_sample_count":179,"mrna_microarray_sample_count":0},{"cancer_study_identifier":"paad_tcga_gdc","name":"Pancreatic Adenocarcinoma (TCGA GDC, 2025)","type_of_cancer_id":"paad","sample_count":186,"mrna_expression_sample_count":179,"rna_seq_sample_count":0,"mrna_microarray_sample_count":0},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","name":"Pancreatic Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"paad","sample_count":184,"mrna_expression_sample_count":177,"rna_seq_sample_count":177,"mrna_microarray_sample_count":0},{"cancer_study_identifier":"pancreas_cptac_gdc","name":"Pancreatic Cancer (CPTAC GDC, 2025)","type_of_cancer_id":"pancreas","sample_count":183,"mrna_expression_sample_count":161,"rna_seq_sample_count":0,"mrna_microarray_sample_count":0},{"cancer_study_identifier":"paad_cptac_2021","name":"Pancreatic Ductal Adenocarcinoma (CPTAC, Cell 2021)","type_of_cancer_id":"paad","sample_count":140,"mrna_expression_sample_count":140,"rna_seq_sample_count":140,"mrna_microarray_sample_count":0},{"cancer_study_identifier":"paad_iatlas_prince_2022","name":"Metastatic Pancreatic Adenocarcinoma (PRINCE Trial, Nat Med. 2022) - iAtlas Harmonized","type_of_cancer_id":"paad","sample_count":93,"mrna_expression_sample_count":93,"rna_seq_sample_count":0,"mrna_microarray_sample_count":0}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, count() AS n_rows FROM genetic_alteration_derived WHERE cancer_study_identifier IN ('paad_qcmg_uq_2016','paad_tcga','paad_tcga_gdc','paad_tcga_pan_can_atlas_2018','paad_cptac_2021','paad_iatlas_prince_2022','pancreas_cptac_gdc') AND hugo_gene_symbol IN ('CEACAM5','ITGB6','MUC2','TPGB','MUC1') AND (profile_type LIKE '%mrna%' OR profile_type LIKE '%rna%') GROUP BY cancer_study_identifier, profile_type ORDER BY cancer_study_identifier, profile_type"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"paad_cptac_2021","profile_type":"mrna","n_rows":560},{"cancer_study_identifier":"paad_cptac_2021","profile_type":"mrna_median_Zscores","n_rows":560},{"cancer_study_identifier":"paad_cptac_2021","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n_rows":560},{"cancer_study_identifier":"paad_iatlas_prince_2022","profile_type":"rna_seq_mrna","n_rows":372},{"cancer_study_identifier":"paad_iatlas_prince_2022","profile_type":"rna_seq_mrna_median_Zscores","n_rows":372},{"cancer_study_identifier":"paad_qcmg_uq_2016","profile_type":"rna_seq_mrna","n_rows":288},{"cancer_study_identifier":"paad_qcmg_uq_2016","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n_rows":288},{"cancer_study_identifier":"paad_tcga","profile_type":"rna_seq_v2_mrna","n_rows":716},{"cancer_study_identifier":"paad_tcga","profile_type":"rna_seq_v2_mrna_median_Zscores","n_rows":716},{"cancer_study_identifier":"paad_tcga","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n_rows":716},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_fpkm","n_rows":716},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_fpkm_Zscores","n_rows":716},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_read_counts_Zscores","n_rows":716},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_tpm","n_rows":716},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_tpm_Zscores","n_rows":716},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"rna_seq_mrna","n_rows":716},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna","n_rows":708},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna_median_Zscores","n_rows":708},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n_rows":708},{"cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_fpkm","n_rows":644},{"cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_fpkm_Zscores","n_rows":644},{"cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_read_counts_Zscores","n_rows":644},{"cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_tpm","n_rows":644},{"cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_tpm_Zscores","n_rows":644},{"cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"rna_seq_mrna","n_rows":644}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, hugo_gene_symbol, count() AS n, round(median(toFloat64OrNull(alteration_value)), 2) AS median_raw, round(quantile(0.25)(toFloat64OrNull(alteration_value)), 2) AS q1, round(quantile(0.75)(toFloat64OrNull(alteration_value)), 2) AS q3 FROM genetic_alteration_derived WHERE (cancer_study_identifier, profile_type) IN (('paad_tcga_pan_can_atlas_2018','rna_seq_v2_mrna'), ('paad_cptac_2021','mrna'), ('paad_qcmg_uq_2016','rna_seq_mrna'), ('paad_iatlas_prince_2022','rna_seq_mrna'), ('paad_tcga_gdc','rna_seq_mrna'), ('pancreas_cptac_gdc','rna_seq_mrna')) AND hugo_gene_symbol IN ('CEACAM5','ITGB6','MUC2','TPGB','MUC1') AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL GROUP BY cancer_study_identifier, profile_type, hugo_gene_symbol ORDER BY cancer_study_identifier, hugo_gene_symbol",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"paad_cptac_2021","profile_type":"mrna","hugo_gene_symbol":"CEACAM5","n":140,"median_raw":13.38,"q1":11.53,"q3":14.71},{"cancer_study_identifier":"paad_cptac_2021","profile_type":"mrna","hugo_gene_symbol":"ITGB6","n":140,"median_raw":13.3,"q1":12.43,"q3":13.77},{"cancer_study_identifier":"paad_cptac_2021","profile_type":"mrna","hugo_gene_symbol":"MUC1","n":140,"median_raw":11.51,"q1":10.75,"q3":12.32},{"cancer_study_identifier":"paad_cptac_2021","profile_type":"mrna","hugo_gene_symbol":"MUC2","n":140,"median_raw":3.5,"q1":1.58,"q3":5.22},{"cancer_study_identifier":"paad_iatlas_prince_2022","profile_type":"rna_seq_mrna","hugo_gene_symbol":"CEACAM5","n":93,"median_raw":12.27,"q1":8.61,"q3":14.53},{"cancer_study_identifier":"paad_iatlas_prince_2022","profile_type":"rna_seq_mrna","hugo_gene_symbol":"ITGB6","n":93,"median_raw":11.41,"q1":9.83,"q3":12.18},{"cancer_study_identifier":"paad_iatlas_prince_2022","profile_type":"rna_seq_mrna","hugo_gene_symbol":"MUC1","n":93,"median_raw":12.39,"q1":10.41,"q3":13.32},{"cancer_study_identifier":"paad_iatlas_prince_2022","profile_type":"rna_seq_mrna","hugo_gene_symbol":"MUC2","n":93,"median_raw":7.95,"q1":5.65,"q3":10.88},{"cancer_study_identifier":"paad_qcmg_uq_2016","profile_type":"rna_seq_mrna","hugo_gene_symbol":"CEACAM5","n":96,"median_raw":9.11,"q1":7.13,"q3":10.34},{"cancer_study_identifier":"paad_qcmg_uq_2016","profile_type":"rna_seq_mrna","hugo_gene_symbol":"MUC1","n":96,"median_raw":7.55,"q1":6.48,"q3":8.39},{"cancer_study_identifier":"paad_qcmg_uq_2016","profile_type":"rna_seq_mrna","hugo_gene_symbol":"MUC2","n":96,"median_raw":0.53,"q1":-0.95,"q3":2.32},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"rna_seq_mrna","hugo_gene_symbol":"CEACAM5","n":179,"median_raw":16047,"q1":2714,"q3":61761},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"rna_seq_mrna","hugo_gene_symbol":"ITGB6","n":179,"median_raw":7759,"q1":4395.5,"q3":13063.5},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"rna_seq_mrna","hugo_gene_symbol":"MUC1","n":179,"median_raw":27935,"q1":13702.5,"q3":50878},{"cancer_study_identifier":"paad_tcga_gdc","profile_type":"rna_seq_mrna","hugo_gene_symbol":"MUC2","n":179,"median_raw":25,"q1":7,"q3":170},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna","hugo_gene_symbol":"CEACAM5","n":177,"median_raw":10049.7,"q1":1115.14,"q3":32625.1},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna","hugo_gene_symbol":"ITGB6","n":177,"median_raw":3740.15,"q1":2365.02,"q3":6166.43},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna","hugo_gene_symbol":"MUC1","n":177,"median_raw":14799,"q1":7580.57,"q3":26641.5},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna","hugo_gene_symbol":"MUC2","n":177,"median_raw":6.53,"q1":1.35,"q3":65.17},{"cancer_study_identifier":"pancreas_cptac_gdc","profile … (548 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT g.hugo_gene_symbol, count() AS n_rows, uniqExact(cancer_study_identifier) AS n_studies FROM genetic_alteration_derived g WHERE hugo_gene_symbol LIKE 'TPG%' OR hugo_gene_symbol = 'TPGB' GROUP BY hugo_gene_symbol ORDER BY n_rows DESC LIMIT 20"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"TPGS2","n_rows":370636,"n_studies":251},{"hugo_gene_symbol":"TPGS1","n_rows":368779,"n_studies":251}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT hugo_gene_symbol, cancer_study_identifier, profile_type, count() AS n FROM genetic_alteration_derived WHERE hugo_gene_symbol IN ('TPGB','TPGB1','TP63') AND cancer_study_identifier IN ('paad_tcga_pan_can_atlas_2018','paad_cptac_2021','paad_qcmg_uq_2016','paad_iatlas_prince_2022','paad_tcga_gdc','pancreas_cptac_gdc') GROUP BY hugo_gene_symbol, cancer_study_identifier, profile_type ORDER BY n DESC LIMIT 20"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"log2CNA","n":183},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"gistic","n":183},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_gdc","profile_type":"cna","n":182},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_tpm","n":179},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_fpkm","n":179},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_gdc","profile_type":"rna_seq_mrna","n":179},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_read_counts_Zscores","n":179},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_fpkm_Zscores","n":179},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_gdc","profile_type":"mrna_seq_tpm_Zscores","n":179},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna_median_Zscores","n":177},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n":177},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna","n":177},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_read_counts_Zscores","n":161},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_tpm_Zscores","n":161},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_fpkm_Zscores","n":161},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_fpkm","n":161},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"mrna_seq_tpm","n":161},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"rna_seq_mrna","n":161},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"pancreas_cptac_gdc","profile_type":"cna","n":149},{"hugo_gene_symbol":"TP63","cancer_study_identifier":"paad_cptac_2021","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n":140}]}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "paad_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "CEACAM5",
+  "ITGB6",
+  "MUC2",
+  "MUC1"
+ ],
+ "tab": "plots"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/plots?cancer_study_list=paad_tcga_pan_can_atlas_2018&gene_list=CEACAM5%0AITGB6%0AMUC2%0AMUC1&case_set_id=paad_tcga_pan_can_atlas_2018_all","url":"https://www.cbioportal.org/results/plots?cancer_study_list=paad_tcga_pan_can_atlas_2018&gene_list=CEACAM5%0AITGB6%0AMUC2%0AMUC1&case_set_id=paad_tcga_pan_can_atlas_2018_all","data":{"studyIds":["paad_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"paad_tcga_pan_can_atlas_2018","name":"Pancreatic Adenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":184}],"genes":["CEACAM5","ITGB6","MUC2","MUC1"],"caseSetId":"paad_tcga_pan_can_atlas_2018_all","pageDescription":"Scatter/box plots comparing any two data elements."}}
+
+═ answer (success)
+Median mRNA expression in pancreatic adenocarcinoma (PAAD), per study, using the raw (non-Z-score) mRNA profile in each study. Values are per sample, and each gene is counted only in samples where it has a value.
+
+**Important caveats**
+- **TPGB returns no data.** It is not present in any expression profile in the database. The closest matches are TPGS1 and TPGS2, which are different genes. I have not substituted them; tell me if you want those instead.
+- **Units differ by study.** The TCGA values are RSEM-scale counts, the CPTAC/PRINCE values are log2-scale, and the QCMG values are also log-scale. Medians should not be compared across studies.
+- **Overlapping cohorts.** The TCGA Firehose, TCGA GDC and TCGA PanCancer Atlas studies share most of the same patients, so I have not pooled them.
+
+**Median expression (IQR in brackets)**
+
+**TCGA PanCancer Atlas (`paad_tcga_pan_can_atlas_2018`, RSEM, n = 177 for CEACAM5/ITGB6/MUC1 and n = 177 for MUC2)**
+
+| Gene | Median | IQR |
+|---|---|---|
+| CEACAM5 | 10,049.7 | 1,115.1 – 32,625.1 |
+| ITGB6 | 3,740.2 | 2,365.0 – 6,166.4 |
+| MUC2 | 6.5 | 1.4 – 65.2 |
+| MUC1 | 14,799 | 7,580.6 – 26,641.5 |
+| TPGB | no data | – |
+
+**CPTAC 2021 (`paad_cptac_2021`, n = 140)**
+
+| Gene | Median | IQR |
+|---|---|---|
+| CEACAM5 | 13.38 | 11.53 – 14.71 |
+| ITGB6 | 13.30 | 12.43 – 13.77 |
+| MUC2 | 3.50 | 1.58 – 5.22 |
+| MUC1 | 11.51 | 10.75 – 12.32 |
+| TPGB | no data | – |
+
+**PRINCE metastatic (`paad_iatlas_prince_2022`, n = 93)**
+
+| Gene | Median | IQR |
+|---|---|---|
+| CEACAM5 | 12.27 | 8.61 – 14.53 |
+| ITGB6 | 11.41 | 9.83 – 12.18 |
+| MUC2 | 7.95 | 5.65 – 10.88 |
+| MUC1 | 12.39 | 10.41 – 13.32 |
+| TPGB | no data | – |
+
+**QCMG 2016 (`paad_qcmg_uq_2016`, n = 96)**
+
+| Gene | Median | IQR |
+|---|---|---|
+| CEACAM5 | 9.11 | 7.13 – 10.34 |
+| ITGB6 | no data | – |
+| MUC2 | 0.53 | −0.95 – 2.32 |
+| MUC1 | 7.55 | 6.48 – 8.39 |
+| TPGB | no data | – |
+
+ITGB6 has no values in this study.
+
+**TCGA GDC (`paad_tcga_gdc`, n = 179, raw counts)**
+
+| Gene | Median | IQR |
+|---|---|---|
+| CEACAM5 | 16,047 | 2,714 – 61,761 |
+| ITGB6 | 7,759 | 4,395.5 – 13,063.5 |
+| MUC2 | 25 | 7 – 170 |
+| MUC1 | 27,935 | 13,702.5 – 50,878 |
+| TPGB | no data | – |
+
+**CPTAC GDC (`pancreas_cptac_gdc`, n = 161, raw counts)**
+
+| Gene | Median | IQR |
+|---|---|---|
+| CEACAM5 | 7,517 | 2,071 – 21,740 |
+| ITGB6 | 7,468 | 4,185 – 10,790 |
+| MUC2 | 10 | 2 – 40 |
+| MUC1 | 2,720 | 1,451 – 4,466 |
+| TPGB | no data | – |
+
+In every study, MUC2 is the lowest-expressed of the five genes, and CEACAM5 and MUC1 are among the highest.
+
+Explore the TCGA PanCancer Atlas cohort in the cBioPortal plots view: [View PAAD TCGA PanCancer Atlas plots](https://www.cbioportal.org/results/plots?cancer_study_list=paad_tcga_pan_can_atlas_2018&gene_list=CEACAM5%0AITGB6%0AMUC2%0AMUC1&case_set_id=paad_tcga_pan_can_atlas_2018_all)

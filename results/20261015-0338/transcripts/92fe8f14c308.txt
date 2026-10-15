@@ -1,0 +1,406 @@
+Q (qwen3.8-27b): In the TCGA PanCancer Atlas breast cancer study, what is the average tumor mutational burden of patients who have at least two of the five most frequently mutated genes and how does this compare to the average TMB of all patients?
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ list_studies
+{
+ "search": "[\"TCGA\", \"breast\", \"pancancer\"]"
+}
+
+◀ result
+[{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"brca","sample_count":1084,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018"}]
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "\n-- Check TMB attribute availability and patient/sample levels\nSELECT\n    attribute_name,\n    description,\n    patient_attribute\nFROM clinical_attribute_meta\nWHERE cancer_study_id = (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018')\n  AND (upper(description) LIKE '%mutational burden%'\n       OR upper(attr_id) LIKE '%TMB%')\nORDER BY attr_id;\n"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `attribute_name` in scope SELECT attribute_name, description, patient_attribute FROM clinical_attribute_meta WHERE (cancer_study_id = (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018')) AND ((upper(description) LIKE '%mutational burden%') OR (upper(attr_id) LIKE '%TMB%')) ORDER BY attr_id ASC. (UNKNOWN_IDENTIFIER) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "\nSELECT hugo_gene_symbol, altered_samples, profiled_samples, frequency_pct, total_mutation_events\nFROM top_mutated_genes_in_study(study = 'brca_tcga_pan_can_atlas_2018', top_n = 5)\nORDER BY altered_samples DESC LIMIT 5;\n"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"PIK3CA","altered_samples":347,"profiled_samples":1066,"frequency_pct":32.6,"total_mutation_events":387},{"hugo_gene_symbol":"TP53","altered_samples":347,"profiled_samples":1066,"frequency_pct":32.6,"total_mutation_events":353},{"hugo_gene_symbol":"TTN","altered_samples":187,"profiled_samples":1066,"frequency_pct":17.5,"total_mutation_events":311},{"hugo_gene_symbol":"CDH1","altered_samples":130,"profiled_samples":1066,"frequency_pct":12.2,"total_mutation_events":132},{"hugo_gene_symbol":"GATA3","altered_samples":127,"profiled_samples":1066,"frequency_pct":11.9,"total_mutation_events":130}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_attribute_meta"
+}
+
+◀ result
+{"columns":[{"name":"attr_id","type":"String"},{"name":"display_name","type":"String"},{"name":"description","type":"String"},{"name":"datatype","type":"String"},{"name":"patient_attribute","type":"Int32"},{"name":"priority","type":"String"},{"name":"cancer_study_id","type":"Int64"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "-- Check TMB attribute values and how many patients/samples have it\nSELECT\n    attribute_name,\n    count() as rows_count,\n    uniqExact(sample_unique_id) as distinct_samples,\n    uniqExact(patient_unique_id) as distinct_patients\nFROM clinical_data_derived\nWHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n  AND (upper(attribute_name) LIKE '%TMB%' OR upper(attribute_name) LIKE '%MUTATIONAL BURDEN%')\nGROUP BY attribute_name\nORDER BY attribute_name;\n"
+}
+
+◀ result
+{"rows":[{"attribute_name":"TMB_NONSYNONYMOUS","rows_count":1084,"distinct_samples":1084,"distinct_patients":1084}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "\nWITH top5 AS (\n    SELECT sample_unique_id, hugo_gene_symbol\n    FROM genomic_event_derived\n    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n      AND variant_type = 'mutation'\n      AND mutation_status != 'UNCALLED'\n      AND off_panel = 0\n      AND hugo_gene_symbol IN ('PIK3CA', 'TP53', 'TTN', 'CDH1', 'GATA3')\n),\nsamples_qualifying AS (\n    -- a sample qualifies if it has alterations in at least 2 of the 5 genes\n    SELECT sample_unique_id, count(DISTINCT hugo_gene_symbol) AS num_altered\n    FROM top5\n    GROUP BY sample_unique_id\n    HAVING count(DISTINCT hugo_gene_symbol) >= 2\n),\npatients_qualifying AS (\n    SELECT DISTINCT p.patient_unique_id\n    FROM clinical_data_derived p\n    JOIN samples_qualifying sq USING (sample_unique_id)\n    WHERE p.cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n      AND p.attribute_name = 'TMB_NONSYNONYMOUS'\n),\ntmb AS (\n    SELECT patient_unique_id, toFloat64OrNull(attribute_value) AS tmb\n    FROM clinical_data_derived\n    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n      AND attribute_name = 'TMB_NONSYNONYMOUS'\n      AND toFloat64OrNull(attribute_value) IS NOT NULL\n)\nSELECT\n    count() AS n_patients,\n    round(avg(tmb), 2) AS mean_tmb,\n    round(quantile(0.5)(tmb), 2) AS median_tmb,\n    min(tmb) AS min_tmb,\n    max(tmb) AS max_tmb,\n    uniqExact((SELECT uniqExact(patient_unique_id) FROM tmb)) AS total_patients_with_tmb\nFROM tmb\nWHERE patient_unique_id IN (SELECT patient_unique_id FROM patients_qualifying);\n"
+}
+
+◀ result
+{"rows":[{"n_patients":296,"mean_tmb":5.53,"median_tmb":2.03,"min_tmb":0.433333333,"max_tmb":180.8333333,"total_patients_with_tmb":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "\nWITH top5 AS (\n    SELECT sample_unique_id, hugo_gene_symbol\n    FROM genomic_event_derived\n    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n      AND variant_type = 'mutation'\n      AND mutation_status != 'UNCALLED'\n      AND off_panel = 0\n      AND hugo_gene_symbol IN ('PIK3CA', 'TP53', 'TTN', 'CDH1', 'GATA3')\n),\nsamples_qualifying AS (\n    SELECT sample_unique_id\n    FROM top5\n    GROUP BY sample_unique_id\n    HAVING uniqExact(hugo_gene_symbol) >= 2\n),\ntmb AS (\n    SELECT patient_unique_id, toFloat64OrNull(attribute_value) AS tmb\n    FROM clinical_data_derived\n    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n      AND attribute_name = 'TMB_NONSYNONYMOUS'\n      AND toFloat64OrNull(attribute_value) IS NOT NULL\n),\nqualifying_patients AS (\n    SELECT DISTINCT p.patient_unique_id\n    FROM tmb p\n    WHERE p.patient_unique_id IN (\n        SELECT DISTINCT cdp.patient_unique_id\n        FROM clinical_data_derived cdp\n        WHERE cdp.cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n          AND cdp.sample_unique_id IN (SELECT sample_unique_id FROM samples_qualifying)\n    )\n)\nSELECT\n    'All patients' AS group_name,\n    count() AS n,\n    round(avg(tmb), 2) AS mean_tmb,\n    round(quantile(0.5)(tmb), 2) AS median_tmb,\n    round(quantile(0.25)(tmb), 2) AS q1,\n    round(quantile(0.75)(tmb), 2) AS q3\nFROM tmb\nUNION ALL\nSELECT\n    'Patients with >=2 of top 5 mutated genes' AS group_name,\n    count() AS n,\n    round(avg(tmb), 2) AS mean_tmb,\n    round(quantile(0.5)(tmb), 2) AS median_tmb,\n    round(quantile(0.25)(tmb), 2) AS q1,\n    round(quantile(0.75)(tmb), 2) AS q3\nFROM tmb\nWHERE patient_unique_id IN (SELECT patient_unique_id FROM qualifying_patients)\nORDER BY group_name;\n"
+}
+
+◀ result
+{"rows":[{"group_name":"All patients","n":1066,"mean_tmb":2.73,"median_tmb":1.3,"q1":0.83,"q3":2.3},{"group_name":"Patients with >=2 of top 5 mutated genes","n":296,"mean_tmb":5.53,"median_tmb":2.03,"q1":1.07,"q3":4.27}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "-- Sanity check: patients with TMB values vs. total patients; verify 1:1 sample-patient\nSELECT\n    uniqExact(patient_unique_id) AS patients_with_tmb,\n    uniqExact(sample_unique_id) AS samples_with_tmb,\n    count() AS rows\nFROM clinical_data_derived\nWHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n  AND attribute_name = 'TMB_NONSYNONYMOUS'\n  AND toFloat64OrNull(attribute_value) IS NOT NULL;\n\n-- And study-wide patient count\nSELECT uniqExact(patient_unique_id) AS total_patients\nFROM clinical_data_derived\nWHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'\n  AND attribute_name = 'TMB_NONSYNONYMOUS';\n"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 62\n Code: 62. DB::Exception: Syntax error: failed at position 422 (end of query) (line 9, col 51): ;. Expected one of: OR, AND, IS NOT DISTINCT FROM, IS DISTINCT FROM, IS NOT UNKNOWN, IS UNKNOWN, IS NOT FALSE, IS FALSE, IS NOT TRUE, IS TRUE, IS NULL, IS NOT NULL, BETWEEN, NOT BETWEEN, LIKE, ILIKE, NOT LIKE, NOT ILIKE, REGEXP, IN, NOT IN, GLOBAL IN, GLOBAL NOT IN, MOD, DIV, alias, AS, GROUP BY, WITH, HAVING, WINDOW, QUALIFY, ORDER BY, LIMIT, OFFSET, FETCH, SETTINGS, UNION, EXCEPT, INTERSECT. (SYNTAX_ERROR) (version 26.6.1.2326 (official build))\n"}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "summary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018","url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018","data":{"studyIds":["brca_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084}],"tab":"summary","hasFilters":false,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "PIK3CA",
+  "TP53",
+  "TTN",
+  "CDH1",
+  "GATA3"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=PIK3CA%0ATP53%0ATTN%0ACDH1%0AGATA3&case_set_id=brca_tcga_pan_can_atlas_2018_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=PIK3CA%0ATP53%0ATTN%0ACDH1%0AGATA3&case_set_id=brca_tcga_pan_can_atlas_2018_all","data":{"studyIds":["brca_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084}],"genes":["PIK3CA","TP53","TTN","CDH1","GATA3"],"caseSetId":"brca_tcga_pan_can_atlas_2018_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "≥2 of top-5 mutated",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        },
+        {
+         "hugoGeneSymbol": "TP53"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        },
+        {
+         "hugoGeneSymbol": "TTN"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        },
+        {
+         "hugoGeneSymbol": "CDH1"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        },
+        {
+         "hugoGeneSymbol": "GATA3"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "TP53"
+        },
+        {
+         "hugoGeneSymbol": "TTN"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "TP53"
+        },
+        {
+         "hugoGeneSymbol": "CDH1"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "TP53"
+        },
+        {
+         "hugoGeneSymbol": "GATA3"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "TTN"
+        },
+        {
+         "hugoGeneSymbol": "CDH1"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "TTN"
+        },
+        {
+         "hugoGeneSymbol": "GATA3"
+        }
+       ],
+       [
+        {
+         "hugoGeneSymbol": "CDH1"
+        },
+        {
+         "hugoGeneSymbol": "GATA3"
+        }
+       ]
+      ],
+      "molecularProfileIds": [
+       "brca_tcga_pan_can_atlas_2018_mutations"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "isUnselected": true,
+   "name": "Rest of cohort"
+  }
+ ],
+ "tab": "clinical"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/clinical?comparisonId=6ad067fae497aad53593f75e","url":"https://www.cbioportal.org/comparison/clinical?comparisonId=6ad067fae497aad53593f75e","data":{"description":"Group comparison (2 custom groups)","studies":["brca_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"≥2 of top-5 mutated","sampleCount":1},{"name":"Rest of cohort","sampleCount":1083}],"studyViewUrl":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"≥2 of top-5 mutated","url":"https://www.cbioportal.org/study?id=brca_tcga_pan_can_atlas_2018#filterJson=%7B%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22TTN%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22CDH1%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22GATA3%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22TTN%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22CDH1%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22TP53%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22GATA3%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22TTN%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22CDH1%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22TTN%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22GATA3%22%7D%5D%2C%5B%7B%22hugoGeneSymbol%22%3A%22CDH1%22%7D%2C%7B%22hugoGeneSymbol%22%3A%22GATA3%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22brca_tcga_pan_can_atlas_2018_mutations%22%5D%7D%5D%7D"}],"pageDescription":"Clinical attribute distributions compared across ≥2 of top-5 mutated (1) vs Rest of cohort (1083)."}}
+
+═ answer (success)
+The query results match and are internally consistent. The group comparison only captured 1 sample because my `geneQueries` was structured as pairwise AND (each inner array requires all genes); that view is not the right one anyway for the "any 2 of 5" semantics — the correct definition is a sample carrying at least any 2 of the 5 genes, which is what my ClickHouse query computed. The OncoPrint link will show per-sample alteration status so the user can see the 296 patients.
+
+## Results
+
+**Top-5 most frequently mutated genes (TCGA PanCancer Atlas breast cancer, n=1,066 profiled samples):**
+
+| Rank | Gene | Altered / Profiled | Frequency |
+|---|---|---|---|
+| 1 | PIK3CA | 347 / 1,066 | 32.6% |
+| 2 | TP53 | 347 / 1,066 | 32.6% |
+| 3 | TTN | 187 / 1,066 | 17.5% |
+| 4 | CDH1 | 130 / 1,066 | 12.2% |
+| 5 | GATA3 | 127 / 1,066 | 11.9% |
+
+**TMB comparison (TMB_NONSYNONYMOUS, mutations/Mb):**
+
+| Group | n | Mean TMB | Median | Q1–Q3 |
+|---|---|---|---|---|
+| All patients | 1,066 | **2.73** | 1.30 | 0.83 – 2.30 |
+| Patients with ≥ 2 of the 5 mutated | 296 | **5.53** | 2.03 | 1.07 – 4.27 |
+
+**Interpretation:** Patients whose samples carry mutations in at least two of the top-5 genes show a roughly **2.0× higher mean TMB** (5.53 vs. 2.73) and a ~1.6× higher median (2.03 vs. 1.30) than the all-patient cohort. 296 of 1,066 patients (~27.8%) fall into the "≥ 2 of top 5" group. The mean is more heavily shifted than the median, suggesting a right-tail of high-TMB patients (max 180.8) in the qualifying group — expected, as multi-gene co-mutation often tracks with hypermutation. I have not computed a significance test (Wilcoxon rank-sum is the appropriate test for this 2-group continuous comparison — run in R/Python, or use the [Group Comparison → Clinical tab](https://www.cbioportal.org/comparison/clinical?comparisonId=6ad067fae497aad53593f75e) — but note the link above uses a stricter pairwise AND; for the exact "any 2 of 5" definition, use the query results here).
+
+**Links:**
+- [TCGA PanCancer Atlas Breast study (overview)](https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018)
+- [OncoPrint for PIK3CA, TP53, TTN, CDH1, GATA3](https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=PIK3CA%0ATP53%0ATTN%0ACDH1%0AGATA3&case_set_id=brca_tcga_pan_can_atlas_2018_all) — visual confirmation of which samples carry multiple of the 5
+- [Group comparison (stricter interpretation)](https://www.cbioportal.org/comparison/clinical?comparisonId=6ad067fae497aad53593f75e)
+
+Counting unit: patient (one TMB per patient; 1:1 patient/sample in this study). Qualifying = a patient with at least one sample mutated in ≥ 2 of the 5 genes (the patient-level version in this study is equivalent to the sample-level, given the 1:1 mapping).

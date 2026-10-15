@@ -1,0 +1,571 @@
+Q (haiku-5.5): Do patients with PIK3CA mutations have different overall survival outcomes compared to PIK3CA wild-type patients in breast cancer from the MSK-CHORD Study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+▶ list_studies
+{
+ "search": "MSK-CHORD"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+▶ search_oncotree
+{
+ "search_term": "breast cancer"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+◀ result
+{"result":[{"code":"ACBC","name":"Adenoid Cystic Breast Cancer","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA > ACBC"},{"code":"BNNOS","name":"Breast Neoplasm, NOS","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BNNOS"},{"code":"BRAME","name":"Adenomyoepithelioma of the Breast","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRAME"},{"code":"BRCA","name":"Invasive Breast Carcinoma","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA"},{"code":"BRCANOS","name":"Breast Invasive Cancer, NOS","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA > BRCANOS"},{"code":"BRCNOS","name":"Breast Invasive Carcinoma, NOS","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA > BRCNOS"},{"code":"BREAST","name":"Breast","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST"},{"code":"BRSRCC","name":"Breast Carcinoma with Signet Ring","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA > BRSRCC"},{"code":"CCHM","name":"Carcinoma with Chondroid Metaplasia","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > MBC > MMBC > CCHM"},{"code":"COM","name":"Carcinoma with Osseous Metaplasia","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > MBC > MMBC > COM"},{"code":"CSNOS","name":"Breast Invasive Carcinosarcoma, NOS","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA > CSNOS"},{"code":"DCIS","name":"Breast Ductal Carcinoma In Situ","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > DCIS"},{"code":"EMBC","name":"Epithelial Type Metaplastic Breast Cancer","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > MBC > EMBC"},{"code":"IBC","name":"Inflammatory Breast Cancer","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > IBC"},{"code":"IDC","name":"Breast Invasive Ductal Carcinoma","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA > IDC"},{"code":"ILC","name":"Breast Invasive Lobular Carcinoma","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA > ILC"},{"code":"IMMC","name":"Breast Invasive Mixed Mucinous Carcinoma","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > BRCA > IMMC"},{"code":"JSCB","name":"Juvenile Secretory Carcinoma of the Breast","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > JSCB"},{"code":"LCIS","name":"Breast Lobular Carcinoma In Situ","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > LCIS"},{"code":"MASC","name":"Metaplastic Adenosquamous Carcinoma","score":65,"mainType":"Breast Cancer","tissue":"Breast","hierarchy":"BREAST > MBC > EMBC > MASC"},{"code":"MASCC","name":"Metaplastic Adenocarcinoma with Spindle  … (712 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH breast AS (
+    SELECT DISTINCT patient_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+      AND attribute_name = 'CANCER_TYPE'
+      AND attribute_value = 'Breast Cancer'
+),
+profiled_samples AS (
+    SELECT sample_unique_id FROM mutation_panel_gene_coverage
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'PIK3CA'
+    UNION ALL
+    SELECT sample_unique_id FROM mutation_wes_coverage
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+),
+profiled_patients AS (
+    SELECT DISTINCT patient_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+      AND sample_unique_id IN (SELECT sample_unique_id FROM profiled_samples)
+      AND patient_unique_id IN (SELECT patient_unique_id FROM breast)
+),
+mut_patients AS (
+    SELECT DISTINCT patient_unique_id
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+      AND variant_type = 'mutation'
+      AND hugo_gene_symbol = 'PIK3CA'
+      AND mutation_status != 'UNCALLED'
+      AND off_panel = 0
+),
+os AS (
+    SELECT patient_unique_id,
+           maxIf(toFloat64OrNull(attribute_value), attribute_name = 'OS_MONTHS') AS os_months,
+           maxIf(attribute_value, attribute_name = 'OS_STATUS') AS os_status
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+      AND attribute_name IN ('OS_MONTHS', 'OS_STATUS')
+    GROUP BY patient_unique_id
+)
+SELECT
+    if(patient_unique_id IN (SELECT patient_unique_id FROM mut_patients), 'PIK3CA mutant', 'PIK3CA wild-type') AS group_name,
+    count() AS n_patients,
+    countIf(startsWith(os_status, '1')) AS n_events,
+    countIf(startsWith(os_status, '0')) AS n_censored,
+    round(min(os_months), 1) AS min_followup_months,
+    round(max(os_months), 1) AS max_followup_months
+FROM os
+WHERE patient_unique_id IN (SELECT patient_unique_id FROM profiled_patients)
+  AND os_months IS NOT NULL
+  AND os_status != ''
+GROUP BY group_name
+ORDER BY group_name"
+}
+
+◀ result
+{"rows":[{"group_name":"PIK3CA mutant","n_patients":1908,"n_events":718,"n_censored":1190,"min_followup_months":0,"max_followup_months":113.1},{"group_name":"PIK3CA wild-type","n_patients":3460,"n_events":1272,"n_censored":2188,"min_followup_months":0,"max_followup_months":118.5}]}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "studyViewFilter": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Breast Cancer"
+     }
+    ]
+   }
+  ]
+ },
+ "groups": [
+  {
+   "name": "PIK3CA mutant",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "msk_chord_2024_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "PIK3CA wild-type",
+   "isUnselected": true
+  }
+ ],
+ "tab": "survival"
+}
+
+✗ error
+The operation timed out.
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "studyViewFilter": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Breast Cancer"
+     }
+    ]
+   }
+  ]
+ },
+ "groups": [
+  {
+   "name": "PIK3CA mutant",
+   "studyViewFilter": {
+    "geneFilters": [
+     {
+      "molecularProfileIds": [
+       "msk_chord_2024_mutations"
+      ],
+      "geneQueries": [
+       [
+        {
+         "hugoGeneSymbol": "PIK3CA"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "PIK3CA wild-type",
+   "isUnselected": true
+  }
+ ],
+ "tab": "survival"
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/filtered-samples/fetch","data":{"studyIds":["msk_chord_2024"],"clinicalDataFilters":[{"attributeId":"CANCER_TYPE","values":[{"value":"Breast Cancer"}]}],"geneFilters":[{"molecularProfileIds":["msk_chord_2024_mutations"],"geneQueries":[[{"hugoGeneSymbol":"PIK3CA"}]]}]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"date":"Thu, 15 Oct 2026 08:10:43 GMT","content-type":"application/json","transfer-encoding":"chunked","connection":"close","cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","elapsed-time":"0","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","cf-cache-status":"DYNAMIC","report-to":"{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=Pjnzcjy1i7AZxUpXAFCS7j8OICTH5iHyg5aCPuo0QE2gZLe0qLy6GRSC8bWQebZjA0rn3xnO8Cvev7J1H71Wwey6qI%2BBq6t73ll6C7nIFq1BhSuLqlYJNSX0VfdtqHRBQbAUog%3D%3D\"}]}","nel":"{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}","server":"cloudflare","cf-ray":"a4ad584bbdbb2a30-IAD"},"status":500,"text":"{\"timestamp\":1792051843462,\"status\":500,\"error\":\"Internal Server Error\",\"path\":\"/api/filtered-samples/fetch\"}"}}}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "genes": [
+  "PIK3CA"
+ ],
+ "studyViewFilter": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Breast Cancer"
+     }
+    ]
+   }
+  ]
+ },
+ "tab": "survival"
+}
+
+✗ error
+The operation timed out.
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "filterJson": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Breast Cancer"
+     }
+    ]
+   }
+  ],
+  "geneFilters": [
+   {
+    "molecularProfileIds": [
+     "msk_chord_2024_mutations"
+    ],
+    "geneQueries": [
+     [
+      {
+       "hugoGeneSymbol": "PIK3CA"
+      }
+     ]
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%2C%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_chord_2024_mutations%22%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%2C%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_chord_2024_mutations%22%5D%7D%5D%7D","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+In MSK-CHORD breast cancer, the descriptive survival counts for PIK3CA-mutant and wild-type patients are very similar, but I can't say whether the difference is statistically significant. That needs a Kaplan-Meier survival curve with a log-rank test, which I couldn't run here.
+
+**Cohort:** Breast cancer patients (`CANCER_TYPE = Breast Cancer`) in MSK-CHORD, counted per patient. Patients were included only if they had a sample profiled for PIK3CA. Mutant means at least one PIK3CA mutation call in a sample on the panel. Wild-type means profiled for PIK3CA with no mutation.
+
+| Group | Patients | Deaths (OS_STATUS = 1) | Censored (alive at last follow-up) | Follow-up range (months) |
+|---|---|---|---|---|
+| PIK3CA mutant | 1,908 | 718 (37.6%) | 1,190 | 0 – 113.1 |
+| PIK3CA wild-type | 3,460 | 1,272 (36.8%) | 2,188 | 0 – 118.5 |
+
+- Both groups have fewer than half of patients with an event. The Kaplan-Meier median is therefore likely not reached in either group, so I haven't reported medians.
+- The difference in event proportions is about 0.8 percentage points. That is a descriptive observation only, not a test result.
+- The next step is a Kaplan-Meier curve and log-rank test, which you can run in cBioPortal's Group Comparison Survival tab or in R (`survival::survfit`) or Python (`lifelines`). My attempt to generate the Group Comparison link timed out with a server error, so you'll need to set up the two groups there yourself.
+
+A StudyView link to the breast cancer cohort filtered to PIK3CA-mutant patients: [View MSK-CHORD breast cancer, PIK3CA-mutant cohort](https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Breast%20Cancer%22%7D%5D%7D%5D%2C%22geneFilters%22%3A%5B%7B%22geneQueries%22%3A%5B%5B%7B%22hugoGeneSymbol%22%3A%22PIK3CA%22%7D%5D%5D%2C%22molecularProfileIds%22%3A%5B%22msk_chord_2024_mutations%22%5D%7D%5D%7D)

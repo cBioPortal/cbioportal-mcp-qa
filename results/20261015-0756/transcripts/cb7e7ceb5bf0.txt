@@ -1,0 +1,131 @@
+Q (haiku-5.5): In the TCGA PanCancer Atlas endometrial cancer study, what percentage of patients have co-occurring oncogenic mutations in both KRAS and NRAS?
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, sample_count, mutation_sample_count FROM cancer_study WHERE cancer_study_identifier LIKE 'ucec_tcga%'"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"ucec_tcga","name":"Uterine Corpus Endometrial Carcinoma (TCGA, Firehose Legacy)","sample_count":549,"mutation_sample_count":248},{"cancer_study_identifier":"ucec_tcga_gdc","name":"Endometrial Carcinoma (TCGA GDC, 2025)","sample_count":547,"mutation_sample_count":511},{"cancer_study_identifier":"ucec_tcga_pub","name":"Uterine Corpus Endometrial Carcinoma (TCGA, Nature 2013)","sample_count":373,"mutation_sample_count":248},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sample_count":529,"mutation_sample_count":517}]}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT driver_filter, count() AS mutations, uniqExact(sample_unique_id) AS samples FROM genomic_event_derived WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018' AND variant_type = 'mutation' GROUP BY driver_filter"
+}
+
+◀ result
+{"rows":[{"mutations":538948,"samples":515}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT gene_panel_id, alteration_type, count() AS samples, uniqExact(sample_unique_id) AS n FROM sample_to_gene_panel_derived WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018' GROUP BY gene_panel_id, alteration_type"
+}
+
+◀ result
+{"rows":[{"gene_panel_id":"WES","alteration_type":"PROTEIN_LEVEL","samples":846,"n":423},{"gene_panel_id":"WES","alteration_type":"MUTATION_EXTENDED","samples":517,"n":517},{"gene_panel_id":"WES","alteration_type":"COPY_NUMBER_ALTERATION","samples":1046,"n":523},{"gene_panel_id":"WES","alteration_type":"STRUCTURAL_VARIANT","samples":517,"n":517},{"gene_panel_id":"WES","alteration_type":"MRNA_EXPRESSION","samples":2108,"n":527},{"gene_panel_id":"WES","alteration_type":"GENERIC_ASSAY","samples":1970,"n":529}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH prof AS (
+  SELECT DISTINCT cd.patient_unique_id AS pid
+  FROM sample_to_gene_panel_derived s
+  JOIN (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018') cd USING (sample_unique_id)
+  WHERE s.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018' AND s.alteration_type = 'MUTATION_EXTENDED'
+),
+m AS (
+  SELECT DISTINCT cd.patient_unique_id AS pid, g.hugo_gene_symbol AS gene, g.mutation_type AS mt
+  FROM genomic_event_derived g
+  JOIN (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018') cd USING (sample_unique_id)
+  WHERE g.cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018'
+    AND g.variant_type = 'mutation' AND g.mutation_status != 'UNCALLED' AND g.off_panel = 0
+    AND g.hugo_gene_symbol IN ('KRAS','NRAS')
+),
+kras AS (SELECT DISTINCT pid FROM m WHERE gene = 'KRAS' AND mt != 'Silent'),
+nras AS (SELECT DISTINCT pid FROM m WHERE gene = 'NRAS' AND mt != 'Silent')
+SELECT
+  (SELECT uniqExact(pid) FROM prof) AS profiled_patients,
+  (SELECT uniqExact(pid) FROM kras) AS kras_mut_patients,
+  (SELECT uniqExact(pid) FROM nras) AS nras_mut_patients,
+  (SELECT uniqExact(pid) FROM kras WHERE pid IN (SELECT pid FROM nras)) AS both_patients,
+  (SELECT uniqExact(pid) FROM m WHERE gene='KRAS' AND pid IN (SELECT pid FROM nras)) AS kras_any_with_nras_mut,
+  (SELECT count() FROM (SELECT DISTINCT cd.patient_unique_id FROM genomic_event_derived g JOIN (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier = 'ucec_tcga_pan_can_atlas_2018') cd USING (sample_unique_id) WHERE g.cancer_study_identifier='ucec_tcga_pan_can_atlas_2018' AND g.variant_type='mutation' AND g.driver_filter != '')) AS patients_with_any_driver_annotation
+"
+}
+
+◀ result
+{"rows":[{"profiled_patients":517,"kras_mut_patients":99,"nras_mut_patients":21,"both_patients":4,"kras_any_with_nras_mut":4,"patients_with_any_driver_annotation":0}]}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "ucec_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "KRAS: MUT",
+  "NRAS: MUT"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=KRAS%3A+MUT%0ANRAS%3A+MUT&case_set_id=ucec_tcga_pan_can_atlas_2018_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=KRAS%3A+MUT%0ANRAS%3A+MUT&case_set_id=ucec_tcga_pan_can_atlas_2018_all","data":{"studyIds":["ucec_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ucec_tcga_pan_can_atlas_2018","name":"Uterine Corpus Endometrial Carcinoma (TCGA, PanCancer Atlas)","sampleCount":529}],"genes":["KRAS","NRAS"],"caseSetId":"ucec_tcga_pan_can_atlas_2018_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+**Answer: 4 of 517 profiled patients (0.8%) have a non-silent somatic mutation in both KRAS and NRAS.** This is in the TCGA PanCancer Atlas endometrial cancer study (`ucec_tcga_pan_can_atlas_2018`).
+
+- **Counting unit:** patients, not samples.
+- **Denominator:** 517 patients with mutation data. All of them were sequenced by whole-exome sequencing, so every gene is covered.
+- **Numerator:** 4 patients with at least one non-silent, called mutation in KRAS and at least one in NRAS.
+- **Context:** 99 patients (19.1%) have a KRAS mutation and 21 (4.1%) have an NRAS mutation. Only 4 of the 99 KRAS-mutant patients also carry an NRAS mutation.
+
+**Caveat on "oncogenic":** the database has no driver or oncogenicity annotation for this study, so I could not restrict to oncogenic mutations. The figure above includes any non-silent somatic mutation, so it is an upper bound on the oncogenic-only rate. To check oncogenicity, use OncoKB or the `DRIVER` modifier in the portal.
+
+[View KRAS and NRAS mutations in the OncoPrint](https://www.cbioportal.org/results/oncoprint?cancer_study_list=ucec_tcga_pan_can_atlas_2018&gene_list=KRAS%3A+MUT%0ANRAS%3A+MUT&case_set_id=ucec_tcga_pan_can_atlas_2018_all)

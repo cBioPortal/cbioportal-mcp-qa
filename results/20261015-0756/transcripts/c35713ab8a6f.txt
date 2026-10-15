@@ -1,0 +1,397 @@
+Q (haiku-5.5): In the TCGA PanCancer Atlas breast cancer study, what is the concordance between ERBB2 copy number amplification, mRNA overexpression, and protein overexpression?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ list_studies
+{
+ "search": "breast TCGA pan can atlas"
+}
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"brca","sample_count":1084,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018"}]}
+
+▶ get_study_guide
+{
+ "study_id": "brca_tcga_pan_can_atlas_2018"
+}
+
+◀ result
+# Breast Invasive Carcinoma (TCGA, PanCancer Atlas)
+
+**Study ID:** `brca_tcga_pan_can_atlas_2018`
+
+See `_tcga_pancan_template.md` for common TCGA clinical attributes.
+
+## Study-Specific Attributes
+
+### Molecular Subtypes
+| Attribute | Description | Values (patients) |
+|-----------|-------------|--------|
+| `SUBTYPE` | PAM50 molecular subtype | `BRCA_LumA` 499, `BRCA_LumB` 197, `BRCA_Basal` 171, `BRCA_Her2` 78, `BRCA_Normal` 36, blank 103 |
+
+### Histology
+| Attribute | Description | Values (samples) |
+|-----------|-------------|--------|
+| `CANCER_TYPE_DETAILED` | Histological type | Breast Invasive Ductal Carcinoma 780, Breast Invasive Lobular Carcinoma 201, Breast Invasive Carcinoma (NOS) 77, Breast Invasive Mixed Mucinous Carcinoma 17, Metaplastic Breast Cancer 8, Invasive Breast Carcinoma 1 |
+
+### Not available in this study
+- **ER / PR / HER2 receptor status and triple-negative status**: no clinical attribute; say it is not available here. Do not infer receptor status from `SUBTYPE`: PAM50 is an expression-based classification, not IHC/FISH. If the user accepts an expression-based proxy, `BRCA_Basal` (≈ triple-negative) or `BRCA_Her2` can be offered, labelled as PAM50. ERBB2 amplification is available from CNA data.
+- `GRADE` is blank for all samples.
+
+## Key Genes
+- **TP53**: Most frequently mutated (~30%)
+- **PIK3CA**: Common in ER+ tumors (~35%)
+- **CDH1**: Enriched in lobular carcinoma
+- **GATA3**: Luminal marker
+- **ERBB2**: HER2 amplification target
+
+## Notes
+- Molecular subtypes (PAM50) correlate strongly with clinical behavior
+- Lobular vs ductal distinction has different mutation profiles
+
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT profile_type, count() AS rows, uniqExact(sample_unique_id) AS samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'ERBB2'
+GROUP BY profile_type
+ORDER BY profile_type"
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic","rows":1070,"samples":1070},{"profile_type":"log2CNA","rows":1070,"samples":1070},{"profile_type":"protein_quantification","rows":105,"samples":105},{"profile_type":"protein_quantification_zscores","rows":105,"samples":105},{"profile_type":"rna_seq_v2_mrna","rows":1082,"samples":1082},{"profile_type":"rna_seq_v2_mrna_median_Zscores","rows":1082,"samples":1082},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","rows":1082,"samples":1082},{"profile_type":"rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores","rows":1082,"samples":1082},{"profile_type":"rppa","rows":876,"samples":876},{"profile_type":"rppa_Zscores","rows":876,"samples":876}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT profile_type,
+       count() AS n,
+       min(toFloat64OrNull(alteration_value)) AS min_v,
+       quantile(0.5)(toFloat64OrNull(alteration_value)) AS median_v,
+       max(toFloat64OrNull(alteration_value)) AS max_v,
+       countIf(alteration_value IN ('2','2.0')) AS n_eq2,
+       countIf(toFloat64OrNull(alteration_value) > 2) AS n_gt2
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'ERBB2'
+  AND profile_type IN ('gistic','rna_seq_v2_mrna_median_all_sample_Zscores','rppa_Zscores')
+  AND alteration_value NOT IN ('', 'NA')
+GROUP BY profile_type"
+}
+
+◀ result
+{"rows":[{"profile_type":"rppa_Zscores","n":876,"min_v":-1.8536000000000001,"median_v":-0.195,"max_v":4.2354,"n_eq2":0,"n_gt2":53},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n":1082,"min_v":-3.8045,"median_v":-0.13019999999999998,"max_v":3.7214,"n_eq2":0,"n_gt2":75},{"profile_type":"gistic","n":1070,"min_v":-1,"median_v":0,"max_v":2,"n_eq2":123,"n_gt2":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH cna AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'ERBB2' AND profile_type = 'gistic'
+      AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+mrna AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'ERBB2' AND profile_type = 'rna_seq_v2_mrna_median_all_sample_Zscores'
+      AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+prot AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'ERBB2' AND profile_type = 'rppa_Zscores'
+      AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+joined AS (
+    SELECT cna.sample_unique_id AS s,
+           cna.v = 2 AS amp,
+           mrna.v > 2 AS mrna_high,
+           prot.v > 2 AS prot_high
+    FROM cna
+    INNER JOIN mrna USING (sample_unique_id)
+    INNER JOIN prot ON prot.sample_unique_id = cna.sample_unique_id
+)
+SELECT
+    count() AS samples_with_all_three,
+    countIf(amp) AS cna_amp,
+    countIf(mrna_high) AS mrna_high,
+    countIf(prot_high) AS protein_high,
+    countIf(amp AND mrna_high) AS amp_and_mrna,
+    countIf(amp AND prot_high) AS amp_and_protein,
+    countIf(mrna_high AND prot_high) AS mrna_and_protein,
+    countIf(amp AND mrna_high AND prot_high) AS all_three,
+    countIf(amp OR mrna_high OR prot_high) AS any_of_three,
+    countIf(NOT amp AND NOT mrna_high AND NOT prot_high) AS none_of_three
+FROM joined"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 184\n Code: 184. DB::Exception: Aggregate function countIf(mrna_high) AS mrna_high is found inside another aggregate function in query. (ILLEGAL_AGGREGATION) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH cna AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'ERBB2' AND profile_type = 'gistic'
+      AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+mrna AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'ERBB2' AND profile_type = 'rna_seq_v2_mrna_median_all_sample_Zscores'
+      AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+prot AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'brca_tcga_pan_can_atlas_2018'
+      AND hugo_gene_symbol = 'ERBB2' AND profile_type = 'rppa_Zscores'
+      AND alteration_value NOT IN ('', 'NA') AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+joined AS (
+    SELECT cna.sample_unique_id AS s,
+           cna.v = 2 AS f_amp,
+           mrna.v > 2 AS f_mrna,
+           prot.v > 2 AS f_prot
+    FROM cna
+    INNER JOIN mrna USING (sample_unique_id)
+    INNER JOIN prot ON prot.sample_unique_id = cna.sample_unique_id
+)
+SELECT
+    count() AS samples_with_all_three,
+    countIf(f_amp) AS cna_amp,
+    countIf(f_mrna) AS mrna_high,
+    countIf(f_prot) AS protein_high,
+    countIf(f_amp AND f_mrna) AS amp_and_mrna,
+    countIf(f_amp AND f_prot) AS amp_and_protein,
+    countIf(f_mrna AND f_prot) AS mrna_and_protein,
+    countIf(f_amp AND f_mrna AND f_prot) AS all_three,
+    countIf(f_amp OR f_mrna OR f_prot) AS any_of_three,
+    countIf(NOT f_amp AND NOT f_mrna AND NOT f_prot) AS none_of_three
+FROM joined"
+}
+
+◀ result
+{"rows":[{"samples_with_all_three":863,"cna_amp":101,"mrna_high":62,"protein_high":52,"amp_and_mrna":58,"amp_and_protein":50,"mrna_and_protein":44,"all_three":42,"any_of_three":105,"none_of_three":758}]}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "brca_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "ERBB2: AMP",
+  "ERBB2: EXP > 2",
+  "ERBB2: PROT > 2"
+ ],
+ "profileFilter": "gistic,rna_seq_v2_mrna_median_all_sample_Zscores,rppa_Zscores",
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=ERBB2%3A+AMP%0AERBB2%3A+EXP+%3E+2%0AERBB2%3A+PROT+%3E+2&case_set_id=brca_tcga_pan_can_atlas_2018_all&profileFilter=gistic%2Crna_seq_v2_mrna_median_all_sample_Zscores%2Crppa_Zscores","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=ERBB2%3A+AMP%0AERBB2%3A+EXP+%3E+2%0AERBB2%3A+PROT+%3E+2&case_set_id=brca_tcga_pan_can_atlas_2018_all&profileFilter=gistic%2Crna_seq_v2_mrna_median_all_sample_Zscores%2Crppa_Zscores","data":{"studyIds":["brca_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","sampleCount":1084}],"genes":["ERBB2","ERBB2","ERBB2"],"caseSetId":"brca_tcga_pan_can_atlas_2018_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+## ERBB2 concordance in TCGA PanCancer Atlas breast cancer (`brca_tcga_pan_can_atlas_2018`)
+
+**Result:** Among 863 patients with all three measurements, ERBB2 copy-number amplification, mRNA overexpression, and protein overexpression mostly co-occur. Protein and mRNA overexpression are both largely explained by amplification, but amplification alone misses a substantial share of mRNA and protein high-expressors.
+
+**Definitions**
+- Amplification: GISTIC copy-number value = 2 (high-level gain)
+- mRNA overexpression: RNA-seq z-score > 2 (all-sample reference)
+- Protein overexpression: RPPA z-score > 2
+- Denominator: 863 samples profiled on all three assays (RPPA covers 876 samples, mRNA 1,082, CNA 1,070)
+
+**Counts (n = 863)**
+
+| Category | Samples | % of 863 |
+|---|---|---|
+| Amplified | 101 | 11.7% |
+| mRNA high | 62 | 7.2% |
+| Protein high | 52 | 6.0% |
+| Amplified + mRNA high | 58 | |
+| Amplified + protein high | 50 | |
+| mRNA high + protein high | 44 | |
+| All three | 42 | |
+| Any of the three | 105 | 12.2% |
+| None | 758 | 87.8% |
+
+**Conditional overlap**
+- Of amplified tumors, 57% (58/101) are mRNA high and 50% (50/101) are protein high. Only 42% (42/101) are high on all three.
+- Of mRNA-high tumors, 94% (58/62) are amplified.
+- Of protein-high tumors, 96% (50/52) are amplified, and 85% (44/52) are also mRNA high.
+- Every protein-high tumor is either amplified or mRNA high. None are protein-high alone.
+
+**Caveats**
+- These are descriptive counts. I did not compute kappa, p-values, or other statistical tests, which this database can't run.
+- Simple percent agreement is inflated by the low base rate of positives, so I left it out. The conditional percentages above are more informative.
+- The thresholds (GISTIC 2, z > 2) are conventional choices. Other cutoffs will shift the numbers.
+- Overlapping cohorts across studies can double-count, but this analysis uses a single study.
+
+You can view the ERBB2 amplification, mRNA, and protein status for this cohort in the [ERBB2 OncoPrint](https://www.cbioportal.org/results/oncoprint?cancer_study_list=brca_tcga_pan_can_atlas_2018&gene_list=ERBB2%3A+AMP%0AERBB2%3A+EXP+%3E+2%0AERBB2%3A+PROT+%3E+2&case_set_id=brca_tcga_pan_can_atlas_2018_all&profileFilter=gistic%2Crna_seq_v2_mrna_median_all_sample_Zscores%2Crppa_Zscores).

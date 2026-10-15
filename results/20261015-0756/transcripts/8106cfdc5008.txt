@@ -1,0 +1,171 @@
+Q (haiku-5.5): What fraction of patients were older than five when diagnosed according to the Pediatric Neuroblastoma study from TARGET?
+
+▶ list_studies
+{
+ "search": "neuroblastoma TARGET"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"nbl_target_2018_pub","name":"Pediatric Neuroblastoma (TARGET, 2018)","type_of_cancer_id":"nbl","sample_count":1089,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nbl_target_2018_pub"},{"cancer_study_identifier":"nbl_target_gdc","name":"Neuroblastoma (TARGET GDC, 2025)","type_of_cancer_id":"nbl","sample_count":533,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nbl_target_gdc"},{"cancer_study_identifier":"nbl_msk_2023","name":"Pediatric Neuroblastoma (MSK, Nat Genet 2023)","type_of_cancer_id":"nbl","sample_count":223,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=nbl_msk_2023"}]}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, count(DISTINCT patient_unique_id) AS patients, countIf(attribute_value = '') AS empty_values
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'nbl_target_2018_pub'
+  AND (upper(attribute_name) LIKE '%AGE%' OR upper(attribute_name) LIKE '%DIAG%')
+GROUP BY attribute_name
+ORDER BY attribute_name"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"rows":[{"attribute_name":"AGE","patients":1076,"empty_values":0},{"attribute_name":"AGE_IN_DAYS","patients":1076,"empty_values":0},{"attribute_name":"DIAGNOSIS","patients":1076,"empty_values":0},{"attribute_name":"INSS_STAGE","patients":1076,"empty_values":0},{"attribute_name":"PERCENTAGE_NECROSIS","patients":1076,"empty_values":789},{"attribute_name":"PERCENTAGE_TUMOR_PURITY","patients":1076,"empty_values":266},{"attribute_name":"YEAR_OF_DIAGNOSIS","patients":1076,"empty_values":0}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH p AS (
+  SELECT patient_unique_id,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'AGE') AS age_years,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'AGE_IN_DAYS') AS age_days
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'nbl_target_2018_pub'
+    AND attribute_name IN ('AGE', 'AGE_IN_DAYS')
+  GROUP BY patient_unique_id
+)
+SELECT
+  count() AS patients,
+  countIf(age_years IS NOT NULL) AS with_age,
+  min(age_years) AS min_age_years, max(age_years) AS max_age_years,
+  countIf(age_years > 5) AS over5_by_AGE,
+  countIf(age_days IS NOT NULL) AS with_days,
+  min(age_days) AS min_days, max(age_days) AS max_days,
+  countIf(age_days / 365.25 > 5) AS over5_by_days,
+  countIf(age_days > 5 * 365.25) AS over5_days_strict,
+  countIf(age_years = 5) AS exactly5_AGE,
+  countIf(age_days BETWEEN 5*365.25 - 0.5 AND 5*365.25 + 0.5) AS near5_days
+FROM p"
+}
+
+◀ result
+{"rows":[{"patients":1076,"with_age":1076,"min_age_years":0,"max_age_years":21,"over5_by_AGE":125,"with_days":1076,"min_days":0,"max_days":7612,"over5_by_days":125,"over5_days_strict":125,"exactly5_AGE":126,"near5_days":0}]}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "nbl_target_2018_pub"
+ ],
+ "tab": "clinicalData"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/clinicalData?id=nbl_target_2018_pub","url":"https://www.cbioportal.org/study/clinicalData?id=nbl_target_2018_pub","data":{"studyIds":["nbl_target_2018_pub"],"studies":[{"studyId":"nbl_target_2018_pub","name":"Pediatric Neuroblastoma (TARGET, 2018)","sampleCount":1089}],"tab":"clinicalData","hasFilters":false,"hasPlotsConfig":false,"pageDescription":"Table of clinical attributes per sample."}}
+
+═ answer (success)
+About 11.6% of patients were older than five at diagnosis: 125 of 1,076 patients with a recorded age (`nbl_target_2018_pub`, Pediatric Neuroblastoma (TARGET, 2018)).
+
+- **Denominator:** 1,076 patients, all of whom have an age recorded. The study has 1,089 samples, but I counted patients.
+- **Method:** I used the `AGE` attribute, which is in years and ranges from 0 to 21. It does not show the floor or cap seen in some TARGET GDC studies. Age in days (`AGE_IN_DAYS`) gives the same count of 125.
+- **Boundary:** 126 patients are recorded at exactly 5 years. I excluded them because "older than five" is read as strictly greater than 5. If you want "5 or older," the count would be 251 (23.3%).
+
+The database has a second TARGET neuroblastoma study, Neuroblastoma (TARGET GDC, 2025, `nbl_target_gdc`), that I did not use because its name doesn't match "Pediatric Neuroblastoma." If you meant that one, let me know and I'll run the same calculation.
+
+You can view this study's clinical data here: [View clinical data for Pediatric Neuroblastoma (TARGET, 2018)](https://www.cbioportal.org/study/clinicalData?id=nbl_target_2018_pub)
