@@ -52,9 +52,17 @@ class Run:
         runner: str = "agents-api",
         extra: dict | None = None,
     ) -> "Run":
-        run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M")
+        # Runs started in the same minute get -2, -3, ...: each run owns its directory.
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        for n in range(1, 1000):
+            run_id = stamp if n == 1 else f"{stamp}-{n}"
+            try:
+                (RESULTS_DIR / run_id).mkdir()
+                break
+            except FileExistsError:
+                continue
         path = RESULTS_DIR / run_id / "run.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "run_id": run_id,
             "target": target,

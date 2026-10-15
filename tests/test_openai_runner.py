@@ -245,3 +245,32 @@ def test_expired_token_is_refreshed_and_saved(tmp_path, monkeypatch):
     assert tokens.get() == "new-access-token" and len(posted) == 1
     with pytest.raises(RuntimeError, match="not https://other"):
         OAuthTokens("https://other/db/mcp", path)
+
+
+def test_context_overflow_error_says_so(tmp_path):
+    sent = []
+    client = _client(tmp_path, [], sent)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/version"):
+            return httpx.Response(404)
+        return httpx.Response(500, json={"error": {"message": "no user query found in messages"}})
+
+    client.http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+
+    async def go():
+        await client.start()
+        return await client.ask("q", "llama3.1-8b")
+
+    reply = asyncio.run(go())
+    assert reply.status is None and "exceeded the context window" in reply.error
+
+
+def test_runs_started_in_the_same_minute_get_their_own_directory(tmp_path, monkeypatch):
+    from cbioportal_mcp_qa import run as run_mod
+
+    monkeypatch.setattr(run_mod, "RESULTS_DIR", tmp_path)
+    a = run_mod.Run.create("beta", ["haiku"], 1, "j", "q.yaml")
+    b = run_mod.Run.create("beta", ["haiku"], 1, "j", "q.yaml")
+    assert b.data["run_id"] == a.data["run_id"] + "-2"
+    assert a.path.parent != b.path.parent and a.path.is_file() and b.path.is_file()

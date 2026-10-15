@@ -30,6 +30,8 @@ MAX_TOOL_ROUNDS = 25
 # No tokenizer reads more than this many characters per token on average (prompts and JSON run ~3-4.5): a
 # smaller count than the characters sent allow means the server truncated the prompt.
 MAX_CHARS_PER_TOKEN = 6
+# Ollama's error when it cut a conversation to fit the window and no user message was left (Qwen templates).
+CONTEXT_OVERFLOW = "no user query found in messages"
 THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 SERVER_INSTRUCTIONS_DELIVERY = "openai runner (appended to the system prompt, LibreChat order)"
 
@@ -283,6 +285,11 @@ class OpenAIChatClient:
             else:
                 if resp.status_code == 200:
                     break
+                if CONTEXT_OVERFLOW in resp.text:
+                    raise RuntimeError(
+                        "prompt exceeded the context window: the server dropped the oldest messages, the question "
+                        f"among them ({self.context_window or '?'} tokens; raise num_ctx)"
+                    )
                 failure = _RequestFailed(resp.status_code, redact(resp.text)[:2000])
                 if resp.status_code not in RETRYABLE_STATUS:
                     raise failure
