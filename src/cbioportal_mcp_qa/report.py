@@ -490,6 +490,9 @@ def run_setup(run: dict) -> dict:
     if run.get("runner") == "claude-code":
         cc = v.get("claude_code")
         runner = "Claude Code " + cc.split()[0] if isinstance(cc, str) else "Claude Code"
+    elif run.get("runner") == "openai":
+        backend = (run.get("openai") or {}).get("backend") or {}
+        runner = f"Ollama {backend['ollama']}" if backend.get("ollama") else "OpenAI-compatible"
     else:
         lc = v.get("librechat")
         runner = "LibreChat " + lc.split(":")[-1] if isinstance(lc, str) else "LibreChat"

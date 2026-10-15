@@ -468,6 +468,49 @@ Every run also records versions (both runners): cBioPortal portal / DB schema / 
 `https://www.cbioportal.org/api/info`, and the cbioportal-mcp and navigator server versions (with a hash of
 the server's instructions) and image digests.
 
+## Self-hosted models (`--runner openai`)
+
+`--runner openai` answers with a model behind an OpenAI-compatible chat endpoint (Ollama's `/v1`, vLLM) and runs
+the tool-calling loop itself:
+
+- **System prompt:** the deployed agent's instructions (from kubectl, or `--system-prompt-file`, e.g. a run's
+  recorded `results/<run>/agent-prompt.md`), followed by the MCP servers' own instructions: LibreChat's order with
+  `serverInstructions: true`. `run.json` (`openai.prompt`) records the hashes of each part and of the whole.
+- **Tools:** every tool the database MCP and the navigator list, under their own names, as OpenAI function tools.
+  Tool errors, invalid arguments and unknown tools go back to the model as the tool's result. After
+  `--max-tool-rounds` (default 25) rounds the model must answer without tools.
+- **Records:** answer, latency, tokens (summed over the LLM calls), every tool call with its input and result, and a
+  transcript under `transcripts/`, in the claude-code runner's shapes, so reports, `compare` and the judge work
+  unchanged. Models are priced at $0. `run.json` records the endpoint, the served model name, the server (Ollama
+  version), its context window and the tool list (`openai`).
+- **Models:** `--models llama3.1-8b` or `qwen3.8-27b` (`config.MODELS`, `openai_id`). Set `OPENAI_BASE_URL`
+  (default `http://127.0.0.1:11434/v1`), `OPENAI_API_KEY` if the server wants one, and `OPENAI_SERVED_MODEL` when
+  the server knows the model by another name (e.g. an Ollama model derived to pin `num_ctx`).
+- **Thinking:** `--reasoning-effort none` turns a thinking model's reasoning off, as the deployed agent runs;
+  without it the request leaves the server's default. Inline `<think>` blocks are dropped from the answer.
+
+The public database MCP needs an OAuth login, which the openai runner does itself. Log in once:
+
+```bash
+uv run cbioportal-mcp-qa mcp-login
+```
+
+It prints a URL to open in a browser. After the login the browser is sent to `http://127.0.0.1:8976/callback?...`,
+which needn't load: paste that URL back. The tokens go in `.mcp-oauth.json` (owner-only, gitignored,
+`MCP_OAUTH_FILE` to move it) and are refreshed as needed. With `DATABASE_MCP_URL` (a port-forward) no login is used.
+
+```bash
+uv run cbioportal-mcp-qa run --runner openai --models qwen3.8-27b --reasoning-effort none \
+  --system-prompt-file results/20261002-2344/agent-prompt.md --questions 1-10 --concurrency 1 --no-grade
+uv run cbioportal-mcp-qa grade <run> --judge-runner claude-code
+```
+
+**Context window.** The prompt alone (agent instructions, server instructions and tool schemas) is about 37k tokens,
+before any guide or query result. Ollama's `/v1` endpoint silently cuts a prompt that doesn't fit its `num_ctx`,
+from the start (the system prompt first), and reports the cut count. The runner fails such an answer ("prompt
+truncated by the server") rather than grade an answer to a prompt it never saw: give the server a window of 64k or
+more. `--concurrency` should not exceed the server's parallel slots (`OLLAMA_NUM_PARALLEL`).
+
 ## Adding questions
 
 Append to `input/questions.yaml` with the next unused `id` (ids are stable; never renumber or reuse):

@@ -35,7 +35,12 @@ class Model:
     bedrock_id: str | None
     price: Price | None
     claude_code_id: str | None = None
+    # The model's name on an OpenAI-compatible server (Ollama, vLLM) for the openai runner.
+    openai_id: str | None = None
 
+
+# Self-hosted models cost nothing per token.
+LOCAL = Price(0.0, 0.0, 0.0, 0.0)
 
 MODELS = {
     "haiku": Model(
@@ -56,6 +61,8 @@ MODELS = {
         "us.anthropic.claude-sonnet-4-6",
         Price(3.0, 15.0, 3.75, 0.30),
     ),
+    "llama3.1-8b": Model("llama3.1-8b", "Llama 3.1 8B", None, LOCAL, openai_id="llama3.1:8b"),
+    "qwen3.8-27b": Model("qwen3.8-27b", "Qwen3.8 27B", None, LOCAL, openai_id="qwen3.8:27b"),
     "router": Model("router", "Handoff router", None, None),
     "unified": Model("unified", "Unified agent", None, None),
 }
@@ -147,6 +154,9 @@ class Settings:
     database_connector: str | None
     kube_context: str | None
     database_mcp_env: str | None = None
+    openai_base_url: str = "http://127.0.0.1:11434/v1"
+    openai_api_key: str = ""
+    openai_served_model: str | None = None
 
 
 def load_settings() -> Settings:
@@ -169,7 +179,17 @@ def load_settings() -> Settings:
         kube_context=os.environ.get("KUBE_CONTEXT") or None,
         # What a DATABASE_MCP_URL that can't be told apart by its host (a port-forward, a local image) serves.
         database_mcp_env=(os.environ.get("DATABASE_MCP_ENV") or "").strip().lower() or None,
+        openai_base_url=os.environ.get("OPENAI_BASE_URL") or "http://127.0.0.1:11434/v1",
+        openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
+        # The name the server knows the model by when it isn't the model's openai_id (e.g. an Ollama model
+        # derived to pin num_ctx / num_thread).
+        openai_served_model=os.environ.get("OPENAI_SERVED_MODEL") or None,
     )
-    for value in (settings.api_key, settings.langfuse_secret_key, settings.langfuse_public_key):
+    for value in (
+        settings.api_key,
+        settings.langfuse_secret_key,
+        settings.langfuse_public_key,
+        settings.openai_api_key,
+    ):
         add_secret(value)
     return settings
