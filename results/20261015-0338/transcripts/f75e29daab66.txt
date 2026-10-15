@@ -1,0 +1,452 @@
+Q (haiku-5.5): In lower grade glioma, are there genes which are overexpressed in any of the molecular subtypes?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "lower grade glioma"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, attribute_value, count() AS n
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+  AND attribute_name IN ('SUBTYPE','CANCER_TYPE_DETAILED','IDH_CODEL_SUBTYPE','IDH_STATUS','GRADE')
+GROUP BY attribute_name, attribute_value
+ORDER BY attribute_name, n DESC"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'lgg_tcga_pan_can_atlas_2018'
+ORDER BY profile_type"
+}
+
+◀ result
+{"rows":[{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Astrocytoma","n":194},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Oligodendroglioma","n":189},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Oligoastrocytoma","n":130},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Low-Grade Glioma (NOS)","n":1},{"attribute_name":"GRADE","attribute_value":"G3","n":264},{"attribute_name":"GRADE","attribute_value":"G2","n":248},{"attribute_name":"GRADE","n":2},{"attribute_name":"SUBTYPE","attribute_value":"LGG_IDHmut-non-codel","n":248},{"attribute_name":"SUBTYPE","attribute_value":"LGG_IDHmut-codel","n":167},{"attribute_name":"SUBTYPE","attribute_value":"LGG_IDHwt","n":92},{"attribute_name":"SUBTYPE","n":7}]}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"log2CNA"},{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rppa"},{"profile_type":"rppa_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+  SELECT sample_unique_id, attribute_value AS subtype FROM clinical_data_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+e AS (
+  SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores'
+    AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(avgIf(z, subtype='LGG_IDHmut-codel'),2) AS mean_z_in,
+  round(avgIf(z, subtype!='LGG_IDHmut-codel'),2) AS mean_z_out,
+  round(mean_z_in - mean_z_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHmut-codel'),3) AS frac_z2_in
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHmut-codel') >= 100 AND countIf(subtype!='LGG_IDHmut-codel') >= 100
+ORDER BY diff DESC
+LIMIT 25",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+  SELECT sample_unique_id, attribute_value AS subtype FROM clinical_data_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+e AS (
+  SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores'
+    AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(avgIf(z, subtype='LGG_IDHmut-non-codel'),2) AS mean_z_in,
+  round(avgIf(z, subtype!='LGG_IDHmut-non-codel'),2) AS mean_z_out,
+  round(mean_z_in - mean_z_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHmut-non-codel'),3) AS frac_z2_in
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHmut-non-codel') >= 100 AND countIf(subtype!='LGG_IDHmut-non-codel') >= 100
+ORDER BY diff DESC
+LIMIT 25",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+  SELECT sample_unique_id, attribute_value AS subtype FROM clinical_data_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+e AS (
+  SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores'
+    AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(avgIf(z, subtype='LGG_IDHwt'),2) AS mean_z_in,
+  round(avgIf(z, subtype!='LGG_IDHwt'),2) AS mean_z_out,
+  round(mean_z_in - mean_z_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHwt'),3) AS frac_z2_in
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHwt') >= 50 AND countIf(subtype!='LGG_IDHwt') >= 100
+ORDER BY diff DESC
+LIMIT 25",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 'clin' AS src, sample_unique_id, attribute_value FROM clinical_data_derived
+WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' LIMIT 3
+UNION ALL
+SELECT 'expr', sample_unique_id, alteration_value FROM genetic_alteration_derived
+WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores' AND hugo_gene_symbol='EGFR' LIMIT 3"
+}
+
+◀ result
+{"rows":[{"src":"clin","attribute_value":"LGG_IDHmut-non-codel"},{"src":"clin","attribute_value":"LGG_IDHwt"},{"src":"clin","attribute_value":"LGG_IDHmut-non-codel"},{"src":"expr","sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4938-01","attribute_value":"-0.4755"},{"src":"expr","sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4941-01","attribute_value":"20.3720"},{"src":"expr","sample_unique_id":"lgg_tcga_pan_can_atlas_2018_TCGA-CS-4942-01","attribute_value":"0.3520"}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sp AS (
+  SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND sample_unique_id != ''),
+pt AS (
+  SELECT patient_unique_id, attribute_value AS subtype FROM clinical_data_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+s AS (SELECT sp.sample_unique_id, pt.subtype FROM sp JOIN pt USING (patient_unique_id)),
+e AS (
+  SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores'
+    AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT
+  countDistinctIf(sample_unique_id, subtype='LGG_IDHmut-codel') AS n_codel,
+  countDistinctIf(sample_unique_id, subtype='LGG_IDHmut-non-codel') AS n_noncodel,
+  countDistinctIf(sample_unique_id, subtype='LGG_IDHwt') AS n_wt
+FROM e JOIN s USING (sample_unique_id)"
+}
+
+◀ result
+{"rows":[{"n_codel":167,"n_noncodel":248,"n_wt":92}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sp AS (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND sample_unique_id != ''),
+pt AS (SELECT patient_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+s AS (SELECT sp.sample_unique_id, pt.subtype FROM sp JOIN pt USING (patient_unique_id)),
+e AS (SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(avgIf(z, subtype='LGG_IDHmut-codel'),2) AS mean_z_in,
+  round(avgIf(z, subtype!='LGG_IDHmut-codel'),2) AS mean_z_out,
+  round(mean_z_in - mean_z_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHmut-codel'),3) AS frac_z2_in
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHmut-codel') >= 100 AND countIf(subtype!='LGG_IDHmut-codel') >= 100
+ORDER BY diff DESC LIMIT 20",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"gene":"PRAMEF18","mean_z_in":6.86,"mean_z_out":0,"diff":6.86,"frac_z2_in":0.042},{"gene":"TNNT1","mean_z_in":2.57,"mean_z_out":-0.03,"diff":2.6,"frac_z2_in":0.467},{"gene":"LIN28A","mean_z_in":1.94,"mean_z_out":-0.01,"diff":1.95,"frac_z2_in":0.293},{"gene":"RLN3","mean_z_in":1.91,"mean_z_out":0.09,"diff":1.82,"frac_z2_in":0.054},{"gene":"KRTDAP","mean_z_in":1.75,"mean_z_out":0.01,"diff":1.74,"frac_z2_in":0.072},{"gene":"ATCAY","mean_z_in":1.27,"mean_z_out":-0.46,"diff":1.73,"frac_z2_in":0.21},{"gene":"CACNG2","mean_z_in":1.1,"mean_z_out":-0.59,"diff":1.69,"frac_z2_in":0.144},{"gene":"CHGB","mean_z_in":1.04,"mean_z_out":-0.59,"diff":1.63,"frac_z2_in":0.138},{"gene":"TIMM10B","mean_z_in":0.82,"mean_z_out":-0.76,"diff":1.58,"frac_z2_in":0.102},{"gene":"NALF1","mean_z_in":0.93,"mean_z_out":-0.64,"diff":1.57,"frac_z2_in":0.084},{"gene":"TMX2","mean_z_in":1.1,"mean_z_out":-0.44,"diff":1.54,"frac_z2_in":0.162},{"gene":"TRPC3","mean_z_in":1.09,"mean_z_out":-0.42,"diff":1.51,"frac_z2_in":0.192},{"gene":"KCNK3","mean_z_in":0.98,"mean_z_out":-0.52,"diff":1.5,"frac_z2_in":0.174},{"gene":"LRRTM4","mean_z_in":0.96,"mean_z_out":-0.54,"diff":1.5,"frac_z2_in":0.084},{"gene":"RIC3","mean_z_in":0.83,"mean_z_out":-0.63,"diff":1.46,"frac_z2_in":0.054},{"gene":"SYCE2","mean_z_in":1.15,"mean_z_out":-0.3,"diff":1.45,"frac_z2_in":0.192},{"gene":"ZDHHC22","mean_z_in":0.82,"mean_z_out":-0.63,"diff":1.45,"frac_z2_in":0.132},{"gene":"KCNJ11","mean_z_in":0.91,"mean_z_out":-0.53,"diff":1.44,"frac_z2_in":0.168},{"gene":"DRG2","mean_z_in":0.97,"mean_z_out":-0.46,"diff":1.43,"frac_z2_in":0.054},{"gene":"ATRX","mean_z_in":0.87,"mean_z_out":-0.56,"diff":1.43,"frac_z2_in":0.126}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sp AS (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND sample_unique_id != ''),
+pt AS (SELECT patient_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+s AS (SELECT sp.sample_unique_id, pt.subtype FROM sp JOIN pt USING (patient_unique_id)),
+e AS (SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(avgIf(z, subtype='LGG_IDHmut-non-codel'),2) AS mean_z_in,
+  round(avgIf(z, subtype!='LGG_IDHmut-non-codel'),2) AS mean_z_out,
+  round(mean_z_in - mean_z_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHmut-non-codel'),3) AS frac_z2_in
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHmut-non-codel') >= 100 AND countIf(subtype!='LGG_IDHmut-non-codel') >= 100
+ORDER BY diff DESC LIMIT 20",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"gene":"SLCO1B1","mean_z_in":10.61,"mean_z_out":0.26,"diff":10.35,"frac_z2_in":0.008},{"gene":"OR7G2","mean_z_in":7.28,"mean_z_out":0.08,"diff":7.2,"frac_z2_in":0.02},{"gene":"CEACAM16","mean_z_in":6.01,"mean_z_out":0.31,"diff":5.7,"frac_z2_in":0.008},{"gene":"OR6W1P","mean_z_in":3.32,"mean_z_out":-0.03,"diff":3.35,"frac_z2_in":0.056},{"gene":"MAGEA2","mean_z_in":3.12,"mean_z_out":0.2,"diff":2.92,"frac_z2_in":0.02},{"gene":"KRT84","mean_z_in":2.82,"mean_z_out":0.12,"diff":2.7,"frac_z2_in":0.02},{"gene":"RHAG","mean_z_in":2.6,"mean_z_out":0.03,"diff":2.57,"frac_z2_in":0.073},{"gene":"LRRC41","mean_z_in":0.14,"mean_z_out":-2.02,"diff":2.16,"frac_z2_in":0.04},{"gene":"NXF2","mean_z_in":2.18,"mean_z_out":0.11,"diff":2.07,"frac_z2_in":0.028},{"gene":"PPP1R8","mean_z_in":0.19,"mean_z_out":-1.87,"diff":2.06,"frac_z2_in":0.032},{"gene":"GPBP1L1","mean_z_in":0.04,"mean_z_out":-1.99,"diff":2.03,"frac_z2_in":0.04},{"gene":"OR8K5","mean_z_in":1.87,"mean_z_out":-0.08,"diff":1.95,"frac_z2_in":0.028},{"gene":"CSDE1","mean_z_in":0.14,"mean_z_out":-1.81,"diff":1.95,"frac_z2_in":0.044},{"gene":"CDC123","mean_z_in":1.05,"mean_z_out":-0.89,"diff":1.94,"frac_z2_in":0.202},{"gene":"FBXO42","mean_z_in":0.17,"mean_z_out":-1.74,"diff":1.91,"frac_z2_in":0.06},{"gene":"OR5F1","mean_z_in":1.87,"mean_z_out":0.02,"diff":1.85,"frac_z2_in":0.008},{"gene":"PSMB2","mean_z_in":0.07,"mean_z_out":-1.76,"diff":1.83,"frac_z2_in":0.048},{"gene":"MFN2","mean_z_in":0.04,"mean_z_out":-1.78,"diff":1.82,"frac_z2_in":0.04},{"gene":"THRAP3","mean_z_in":0.13,"mean_z_out":-1.66,"diff":1.79,"frac_z2_in":0.044},{"gene":"CMPK1","mean_z_in":0.12,"mean_z_out":-1.64,"diff":1.76,"frac_z2_in":0.06}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sp AS (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND sample_unique_id != ''),
+pt AS (SELECT patient_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+s AS (SELECT sp.sample_unique_id, pt.subtype FROM sp JOIN pt USING (patient_unique_id)),
+e AS (SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(avgIf(z, subtype='LGG_IDHwt'),2) AS mean_z_in,
+  round(avgIf(z, subtype!='LGG_IDHwt'),2) AS mean_z_out,
+  round(mean_z_in - mean_z_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHwt'),3) AS frac_z2_in
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHwt') >= 50 AND countIf(subtype!='LGG_IDHwt') >= 100
+ORDER BY diff DESC LIMIT 20",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"gene":"SEPTIN14","mean_z_in":235.92,"mean_z_out":0.04,"diff":235.88,"frac_z2_in":0.163},{"gene":"KLK11","mean_z_in":31.38,"mean_z_out":0.17,"diff":31.21,"frac_z2_in":0.043},{"gene":"SEC61G","mean_z_in":23.45,"mean_z_out":0.04,"diff":23.41,"frac_z2_in":0.467},{"gene":"CYP27B1","mean_z_in":20.86,"mean_z_out":0.33,"diff":20.53,"frac_z2_in":0.283},{"gene":"ASZ1","mean_z_in":18.33,"mean_z_out":0.04,"diff":18.29,"frac_z2_in":0.043},{"gene":"CRISP2","mean_z_in":13.62,"mean_z_out":0.12,"diff":13.5,"frac_z2_in":0.054},{"gene":"BIRC8","mean_z_in":13.5,"mean_z_out":0,"diff":13.5,"frac_z2_in":0.065},{"gene":"HPVC1","mean_z_in":12.41,"mean_z_out":-0.01,"diff":12.42,"frac_z2_in":0.065},{"gene":"SLC13A2","mean_z_in":11.67,"mean_z_out":-0.03,"diff":11.7,"frac_z2_in":0.022},{"gene":"LGALS13","mean_z_in":9.64,"mean_z_out":-0.02,"diff":9.66,"frac_z2_in":0.054},{"gene":"TSPAN31","mean_z_in":9.92,"mean_z_out":0.33,"diff":9.59,"frac_z2_in":0.207},{"gene":"MARCHF9","mean_z_in":10.15,"mean_z_out":0.67,"diff":9.48,"frac_z2_in":0.207},{"gene":"TSFM","mean_z_in":9.37,"mean_z_out":0.15,"diff":9.22,"frac_z2_in":0.174},{"gene":"VOPP1","mean_z_in":8.78,"mean_z_out":0.11,"diff":8.67,"frac_z2_in":0.25},{"gene":"WNT16","mean_z_in":8.4,"mean_z_out":-0.12,"diff":8.52,"frac_z2_in":0.467},{"gene":"METTL1","mean_z_in":8.15,"mean_z_out":0.08,"diff":8.07,"frac_z2_in":0.207},{"gene":"EEF1AKMT3","mean_z_in":8.19,"mean_z_out":0.13,"diff":8.06,"frac_z2_in":0.272},{"gene":"RASSF6","mean_z_in":7.05,"mean_z_out":-0.07,"diff":7.12,"frac_z2_in":0.054},{"gene":"MEOX2","mean_z_in":6.64,"mean_z_out":-0.13,"diff":6.77,"frac_z2_in":0.609},{"gene":"FKBP9P1","mean_z_in":6.44,"mean_z_out":-0.12,"diff":6.56,"frac_z2_in":0.674}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sp AS (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND sample_unique_id != ''),
+pt AS (SELECT patient_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+s AS (SELECT sp.sample_unique_id, pt.subtype FROM sp JOIN pt USING (patient_unique_id)),
+e AS (SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(medianIf(z, subtype='LGG_IDHmut-codel'),2) AS med_in,
+  round(medianIf(z, subtype!='LGG_IDHmut-codel'),2) AS med_out,
+  round(med_in - med_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHmut-codel'),3) AS frac_z2_in,
+  round(avgIf(z>=2, subtype!='LGG_IDHmut-codel'),3) AS frac_z2_out
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHmut-codel') >= 100 AND countIf(subtype!='LGG_IDHmut-codel') >= 100
+  AND frac_z2_in >= 0.2
+ORDER BY diff DESC LIMIT 15",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"gene":"TNNT1","med_in":1.92,"med_out":-0.37,"diff":2.29,"frac_z2_in":0.467,"frac_z2_out":0.05},{"gene":"ATCAY","med_in":1.11,"med_out":-0.54,"diff":1.65,"frac_z2_in":0.21,"frac_z2_out":0.003},{"gene":"GTF2F1","med_in":0.83,"med_out":-0.4,"diff":1.23,"frac_z2_in":0.204,"frac_z2_out":0.015},{"gene":"ZBTB8B","med_in":0.77,"med_out":-0.26,"diff":1.03,"frac_z2_in":0.251,"frac_z2_out":0.056},{"gene":"LRP8","med_in":0.75,"med_out":-0.11,"diff":0.86,"frac_z2_in":0.228,"frac_z2_out":0.038},{"gene":"LIN28A","med_in":0.58,"med_out":-0.21,"diff":0.79,"frac_z2_in":0.293,"frac_z2_out":0.041},{"gene":"ANO8","med_in":0.33,"med_out":-0.25,"diff":0.58,"frac_z2_in":0.216,"frac_z2_out":0.009},{"gene":"NPPA","med_in":0.13,"med_out":-0.26,"diff":0.39,"frac_z2_in":0.234,"frac_z2_out":0.038}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sp AS (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND sample_unique_id != ''),
+pt AS (SELECT patient_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+s AS (SELECT sp.sample_unique_id, pt.subtype FROM sp JOIN pt USING (patient_unique_id)),
+e AS (SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(medianIf(z, subtype='LGG_IDHmut-non-codel'),2) AS med_in,
+  round(medianIf(z, subtype!='LGG_IDHmut-non-codel'),2) AS med_out,
+  round(med_in - med_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHmut-non-codel'),3) AS frac_z2_in,
+  round(avgIf(z>=2, subtype!='LGG_IDHmut-non-codel'),3) AS frac_z2_out
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHmut-non-codel') >= 100 AND countIf(subtype!='LGG_IDHmut-non-codel') >= 100
+  AND frac_z2_in >= 0.2
+ORDER BY diff DESC LIMIT 15",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"gene":"CDC123","med_in":0.51,"med_out":-0.7,"diff":1.21,"frac_z2_in":0.202,"frac_z2_out":0.019},{"gene":"EXOC4","med_in":0.52,"med_out":-0.03,"diff":0.55,"frac_z2_in":0.206,"frac_z2_out":0.062},{"gene":"ZNF212","med_in":0.68,"med_out":0.14,"diff":0.54,"frac_z2_in":0.202,"frac_z2_out":0.089},{"gene":"PTCD1","med_in":0.6,"med_out":0.07,"diff":0.53,"frac_z2_in":0.214,"frac_z2_out":0.178},{"gene":"NUB1","med_in":0.52,"med_out":0,"diff":0.52,"frac_z2_in":0.222,"frac_z2_out":0.185},{"gene":"CUL1","med_in":0.53,"med_out":0.2,"diff":0.33,"frac_z2_in":0.206,"frac_z2_out":0.193},{"gene":"ZNF746","med_in":0.38,"med_out":0.3,"diff":0.08,"frac_z2_in":0.226,"frac_z2_out":0.17},{"gene":"ABCF2","med_in":0.32,"med_out":0.72,"diff":-0.4,"frac_z2_in":0.222,"frac_z2_out":0.263}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sp AS (SELECT DISTINCT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND sample_unique_id != ''),
+pt AS (SELECT patient_unique_id, attribute_value AS subtype FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND attribute_name='SUBTYPE' AND attribute_value LIKE 'LGG_%'),
+s AS (SELECT sp.sample_unique_id, pt.subtype FROM sp JOIN pt USING (patient_unique_id)),
+e AS (SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS z FROM genetic_alteration_derived
+  WHERE cancer_study_identifier='lgg_tcga_pan_can_atlas_2018' AND profile_type='rna_seq_v2_mrna_median_Zscores' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT gene,
+  round(medianIf(z, subtype='LGG_IDHwt'),2) AS med_in,
+  round(medianIf(z, subtype!='LGG_IDHwt'),2) AS med_out,
+  round(med_in - med_out,2) AS diff,
+  round(avgIf(z>=2, subtype='LGG_IDHwt'),3) AS frac_z2_in,
+  round(avgIf(z>=2, subtype!='LGG_IDHwt'),3) AS frac_z2_out
+FROM e JOIN s USING (sample_unique_id)
+GROUP BY gene
+HAVING countIf(subtype='LGG_IDHwt') >= 50 AND countIf(subtype!='LGG_IDHwt') >= 100
+  AND frac_z2_in >= 0.2
+ORDER BY diff DESC LIMIT 15",
+ "max_rows": 50
+}
+
+◀ result
+{"rows":[{"gene":"MEOX2","med_in":4.5,"med_out":-0.18,"diff":4.68,"frac_z2_in":0.609,"frac_z2_out":0},{"gene":"TMEM248","med_in":3.98,"med_out":-0.1,"diff":4.08,"frac_z2_in":0.739,"frac_z2_out":0.065},{"gene":"FKBP9P1","med_in":3.53,"med_out":-0.27,"diff":3.8,"frac_z2_in":0.674,"frac_z2_out":0.012},{"gene":"FKBP9","med_in":3.32,"med_out":-0.32,"diff":3.64,"frac_z2_in":0.783,"frac_z2_out":0.005},{"gene":"MRM2","med_in":3.49,"med_out":-0.09,"diff":3.58,"frac_z2_in":0.587,"frac_z2_out":0.077},{"gene":"RPS2P32","med_in":3.07,"med_out":-0.36,"diff":3.43,"frac_z2_in":0.728,"frac_z2_out":0.027},{"gene":"GSTK1","med_in":3.14,"med_out":-0.1,"diff":3.24,"frac_z2_in":0.674,"frac_z2_out":0.041},{"gene":"FZD1","med_in":3.03,"med_out":-0.17,"diff":3.2,"frac_z2_in":0.587,"frac_z2_out":0.01},{"gene":"DENND2A","med_in":3.15,"med_out":-0.04,"diff":3.19,"frac_z2_in":0.652,"frac_z2_out":0.034},{"gene":"HOXA1","med_in":2.88,"med_out":-0.3,"diff":3.18,"frac_z2_in":0.565,"frac_z2_out":0.017},{"gene":"PDIA4","med_in":3.08,"med_out":-0.1,"diff":3.18,"frac_z2_in":0.663,"frac_z2_out":0.046},{"gene":"PSMC2","med_in":3.16,"med_out":0,"diff":3.16,"frac_z2_in":0.652,"frac_z2_out":0.108},{"gene":"PAXIP1-AS2","med_in":2.87,"med_out":-0.26,"diff":3.13,"frac_z2_in":0.652,"frac_z2_out":0.029},{"gene":"GSAP","med_in":2.76,"med_out":-0.29,"diff":3.05,"frac_z2_in":0.707,"frac_z2_out":0.019},{"gene":"TRIP6","med_in":2.71,"med_out":-0.31,"diff":3.02,"frac_z2_in":0.63,"frac_z2_out":0.043}]}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "lgg_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "IDHmut-codel",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHmut-codel"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "IDHmut-non-codel",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHmut-non-codel"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "IDHwt",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "SUBTYPE",
+      "values": [
+       {
+        "value": "LGG_IDHwt"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "mrna"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/mrna?comparisonId=6ab22c8ae497aad53593b7bb","url":"https://www.cbioportal.org/comparison/mrna?comparisonId=6ab22c8ae497aad53593b7bb","data":{"description":"Group comparison (3 custom groups)","studies":["lgg_tcga_pan_can_atlas_2018"],"totalGroups":3,"groups":[{"name":"IDHmut-codel","sampleCount":167},{"name":"IDHmut-non-codel","sampleCount":248},{"name":"IDHwt","sampleCount":92}],"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"IDHmut-codel","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHmut-codel%22%7D%5D%7D%5D%7D"},{"groupName":"IDHmut-non-codel","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHmut-non-codel%22%7D%5D%7D%5D%7D"},{"groupName":"IDHwt","url":"https://www.cbioportal.org/study?id=lgg_tcga_pan_can_atlas_2018#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22SUBTYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22LGG_IDHwt%22%7D%5D%7D%5D%7D"}],"pageDescription":"mRNA expression for all genes compared across IDHmut-codel (167) vs IDHmut-non-codel (248) vs IDHwt (92)."}}
+
+═ answer (success)
+Yes. In the TCGA lower grade glioma PanCancer Atlas study, each of the three molecular subtypes has genes that are clearly higher than in the other two. The strongest signal is in IDH-wildtype tumours, followed by IDH-mutant codel. IDH-mutant non-codel shows only weak differences.
+
+**Method:** I used the study's Z-scored mRNA profile (`rna_seq_v2_mrna_median_Zscores`), which is relative to diploid tumours in the same study. For each subtype I compared the median Z-score inside the subtype with the median in the other two subtypes, keeping only genes where at least 20% of tumours in the subtype have Z ≥ 2. These are descriptive comparisons; I did not run statistical tests.
+
+**IDH-wildtype (n = 92)**, top genes by median difference:
+
+| Gene | Median Z (subtype) | Median Z (other subtypes) | % tumours Z ≥ 2 (subtype) | % tumours Z ≥ 2 (other subtypes) |
+|---|---|---|---|---|
+| MEOX2 | 4.50 | −0.18 | 61% | 0% |
+| TMEM248 | 3.98 | −0.10 | 74% | 7% |
+| FKBP9 | 3.32 | −0.32 | 78% | 1% |
+| MRM2 | 3.49 | −0.09 | 59% | 8% |
+| FZD1 | 3.03 | −0.17 | 59% | 1% |
+| HOXA1 | 2.88 | −0.30 | 57% | 2% |
+
+**IDH-mutant codel (n = 167)**, top genes:
+
+| Gene | Median Z (subtype) | Median Z (other subtypes) | % tumours Z ≥ 2 (subtype) |
+|---|---|---|---|
+| TNNT1 | 1.92 | −0.37 | 47% |
+| ATCAY | 1.11 | −0.54 | 21% |
+| GTF2F1 | 0.83 | −0.40 | 20% |
+| LIN28A | 0.58 | −0.21 | 29% |
+
+**IDH-mutant non-codel (n = 248):** I found no gene with a strong, consistent overexpression signal. The top candidates (for example CDC123, EXOC4, ZNF212) have median Z-score differences of only about 0.5–1.2, with a minority of tumours above Z = 2.
+
+Caveats:
+- Results are within this study. "Overexpressed" means higher than the other two LGG subtypes, not higher than normal brain tissue.
+- The study has 514 samples, and 507 have a subtype label.
+- A second study, Brain Lower Grade Glioma (TCGA, Firehose Legacy, `lgg_tcga`), also exists. I analysed only the PanCancer Atlas version; the Firehose version may give somewhat different numbers.
+
+You can view all genes compared across the three subtypes in the cBioPortal Group Comparison mRNA tab: [Compare IDH-mutant codel, IDH-mutant non-codel, and IDH-wildtype mRNA expression](https://www.cbioportal.org/comparison/mrna?comparisonId=6ab22c8ae497aad53593b7bb)

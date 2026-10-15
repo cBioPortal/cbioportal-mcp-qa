@@ -1,0 +1,291 @@
+Q (haiku-5.5): Can you explore the difference in mutation frequency between left-sided and right-sided CRC?
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 1",
+ "max_rows": 1
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+{"rows":[{"1":1}]}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, attribute_name, count() AS n, uniqExact(attribute_value) AS distinct_vals, any(attribute_value) AS example
+FROM clinical_data_derived
+WHERE (lower(attribute_name) LIKE '%side%' OR lower(attribute_name) LIKE '%location%' OR lower(attribute_name) LIKE '%site%' OR lower(attribute_name) LIKE '%laterality%')
+  AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM clinical_data_derived WHERE attribute_name='CANCER_TYPE_DETAILED' AND lower(attribute_value) LIKE '%colorectal%' GROUP BY cancer_study_identifier)
+GROUP BY cancer_study_identifier, attribute_name
+ORDER BY cancer_study_identifier, attribute_name
+LIMIT 200",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"bowel_colitis_msk_2022","attribute_name":"CLASSIFICATION_OF_PRIMARY_SITE","n":180,"distinct_vals":5,"example":"R side"},{"cancer_study_identifier":"bowel_colitis_msk_2022","attribute_name":"FIRST_SITE_OF_METS","n":180,"distinct_vals":28,"example":"Liver"},{"cancer_study_identifier":"bowel_colitis_msk_2022","attribute_name":"METASTATIC_SITE","n":180,"distinct_vals":9,"example":"Liver"},{"cancer_study_identifier":"bowel_colitis_msk_2022","attribute_name":"PRIMARY_SITE","n":180,"distinct_vals":30,"example":"R Colon"},{"cancer_study_identifier":"ccle_broad_2019","attribute_name":"PRIMARY_SITE","n":1739,"distinct_vals":25},{"cancer_study_identifier":"ccle_broad_2019","attribute_name":"SITE_OF_FINDING","n":1739,"distinct_vals":33},{"cancer_study_identifier":"ccle_broad_2019","attribute_name":"SITE_SUBTYPE1","n":1739,"distinct_vals":38},{"cancer_study_identifier":"ccle_broad_2019","attribute_name":"SITE_SUBTYPE2","n":1739,"distinct_vals":17},{"cancer_study_identifier":"ccle_broad_2019","attribute_name":"SITE_SUBTYPE3","n":1739,"distinct_vals":2},{"cancer_study_identifier":"ccle_broad_2025","attribute_name":"SAMPLE_COLLECTION_SITE","n":1981,"distinct_vals":62,"example":"Embryonal"},{"cancer_study_identifier":"ccle_genentech_2014","attribute_name":"METASTATIC_SITE","n":675,"distinct_vals":13},{"cancer_study_identifier":"ccle_genentech_2014","attribute_name":"PRIMARY_SITE","n":675,"distinct_vals":31,"example":"Skin"},{"cancer_study_identifier":"cellline_ccle_broad","attribute_name":"PRIMARY_SITE","n":1020,"distinct_vals":25,"example":"Central Nervous System"},{"cancer_study_identifier":"coadread_cass_2020","attribute_name":"ATOMIC_SITE_DETAIL","n":146,"distinct_vals":10,"example":"Desending Colon"},{"cancer_study_identifier":"coadread_cass_2020","attribute_name":"METASTATIC_SITE","n":146,"distinct_vals":7,"example":"Liver"},{"cancer_study_identifier":"coadread_cass_2020","attribute_name":"PROGRESSION_SITE","n":146,"distinct_vals":17},{"cancer_study_identifier":"coadread_cass_2020","attribute_name":"TUMOR_SITE","n":146,"distinct_vals":4,"example":"Left Colon"},{"cancer_study_identifier":"coadread_dfci_2016","attribute_name":"TUMOR_SITE","n":619,"distinct_vals":5,"example":"Ascending To Transverse Colon"},{"cancer_study_identifier":"coadread_genentech","attribute_name":"TISSUE_SOURCE_SITE","n":74,"distinct_vals":1,"example":"Tumor"},{"cancer_study_identifier":"coadread_mskcc","attribute_name":"METASTATIC_SITE","n":138,"distinct_vals":4,"example":"Liver"},{"cancer_study_identifier":"coadread_mskcc","attribute_name":"PRIMARY_SITE","n":138,"distinct_vals":4},{"cancer_study_identifier":"coadread_mskresistance_2022","attribute_name":"METASTATIC_SITE","n":22,"distinct_vals":6,"example":"Lung"},{"cancer_study_identifier":"coadread_mskresistance_2022","attribute_name":"PRIMARY_SITE","n":22,"distinct_vals":3,"example":"Colon"},{"cancer_study_identifier":"coadread_tcga","attribute_name":"ICD_O_3_SITE","n":636,"distinct_vals":13,"ex … (8303 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, attribute_name, attribute_value, count() AS samples
+FROM clinical_data_derived
+WHERE (cancer_study_identifier, attribute_name) IN (
+  ('crc_msk_2017','PRIMARY_TUMOR_LOCATION'),
+  ('crc_eo_2020','PRIMARY_TUMOR_LOCATION'),
+  ('coadread_tcga','PRIMARY_SITE_PATIENT'),
+  ('crc_hta8_htan_2024','PRI_SITE_BINARY'),
+  ('crc_msk_2026','PRIMARY_SITE'))
+GROUP BY cancer_study_identifier, attribute_name, attribute_value
+ORDER BY cancer_study_identifier, attribute_name, samples DESC
+LIMIT 200",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Sigmoid Colon","samples":158},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Rectum","samples":113},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Cecum","samples":107},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Ascending Colon","samples":87},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Rectosigmoid Junction","samples":51},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Transverse Colon","samples":38},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","samples":29},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Hepatic Flexure","samples":26},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Descending Colon","samples":20},{"cancer_study_identifier":"coadread_tcga","attribute_name":"PRIMARY_SITE_PATIENT","attribute_value":"Splenic Flexure","samples":7},{"cancer_study_identifier":"crc_eo_2020","attribute_name":"PRIMARY_TUMOR_LOCATION","attribute_value":"Left","samples":664},{"cancer_study_identifier":"crc_eo_2020","attribute_name":"PRIMARY_TUMOR_LOCATION","attribute_value":"Rectum","samples":411},{"cancer_study_identifier":"crc_eo_2020","attribute_name":"PRIMARY_TUMOR_LOCATION","attribute_value":"Right","samples":374},{"cancer_study_identifier":"crc_eo_2020","attribute_name":"PRIMARY_TUMOR_LOCATION","samples":67},{"cancer_study_identifier":"crc_hta8_htan_2024","attribute_name":"PRI_SITE_BINARY","attribute_value":"Left","samples":21},{"cancer_study_identifier":"crc_hta8_htan_2024","attribute_name":"PRI_SITE_BINARY","attribute_value":"Right","samples":7},{"cancer_study_identifier":"crc_hta8_htan_2024","attribute_name":"PRI_SITE_BINARY","attribute_value":"Appendix","samples":1},{"cancer_study_identifier":"crc_msk_2017","attribute_name":"PRIMARY_TUMOR_LOCATION","attribute_value":"Left","samples":779},{"cancer_study_identifier":"crc_msk_2017","attribute_name":"PRIMARY_TUMOR_LOCATION","attribute_value":"Right","samples":341},{"cancer_study_identifier":"crc_msk_2017","attribute_name":"PRIMARY_TUMOR_LOCATION","samples":14},{"cancer_study_identifier":"crc_msk_2026","attribute_name":"PRIMARY_SITE","attribute_value":"Colon","samples":3430},{"cancer_study_identifier":"crc_msk_2026","attribute_name":"PRIMARY_SITE","attribute_value":"Rectum","samples":1719},{"cancer_study_identifier":"crc_msk_2026","attribute_name":"PRIMARY_SITE","attribute_value":"Sigmoid Colon","samples":646},{"cancer_study_identifier":"crc_msk_2026","attribute_name":"PRIMARY_SITE","attribute_value":"Ascending Colon","samples":370},{"cancer_study_identifier":"crc_msk_2026", … (1781 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation_panel_gene_coverage"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"gene_panel_id","type":"LowCardinality(String)"}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sd AS (
+    SELECT sample_unique_id, attribute_value AS side_val
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'crc_msk_2017'
+      AND attribute_name = 'PRIMARY_TUMOR_LOCATION'
+      AND attribute_value IN ('Left', 'Right')
+),
+alt AS (
+    SELECT sd.side_val, ged.hugo_gene_symbol AS gene, uniqExact(ged.sample_unique_id) AS n
+    FROM genomic_event_derived ged
+    JOIN sd ON sd.sample_unique_id = ged.sample_unique_id
+    WHERE ged.cancer_study_identifier = 'crc_msk_2017'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.off_panel = 0
+    GROUP BY sd.side_val, gene
+),
+prof AS (
+    SELECT sd.side_val, p.hugo_gene_symbol AS gene, uniqExact(p.sample_unique_id) AS n
+    FROM mutation_panel_gene_coverage p
+    JOIN sd ON sd.sample_unique_id = p.sample_unique_id
+    WHERE p.cancer_study_identifier = 'crc_msk_2017'
+    GROUP BY sd.side_val, gene
+),
+genes AS (
+    SELECT gene FROM alt GROUP BY gene HAVING sum(n) >= 40 ORDER BY sum(n) DESC LIMIT 25
+)
+SELECT pr.gene, pr.side_val AS side, pr.n AS profiled_samples, ifNull(al.n, 0) AS altered_samples,
+       round(ifNull(al.n, 0) * 100.0 / pr.n, 1) AS frequency_pct
+FROM prof pr
+LEFT JOIN alt al ON al.side_val = pr.side_val AND al.gene = pr.gene
+WHERE pr.gene IN (SELECT gene FROM genes)
+ORDER BY altered_samples DESC, pr.gene, pr.side_val",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"gene":"APC","side":"Left","profiled_samples":779,"altered_samples":635,"frequency_pct":81.5},{"gene":"TP53","side":"Left","profiled_samples":779,"altered_samples":617,"frequency_pct":79.2},{"gene":"KRAS","side":"Left","profiled_samples":779,"altered_samples":293,"frequency_pct":37.6},{"gene":"APC","side":"Right","profiled_samples":341,"altered_samples":223,"frequency_pct":65.4},{"gene":"TP53","side":"Right","profiled_samples":341,"altered_samples":200,"frequency_pct":58.7},{"gene":"KRAS","side":"Right","profiled_samples":341,"altered_samples":194,"frequency_pct":56.9},{"gene":"PIK3CA","side":"Left","profiled_samples":779,"altered_samples":124,"frequency_pct":15.9},{"gene":"PIK3CA","side":"Right","profiled_samples":341,"altered_samples":101,"frequency_pct":29.6},{"gene":"SMAD4","side":"Left","profiled_samples":779,"altered_samples":100,"frequency_pct":12.8},{"gene":"FBXW7","side":"Left","profiled_samples":779,"altered_samples":92,"frequency_pct":11.8},{"gene":"TCF7L2","side":"Left","profiled_samples":641,"altered_samples":86,"frequency_pct":13.4},{"gene":"BRAF","side":"Right","profiled_samples":341,"altered_samples":77,"frequency_pct":22.6},{"gene":"SMAD4","side":"Right","profiled_samples":341,"altered_samples":70,"frequency_pct":20.5},{"gene":"KMT2D","side":"Right","profiled_samples":341,"altered_samples":61,"frequency_pct":17.9},{"gene":"RNF43","side":"Right","profiled_samples":341,"altered_samples":60,"frequency_pct":17.6},{"gene":"SOX9","side":"Left","profiled_samples":779,"altered_samples":58,"frequency_pct":7.4},{"gene":"BRAF","side":"Left","profiled_samples":779,"altered_samples":55,"frequency_pct":7.1},{"gene":"ARID1A","side":"Left","profiled_samples":779,"altered_samples":52,"frequency_pct":6.7},{"gene":"FBXW7","side":"Right","profiled_samples":341,"altered_samples":52,"frequency_pct":15.2},{"gene":"ARID1A","side":"Right","profiled_samples":341,"altered_samples":51,"frequency_pct":15},{"gene":"PTPRS","side":"Right","profiled_samples":341,"altered_samples":51,"frequency_pct":15},{"gene":"PTPRS","side":"Left","profiled_samples":779,"altered_samples":49,"frequency_pct":6.3},{"gene":"PTPRT","side":"Left","profiled_samples":779,"altered_samples":49,"frequency_pct":6.3},{"gene":"SOX9","side":"Right","profiled_samples":341,"altered_samples":48,"frequency_pct":14.1},{"gene":"CTNNB1","side":"Left","profiled_samples":779,"altered_samples":46,"frequency_pct":5.9},{"gene":"KMT2D","side":"Left","profiled_samples":779,"altered_samples":45,"frequency_pct":5.8},{"gene":"FAT1","side":"Right","profiled_samples":341,"altered_samples":44,"frequency_pct":12.9},{"gene":"ATM","side":"Right","profiled_samples":341,"altered_samples":43,"frequency_pct":12.6},{"gene":"NOTCH3","side":"Left","profiled_samples":779,"altered_samples":43,"frequency_pct":5.5},{"gene":"ATM","side":"Left","profiled_samples":779,"altered_samples":42,"frequency_pct":5.4},{"gene":"NOTCH3","side":"Right","profiled_samples":341,"altered_samples":41,"frequency_pct":12},{"gene":"ZFHX3" … (1811 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_value AS primary_tumor_location, uniqExact(sample_unique_id) AS samples, uniqExact(patient_unique_id) AS patients
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'crc_msk_2017'
+  AND attribute_name = 'PRIMARY_TUMOR_LOCATION'
+  AND attribute_value IN ('Left', 'Right')
+GROUP BY attribute_value",
+ "max_rows": 10
+}
+
+◀ result
+{"rows":[{"primary_tumor_location":"Left","samples":779,"patients":760},{"primary_tumor_location":"Right","samples":341,"patients":326}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "crc_msk_2017"
+ ]
+}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "crc_msk_2017",
+ "attributeIds": [
+  "PRIMARY_TUMOR_LOCATION"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"crc_msk_2017","name":"Metastatic Colorectal Cancer (MSK, Cancer Cell 2018)","sampleCount":1134,"studyViewUrl":"https://www.cbioportal.org/study?id=crc_msk_2017","metadata":{"clinicalAttributeIds":["AGE_AT_DIAGNOSIS","CANCER_TYPE","CANCER_TYPE_DETAILED","CHEMO_EXP_SEQ_SPECIMEN","FIRST_SITE_OF_METS","FRACTION_GENOME_ALTERED","GENE_PANEL","MCRC_TYPE","METASTASECTOMY","METASTASECTOMY_SITE","METASTASES_SITE_FIRST_BONE","METASTASES_SITE_FIRST_BRAIN","METASTASES_SITE_FIRST_GYN","METASTASES_SITE_FIRST_LIVER","METASTASES_SITE_FIRST_LN","METASTASES_SITE_FIRST_LUNG","METASTASES_SITE_FIRST_PELVIS","METASTASES_SITE_FIRST_PERITONEUM_OMENTUM_ABDOMEN","METASTATIC_BIOPSY_SITE","MOLECULAR_SUBTYPE","MSI_SCORE","MSI_STATUS","MUTATION_COUNT","ONCOTREE_CODE","OS_MONTHS","OS_MONTHS_ADDITIONAL","OS_STATUS","OTHER_SITES_OF_METS","PATIENT_GRADE","PRIMARY_SITE","PRIMARY_TUMOR_LOCATION","SAMPLE_COUNT","SAMPLE_TYPE","SEX","SOMATIC_STATUS","SPECIMEN_TYPE","STAGE_AT_DIAGNOSIS","TIME_FROM_MET_DX_SEQUENCING","TIME_TO_METASTASIS_MONTHS","TMB_NONSYNONYMOUS","TUMOR_SAMPLE_HISTOLOGY","VITAL_STATUS"],"molecularProfileIds":["crc_msk_2017_gistic","crc_msk_2017_mutations","crc_msk_2017_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"crc_msk_2017","attributes":[{"attributeId":"PRIMARY_TUMOR_LOCATION","displayName":"Primary Tumor Location","description":"Primary Tumor Location","datatype":"STRING","values":["Left","NA","Right"]}]}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "crc_msk_2017"
+ ],
+ "groups": [
+  {
+   "name": "Left-sided",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "PRIMARY_TUMOR_LOCATION",
+      "values": [
+       {
+        "value": "Left"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Right-sided",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "PRIMARY_TUMOR_LOCATION",
+      "values": [
+       {
+        "value": "Right"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "mutations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/mutations?comparisonId=6ad05340c2115c492d888364","url":"https://www.cbioportal.org/comparison/mutations?comparisonId=6ad05340c2115c492d888364","data":{"description":"Group comparison (2 custom groups)","studies":["crc_msk_2017"],"totalGroups":2,"groups":[{"name":"Left-sided","sampleCount":779},{"name":"Right-sided","sampleCount":341}],"studyViewUrl":"https://www.cbioportal.org/study?id=crc_msk_2017","groupUrls":[{"groupName":"Left-sided","url":"https://www.cbioportal.org/study?id=crc_msk_2017#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22PRIMARY_TUMOR_LOCATION%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Left%22%7D%5D%7D%5D%7D"},{"groupName":"Right-sided","url":"https://www.cbioportal.org/study?id=crc_msk_2017#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22PRIMARY_TUMOR_LOCATION%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Right%22%7D%5D%7D%5D%7D"}],"pageDescription":"Mutation frequency (protein change) compared across Left-sided (779) vs Right-sided (341)."}}
+
+═ answer (success)
+Across the top mutated genes in this study, the clearest left–right differences are TP53 and APC (higher on the left) and BRAF, KRAS, PIK3CA, and KMT2D (higher on the right).
+
+**Study:** Metastatic Colorectal Cancer (MSK, Cancer Cell 2018), `crc_msk_2017`. Tumors were grouped by the recorded primary tumor location, Left (779 samples, 760 patients) vs Right (341 samples, 326 patients). Rectal and unknown-location tumors are excluded. Frequencies are sample-level, with each gene's own profiled sample count as the denominator (MSK-IMPACT panel coverage varies by gene).
+
+| Gene | Left-sided | Right-sided | Direction |
+|---|---|---|---|
+| APC | 81.5% (635/779) | 65.4% (223/341) | Left higher |
+| TP53 | 79.2% (617/779) | 58.7% (200/341) | Left higher |
+| KRAS | 37.6% (293/779) | 56.9% (194/341) | Right higher |
+| PIK3CA | 15.9% (124/779) | 29.6% (101/341) | Right higher |
+| BRAF | 7.1% (55/779) | 22.6% (77/341) | Right higher |
+| SMAD4 | 12.8% (100/779) | 20.5% (70/341) | Right higher |
+| KMT2D | 5.8% (45/779) | 17.9% (61/341) | Right higher |
+| RNF43 | 4.2% (33/779) | 17.6% (60/341) | Right higher |
+| ARID1A | 6.7% (52/779) | 15.0% (51/341) | Right higher |
+| SOX9 | 7.4% (58/779) | 14.1% (48/341) | Right higher |
+| PTEN | 3.7% (29/779) | 11.1% (38/341) | Right higher |
+| NOTCH3 | 5.5% (43/779) | 12.0% (41/341) | Right higher |
+| CTNNB1 | 5.9% (46/779) | 11.1% (38/341) | Right higher |
+| FBXW7 | 11.8% (92/779) | 15.2% (52/341) | Right higher (small gap) |
+| TCF7L2 | 13.4% (86/641) | 13.2% (35/266) | Similar |
+
+These are descriptive percentages only. I have not run a significance test, so I can't say which differences are statistically significant. To test them, open the Mutations comparison in cBioPortal, which uses Fisher's exact test by default:
+
+[Compare Left vs Right mutations in cBioPortal](https://www.cbioportal.org/comparison/mutations?comparisonId=6ad05340c2115c492d888364)
+
+Other links:
+- [Left vs Right samples in the study view](https://www.cbioportal.org/study?id=crc_msk_2017#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22PRIMARY_TUMOR_LOCATION%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Left%22%7D%5D%7D%5D%7D) (Left-sided group)
+- [Right-sided group in the study view](https://www.cbioportal.org/study?id=crc_msk_2017#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22PRIMARY_TUMOR_LOCATION%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Right%22%7D%5D%7D%5D%7D)
+
+This is a single MSK-IMPACT cohort of metastatic CRC, so the results may not generalize to all CRC. The study `crc_eo_2020` (early-onset CRC) also records left/right tumor location and could be used to check whether the pattern holds. I can run the same comparison there if you want.

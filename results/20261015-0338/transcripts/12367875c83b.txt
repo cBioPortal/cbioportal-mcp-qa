@@ -1,0 +1,337 @@
+Q (haiku-5.5): Are there DNA methylation differences between lower grade glioma molecular subtypes?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, sample_count, methylation_hm27_sample_count, methylation_hm450_sample_count FROM cancer_study WHERE lower(name) LIKE '%glioma%' OR lower(cancer_study_identifier) LIKE '%lgg%' OR lower(cancer_study_identifier) LIKE '%lgggbm%'"
+}
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Unknown expression identifier `methylation_hm27_sample_count` in scope SELECT cancer_study_identifier, name, sample_count, methylation_hm27_sample_count, methylation_hm450_sample_count FROM cancer_study WHERE (lower(name) LIKE '%glioma%') OR (lower(cancer_study_identifier) LIKE '%lgg%') OR (lower(cancer_study_identifier) LIKE '%lgggbm%'). Maybe you meant: ['mutation_sample_count']. (UNKNOWN_IDENTIFIER) (version 26.6.1.2326 (official build))\n"}
+
+▶ list_studies
+{
+ "search": "glioma",
+ "limit": 50
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "cancer_study"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"glioma_mskcc_2019","name":"Glioma (MSK, Clin Cancer Res 2019)","type_of_cancer_id":"difg","sample_count":1004,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=glioma_mskcc_2019"},{"cancer_study_identifier":"difg_glass","name":"Diffuse Glioma (GLASS Consortium)","type_of_cancer_id":"difg","sample_count":693,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=difg_glass"},{"cancer_study_identifier":"difg_tcga_gdc","name":"Diffuse Glioma (TCGA GDC, 2025)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=difg_tcga_gdc"},{"cancer_study_identifier":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":530,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"difg_glass_2019","name":"Diffuse Glioma (GLASS Consortium, Nature 2019)","type_of_cancer_id":"difg","sample_count":444,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=difg_glass_2019"},{"cancer_study_identifier":"brain_cptac_2020","name":"Pediatric Brain Cancer (CPTAC/CHOP, Cell 2020)","type_of_cancer_id":"brain","sample_count":218,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=brain_cptac_2020"},{"cancer_study_identifier":"pcpg_tcga","name":"Pheochromocytoma and Paraganglioma (TCGA, Firehose Legacy)","type_of_cancer_id":"mnet","sample_count":184,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pcpg_tcga"},{"cancer_study_identifier":"pcpg_tcga_pan_can_atlas_2018","name":"Pheochromocytoma and Paraganglioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"soft_tissue","sample_count":178,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pcpg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"pcpg_tcga_pub","name":"Pheochromocytoma and Paraganglioma (TCGA, Cell 2017)","type_of_cancer_id":"soft_tissue","sample_count":178,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=pcpg_tcga_pub"},{"cancer_study_identifier":"hnsc_a5consortium_2025","name":"Hereditary SDHB-Mutant Pheochromocytomas and Paragangliomas (A5 Consortium, Nature Comm 2025)","type_of_cancer_id":"hnsc","sample_count":94,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=hnsc_a5consortium_2025"},{"cancer_study_identifier":"glioma_msk_2018","name":"Glioma (MSK, Nature 2019)","type_of_cancer_id":"difg","sample_count":91,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=glioma_msk_2018"},{"cancer_study_identifier":"difg_msk_2023","name":"IDH-mutated Diffuse Glioma (MSK, Clin Cancer Res 2024)","type_of_cance … (855 more chars)
+
+◀ result
+{"columns":[{"name":"cancer_study_id","type":"Int64","comment":"Internal numeric ID. Prefer cancer_study_identifier for queries as it is more readable and stable."},{"name":"cancer_study_identifier","type":"Nullable(String)","comment":"Stable string identifier for the study (e.g., \"msk_chord_2024\", \"brca_tcga\"). Use this for filtering, not cancer_study_id."},{"name":"type_of_cancer_id","type":"String"},{"name":"name","type":"String","comment":"Full descriptive name of the study (e.g., \"MSK-CHORD (MSK, Nature 2024)\")."},{"name":"description","type":"String"},{"name":"public","type":"Int32"},{"name":"pmid","type":"Nullable(String)"},{"name":"citation","type":"Nullable(String)"},{"name":"groups","type":"Nullable(String)"},{"name":"status","type":"Nullable(Int64)"},{"name":"import_date","type":"Nullable(DateTime64(6))"},{"name":"reference_genome_id","type":"Nullable(Int64)"},{"name":"sample_count","type":"UInt32","comment":"Samples in the study (members of <study>_all), as shown in the portal study list. Precomputed daily at LLM-prep time."},{"name":"mutation_sample_count","type":"UInt32","comment":"Samples profiled for mutations (<study>_sequenced) — portal \"Data type\" filter: \"Mutations\". 0 = no mutation data."},{"name":"cna_sample_count","type":"UInt32","comment":"Samples profiled for copy-number alterations (<study>_cna) — \"CNA\". 0 = no CNA data."},{"name":"structural_variant_sample_count","type":"UInt32","comment":"Distinct samples with at least one structural variant (fusions etc.). 0 = none."},{"name":"rna_seq_sample_count","type":"UInt32","comment":"Samples with RNA-Seq expression (<study>_rna_seq_v2_mrna) — \"RNA-Seq\"."},{"name":"mrna_microarray_sample_count","type":"UInt32","comment":"Samples with microarray mRNA expression (<study>_mrna) — \"RNA (microarray)\"."},{"name":"mirna_sample_count","type":"UInt32","comment":"Samples with microRNA expression (<study>_microrna) — \"miRNA\"."},{"name":"rppa_sample_count","type":"UInt32","comment":"Samples with RPPA protein levels (<study>_rppa) — \"RPPA\"."},{"name":"mass_spectrometry_sample_count","type":"UInt32","comment":"Samples with mass-spectrometry protein quantification (<study>_protein_quantification) — \"Protein Mass-Spectrometry\"."},{"name":"treatment_patient_count","type":"UInt32","comment":"PATIENTS (not samples) with treatment clinical events — \"Treatment\". 0 = no treatment data."},{"name":"resource_sample_counts","type":"Map(String, UInt32)","comment":"Samples with each linked resource, keyed by display name: imaging and pathology such as 'Slide Microscopy', 'Computed Tomography', 'Magnetic Resonance', 'H&E Slide', 'MxIF Image'. Query with mapKeys(resource_sample_counts) or resource_sample_counts['Slide Microscopy'] > 0."},{"name":"mrna_expression_sample_count","type":"UInt32","comment":"Samples in any mRNA expression profile (RNA-Seq, microarray, TPM, z-scores; from sample_profile). Use this for \"does the study have expression data\" — rna_seq_sample_count and mrna_m … (136 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, count() AS n FROM genetic_alteration_derived WHERE cancer_study_identifier IN ('lgg_tcga_pan_can_atlas_2018','lgg_tcga','difg_tcga_gdc','lgg_ucsf_2014','difg_glass_2019','difg_glass') AND lower(profile_type) LIKE '%methyl%' GROUP BY cancer_study_identifier, profile_type ORDER BY cancer_study_identifier, profile_type"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"lgg_tcga","profile_type":"methylation_hm450","n":8597780}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, attribute_name, count(DISTINCT sample_unique_id) AS samples FROM clinical_data_derived WHERE cancer_study_identifier IN ('lgg_tcga_pan_can_atlas_2018') AND (lower(attribute_name) LIKE '%subtype%' OR lower(attribute_name) LIKE '%cluster%' OR attribute_name IN ('IDH_STATUS','IDH_CODEL_SUBTYPE','CODEL_STATUS','GRADE','CANCER_TYPE_DETAILED')) GROUP BY cancer_study_identifier, attribute_name ORDER BY attribute_name"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","attribute_name":"CANCER_TYPE_DETAILED","samples":514},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","attribute_name":"GRADE","samples":514},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","attribute_name":"SUBTYPE","samples":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, attribute_value, count(DISTINCT sample_unique_id) AS samples FROM clinical_data_derived WHERE cancer_study_identifier = 'lgg_tcga' AND (lower(attribute_name) LIKE '%subtype%' OR lower(attribute_name) LIKE '%cluster%' OR lower(attribute_name) LIKE '%idh%' OR lower(attribute_name) LIKE '%codel%' OR attribute_name IN ('GRADE','CANCER_TYPE_DETAILED')) GROUP BY attribute_name, attribute_value ORDER BY attribute_name, samples DESC"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT profile_type, count(DISTINCT sample_unique_id) AS samples, count(DISTINCT hugo_gene_symbol) AS genes FROM genetic_alteration_derived WHERE cancer_study_identifier = 'lgg_tcga' AND profile_type = 'methylation_hm450' GROUP BY profile_type"
+}
+
+◀ result
+{"rows":[{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Oligoastrocytoma","samples":134},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Anaplastic Astrocytoma","samples":130},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Oligodendroglioma","samples":120},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Anaplastic Oligoastrocytoma","samples":78},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Astrocytoma","samples":67},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Diffuse Glioma","samples":1},{"attribute_name":"GRADE","attribute_value":"G2","samples":1},{"attribute_name":"GRADE","attribute_value":"G3","samples":1},{"attribute_name":"GRADE","samples":1},{"attribute_name":"IDH1_MUTATION","attribute_value":"NO","samples":1},{"attribute_name":"IDH1_MUTATION","samples":1},{"attribute_name":"IDH1_MUTATION","attribute_value":"YES","samples":1},{"attribute_name":"IDH1_MUTATION_TEST_INDICATOR","attribute_value":"YES","samples":1},{"attribute_name":"IDH1_MUTATION_TEST_INDICATOR","attribute_value":"NO","samples":1},{"attribute_name":"IDH1_MUTATION_TEST_INDICATOR","samples":1},{"attribute_name":"IDH1_MUTATION_TEST_METHOD","samples":1},{"attribute_name":"IDH1_MUTATION_TEST_METHOD","attribute_value":"Sequence Analysis","samples":1},{"attribute_name":"IDH1_MUTATION_TEST_METHOD","attribute_value":"IHC","samples":1}]}
+
+◀ result
+{"rows":[{"profile_type":"methylation_hm450","samples":530,"genes":16230}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, count() AS rows_n, uniqExact(patient_unique_id) AS patients FROM clinical_data_derived WHERE cancer_study_identifier = 'lgg_tcga' GROUP BY attribute_name ORDER BY attribute_name",
+ "max_rows": 300
+}
+
+◀ result
+{"rows":[{"attribute_name":"AGE","rows_n":516,"patients":516},{"attribute_name":"ANIMAL_INSECT_ALLERGY_AGE","rows_n":516,"patients":516},{"attribute_name":"ANIMAL_INSECT_ALLERGY_HIST","rows_n":516,"patients":516},{"attribute_name":"ASTHMA_ECZEMA_ALLERGY_FIRST_DIAGNOSIS","rows_n":516,"patients":516},{"attribute_name":"ASTHMA_HISTORY","rows_n":516,"patients":516},{"attribute_name":"CANCER_TYPE","rows_n":530,"patients":516},{"attribute_name":"CANCER_TYPE_DETAILED","rows_n":530,"patients":516},{"attribute_name":"DAYS_TO_COLLECTION","rows_n":530,"patients":516},{"attribute_name":"DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","rows_n":516,"patients":516},{"attribute_name":"DAYS_TO_SPECIMEN_COLLECTION","rows_n":530,"patients":516},{"attribute_name":"DFS_MONTHS","rows_n":516,"patients":516},{"attribute_name":"DFS_STATUS","rows_n":516,"patients":516},{"attribute_name":"DISEASE_CODE","rows_n":516,"patients":516},{"attribute_name":"ECOG_SCORE","rows_n":516,"patients":516},{"attribute_name":"ECZEMA_HISTORY","rows_n":516,"patients":516},{"attribute_name":"ETHNICITY","rows_n":516,"patients":516},{"attribute_name":"FAMILY_HISTORY_OF_CANCER","rows_n":516,"patients":516},{"attribute_name":"FAMILY_HISTORY_OF_PRIMARY_BRAIN_TUMOR","rows_n":516,"patients":516},{"attribute_name":"FIRST_SYMPTOM_LONGEST_DURATION","rows_n":516,"patients":516},{"attribute_name":"FOOD_ALLERGY_AGE","rows_n":516,"patients":516},{"attribute_name":"FOOD_ALLERGY_HISTORY","rows_n":516,"patients":516},{"attribute_name":"FOOD_ALLERGY_TYPES","rows_n":516,"patients":516},{"attribute_name":"FORM_COMPLETION_DATE","rows_n":516,"patients":516},{"attribute_name":"FRACTION_GENOME_ALTERED","rows_n":530,"patients":516},{"attribute_name":"GRADE","rows_n":516,"patients":516},{"attribute_name":"HAY_FEVER_HISTORY","rows_n":516,"patients":516},{"attribute_name":"HEADACHE_HISTORY","rows_n":516,"patients":516},{"attribute_name":"HISTOLOGICAL_DIAGNOSIS","rows_n":516,"patients":516},{"attribute_name":"HISTORY_IONIZING_RT_TO_HEAD","rows_n":516,"patients":516},{"attribute_name":"HISTORY_NEOADJUVANT_MEDICATION","rows_n":516,"patients":516},{"attribute_name":"HISTORY_NEOADJUVANT_STEROID_TX","rows_n":516,"patients":516},{"attribute_name":"HISTORY_NEOADJUVANT_TRTYN","rows_n":516,"patients":516},{"attribute_name":"HISTORY_OTHER_MALIGNANCY","rows_n":516,"patients":516},{"attribute_name":"ICD_10","rows_n":516,"patients":516},{"attribute_name":"ICD_O_3_HISTOLOGY","rows_n":516,"patients":516},{"attribute_name":"ICD_O_3_SITE","rows_n":516,"patients":516},{"attribute_name":"IDH1_MUTATION","rows_n":516,"patients":516},{"attribute_name":"IDH1_MUTATION_TEST_INDICATOR","rows_n":516,"patients":516},{"attribute_name":"IDH1_MUTATION_TEST_METHOD","rows_n":516,"patients":516},{"attribute_name":"INFORMED_CONSENT_VERIFIED","rows_n":516,"patients":516},{"attribute_name":"INHERITED_GENETIC_SYNDROME_INDICATOR","rows_n":516,"patients":516},{"attribute_name":"INHERITED_GENETIC_SYNDROME_SPECIFIED","rows_n":516,"patients":516},{"attribute_name":"INITIAL_ … (3614 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH pat AS (SELECT patient_unique_id, anyIf(attribute_value, attribute_name='IDH1_MUTATION') AS idh1, anyIf(attribute_value, attribute_name='CANCER_TYPE_DETAILED') AS histology FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga' GROUP BY patient_unique_id) SELECT idh1, histology, count() AS patients FROM pat GROUP BY idh1, histology ORDER BY idh1, patients DESC"
+}
+
+◀ result
+{"rows":[{"histology":"Oligoastrocytoma","patients":96},{"histology":"Anaplastic Astrocytoma","patients":92},{"histology":"Oligodendroglioma","patients":91},{"histology":"Anaplastic Oligoastrocytoma","patients":63},{"histology":"Astrocytoma","patients":48},{"histology":"Diffuse Glioma","patients":1},{"idh1":"NO","histology":"Anaplastic Astrocytoma","patients":17},{"idh1":"NO","histology":"Oligoastrocytoma","patients":6},{"idh1":"NO","histology":"Astrocytoma","patients":5},{"idh1":"NO","histology":"Anaplastic Oligoastrocytoma","patients":3},{"idh1":"NO","histology":"Oligodendroglioma","patients":3},{"idh1":"YES","histology":"Oligoastrocytoma","patients":28},{"idh1":"YES","histology":"Anaplastic Astrocytoma","patients":21},{"idh1":"YES","histology":"Oligodendroglioma","patients":19},{"idh1":"YES","histology":"Anaplastic Oligoastrocytoma","patients":12},{"idh1":"YES","histology":"Astrocytoma","patients":11}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT quantilesExact(0, 0.1, 0.5, 0.9, 1)(toFloat64OrNull(alteration_value)) AS value_quantiles_min_p10_median_p90_max, count() AS n_values FROM genetic_alteration_derived WHERE cancer_study_identifier='lgg_tcga' AND profile_type='methylation_hm450' AND hugo_gene_symbol IN ('MGMT','IDH1','CDKN2A','TP53','MLH1') AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL"
+}
+
+◀ result
+{"rows":[{"value_quantiles_min_p10_median_p90_max":[0.0104870479865,0.121909732005574,0.523481362054204,0.861640064503304,0.942631945566217],"n_values":2649}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH idh_mut AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE cancer_study_identifier='lgg_tcga' AND variant_type='mutation' AND hugo_gene_symbol IN ('IDH1','IDH2') AND mutation_status != 'UNCALLED'),
+meth AS (SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS beta FROM genetic_alteration_derived WHERE cancer_study_identifier='lgg_tcga' AND profile_type='methylation_hm450' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL),
+grp AS (SELECT DISTINCT sample_unique_id, if(sample_unique_id IN (SELECT sample_unique_id FROM idh_mut), 'IDH-mutant', 'IDH-wildtype') AS grp FROM meth)
+SELECT grp, uniqExact(m.sample_unique_id) AS samples, round(avg(beta),4) AS mean_beta_all_genes, round(quantile(0.5)(beta),4) AS median_beta_all_genes
+FROM meth m JOIN grp USING (sample_unique_id) GROUP BY grp ORDER BY grp"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH idh_mut AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE cancer_study_identifier='lgg_tcga' AND variant_type='mutation' AND hugo_gene_symbol IN ('IDH1','IDH2') AND mutation_status != 'UNCALLED'),
+meth AS (SELECT sample_unique_id, hugo_gene_symbol AS gene, toFloat64OrNull(alteration_value) AS beta FROM genetic_alteration_derived WHERE cancer_study_identifier='lgg_tcga' AND profile_type='methylation_hm450' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL),
+grp AS (SELECT DISTINCT sample_unique_id, if(sample_unique_id IN (SELECT sample_unique_id FROM idh_mut), 'IDH-mutant', 'IDH-wildtype') AS grp FROM meth),
+g AS (SELECT gene, avgIf(beta, grp='IDH-mutant') AS mean_mut, avgIf(beta, grp='IDH-wildtype') AS mean_wt, countIf(grp='IDH-mutant') AS n_mut, countIf(grp='IDH-wildtype') AS n_wt FROM meth m JOIN grp USING (sample_unique_id) GROUP BY gene HAVING n_mut >= 20 AND n_wt >= 20)
+SELECT gene, round(mean_mut,3) AS mean_beta_IDH_mut, round(mean_wt,3) AS mean_beta_IDH_wt, round(mean_mut - mean_wt,3) AS diff_mut_minus_wt, n_mut, n_wt FROM g ORDER BY abs(mean_mut - mean_wt) DESC LIMIT 30"
+}
+
+◀ result
+{"rows":[{"grp":"IDH-mutant","samples":233,"mean_beta_all_genes":0.4585,"median_beta_all_genes":0.4322},{"grp":"IDH-wildtype","samples":297,"mean_beta_all_genes":0.4296,"median_beta_all_genes":0.3251}]}
+
+◀ result
+{"rows":[{"gene":"RASGRP2","mean_beta_IDH_mut":0.831,"mean_beta_IDH_wt":0.587,"diff_mut_minus_wt":0.244,"n_mut":232,"n_wt":297},{"gene":"VSX1","mean_beta_IDH_mut":0.783,"mean_beta_IDH_wt":0.547,"diff_mut_minus_wt":0.237,"n_mut":233,"n_wt":297},{"gene":"PITPNM1","mean_beta_IDH_mut":0.839,"mean_beta_IDH_wt":0.604,"diff_mut_minus_wt":0.236,"n_mut":233,"n_wt":297},{"gene":"RAB3D","mean_beta_IDH_mut":0.729,"mean_beta_IDH_wt":0.498,"diff_mut_minus_wt":0.232,"n_mut":233,"n_wt":297},{"gene":"PITX1","mean_beta_IDH_mut":0.876,"mean_beta_IDH_wt":0.645,"diff_mut_minus_wt":0.231,"n_mut":233,"n_wt":297},{"gene":"VAV3","mean_beta_IDH_mut":0.807,"mean_beta_IDH_wt":0.577,"diff_mut_minus_wt":0.231,"n_mut":233,"n_wt":297},{"gene":"EHD4","mean_beta_IDH_mut":0.634,"mean_beta_IDH_wt":0.405,"diff_mut_minus_wt":0.229,"n_mut":233,"n_wt":297},{"gene":"KHNYN","mean_beta_IDH_mut":0.75,"mean_beta_IDH_wt":0.522,"diff_mut_minus_wt":0.229,"n_mut":233,"n_wt":297},{"gene":"MRC2","mean_beta_IDH_mut":0.771,"mean_beta_IDH_wt":0.544,"diff_mut_minus_wt":0.227,"n_mut":233,"n_wt":297},{"gene":"LINC00092","mean_beta_IDH_mut":0.758,"mean_beta_IDH_wt":0.534,"diff_mut_minus_wt":0.224,"n_mut":233,"n_wt":297},{"gene":"SFRP4","mean_beta_IDH_mut":0.754,"mean_beta_IDH_wt":0.53,"diff_mut_minus_wt":0.223,"n_mut":233,"n_wt":297},{"gene":"GNMT","mean_beta_IDH_mut":0.769,"mean_beta_IDH_wt":0.547,"diff_mut_minus_wt":0.222,"n_mut":233,"n_wt":294},{"gene":"PRODH","mean_beta_IDH_mut":0.688,"mean_beta_IDH_wt":0.467,"diff_mut_minus_wt":0.221,"n_mut":233,"n_wt":297},{"gene":"ACACB","mean_beta_IDH_mut":0.764,"mean_beta_IDH_wt":0.543,"diff_mut_minus_wt":0.22,"n_mut":233,"n_wt":297},{"gene":"EMP3","mean_beta_IDH_mut":0.761,"mean_beta_IDH_wt":0.542,"diff_mut_minus_wt":0.219,"n_mut":233,"n_wt":297},{"gene":"BICD1","mean_beta_IDH_mut":0.712,"mean_beta_IDH_wt":0.494,"diff_mut_minus_wt":0.218,"n_mut":233,"n_wt":297},{"gene":"CHST6","mean_beta_IDH_mut":0.691,"mean_beta_IDH_wt":0.474,"diff_mut_minus_wt":0.218,"n_mut":233,"n_wt":297},{"gene":"ALS2CL","mean_beta_IDH_mut":0.81,"mean_beta_IDH_wt":0.594,"diff_mut_minus_wt":0.216,"n_mut":233,"n_wt":297},{"gene":"SOCS3","mean_beta_IDH_mut":0.768,"mean_beta_IDH_wt":0.552,"diff_mut_minus_wt":0.216,"n_mut":233,"n_wt":297},{"gene":"TLE4","mean_beta_IDH_mut":0.757,"mean_beta_IDH_wt":0.544,"diff_mut_minus_wt":0.214,"n_mut":233,"n_wt":297},{"gene":"CARMIL1","mean_beta_IDH_mut":0.807,"mean_beta_IDH_wt":0.595,"diff_mut_minus_wt":0.212,"n_mut":233,"n_wt":297},{"gene":"TMEM26","mean_beta_IDH_mut":0.817,"mean_beta_IDH_wt":0.605,"diff_mut_minus_wt":0.212,"n_mut":233,"n_wt":297},{"gene":"PNMT","mean_beta_IDH_mut":0.787,"mean_beta_IDH_wt":0.576,"diff_mut_minus_wt":0.211,"n_mut":233,"n_wt":297},{"gene":"FGFRL1","mean_beta_IDH_mut":0.635,"mean_beta_IDH_wt":0.424,"diff_mut_minus_wt":0.211,"n_mut":233,"n_wt":297},{"gene":"UPP1","mean_beta_IDH_mut":0.723,"mean_beta_IDH_wt":0.513,"diff_mut_minus_wt":0.211,"n_mut":233,"n_wt":297},{"gene":"SGMS2","mean_beta_IDH_mut":0.699,"mean_beta_IDH_wt":0.489 … (521 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH idh_mut AS (SELECT DISTINCT sample_unique_id FROM genomic_event_derived WHERE cancer_study_identifier='lgg_tcga' AND variant_type='mutation' AND hugo_gene_symbol IN ('IDH1','IDH2') AND mutation_status != 'UNCALLED'),
+hist AS (SELECT DISTINCT sample_unique_id, attribute_value AS histology FROM clinical_data_derived WHERE cancer_study_identifier='lgg_tcga' AND attribute_name='CANCER_TYPE_DETAILED'),
+meth AS (SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS beta FROM genetic_alteration_derived WHERE cancer_study_identifier='lgg_tcga' AND profile_type='methylation_hm450' AND alteration_value NOT IN ('','NA') AND toFloat64OrNull(alteration_value) IS NOT NULL)
+SELECT h.histology, uniqExact(m.sample_unique_id) AS samples, countIf(m.sample_unique_id IN (SELECT sample_unique_id FROM idh_mut)) AS idh_mut_samples_in_group, round(avg(beta),4) AS mean_beta_all_genes, round(quantile(0.5)(beta),4) AS median_beta_all_genes
+FROM meth m JOIN hist h USING (sample_unique_id) GROUP BY h.histology ORDER BY mean_beta_all_genes DESC"
+}
+
+◀ result
+{"rows":[{"histology":"Diffuse Glioma","samples":1,"idh_mut_samples_in_group":0,"mean_beta_all_genes":0.476,"median_beta_all_genes":0.4552},{"histology":"Anaplastic Oligoastrocytoma","samples":78,"idh_mut_samples_in_group":615751,"mean_beta_all_genes":0.4517,"median_beta_all_genes":0.4099},{"histology":"Oligodendroglioma","samples":120,"idh_mut_samples_in_group":1022051,"mean_beta_all_genes":0.4504,"median_beta_all_genes":0.4423},{"histology":"Oligoastrocytoma","samples":134,"idh_mut_samples_in_group":1054304,"mean_beta_all_genes":0.446,"median_beta_all_genes":0.4043},{"histology":"Astrocytoma","samples":67,"idh_mut_samples_in_group":421710,"mean_beta_all_genes":0.4455,"median_beta_all_genes":0.4197},{"histology":"Anaplastic Astrocytoma","samples":130,"idh_mut_samples_in_group":665021,"mean_beta_all_genes":0.4233,"median_beta_all_genes":0.3679}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "lgg_tcga"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"lgg_tcga","name":"Brain Lower Grade Glioma (TCGA, Firehose Legacy)","sampleCount":530,"studyViewUrl":"https://www.cbioportal.org/study?id=lgg_tcga","metadata":{"clinicalAttributeIds":["AGE","ANIMAL_INSECT_ALLERGY_AGE","ANIMAL_INSECT_ALLERGY_HIST","ASTHMA_ECZEMA_ALLERGY_FIRST_DIAGNOSIS","ASTHMA_HISTORY","CANCER_TYPE","CANCER_TYPE_DETAILED","DAYS_TO_COLLECTION","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DAYS_TO_SPECIMEN_COLLECTION","DFS_MONTHS","DFS_STATUS","DISEASE_CODE","ECOG_SCORE","ECZEMA_HISTORY","ETHNICITY","FAMILY_HISTORY_OF_CANCER","FAMILY_HISTORY_OF_PRIMARY_BRAIN_TUMOR","FIRST_SYMPTOM_LONGEST_DURATION","FOOD_ALLERGY_AGE","FOOD_ALLERGY_HISTORY","FOOD_ALLERGY_TYPES","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","GRADE","HAY_FEVER_HISTORY","HEADACHE_HISTORY","HISTOLOGICAL_DIAGNOSIS","HISTORY_IONIZING_RT_TO_HEAD","HISTORY_NEOADJUVANT_MEDICATION","HISTORY_NEOADJUVANT_STEROID_TX","HISTORY_NEOADJUVANT_TRTYN","HISTORY_OTHER_MALIGNANCY","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","IDH1_MUTATION","IDH1_MUTATION_TEST_INDICATOR","IDH1_MUTATION_TEST_METHOD","INFORMED_CONSENT_VERIFIED","INHERITED_GENETIC_SYNDROME_INDICATOR","INHERITED_GENETIC_SYNDROME_SPECIFIED","INITIAL_PATHOLOGIC_DX_YEAR","IS_FFPE","KARNOFSKY_PERFORMANCE_SCORE","LATERALITY","LONGEST_DIMENSION","METHOD_OF_SAMPLE_PROCUREMENT","MOLD_OR_DUST_ALLERGY_HISTORY","MUTATION_COUNT","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","OCT_EMBEDDED","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_METHOD_OF_SAMPLE_PROCUREMENT","OTHER_PATIENT_ID","OTHER_SAMPLE_ID","PATHOLOGY_REPORT_FILE_NAME","PATHOLOGY_REPORT_UUID","PERFORMANCE_STATUS_DAYS_TO","PERFORMANCE_STATUS_TIMING","PROJECT_CODE","PROSPECTIVE_COLLECTION","RACE","RADIATION_TREATMENT_ADJUVANT","RELATED_SYMPTOM_FIRST_PRESENT","RETROSPECTIVE_COLLECTION","SAMPLE_COUNT","SAMPLE_INITIAL_WEIGHT","SAMPLE_TYPE","SAMPLE_TYPE_ID","SEIZURE_HISTORY","SEX","SHORTEST_DIMENSION","SITE_OF_TUMOR_TISSUE","SOMATIC_STATUS","SPECIMEN_CURRENT_WEIGHT","SPECIMEN_FREEZING_METHOD","SPECIMEN_SECOND_LONGEST_DIMENSION","SUPRATENTORIAL_LOCALIZATION","SYMP_CHANGES_MENTAL_STATUS","SYMP_CHANGES_MOTOR_MOVEMENT","SYMP_CHANGES_SENSORY","SYMP_CHANGES_VISUAL","TARGETED_MOLECULAR_THERAPY","TIME_BETWEEN_CLAMPING_AND_FREEZING","TIME_BETWEEN_EXCISION_AND_FREEZING","TISSUE_SOURCE_SITE","TMB_NONSYNONYMOUS","TREATMENT_OUTCOME_FIRST_COURSE","TUMOR_SITE","TUMOR_STATUS","VIAL_NUMBER"],"molecularProfileIds":["lgg_tcga_gistic","lgg_tcga_linear_CNA","lgg_tcga_methylation_hm450","lgg_tcga_mrna","lgg_tcga_mrna_median_Zscores","lgg_tcga_mrna_median_all_sample_Zscores","lgg_tcga_mutations","lgg_tcga_rna_seq_v2_mrna","lgg_tcga_rna_seq_v2_mrna_median_Zscores","lgg_tcga_rna_seq_v2_mrna_median_all_sample_Zscores","lgg_tcga_rppa","lgg_tcga_rppa_Zscores"],"heatmapProfileIds":["lgg_tcga_methylation_hm450","lgg_tcga_mrna_median_Zscores","lgg_tcga_mrna_median … (266 more chars)
+
+═ answer (success)
+Yes, in the data cBioPortal holds, IDH-mutant lower grade gliomas have higher DNA methylation than IDH-wildtype tumors. The difference is large and consistent across the top-ranked genes. Only one study has methylation data for this question, and the molecular subtypes are only partly represented.
+
+**Data and grouping**
+- **Study:** Brain Lower Grade Glioma (TCGA, Firehose Legacy), `lgg_tcga`. The PanCancer Atlas LGG study has no methylation profile in this database.
+- **Methylation values:** 530 samples, Illumina 450K, reported per gene (16,230 genes). The per-gene aggregation method isn't documented in the database, so values are gene-level beta values from the portal's profile.
+- **Subtype limitation:** The study has no 1p/19q codeletion field, so the full molecular classification (IDH-mutant codeleted, IDH-mutant non-codeleted, IDH-wildtype) can't be reproduced. I grouped samples by IDH1/IDH2 mutation status instead, and by histology.
+
+**IDH-mutant vs IDH-wildtype (samples, not patients)**
+
+| Group | Samples | Mean beta (all genes) | Median beta (all genes) |
+|---|---|---|---|
+| IDH-mutant | 233 | 0.459 | 0.432 |
+| IDH-wildtype | 297 | 0.430 | 0.325 |
+
+The medians differ more than the means. IDH-wildtype tumors have a lower-methylation bulk, and a subset with high methylation drives the wildtype mean up.
+
+**Genes with the largest mean difference (IDH-mutant minus IDH-wildtype)**
+
+| Gene | Mean beta, IDH-mutant | Mean beta, IDH-wildtype | Difference |
+|---|---|---|---|
+| RASGRP2 | 0.831 | 0.587 | +0.244 |
+| VSX1 | 0.783 | 0.547 | +0.237 |
+| PITPNM1 | 0.839 | 0.604 | +0.236 |
+| RAB3D | 0.729 | 0.498 | +0.232 |
+| PITX1 | 0.876 | 0.645 | +0.231 |
+| VAV3 | 0.807 | 0.577 | +0.231 |
+| EHD4 | 0.634 | 0.405 | +0.229 |
+| KHNYN | 0.750 | 0.522 | +0.229 |
+| MRC2 | 0.771 | 0.544 | +0.227 |
+| SFRP4 | 0.754 | 0.530 | +0.223 |
+
+All the top genes show higher methylation in IDH-mutant tumors. Each gene has at least 232 IDH-mutant and 294 IDH-wildtype samples. These are descriptive means only; I didn't run significance tests, which this database can't do.
+
+**Histology**
+Mean beta across all genes was similar across histologies: oligodendroglioma 0.450, oligoastrocytoma 0.446, astrocytoma 0.446, anaplastic oligoastrocytoma 0.452, and anaplastic astrocytoma 0.423. Anaplastic astrocytoma had the lowest mean and median. Histology mixes IDH status, so these differences are weaker than the IDH split and shouldn't be read as independent subtype effects.
+
+You can explore the study's clinical data and methylation profile here: [Brain Lower Grade Glioma (TCGA, Firehose Legacy) study view](https://www.cbioportal.org/study?id=lgg_tcga)

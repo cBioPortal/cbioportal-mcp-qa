@@ -1,0 +1,544 @@
+Q (haiku-5.5): Which cancer types have the highest aneuploidy scores and how does this correlate with mutation burden across TCGA Pan-Cancer studies?
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 1",
+ "max_rows": 1
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+{"rows":[{"1":1}]}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, count() AS rows, uniqExact(cancer_study_identifier) AS studies
+FROM clinical_data_derived
+WHERE cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')
+  AND (upper(attribute_name) LIKE '%ANEUPLOID%' OR upper(attribute_name) LIKE '%TMB%' OR upper(attribute_name) LIKE '%MUTATION_COUNT%')
+GROUP BY attribute_name
+ORDER BY attribute_name"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"rows":[{"attribute_name":"ANEUPLOIDY_SCORE","rows":10967,"studies":32},{"attribute_name":"MUTATION_COUNT","rows":10967,"studies":32},{"attribute_name":"TMB_NONSYNONYMOUS","rows":10967,"studies":32}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+    SELECT sample_unique_id,
+        anyIf(attribute_value, attribute_name = 'CANCER_TYPE') AS cancer_type,
+        anyIf(toFloat64OrNull(attribute_value), attribute_name = 'ANEUPLOIDY_SCORE') AS aneuploidy,
+        anyIf(toFloat64OrNull(attribute_value), attribute_name = 'TMB_NONSYNONYMOUS') AS tmb
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')
+      AND sample_unique_id != ''
+      AND attribute_name IN ('CANCER_TYPE', 'ANEUPLOIDY_SCORE', 'TMB_NONSYNONYMOUS')
+    GROUP BY sample_unique_id
+)
+SELECT cancer_type,
+    count() AS samples,
+    countIf(aneuploidy IS NOT NULL) AS with_aneuploidy,
+    round(quantile(0.5)(aneuploidy), 1) AS median_aneuploidy,
+    round(avg(aneuploidy), 1) AS mean_aneuploidy,
+    countIf(tmb IS NOT NULL) AS with_tmb,
+    round(quantile(0.5)(tmb), 2) AS median_tmb,
+    round(avg(tmb), 2) AS mean_tmb
+FROM s
+WHERE cancer_type != ''
+GROUP BY cancer_type
+HAVING with_aneuploidy >= 50
+ORDER BY median_aneuploidy DESC",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_type":"Seminoma","samples":63,"with_aneuploidy":63,"median_aneuploidy":19,"mean_aneuploidy":19.1,"with_tmb":63,"median_tmb":0.4,"mean_tmb":0.44},{"cancer_type":"Non-Seminomatous Germ Cell Tumor","samples":86,"with_aneuploidy":86,"median_aneuploidy":19,"mean_aneuploidy":18.6,"with_tmb":86,"median_tmb":0.42,"mean_tmb":0.52},{"cancer_type":"Adrenocortical Carcinoma","samples":92,"with_aneuploidy":89,"median_aneuploidy":17,"mean_aneuploidy":18.3,"with_tmb":91,"median_tmb":0.9,"mean_tmb":2.78},{"cancer_type":"Non-Small Cell Lung Cancer","samples":1053,"with_aneuploidy":983,"median_aneuploidy":16,"mean_aneuploidy":15.6,"with_tmb":1050,"median_tmb":7.3,"mean_tmb":9.75},{"cancer_type":"Bladder Cancer","samples":411,"with_aneuploidy":401,"median_aneuploidy":14,"mean_aneuploidy":13.5,"with_tmb":410,"median_tmb":5.77,"mean_tmb":8.44},{"cancer_type":"Ovarian Epithelial Tumor","samples":585,"with_aneuploidy":552,"median_aneuploidy":13,"mean_aneuploidy":14,"with_tmb":523,"median_tmb":1.87,"mean_tmb":2.31},{"cancer_type":"Colorectal Cancer","samples":594,"with_aneuploidy":586,"median_aneuploidy":12,"mean_aneuploidy":12.3,"with_tmb":534,"median_tmb":3.5,"mean_tmb":13.64},{"cancer_type":"Breast Cancer","samples":1084,"with_aneuploidy":1041,"median_aneuploidy":11,"mean_aneuploidy":12.1,"with_tmb":1066,"median_tmb":1.3,"mean_tmb":2.73},{"cancer_type":"Melanoma","samples":448,"with_aneuploidy":434,"median_aneuploidy":11,"mean_aneuploidy":13,"with_tmb":440,"median_tmb":14.88,"mean_tmb":25.91},{"cancer_type":"Esophagogastric Cancer","samples":622,"with_aneuploidy":589,"median_aneuploidy":11,"mean_aneuploidy":12.1,"with_tmb":618,"median_tmb":3.82,"mean_tmb":10.39},{"cancer_type":"Head and Neck Cancer","samples":523,"with_aneuploidy":510,"median_aneuploidy":10,"mean_aneuploidy":11.3,"with_tmb":515,"median_tmb":3.53,"mean_tmb":5.41},{"cancer_type":"Sarcoma","samples":255,"with_aneuploidy":244,"median_aneuploidy":9.5,"mean_aneuploidy":10.9,"with_tmb":255,"median_tmb":1.3,"mean_tmb":2.31},{"cancer_type":"Renal Non-Clear Cell Carcinoma","samples":348,"with_aneuploidy":345,"median_aneuploidy":9,"mean_aneuploidy":9.5,"with_tmb":341,"median_tmb":1.87,"mean_tmb":2.42},{"cancer_type":"Cervical Cancer","samples":297,"with_aneuploidy":294,"median_aneuploidy":8,"mean_aneuploidy":10.1,"with_tmb":291,"median_tmb":2.83,"mean_tmb":6.48},{"cancer_type":"Hepatobiliary Cancer","samples":372,"with_aneuploidy":361,"median_aneuploidy":8,"mean_aneuploidy":10.5,"with_tmb":366,"median_tmb":2.83,"mean_tmb":3.52},{"cancer_type":"Pancreatic Cancer","samples":184,"with_aneuploidy":165,"median_aneuploidy":7,"mean_aneuploidy":9.3,"with_tmb":179,"median_tmb":1.17,"mean_tmb":3.89},{"cancer_type":"Glioblastoma","samples":592,"with_aneuploidy":566,"median_aneuploidy":7,"mean_aneuploidy":8.2,"with_tmb":397,"median_tmb":1.7,"mean_tmb":3.89},{"cancer_type":"Pleural Mesothelioma","samples":87,"with_aneuploidy":81,"median_aneuploidy":6,"mean_aneuploidy":8.2,"with_tmb":86,"median_tmb":0.88,"m … (1484 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+    SELECT sample_unique_id,
+        anyIf(toFloat64OrNull(attribute_value), attribute_name = 'ANEUPLOIDY_SCORE') AS aneuploidy,
+        anyIf(toFloat64OrNull(attribute_value), attribute_name = 'TMB_NONSYNONYMOUS') AS tmb
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')
+      AND sample_unique_id != ''
+      AND attribute_name IN ('ANEUPLOIDY_SCORE', 'TMB_NONSYNONYMOUS')
+    GROUP BY sample_unique_id
+)
+SELECT count() AS samples_both,
+    round(corr(aneuploidy, tmb), 3) AS pearson_raw,
+    round(corr(log10(tmb + 0.01), aneuploidy), 3) AS pearson_log10tmb,
+    round(corr(log10(tmb + 0.01), log10(aneuploidy + 1)), 3) AS pearson_log_both
+FROM s
+WHERE aneuploidy IS NOT NULL AND tmb IS NOT NULL",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"samples_both":9975,"pearson_raw":-0.046,"pearson_log10tmb":0.17,"pearson_log_both":0.207}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+    SELECT sample_unique_id,
+        anyIf(attribute_value, attribute_name = 'CANCER_TYPE') AS cancer_type,
+        anyIf(toFloat64OrNull(attribute_value), attribute_name = 'ANEUPLOIDY_SCORE') AS aneuploidy,
+        anyIf(toFloat64OrNull(attribute_value), attribute_name = 'TMB_NONSYNONYMOUS') AS tmb
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')
+      AND sample_unique_id != ''
+      AND attribute_name IN ('CANCER_TYPE', 'ANEUPLOIDY_SCORE', 'TMB_NONSYNONYMOUS')
+    GROUP BY sample_unique_id
+)
+SELECT cancer_type, count() AS n,
+    round(corr(log10(tmb + 0.01), aneuploidy), 3) AS pearson_log10tmb_vs_aneuploidy
+FROM s
+WHERE cancer_type != '' AND aneuploidy IS NOT NULL AND tmb IS NOT NULL
+GROUP BY cancer_type
+HAVING n >= 100
+ORDER BY pearson_log10tmb_vs_aneuploidy DESC",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_type":"Sarcoma","n":244,"pearson_log10tmb_vs_aneuploidy":0.296},{"cancer_type":"Glioma","n":507,"pearson_log10tmb_vs_aneuploidy":0.289},{"cancer_type":"Pancreatic Cancer","n":162,"pearson_log10tmb_vs_aneuploidy":0.278},{"cancer_type":"Bladder Cancer","n":400,"pearson_log10tmb_vs_aneuploidy":0.255},{"cancer_type":"Non-Small Cell Lung Cancer","n":980,"pearson_log10tmb_vs_aneuploidy":0.24},{"cancer_type":"Thymic Epithelial Tumor","n":106,"pearson_log10tmb_vs_aneuploidy":0.237},{"cancer_type":"Prostate Cancer","n":471,"pearson_log10tmb_vs_aneuploidy":0.178},{"cancer_type":"Pheochromocytoma","n":133,"pearson_log10tmb_vs_aneuploidy":0.143},{"cancer_type":"Breast Cancer","n":1024,"pearson_log10tmb_vs_aneuploidy":0.134},{"cancer_type":"Head and Neck Cancer","n":502,"pearson_log10tmb_vs_aneuploidy":0.104},{"cancer_type":"Leukemia","n":124,"pearson_log10tmb_vs_aneuploidy":0.099},{"cancer_type":"Hepatobiliary Cancer","n":355,"pearson_log10tmb_vs_aneuploidy":0.085},{"cancer_type":"Thyroid Cancer","n":460,"pearson_log10tmb_vs_aneuploidy":0.068},{"cancer_type":"Cervical Cancer","n":288,"pearson_log10tmb_vs_aneuploidy":0.061},{"cancer_type":"Melanoma","n":431,"pearson_log10tmb_vs_aneuploidy":0.025},{"cancer_type":"Glioblastoma","n":378,"pearson_log10tmb_vs_aneuploidy":-0.036},{"cancer_type":"Renal Clear Cell Carcinoma","n":388,"pearson_log10tmb_vs_aneuploidy":-0.056},{"cancer_type":"Ovarian Epithelial Tumor","n":504,"pearson_log10tmb_vs_aneuploidy":-0.096},{"cancer_type":"Renal Non-Clear Cell Carcinoma","n":339,"pearson_log10tmb_vs_aneuploidy":-0.177},{"cancer_type":"Esophagogastric Cancer","n":585,"pearson_log10tmb_vs_aneuploidy":-0.179},{"cancer_type":"Colorectal Cancer","n":529,"pearson_log10tmb_vs_aneuploidy":-0.397},{"cancer_type":"Endometrial Cancer","n":562,"pearson_log10tmb_vs_aneuploidy":-0.447}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga' ORDER BY cancer_study_identifier",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"acc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"chol_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"dlbc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"esca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"hnsc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kich_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"kirp_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"laml_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lihc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"meso_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"paad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"pcpg_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"prad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"sarc_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"skcm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"stad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"tgct_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"thca_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"thym_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucec_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"ucs_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"uvm_tcga_pan_can_atlas_2018"}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+Error: result (81,891 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /home/debruiji/.claude/projects/-gpfs-cdsi-ess-debruiji-tmp-mcp-qa-claude-7nsz6ukh/11978775-cda1-4394-8a00-7a78ba808096/tool-results/mcp-navigator-resolve_and_route-1792036524317.txt.
+Format: Plain text
+- For targeted searches (find a string): use grep on the file directly.
+- For analysis or summarization that requires reading the full content: the file's lines are too long for Read's offset/limit. Slice by character range via Bash instead — e.g. python3 -c 'print(open("/home/debruiji/.claude/projects/-gpfs-cdsi-ess-debruiji-tmp-mcp-qa-claude-7nsz6ukh/11978775-cda1-4394-8a00-7a78ba808096/tool-results/mcp-navigator-resolve_and_route-1792036524317.txt").read()[A:B])' in ~80,000-char spans until you have read 100% of it.
+- If the Agent tool is available, do this inside a subagent so the full output stays out of your main context. Give it the instruction above verbatim, and be explicit about what it must return — e.g. "Slice /home/debruiji/.claude/projects/-gpfs-cdsi-ess-debruiji-tmp-mcp-qa-claude-7nsz6ukh/11978775-cda1-4394-8a00-7a78ba808096/tool-results/mcp-navigator-resolve_and_route-1792036524317.txt in ~80,000-char spans via python (read()[A:B]) until you have read all 81,891 characters, then summarize and quote any key findings verbatim." A vague "summarize this" may lose detail.
+
+
+▶ navigate_to_study_view
+{
+ "filterJson": {
+  "studyIds": [
+   "acc_tcga_pan_can_atlas_2018",
+   "blca_tcga_pan_can_atlas_2018",
+   "brca_tcga_pan_can_atlas_2018",
+   "cesc_tcga_pan_can_atlas_2018",
+   "chol_tcga_pan_can_atlas_2018",
+   "coadread_tcga_pan_can_atlas_2018",
+   "dlbc_tcga_pan_can_atlas_2018",
+   "esca_tcga_pan_can_atlas_2018",
+   "gbm_tcga_pan_can_atlas_2018",
+   "hnsc_tcga_pan_can_atlas_2018",
+   "kich_tcga_pan_can_atlas_2018",
+   "kirc_tcga_pan_can_atlas_2018",
+   "kirp_tcga_pan_can_atlas_2018",
+   "laml_tcga_pan_can_atlas_2018",
+   "lgg_tcga_pan_can_atlas_2018",
+   "lihc_tcga_pan_can_atlas_2018",
+   "luad_tcga_pan_can_atlas_2018",
+   "lusc_tcga_pan_can_atlas_2018",
+   "meso_tcga_pan_can_atlas_2018",
+   "ov_tcga_pan_can_atlas_2018",
+   "paad_tcga_pan_can_atlas_2018",
+   "pcpg_tcga_pan_can_atlas_2018",
+   "prad_tcga_pan_can_atlas_2018",
+   "sarc_tcga_pan_can_atlas_2018",
+   "skcm_tcga_pan_can_atlas_2018",
+   "stad_tcga_pan_can_atlas_2018",
+   "tgct_tcga_pan_can_atlas_2018",
+   "thca_tcga_pan_can_atlas_2018",
+   "thym_tcga_pan_can_atlas_2018",
+   "ucec_tcga_pan_can_atlas_2018",
+   "ucs_tcga_pan_can_atlas_2018",
+   "uvm_tcga_pan_can_atlas_2018"
+  ]
+ },
+ "studyIds": [
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "summary"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=acc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Claml_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tcga_pan_can_atlas_2018%2Cprad_tcga_pan_can_atlas_2018%2Csarc_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018%2Cstad_tcga_pan_can_atlas_2018%2Ctgct_tcga_pan_can_atlas_2018%2Cthca_tcga_pan_can_atlas_2018%2Cthym_tcga_pan_can_atlas_2018%2Cucec_tcga_pan_can_atlas_2018%2Cucs_tcga_pan_can_atlas_2018%2Cuvm_tcga_pan_can_atlas_2018#filterJson=%7B%22studyIds%22%3A%5B%22acc_tcga_pan_can_atlas_2018%22%2C%22blca_tcga_pan_can_atlas_2018%22%2C%22brca_tcga_pan_can_atlas_2018%22%2C%22cesc_tcga_pan_can_atlas_2018%22%2C%22chol_tcga_pan_can_atlas_2018%22%2C%22coadread_tcga_pan_can_atlas_2018%22%2C%22dlbc_tcga_pan_can_atlas_2018%22%2C%22esca_tcga_pan_can_atlas_2018%22%2C%22gbm_tcga_pan_can_atlas_2018%22%2C%22hnsc_tcga_pan_can_atlas_2018%22%2C%22kich_tcga_pan_can_atlas_2018%22%2C%22kirc_tcga_pan_can_atlas_2018%22%2C%22kirp_tcga_pan_can_atlas_2018%22%2C%22laml_tcga_pan_can_atlas_2018%22%2C%22lgg_tcga_pan_can_atlas_2018%22%2C%22lihc_tcga_pan_can_atlas_2018%22%2C%22luad_tcga_pan_can_atlas_2018%22%2C%22lusc_tcga_pan_can_atlas_2018%22%2C%22meso_tcga_pan_can_atlas_2018%22%2C%22ov_tcga_pan_can_atlas_2018%22%2C%22paad_tcga_pan_can_atlas_2018%22%2C%22pcpg_tcga_pan_can_atlas_2018%22%2C%22prad_tcga_pan_can_atlas_2018%22%2C%22sarc_tcga_pan_can_atlas_2018%22%2C%22skcm_tcga_pan_can_atlas_2018%22%2C%22stad_tcga_pan_can_atlas_2018%22%2C%22tgct_tcga_pan_can_atlas_2018%22%2C%22thca_tcga_pan_can_atlas_2018%22%2C%22thym_tcga_pan_can_atlas_2018%22%2C%22ucec_tcga_pan_can_atlas_2018%22%2C%22ucs_tcga_pan_can_atlas_2018%22%2C%22uvm_tcga_pan_can_atlas_2018%22%5D%7D","url":"https://www.cbioportal.org/study/summary?id=acc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Claml_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tc … (6655 more chars)
+
+═ answer (success)
+## Aneuploidy score by cancer type and its relationship to mutation burden (TCGA PanCancer Atlas)
+
+**Cohort:** the 32 TCGA PanCancer Atlas studies (10,967 samples; 9,975 have both aneuploidy and TMB). All counts and percentages are per sample, not per patient. Each study is a separate TCGA cohort, so overlap between studies is not a concern here.
+
+### Highest aneuploidy scores (median per cancer type, cancer types with ≥50 samples)
+
+| Cancer type (`CANCER_TYPE`) | Samples with aneuploidy | Median aneuploidy | Median TMB (mut/Mb) |
+|---|---|---|---|
+| Seminoma | 63 | 19 | 0.40 |
+| Non-Seminomatous Germ Cell Tumor | 86 | 19 | 0.42 |
+| Adrenocortical Carcinoma | 89 | 17 | 0.90 |
+| Non-Small Cell Lung Cancer (LUAD + LUSC) | 983 | 16 | 7.30 |
+| Bladder Cancer | 401 | 14 | 5.77 |
+| Ovarian Epithelial Tumor | 552 | 13 | 1.87 |
+| Colorectal Cancer | 586 | 12 | 3.50 |
+| Breast Cancer | 1,041 | 11 | 1.30 |
+| Melanoma | 434 | 11 | 14.88 |
+| Esophagogastric Cancer | 589 | 11 | 3.82 |
+
+The lowest medians are in Prostate (1), Glioma (2), and Thymic Epithelial Tumor, Thyroid, and Leukemia (0).
+
+### Correlation with mutation burden
+
+- **Pooled, all samples:** Pearson r = −0.05 with raw TMB, and r = +0.17 with log10(TMB). Both are weak. Cancer type is a strong confounder, because the highest-aneuploidy types (germ cell tumors) have very low TMB, while melanoma has high TMB and only mid-range aneuploidy.
+- **Within each cancer type (log10 TMB vs. aneuploidy):** the direction varies by type.
+  - Positive: Sarcoma r = 0.30, Glioma 0.29, Pancreatic 0.28, Bladder 0.26, NSCLC 0.24
+  - Near zero: Melanoma 0.03, Glioblastoma −0.04, Breast 0.13
+  - Negative: Esophagogastric −0.18, Non-Clear Cell Renal −0.18, Colorectal −0.40, Endometrial −0.45
+
+Overall, there is no consistent pan-cancer relationship. Within some types, higher TMB goes with higher aneuploidy, and within others the reverse holds. Endometrial cancer has one of the highest mean TMB values (32.5, driven by hypermutated tumors) but a median aneuploidy of only 4.
+
+**Caveats:** these are descriptive Pearson coefficients computed in the database. I did not run significance tests or confidence intervals. For p-values, use R (`cor.test`) or Python (`scipy.stats.pearsonr`). Mean TMB is skewed by hypermutators, so the medians are the more reliable comparison.
+
+**Explore the cohort in cBioPortal:** [View the 32 TCGA PanCancer Atlas studies in StudyView](https://www.cbioportal.org/study/summary?id=acc_tcga_pan_can_atlas_2018%2Cblca_tcga_pan_can_atlas_2018%2Cbrca_tcga_pan_can_atlas_2018%2Ccesc_tcga_pan_can_atlas_2018%2Cchol_tcga_pan_can_atlas_2018%2Ccoadread_tcga_pan_can_atlas_2018%2Cdlbc_tcga_pan_can_atlas_2018%2Cesca_tcga_pan_can_atlas_2018%2Cgbm_tcga_pan_can_atlas_2018%2Chnsc_tcga_pan_can_atlas_2018%2Ckich_tcga_pan_can_atlas_2018%2Ckirc_tcga_pan_can_atlas_2018%2Ckirp_tcga_pan_can_atlas_2018%2Claml_tcga_pan_can_atlas_2018%2Clgg_tcga_pan_can_atlas_2018%2Clihc_tcga_pan_can_atlas_2018%2Cluad_tcga_pan_can_atlas_2018%2Clusc_tcga_pan_can_atlas_2018%2Cmeso_tcga_pan_can_atlas_2018%2Cov_tcga_pan_can_atlas_2018%2Cpaad_tcga_pan_can_atlas_2018%2Cpcpg_tcga_pan_can_atlas_2018%2Cprad_tcga_pan_can_atlas_2018%2Csarc_tcga_pan_can_atlas_2018%2Cskcm_tcga_pan_can_atlas_2018%2Cstad_tcga_pan_can_atlas_2018%2Ctgct_tcga_pan_can_atlas_2018%2Cthca_tcga_pan_can_atlas_2018%2Cthym_tcga_pan_can_atlas_2018%2Cucec_tcga_pan_can_atlas_2018%2Cucs_tcga_pan_can_atlas_2018%2Cuvm_tcga_pan_can_atlas_2018)
+
+The StudyView page shows the cohort-level distributions. The per-sample aneuploidy–TMB comparisons above were computed in the database and are not plotted on that page.

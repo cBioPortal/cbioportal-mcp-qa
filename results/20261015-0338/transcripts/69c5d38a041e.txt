@@ -1,0 +1,370 @@
+Q (qwen3.8-27b): Do lung adenocarcinoma patients with high EGFR mRNA expression (top quartile) have different survival outcomes than those with low expression?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+▶ resolve_and_route
+{
+ "studyKeywords": [
+  "TCGA",
+  "lung",
+  "adenocarcinoma"
+ ]
+}
+
+◀ result
+{"success":true,"message":"Found 4 matching studies. Pick the best match (prefer TCGA → prefer PanCancer Atlas), use its metadata to call the appropriate navigation tool(s) and generate URLs immediately. Present other studies as alternatives.","data":{"totalCount":4,"studiesWithMetadata":[{"studyId":"luad_tcga","name":"Lung Adenocarcinoma (TCGA, Firehose Legacy)","sampleCount":586,"studyViewUrl":"https://www.cbioportal.org/study?id=luad_tcga","metadata":{"clinicalAttributeIds":["AGE","AJCC_CLINICAL_TUMOR_STAGE","AJCC_METASTASIS_CLINICAL_CM","AJCC_METASTASIS_PATHOLOGIC_PM","AJCC_NODES_CLINICAL_CN","AJCC_NODES_CLINICAL_CT","AJCC_NODES_PATHOLOGIC_PN","AJCC_PATHOLOGIC_TUMOR_STAGE","AJCC_STAGING_EDITION","AJCC_TUMOR_PATHOLOGIC_PT","ALK_ANALYSIS_TYPE","ALK_TRANSLOCATION_STATUS","ALK_TRANSLOCATION_VARIANT","CANCER_TYPE","CANCER_TYPE_DETAILED","CARBON_MONOXIDE_DIFFUSION_DLCO","DAYS_TO_COLLECTION","DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS","DAYS_TO_PATIENT_PROGRESSION_FREE","DAYS_TO_SPECIMEN_COLLECTION","DAYS_TO_TUMOR_PROGRESSION","DFS_MONTHS","DFS_STATUS","DISEASE_CODE","ECOG_SCORE","ETHNICITY","EXTRANODAL_INVOLVEMENT","FEV1_FVC_RATIO_POSTBRONCHOLIATOR","FEV1_FVC_RATIO_PREBRONCHOLIATOR","FEV1_PERCENT_REF_POSTBRONCHOLIATOR","FEV1_PERCENT_REF_PREBRONCHOLIATOR","FORM_COMPLETION_DATE","FRACTION_GENOME_ALTERED","HISTOLOGICAL_DIAGNOSIS","HISTORY_IMMUNOLOGICAL_DISEASE","HISTORY_IMMUNOLOGICAL_DISEASE_OTHER","HISTORY_NEOADJUVANT_TRTYN","HISTORY_OTHER_MALIGNANCY","HISTORY_RELEVANT_INFECTIOUS_DX","HIV_STATUS","ICD_10","ICD_O_3_HISTOLOGY","ICD_O_3_SITE","INFORMED_CONSENT_VERIFIED","INITIAL_PATHOLOGIC_DX_YEAR","IS_FFPE","KARNOFSKY_PERFORMANCE_SCORE","KRAS_GENE_ANALYSIS_INDICATOR","KRAS_MUTATION","KRAS_MUTATION_IDENTIFIED_TYPE","LATERALITY","LOCATION_LUNG_PARENCHYMA","LONGEST_DIMENSION","METHOD_OF_INITIAL_SAMPLE_PROCUREMENT","METHOD_OF_INITIAL_SAMPLE_PROCUREMENT_OTHER","METHOD_OF_SAMPLE_PROCUREMENT","MUTATION_COUNT","MUTATION_STATUS","MUTATION_TYPE","NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT","NUMBER_OF_LYMPHNODES_POSITIVE_BY_IHC","OCT_EMBEDDED","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER_METHOD_OF_SAMPLE_PROCUREMENT","OTHER_PATIENT_ID","OTHER_SAMPLE_ID","PATHOLOGY_REPORT_FILE_NAME","PATHOLOGY_REPORT_UUID","PERFORMANCE_STATUS_TIMING","PHARMACEUTICAL_TX_ADJUVANT","POS_LYMPH_NODE_LOCATION","PRIMARY_SITE_OTHER","PRIMARY_SITE_PATIENT","PROJECT_CODE","PROSPECTIVE_COLLECTION","PULMONARY_FUNCTION_TEST_INDICATOR","RACE","RADIATION_TREATMENT_ADJUVANT","RESIDUAL_TUMOR","RETROSPECTIVE_COLLECTION","SAMPLE_COUNT","SAMPLE_INITIAL_WEIGHT","SAMPLE_TYPE","SAMPLE_TYPE_ID","SEX","SHORTEST_DIMENSION","SMOKING_PACK_YEARS","SMOKING_YEAR_STARTED","SMOKING_YEAR_STOPPED","SOMATIC_STATUS","SPECIMEN_CURRENT_WEIGHT","SPECIMEN_FREEZING_METHOD","SPECIMEN_SECOND_LONGEST_DIMENSION","STAGE_OTHER","TARGETED_MOLECULAR_THERAPY","TIME_BETWEEN_CLAMPING_AND_FREEZING","TIME_BETWEEN_EXCISION_AND_FREEZING","TISSUE_SOURCE_SITE","TMB_NONSYNONYMOUS","TOBACCO_SMOKING_HISTORY_INDICATOR","TREATMENT_OUTCOME_FIRST_COURS … (6466 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT\n    toFloat64OrNull(cd1.attribute_value) AS os_months,\n    cd2.attribute_value AS os_status\nFROM (select * from clinical_data_derived where attribute_name='OS_MONTHS' and cancer_study_identifier='luad_tcga_pan_can_atlas_2018') cd1\nJOIN (select * from clinical_data_derived where attribute_name='OS_STATUS' and cancer_study_identifier='luad_tcga_pan_can_atlas_2018') cd2\nUSING (sample_unique_id)",
+ "max_rows": 5
+}
+
+◀ result
+{"rows":[{"os_months":0.0,"os_status":"0:LIVING"},{"os_months":0.0},{"os_months":0.0},{"os_months":0.0},{"os_months":0.0}],"truncated":true,"returned_rows":5,"note":"Result truncated to 5 rows; more rows matched but the exact total is unknown because the query was capped during execution for efficiency. Narrow the query (add a LIMIT, aggregate, or filter) or pass a larger max_rows (up to 10000) to see more."}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "luad_tcga_pan_can_atlas_2018",
+ "geneSpecificQueries": [
+  {
+   "hugoGeneSymbol": "EGFR",
+   "profileType": "rna_seq_v2_mrna_median_all_sample_Zscores"
+  },
+  {
+   "hugoGeneSymbol": "EGFR",
+   "profileType": "rna_seq_v2_mrna_median_Zscores"
+  }
+ ]
+}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"luad_tcga_pan_can_atlas_2018","geneSpecificCounts":[{"hugoGeneSymbol":"EGFR","profileType":"rna_seq_v2_mrna_median_all_sample_Zscores","bins":[{"end":-0.5518,"count":128},{"start":-0.5518,"end":0.0385,"count":127},{"start":0.0385,"end":0.5946,"count":128},{"start":0.5946,"count":127}]},{"hugoGeneSymbol":"EGFR","profileType":"rna_seq_v2_mrna_median_Zscores","bins":[]}]}}
+
+▶ clickhouse_run_select_query
+{
+ "max_rows": 10,
+ "query": "WITH egfr AS (\n  SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v\n  FROM genetic_alteration_derived\n  WHERE cancer_study_identifier='luad_tcga_pan_can_atlas_2018'\n    AND profile_type='rna_seq_v2_mrna_median_all_sample_Zscores'\n    AND hugo_gene_symbol='EGFR'\n    AND alteration_value NOT IN ('','NA')\n    AND toFloat64OrNull(alteration_value) IS NOT NULL\n),\ngrp AS (\n  SELECT sample_unique_id,\n         CASE WHEN v > 0.5946 THEN 'High' WHEN v <= -0.5518 THEN 'Low' ELSE 'Mid' END AS g\n  FROM egfr\n),\nos AS (\n  SELECT sample_unique_id,\n         toFloat64OrNull(m.attribute_value) AS os_months,\n         s.attribute_value AS os_status\n  FROM (SELECT sample_unique_id FROM clinical_data_derived WHERE attribute_name='OS_MONTHS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018') m\n  JOIN (SELECT sample_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_STATUS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018') s\n    USING (sample_unique_id)\n)\nSELECT\n  grp.g AS group_label,\n  countIf(os.os_status = '1:DECEASED') AS events,\n  countIf(os.os_status = '0:LIVING') AS censored,\n  toFloat64OrNull('') AS x,\n  min(os.os_months) AS min_months,\n  max(os.os_months) AS max_months\nFROM grp\nLEFT JOIN os USING (sample_unique_id)\nGROUP BY grp.g\nORDER BY grp.g"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: Identifier 'm.attribute_value' cannot be resolved from subquery with name m. In scope  os. (UNKNOWN_IDENTIFIER) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "max_rows": 10,
+ "query": "WITH egfr AS (\n  SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v\n  FROM genetic_alteration_derived\n  WHERE cancer_study_identifier='luad_tcga_pan_can_atlas_2018'\n    AND profile_type='rna_seq_v2_mrna_median_all_sample_Zscores'\n    AND hugo_gene_symbol='EGFR'\n    AND alteration_value NOT IN ('','NA')\n    AND toFloat64OrNull(alteration_value) IS NOT NULL\n),\ngrp AS (\n  SELECT sample_unique_id,\n         CASE WHEN v > 0.5946 THEN 'High' WHEN v <= -0.5518 THEN 'Low' ELSE 'Mid' END AS g\n  FROM egfr\n),\nos AS (\n  SELECT m.sample_unique_id,\n         toFloat64OrNull(m.attribute_value) AS os_months,\n         s.attribute_value AS os_status\n  FROM (SELECT sample_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_MONTHS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018') m\n  JOIN (SELECT sample_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_STATUS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018') s\n    USING (sample_unique_id)\n)\nSELECT\n  grp.g AS group_label,\n  countIf(os.os_status = '1:DECEASED') AS events,\n  countIf(os.os_status = '0:LIVING') AS censored,\n  min(os.os_months) AS min_months,\n  max(os.os_months) AS max_months\nFROM grp\nLEFT JOIN os USING (sample_unique_id)\nGROUP BY grp.g\nORDER BY grp.g"
+}
+
+◀ result
+{"rows":[{"group_label":"High","events":0,"censored":0},{"group_label":"Low","events":0,"censored":0},{"group_label":"Mid","events":0,"censored":0}]}
+
+▶ clickhouse_run_select_query
+{
+ "max_rows": 10,
+ "query": "WITH os AS (\n  SELECT m.sample_unique_id,\n         toFloat64OrNull(m.attribute_value) AS os_months,\n         s.attribute_value AS os_status\n  FROM (SELECT sample_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_MONTHS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018') m\n  JOIN (SELECT sample_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_STATUS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018') s\n    USING (sample_unique_id)\n)\nSELECT count() AS n, \n       countIf(os_status='1:DECEASED') AS events,\n       countIf(os_status='0:LIVING') AS censored,\n       min(os_months) AS min_m, max(os_months) AS max_m\nFROM os"
+}
+
+◀ result
+{"rows":[{"n":320356,"events":105276,"censored":185648,"min_m":0.0,"max_m":238.2877996}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genetic_alteration_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"profile_type","type":"LowCardinality(String)"},{"name":"alteration_value","type":"Nullable(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "max_rows": 10,
+ "query": "WITH os AS (\n  SELECT patient_unique_id,\n         toFloat64OrNull(m.attribute_value) AS os_months,\n         s.attribute_value AS os_status\n  FROM (SELECT patient_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_MONTHS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018' AND type='patient') m\n  JOIN (SELECT patient_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_STATUS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018' AND type='patient') s\n    USING (patient_unique_id)\n)\nSELECT count() AS n,\n       countIf(os_status='1:DECEASED') AS events,\n       countIf(os_status='0:LIVING') AS censored,\n       min(os_months) AS min_m, max(os_months) AS max_m\nFROM os"
+}
+
+◀ result
+{"rows":[{"n":566,"events":186,"censored":328,"min_m":0.0,"max_m":238.2877996}]}
+
+▶ clickhouse_run_select_query
+{
+ "max_rows": 10,
+ "query": "WITH egfr AS (\n  SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v\n  FROM genetic_alteration_derived\n  WHERE cancer_study_identifier='luad_tcga_pan_can_atlas_2018'\n    AND profile_type='rna_seq_v2_mrna_median_all_sample_Zscores'\n    AND hugo_gene_symbol='EGFR'\n    AND alteration_value NOT IN ('','NA')\n    AND toFloat64OrNull(alteration_value) IS NOT NULL\n),\ngrp AS (\n  SELECT sample_unique_id,\n         CASE WHEN v > 0.5946 THEN 'High (Q4)'\n              WHEN v <= -0.5518 THEN 'Low (Q1)'\n              ELSE 'Mid (Q2-Q3)' END AS g\n  FROM egfr\n),\npt AS (\n  SELECT sample_unique_id, patient_unique_id\n  FROM (SELECT DISTINCT sample_unique_id, patient_unique_id\n        FROM clinical_data_derived\n        WHERE cancer_study_identifier='luad_tcga_pan_can_atlas_2018'\n          AND sample_unique_id != '' AND patient_unique_id != '') t\n  LIMIT 1 BY sample_unique_id  -- one patient per sample\n),\nos AS (\n  SELECT m.patient_unique_id,\n         toFloat64OrNull(m.attribute_value) AS os_months,\n         s.attribute_value AS os_status\n  FROM (SELECT patient_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_MONTHS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018' AND type='patient') m\n  JOIN (SELECT patient_unique_id, attribute_value FROM clinical_data_derived WHERE attribute_name='OS_STATUS' AND cancer_study_identifier='luad_tcga_pan_can_atlas_2018' AND type='patient') s\n    USING (patient_unique_id)\n)\nSELECT\n  grp.g AS group_label,\n  countIf(os.os_status = '1:DECEASED') AS events,\n  countIf(os.os_status = '0:LIVING') AS censored,\n  min(os.os_months) AS min_months,\n  max(os.os_months) AS max_months\nFROM grp\nJOIN pt USING (sample_unique_id)\nLEFT JOIN os USING (patient_unique_id)\nGROUP BY grp.g\nORDER BY grp.g"
+}
+
+◀ result
+{"rows":[{"group_label":"High (Q4)","events":51,"censored":76,"min_months":0.0,"max_months":163.0995825},{"group_label":"Low (Q1)","events":49,"censored":79,"min_months":0.427392577,"max_months":232.1727981},{"group_label":"Mid (Q2-Q3)","events":85,"censored":170,"min_months":0.0,"max_months":238.2877996}]}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "groups": "[{\"name\":\"EGFR High (Q4, z > 0.5946)\",\"studyViewFilter\":{\"genomicDataFilters\":[{\"hugoGeneSymbol\":\"EGFR\",\"profileType\":\"rna_seq_v2_mrna_median_all_sample_Zscores\",\"values\":[{\"start\":0.5946}]}]}},{\"name\":\"EGFR Low (Q1, z <= -0.5518)\",\"studyViewFilter\":{\"genomicDataFilters\":[{\"hugoGeneSymbol\":\"EGFR\",\"profileType\":\"rna_seq_v2_mrna_median_all_sample_Zscores\",\"values\":[{\"end\":-0.5518}]}}]}]",
+ "tab": "survival"
+}
+
+✗ error
+MCP error -32602: Input validation error: Invalid arguments for tool navigate_to_group_comparison: [
+  {
+    "expected": "array",
+    "code": "invalid_type",
+    "path": [
+      "groups"
+    ],
+    "message": "Invalid input: expected array, received string"
+  }
+]
+
+▶ navigate_to_group_comparison
+{
+ "groups": "[{\"name\": \"EGFR High (Q4, z > 0.5946)\", \"studyViewFilter\": {\"genomicDataFilters\": [{\"hugoGeneSymbol\": \"EGFR\", \"profileType\": \"rna_seq_v2_mrna_median_all_sample_Zscores\", \"values\": [{\"start\": 0.5946}]}]}}, {\"name\": \"EGFR Low (Q1, z <= -0.5518)\", \"studyViewFilter\": {\"genomicDataFilters\": [{\"hugoGeneSymbol\": \"EGFR\", \"profileType\": \"rna_seq_v2_mrna_median_all_sample_Zscores\", \"values\": [{\"end\": -0.5518}]}}]}]",
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival"
+}
+
+✗ error
+MCP error -32602: Input validation error: Invalid arguments for tool navigate_to_group_comparison: [
+  {
+    "expected": "array",
+    "code": "invalid_type",
+    "path": [
+      "groups"
+    ],
+    "message": "Invalid input: expected array, received string"
+  }
+]
+
+▶ navigate_to_group_comparison
+{
+ "groups": "[{\"name\": \"EGFR High (Q4)\", \"studyViewFilter\": {\"genomicDataFilters\": [{\"hugoGeneSymbol\": \"EGFR\", \"profileType\": \"rna_seq_v2_mrna_median_all_sample_Zscores\", \"values\": [{\"start\": 0.5946}]}]}}, {\"name\": \"EGFR Low (Q1)\", \"studyViewFilter\": {\"genomicDataFilters\": [{\"hugoGeneSymbol\": \"EGFR\", \"profileType\": \"rna_seq_v2_mrna_median_all_sample_Zscores\", \"values\": [{\"end\": -0.5518}]}}]}]",
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival"
+}
+
+✗ error
+MCP error -32602: Input validation error: Invalid arguments for tool navigate_to_group_comparison: [
+  {
+    "expected": "array",
+    "code": "invalid_type",
+    "path": [
+      "groups"
+    ],
+    "message": "Invalid input: expected array, received string"
+  }
+]
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "groups": "[{\"name\": \"EGFR High (Q4)\", \"studyViewFilter\": {\"genomicDataFilters\": [{\"hugoGeneSymbol\": \"EGFR\", \"profileType\": \"rna_seq_v2_mrna_median_all_sample_Zscores\", \"values\": [{\"start\": 0.5946}]}]}}, {\"name\": \"EGFR Low (Q1)\", \"studyViewFilter\": {\"genomicDataFilters\": [{\"hugoGeneSymbol\": \"EGFR\", \"profileType\": \"rna_seq_v2_mrna_median_all_sample_Zscores\", \"values\": [{\"end\": -0.5518}]}}]}]",
+ "tab": "survival"
+}
+
+✗ error
+MCP error -32602: Input validation error: Invalid arguments for tool navigate_to_group_comparison: [
+  {
+    "expected": "array",
+    "code": "invalid_type",
+    "path": [
+      "groups"
+    ],
+    "message": "Invalid input: expected array, received string"
+  }
+]
+
+▶ navigate_to_group_comparison
+{
+ "groups": [
+  {
+   "name": "EGFRHigh",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "rna_seq_v2_mrna_median_all_sample_Zscores",
+      "values": [
+       {
+        "start": 0.5946
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFRLow",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "rna_seq_v2_mrna_median_all_sample_Zscores",
+      "values": [
+       {
+        "end": -0.5518
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "tab": "survival"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/survival?comparisonId=6ad05b62e497aad53593f737","url":"https://www.cbioportal.org/comparison/survival?comparisonId=6ad05b62e497aad53593f737","data":{"description":"Group comparison (2 custom groups)","studies":["luad_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"EGFRHigh","sampleCount":127},{"name":"EGFRLow","sampleCount":128}],"studyViewUrl":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"EGFRHigh","url":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22rna_seq_v2_mrna_median_all_sample_Zscores%22%2C%22values%22%3A%5B%7B%22start%22%3A0.5946%7D%5D%7D%5D%7D"},{"groupName":"EGFRLow","url":"https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22rna_seq_v2_mrna_median_all_sample_Zscores%22%2C%22values%22%3A%5B%7B%22end%22%3A-0.5518%7D%5D%7D%5D%7D"}],"pageDescription":"Kaplan-Meier survival analysis comparing EGFRHigh (127) vs EGFRLow (128)."}}
+
+═ answer (success)
+I'll answer this as a survival (time-to-event) comparison. A few things to note first:
+
+- **Interpretation:** "Survival outcomes" = overall survival (OS) from the OS_MONTHS / OS_STATUS time-to-event pair. This is the only OS pair in the study, so survival is the right read.
+- **Cohort:** TCGA Lung Adenocarcinoma, PanCancer Atlas (`luad_tcga_pan_can_atlas_2018`) — the study most aligned with the TCGA LUAD PanCancer cohort. 566 samples.
+- **Groups:** EGFR mRNA z-score, profile `rna_seq_v2_mrna_median_all_sample_Zscores`, split at the 25th / 75th percentile quartile boundaries (`end = -0.5518` and `start = 0.5946` from the study's own quartile distribution):
+  - High (Q4): 127 patients
+  - Low (Q1): 128 patients
+
+**Censored survival summary (patient-level, one patient per sample):**
+
+| Group | N | Deceased (events) | Living (censored) | OS range (months) |
+|---|---|---|---|---|
+| EGFR High (Q4) | 127 | 51 | 76 | 0.0 – 163.1 |
+| EGFR Low (Q1) | 128 | 49 | 79 | 0.4 – 232.2 |
+| EGFR Mid (Q2–Q3, reference) | 256 | 85 | 170 | 0.0 – 238.3 |
+
+**Important caveat — I can't run the test here.** This is survival (time-to-event) data, so the valid comparison is **Kaplan-Meier + log-rank**. A naive `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)` on these raw values would be wrong because ~60% of patients are censored (`OS_STATUS = 0:LIVING`) and a patient with `OS_MONTHS = 0` is alive at last follow-up, not 0 months from diagnosis. Also note the overall cohort has only 186/566 deceased (33%), so KM medians are likely **not reached** in either quartile.
+
+**Run the KM / log-rank here** ([Group Comparison → Survival](https://www.cbioportal.org/comparison/survival?comparisonId=6ad05b62e497aad53593f737) — EGFR High Q4: 127, EGFR Low Q1: 128, already pre-specified):
+
+- [Open in cBioPortal — KM curves + log-rank](https://www.cbioportal.org/comparison/survival?comparisonId=6ad05b62e497aad53593f737)
+- [EGFR High (Q4) group overview](https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22rna_seq_v2_mrna_median_all_sample_Zscores%22%2C%22values%22%3A%5B%7B%22start%22%3A0.5946%7D%5D%7D%5D%7D)
+- [EGFR Low (Q1) group overview](https://www.cbioportal.org/study?id=luad_tcga_pan_can_atlas_2018#filterJson=%7B%22genomicDataFilters%22%3A%5B%7B%22hugoGeneSymbol%22%3A%22EGFR%22%2C%22profileType%22%3A%22rna_seq_v2_mrna_median_all_sample_Zscores%22%2C%22values%22%3A%5B%7B%22end%22%3A-0.5518%7D%5D%7D%5D%7D)
+
+**Or in R (raw data above; download from cBioPortal or the REST API):**
+```r
+# surv ~ group, with events = (os_status == "1:DECEASED")
+survival::coxph(survival::Surv(os_months, deceased) ~ egfr_group, data = egfr_os)
+survival::survfit(survival::Surv(os_months, deceased) ~ egfr_group, data = egfr_os)
+```
+
+**Follow-up options:**
+1. Same split but using `DFFS_MONTHS / DFS_STATUS` (disease-free survival) for a time-to-event proxy
+2. Restrict to EGFR-mutant vs wildtype LUAD and compare survival — often more discriminating than high vs low expression
+3. Look at the EGFR High group's mutation / CNA / protein (RPPA) profile to see whether high-mRNA EGFR co-occurs with known driver alterations
+4. Use `luad_tcga_gdc` (TCGA GDC 2025) instead if you want the more recent GDC-based cohort for the same expression-based survival split

@@ -1,0 +1,326 @@
+Q (haiku-5.5): What is the correlation between tumor mutational burden and microsatellite instability status in colorectal cancer patients from the MSK-CHORD Study?
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, sample_count FROM cancer_study WHERE cancer_study_identifier LIKE '%chord%'"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sample_count":25040}]}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT attribute_name, attribute_value, count() AS rows FROM clinical_data_derived WHERE cancer_study_identifier = 'msk_chord_2024' AND (upper(attribute_name) LIKE '%MSI%' OR upper(attribute_name) LIKE '%MICROSAT%' OR attribute_name = 'TMB_NONSYNONYMOUS') GROUP BY attribute_name, attribute_value ORDER BY attribute_name, rows DESC LIMIT 200",
+ "max_rows": 200
+}
+
+◀ result
+{"rows":[{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE STABLE (MSS). See MSI note below.","rows":17040},{"attribute_name":"MSI_COMMENT","rows":5697},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE STABLE (MSS). This result is for investigational use only. See MSI note below.","rows":902},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE INSTABILITY-INDETERMINATE. See MSI note below.","rows":688},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE INSTABILITY-HIGH (MSI-H). See MSI note below.","rows":591},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE STABLE (MSS). See note.","rows":64},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE INSTABILITY-INDETERMINATE. This result is for investigational use only. See MSI note below.","rows":37},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE INSTABILITY-HIGH (MSI-H). This result is for investigational use only. See MSI note below.","rows":10},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE INSTABILITY-HIGH (MSI-H). See note.","rows":6},{"attribute_name":"MSI_COMMENT","attribute_value":"See note.","rows":1},{"attribute_name":"MSI_COMMENT","attribute_value":"MSI status cannot be accurately assessed due to low tumor content.","rows":1},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE INSTABILITY-HIGH (MSI-H). This result is for investigational use only. See note.","rows":1},{"attribute_name":"MSI_COMMENT","attribute_value":"MICROSATELLITE STABLE (MSS).  See MSI note below.","rows":1},{"attribute_name":"MSI_COMMENT","attribute_value":"INCONCLUSIVE due to low (tumor purity/ coverage). See MSI note below.","rows":1},{"attribute_name":"MSI_SCORE","attribute_value":"0","rows":5711},{"attribute_name":"MSI_SCORE","attribute_value":"0.06","rows":746},{"attribute_name":"MSI_SCORE","attribute_value":"0.07","rows":602},{"attribute_name":"MSI_SCORE","rows":553},{"attribute_name":"MSI_SCORE","attribute_value":"0.05","rows":446},{"attribute_name":"MSI_SCORE","attribute_value":"0.08","rows":444},{"attribute_name":"MSI_SCORE","attribute_value":"0.13","rows":293},{"attribute_name":"MSI_SCORE","attribute_value":"0.02","rows":288},{"attribute_name":"MSI_SCORE","attribute_value":"0.16","rows":284},{"attribute_name":"MSI_SCORE","attribute_value":"0.15","rows":275},{"attribute_name":"MSI_SCORE","attribute_value":"0.09","rows":267},{"attribute_name":"MSI_SCORE","attribute_value":"0.12","rows":258},{"attribute_name":"MSI_SCORE","attribute_value":"0.17","rows":257},{"attribute_name":"MSI_SCORE","attribute_value":"0.14","rows":253},{"attribute_name":"MSI_SCORE","attribute_value":"0.11","rows":241},{"attribute_name":"MSI_SCORE","attribute_value":"0.18","rows":235},{"attribute_name":"MSI_SCORE","attribute_value":"0.22","rows":225},{"attribute_name":"MSI_SCORE","attribute_value":"0.1","rows":213},{"attribute_name":"MSI_SCORE","attribute_value":"0.03","rows":201},{"attribute_name":"M … (11007 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_name, attribute_value, count() AS rows FROM clinical_data_derived WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name IN ('CANCER_TYPE', 'CANCER_TYPE_DETAILED') AND (upper(attribute_value) LIKE '%COLORECTAL%' OR upper(attribute_value) LIKE '%COLON%' OR upper(attribute_value) LIKE '%RECTAL%' OR upper(attribute_value) LIKE '%BOWEL%') GROUP BY attribute_name, attribute_value ORDER BY attribute_name, rows DESC"
+}
+
+◀ result
+{"rows":[{"attribute_name":"CANCER_TYPE","attribute_value":"Colorectal Cancer","rows":5543},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Colon Adenocarcinoma","rows":3352},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Rectal Adenocarcinoma","rows":1321},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Colorectal Adenocarcinoma","rows":716},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Mucinous Adenocarcinoma of the Colon and Rectum","rows":113},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Medullary Carcinoma of the Colon","rows":21},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Signet Ring Cell Adenocarcinoma of the Colon and Rectum","rows":19},{"attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Colon Adenocarcinoma In Situ","rows":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+  SELECT sample_unique_id,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'TMB_NONSYNONYMOUS') AS tmb,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'MSI_SCORE') AS msi_score,
+    maxIf(attribute_value, attribute_name = 'MSI_COMMENT') AS msi_comment,
+    maxIf(attribute_value, attribute_name = 'CANCER_TYPE') AS cancer_type
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name IN ('TMB_NONSYNONYMOUS','MSI_SCORE','MSI_COMMENT','CANCER_TYPE')
+  GROUP BY sample_unique_id
+),
+crc AS (
+  SELECT *, multiIf(
+      positionCaseInsensitive(msi_comment, 'MICROSATELLITE INSTABILITY-HIGH') > 0, 'MSI-H',
+      positionCaseInsensitive(msi_comment, 'MICROSATELLITE STABLE') > 0, 'MSS',
+      positionCaseInsensitive(msi_comment, 'INDETERMINATE') > 0 OR positionCaseInsensitive(msi_comment, 'INCONCLUSIVE') > 0, 'Indeterminate',
+      'Not reported') AS msi_status
+  FROM s WHERE cancer_type = 'Colorectal Cancer'
+)
+SELECT msi_status,
+  count() AS samples,
+  countIf(tmb IS NOT NULL) AS with_tmb,
+  round(quantile(0.5)(tmb), 2) AS median_tmb,
+  round(avg(tmb), 2) AS mean_tmb,
+  round(min(tmb), 2) AS min_tmb,
+  round(max(tmb), 2) AS max_tmb,
+  round(avgIf(msi_score, msi_score IS NOT NULL), 3) AS mean_msi_score
+FROM crc
+GROUP BY msi_status
+ORDER BY samples DESC"
+}
+
+◀ result
+{"rows":[{"msi_status":"MSS","samples":4082,"with_tmb":4082,"median_tmb":5.74,"mean_tmb":7.42,"min_tmb":0,"max_tmb":570.96,"mean_msi_score":0.605},{"msi_status":"Not reported","samples":775,"with_tmb":775,"median_tmb":6.65,"mean_tmb":12.11,"min_tmb":0,"max_tmb":353.32,"mean_msi_score":3.54},{"msi_status":"MSI-H","samples":521,"with_tmb":521,"median_tmb":57.93,"mean_tmb":66.2,"min_tmb":0,"max_tmb":490.57,"mean_msi_score":29.062},{"msi_status":"Indeterminate","samples":165,"with_tmb":165,"median_tmb":6.85,"mean_tmb":20.31,"min_tmb":1.64,"max_tmb":343.53,"mean_msi_score":4.723}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+  SELECT sample_unique_id,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'TMB_NONSYNONYMOUS') AS tmb,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'MSI_SCORE') AS msi_score,
+    maxIf(attribute_value, attribute_name = 'MSI_COMMENT') AS msi_comment,
+    maxIf(attribute_value, attribute_name = 'CANCER_TYPE') AS cancer_type
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name IN ('TMB_NONSYNONYMOUS','MSI_SCORE','MSI_COMMENT','CANCER_TYPE')
+  GROUP BY sample_unique_id
+)
+SELECT count() AS crc_samples,
+  countIf(tmb IS NOT NULL AND msi_score IS NOT NULL) AS samples_with_tmb_and_msi_score,
+  round(corr(tmb, msi_score), 3) AS pearson_r_tmb_vs_msi_score,
+  round(corr(log10(tmb + 1), msi_score), 3) AS pearson_r_log10tmb_vs_msi_score
+FROM s
+WHERE cancer_type = 'Colorectal Cancer' AND tmb IS NOT NULL AND msi_score IS NOT NULL"
+}
+
+◀ result
+{"rows":[{"crc_samples":5505,"samples_with_tmb_and_msi_score":5505,"pearson_r_tmb_vs_msi_score":0.583,"pearson_r_log10tmb_vs_msi_score":0.753}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+  SELECT sample_unique_id,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'TMB_NONSYNONYMOUS') AS tmb,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'MSI_SCORE') AS msi_score,
+    maxIf(attribute_value, attribute_name = 'CANCER_TYPE') AS cancer_type
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name IN ('TMB_NONSYNONYMOUS','MSI_SCORE','CANCER_TYPE')
+  GROUP BY sample_unique_id
+)
+SELECT count() AS n,
+  round(rankCorr(tmb, msi_score), 3) AS spearman_rho_tmb_vs_msi_score
+FROM s
+WHERE cancer_type = 'Colorectal Cancer' AND tmb IS NOT NULL AND msi_score IS NOT NULL"
+}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ]
+}
+
+◀ result
+{"rows":[{"n":5505,"spearman_rho_tmb_vs_msi_score":0.369}]}
+
+◀ result
+{"success":true,"message":"Found 1 study. Use the metadata to call the appropriate navigation tool(s).","data":{"totalCount":1,"studiesWithMetadata":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040,"studyViewUrl":"https://www.cbioportal.org/study?id=msk_chord_2024","metadata":{"clinicalAttributeIds":["ADRENAL_GLANDS","BONE","CANCER_TYPE","CANCER_TYPE_DETAILED","CLINICAL_GROUP","CLINICAL_SUMMARY","CNS_BRAIN","CURRENT_AGE_DEID","DIAGNOSIS_DESCRIPTION","ETHNICITY","FRACTION_GENOME_ALTERED","GENDER","GENE_PANEL","GLEASON_FIRST_REPORTED","GLEASON_HIGHEST_REPORTED","GLEASON_SAMPLE_LEVEL","HER2","HISTORY_OF_PDL1","HR","ICD_O_HISTOLOGY_DESCRIPTION","INTRA_ABDOMINAL","LIVER","LUNG","LYMPH_NODES","METASTATIC_SITE","MSI_COMMENT","MSI_SCORE","MSI_TYPE","MUTATION_COUNT","NUM_ICDO_DX","ONCOTREE_CODE","OS_MONTHS","OS_STATUS","OTHER","PATHOLOGICAL_GROUP","PDL1_POSITIVE","PLEURA","PRIMARY_SITE","PRIOR_MED_TO_MSK","RACE","REPRODUCTIVE_ORGANS","SAMPLE_CLASS","SAMPLE_COUNT","SAMPLE_COVERAGE","SAMPLE_TYPE","SMOKING_PREDICTIONS_3_CLASSES","SOMATIC_STATUS","STAGE_HIGHEST_RECORDED","TMB_NONSYNONYMOUS","TUMOR_PURITY"],"molecularProfileIds":["msk_chord_2024_cna","msk_chord_2024_mutations","msk_chord_2024_structural_variants"],"availableComparisonTabs":["overlap","clinical","survival","alterations","mutations"]}}]}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_value, count() AS samples FROM clinical_data_derived WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'MSI_TYPE' GROUP BY attribute_value ORDER BY samples DESC"
+}
+
+◀ result
+{"rows":[{"attribute_value":"Stable","samples":21096},{"attribute_value":"Do not report","samples":1825},{"attribute_value":"Indeterminate","samples":865},{"attribute_value":"Instable","samples":699},{"samples":554},{"attribute_value":"Do Not Report","samples":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH s AS (
+  SELECT sample_unique_id,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'TMB_NONSYNONYMOUS') AS tmb,
+    maxIf(toFloat64OrNull(attribute_value), attribute_name = 'MSI_SCORE') AS msi_score,
+    maxIf(attribute_value, attribute_name = 'MSI_TYPE') AS msi_type,
+    maxIf(attribute_value, attribute_name = 'CANCER_TYPE') AS cancer_type
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_chord_2024'
+    AND attribute_name IN ('TMB_NONSYNONYMOUS','MSI_SCORE','MSI_TYPE','CANCER_TYPE')
+  GROUP BY sample_unique_id
+)
+SELECT if(msi_type = '', 'Missing', msi_type) AS msi_type,
+  count() AS samples,
+  countIf(tmb IS NOT NULL) AS with_tmb,
+  round(quantile(0.5)(tmb), 2) AS median_tmb,
+  round(avg(tmb), 2) AS mean_tmb,
+  round(quantile(0.25)(tmb), 2) AS q1_tmb,
+  round(quantile(0.75)(tmb), 2) AS q3_tmb,
+  round(avgIf(msi_score, msi_score IS NOT NULL), 2) AS mean_msi_score
+FROM s
+WHERE cancer_type = 'Colorectal Cancer'
+GROUP BY msi_type
+ORDER BY samples DESC"
+}
+
+▶ navigate_to_study_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "filterJson": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Colorectal Cancer"
+     }
+    ]
+   }
+  ]
+ }
+}
+
+◀ result
+{"rows":[{"msi_type":"Stable","samples":4682,"with_tmb":4682,"median_tmb":5.87,"mean_tmb":7.58,"q1_tmb":4.32,"q3_tmb":7.78,"mean_msi_score":0.62},{"msi_type":"Instable","samples":586,"with_tmb":586,"median_tmb":56.68,"mean_tmb":64.63,"q1_tmb":44.1,"q3_tmb":75.94,"mean_msi_score":29.33},{"msi_type":"Indeterminate","samples":188,"with_tmb":188,"median_tmb":6.56,"mean_tmb":18.57,"q1_tmb":4.92,"q3_tmb":10.15,"mean_msi_score":4.69},{"msi_type":"Do not report","samples":49,"with_tmb":49,"median_tmb":3.33,"mean_tmb":7.06,"q1_tmb":0.86,"q3_tmb":6.92,"mean_msi_score":0.98},{"msi_type":"Missing","samples":38,"with_tmb":38,"median_tmb":3.69,"mean_tmb":8.06,"q1_tmb":1.64,"q3_tmb":5.74}]}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Colorectal%20Cancer%22%7D%5D%7D%5D%7D","url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Colorectal%20Cancer%22%7D%5D%7D%5D%7D","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"tab":"summary","hasFilters":true,"hasPlotsConfig":false,"pageDescription":"Overview of all study data displayed as interactive charts summarizing available clinical and genomic data. Click within a chart to filter. Additional charts may be available in the Charts menu."}}
+
+═ answer (success)
+In MSK-CHORD colorectal cancer samples, tumor mutational burden (TMB) and microsatellite instability (MSI) are strongly positively correlated. Microsatellite-unstable tumors have about 10 times the median TMB of stable tumors.
+
+**TMB by MSI status (colorectal samples, `MSI_TYPE`)**
+
+| MSI status | Samples | Median TMB (mut/Mb) | IQR | Mean TMB | Mean MSI score |
+|---|---|---|---|---|---|
+| Stable | 4,682 | 5.87 | 4.32–7.78 | 7.58 | 0.62 |
+| Instable (MSI-H) | 586 | 56.68 | 44.10–75.94 | 64.63 | 29.33 |
+| Indeterminate | 188 | 6.56 | 4.92–10.15 | 18.57 | 4.69 |
+| Do not report | 49 | 3.33 | 0.86–6.92 | 7.06 | 0.98 |
+| Missing | 38 | 3.69 | 1.64–5.74 | 8.06 | n/a |
+
+**Correlation between TMB and the continuous MSI score (5,505 colorectal samples with both values)**
+- Pearson r = 0.58 on raw TMB
+- Pearson r = 0.75 on log10(TMB + 1)
+- Spearman ρ = 0.37
+
+The Pearson values are inflated by a small number of very high-TMB samples, and the Spearman value is lower because most samples are MSI-stable with tightly clustered TMB. These figures are descriptive. I did not compute p-values or confidence intervals, so I can't say whether the correlations are statistically significant. For that, run the same grouping in R or Python, or use cBioPortal's Group Comparison tab.
+
+**Notes**
+- Counts are per sample. MSK-CHORD can have more than one sample per patient, and I did not collapse to one sample per patient.
+- TMB is `TMB_NONSYNONYMOUS`. The MSI classification is `MSI_TYPE`, and the continuous score is `MSI_SCORE`.
+
+You can view the colorectal cohort in the study: [View MSK-CHORD colorectal cancer cohort](https://www.cbioportal.org/study/summary?id=msk_chord_2024#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Colorectal%20Cancer%22%7D%5D%7D%5D%7D)

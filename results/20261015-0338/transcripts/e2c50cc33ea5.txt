@@ -1,0 +1,229 @@
+Q (qwen3.8-27b): Which cancer type has the highest average tumor mutational burden across all studies?
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://common-pitfalls"
+}
+
+◀ result
+# Common Query Pitfalls Guide
+
+## Overview
+This guide highlights frequent mistakes when analyzing cBioPortal data and provides solutions to avoid them.
+
+## Critical Pitfalls
+
+### 1. 🚨 CRITICAL MUTATION FREQUENCY ERRORS
+
+#### ❌ WRONG: Using study-wide totals for gene frequencies
+```sql
+-- INCORRECT - This gives wrong frequencies!
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples,
+    (SELECT COUNT(DISTINCT sample_unique_id)
+     FROM genomic_event_derived
+     WHERE cancer_study_identifier = 'your_study_id') as total_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND cancer_study_identifier = 'your_study_id'
+GROUP BY hugo_gene_symbol;
+```
+**Problem**: Different genes have different profiling coverage - you can't use study-wide totals!
+
+#### ❌ WRONG: Not using gene-specific profiling denominators
+```sql
+-- INCORRECT - Missing gene-specific denominators
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+GROUP BY hugo_gene_symbol;
+-- Missing: WHERE ARE THE DENOMINATORS FOR EACH GENE?
+```
+
+#### ❌ WRONG: Skipping individual gene profiling queries
+**Problem**: Failing to run separate profiling queries for EACH gene in results.
+**Each gene has different coverage**: TP53 might be profiled in 25,040 samples, MUC16 in 23,000, etc.
+
+#### ✅ CORRECT: Complete gene-specific workflow
+```sql
+-- STEP 1: Get altered counts per gene
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id,
+    COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
+    COUNT(*) AS totalMutationEvents
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY entrez_gene_id, hugo_gene_symbol
+ORDER BY numberOfAlteredSamplesOnPanel DESC;
+
+-- STEP 2: FOR EACH GENE, run this profiling query:
+SELECT COUNT(DISTINCT stgp.sample_unique_id) AS numberOfProfiledSamples
+FROM sample_to_gene_panel_derived stgp
+JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+  AND g.hugo_gene_symbol = 'TP53'  -- Replace with each gene from Step 1
+  AND stgp.cancer_study_identifier = 'your_study_id';
+
+-- STEP 3: Calculate frequency = numberOfAlteredSamplesOnPanel / numberOfProfiledSamples * 100
+```
+
+#### 🚨 WORKFLOW REQUIREMENTS VIOLATIONS:
+- **Missing denominator columns**: Must show gene-specific profiled samples per row
+- **Wrong table format**: Should be | Gene | # Mutations | # Samples | Profiled Samples | Sample % |
+- **Not replacing gene symbols**: Must replace 'TP53' with actual gene for each query
+- **Using study totals**: Never use genomic_event_derived for total sample counts
+
+### 2. 🚨 OFF-PANEL MUTATION INCLUSION
+
+#### ❌ Wrong: Including off-panel mutations
+```sql
+-- INCORRECT - Includes mutations outside gene panels
+SELEC … (38012 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancertype,\n       count(v) AS n,\n       round(avg(v), 2) AS mean_tmb,\n       round(quantile(0.5)(v), 2) AS median_tmb\nFROM (\n    SELECT\n        maxIf(attribute_value, attribute_name = 'CANCER_TYPE_DETAILED') AS cancertype,\n        toFloat64OrNull(attribute_value) AS v\n    FROM clinical_data_derived\n    WHERE attribute_name IN ('TMB_NONSYNONYMOUS', 'CANCER_TYPE_DETAILED')\n      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences\n                                      WHERE preference_name = 'pan_cancer_tcga')\n    GROUP BY sample_unique_id\n)\nGROUP BY cancertype\nORDER BY mean_tmb DESC\nLIMIT 60"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 215\n Code: 215. DB::Exception: Column 'cbioportal_public_librechat_blue.clinical_data_derived.attribute_value' is not under aggregate function and not in GROUP BY keys. In query SELECT maxIf(attribute_value, attribute_name = 'CANCER_TYPE_DETAILED') AS cancertype, toFloat64OrNull(attribute_value) AS v FROM clinical_data_derived WHERE (attribute_name IN ('TMB_NONSYNONYMOUS', 'CANCER_TYPE_DETAILED')) AND (cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')) GROUP BY sample_unique_id. (NOT_AN_AGGREGATE) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancertype,\n       count(v) AS n,\n       round(avg(v), 2) AS mean_tmb,\n       round(quantile(0.5)(v), 2) AS median_tmb\nFROM (\n    SELECT\n        maxIf(attribute_value, attribute_name = 'CANCER_TYPE_DETAILED') AS cancertype\n    FROM clinical_data_derived\n    WHERE attribute_name = 'CANCER_TYPE_DETAILED'\n      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences\n                                      WHERE preference_name = 'pan_cancer_tcga')\n    GROUP BY sample_unique_id\n) t\nJOIN (\n    SELECT sample_unique_id, toFloat64OrNull(attribute_value) AS v\n    FROM clinical_data_derived\n    WHERE attribute_name = 'TMB_NONSYNONYMOUS'\n      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences\n                                      WHERE preference_name = 'pan_cancer_tcga')\n) d USING sample_unique_id\nWHERE v IS NOT NULL\nGROUP BY cancertype\nORDER BY mean_tmb DESC\nLIMIT 60"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 47\n Code: 47. DB::Exception: JOIN  INNER JOIN ... USING (sample_unique_id) using identifier 'sample_unique_id' cannot be resolved from left table expression. In scope SELECT cancertype, count(v) AS n, round(avg(v), 2) AS mean_tmb, round(quantile(0.5)(v), 2) AS median_tmb FROM (SELECT maxIf(attribute_value, attribute_name = 'CANCER_TYPE_DETAILED') AS cancertype FROM clinical_data_derived WHERE (attribute_name = 'CANCER_TYPE_DETAILED') AND (cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')) GROUP BY sample_unique_id) AS t INNER JOIN (SELECT sample_unique_id, toFloat64OrNull(attribute_value) AS v FROM clinical_data_derived WHERE (attribute_name = 'TMB_NONSYNONYMOUS') AND (cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga'))) AS d USING (sample_unique_id) WHERE v IS NOT NULL GROUP BY cancertype ORDER BY mean_tmb DESC LIMIT 60. (UNKNOWN_IDENTIFIER) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH cancertypes AS (\n    SELECT sample_unique_id,\n           maxIf(attribute_value, attribute_name = 'CANCER_TYPE_DETAILED') AS cancertype\n    FROM clinical_data_derived\n    WHERE attribute_name = 'CANCER_TYPE_DETAILED'\n      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences\n                                      WHERE preference_name = 'pan_cancer_tcga')\n    GROUP BY sample_unique_id\n),\ntmbvals AS (\n    SELECT sample_unique_id, toFloat64OrNull(attribute_value) AS v\n    FROM clinical_data_derived\n    WHERE attribute_name = 'TMB_NONSYNONYMOUS'\n      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences\n                                      WHERE preference_name = 'pan_cancer_tcga')\n)\nSELECT c.cancertype,\n       count(t.v) AS n,\n       round(avg(t.v), 2) AS mean_tmb,\n       round(quantile(0.5)(t.v), 2) AS median_tmb\nFROM tmbvals t\nJOIN cancertypes c ON t.sample_unique_id = c.sample_unique_id\nWHERE t.v IS NOT NULL\nGROUP BY c.cancertype\nORDER BY mean_tmb DESC\nLIMIT 60"
+}
+
+◀ result
+{"rows":[{"cancertype":"Uterine Endometrioid Carcinoma","n":388,"mean_tmb":41.3,"median_tmb":4.92},{"cancertype":"Uterine Mixed Endometrial Carcinoma","n":21,"mean_tmb":38.37,"median_tmb":2.13},{"cancertype":"Mucinous Adenocarcinoma of the Colon and Rectum","n":56,"mean_tmb":28.29,"median_tmb":5.12},{"cancertype":"Cutaneous Melanoma","n":440,"mean_tmb":25.91,"median_tmb":14.88},{"cancertype":"Mucinous Stomach Adenocarcinoma","n":22,"mean_tmb":17.94,"median_tmb":4.15},{"cancertype":"Uterine Serous Carcinoma/Uterine Papillary Serous Carcinoma","n":108,"mean_tmb":14.84,"median_tmb":1.82},{"cancertype":"Stomach Adenocarcinoma","n":161,"mean_tmb":14.41,"median_tmb":4.4},{"cancertype":"Tubular Stomach Adenocarcinoma","n":79,"mean_tmb":12.91,"median_tmb":4.27},{"cancertype":"Colon Adenocarcinoma","n":338,"mean_tmb":12.56,"median_tmb":3.67},{"cancertype":"Papillary Stomach Adenocarcinoma","n":8,"mean_tmb":11.79,"median_tmb":5.8},{"cancertype":"Intestinal Type Stomach Adenocarcinoma","n":81,"mean_tmb":11.61,"median_tmb":4.0},{"cancertype":"Endometrioid Carcinoma","n":3,"mean_tmb":11.42,"median_tmb":1.67},{"cancertype":"Rectal Adenocarcinoma","n":140,"mean_tmb":10.41,"median_tmb":3.0},{"cancertype":"Lung Adenocarcinoma","n":566,"mean_tmb":10.02,"median_tmb":6.68},{"cancertype":"Diffuse Type Stomach Adenocarcinoma","n":72,"mean_tmb":9.51,"median_tmb":2.8},{"cancertype":"Lung Squamous Cell Carcinoma","n":484,"mean_tmb":9.43,"median_tmb":7.67},{"cancertype":"Bladder Urothelial Carcinoma","n":410,"mean_tmb":8.44,"median_tmb":5.77},{"cancertype":"Cervical Squamous Cell Carcinoma","n":247,"mean_tmb":6.84,"median_tmb":2.87},{"cancertype":"Signet Ring Cell Carcinoma of the Stomach","n":13,"mean_tmb":6.11,"median_tmb":2.83},{"cancertype":"Esophageal Adenocarcinoma","n":87,"mean_tmb":6.08,"median_tmb":4.13},{"cancertype":"Myxofibrosarcoma","n":25,"mean_tmb":5.49,"median_tmb":1.93},{"cancertype":"Head and Neck Squamous Cell Carcinoma","n":515,"mean_tmb":5.41,"median_tmb":3.53},{"cancertype":"Endocervical Adenocarcinoma","n":24,"mean_tmb":4.68,"median_tmb":2.45},{"cancertype":"Uterine Carcinosarcoma/Uterine Malignant Mixed Mullerian Tumor","n":57,"mean_tmb":4.28,"median_tmb":1.57},{"cancertype":"Diffuse Large B-Cell Lymphoma, NOS","n":41,"mean_tmb":3.96,"median_tmb":3.6},{"cancertype":"Glioblastoma Multiforme","n":397,"mean_tmb":3.89,"median_tmb":1.7},{"cancertype":"Pancreatic Adenocarcinoma","n":179,"mean_tmb":3.89,"median_tmb":1.17},{"cancertype":"Esophageal Squamous Cell Carcinoma","n":95,"mean_tmb":3.77,"median_tmb":3.07},{"cancertype":"Hepatocellular Carcinoma","n":363,"mean_tmb":3.54,"median_tmb":2.83},{"cancertype":"Undifferentiated Pleomorphic Sarcoma/Malignant Fibrous Histiocytoma/High-Grade Spindle Cell Sarcoma","n":50,"mean_tmb":3.18,"median_tmb":1.52},{"cancertype":"Astrocytoma","n":194,"mean_tmb":3.05,"median_tmb":1.0},{"cancertype":"Breast Invasive Carcinoma (NOS)","n":76,"mean_tmb":3.01,"median_tmb":0.97},{"cancertype":"Invasive Breast Carcinoma","n":1, … (2306 more chars)
+
+═ answer (success)
+## Cancer type with the highest mean TMB
+
+**Uterine Endometrioid Carcinoma (endometrioid endometrial carcinoma)** has the highest average tumor mutational burden, but with an important caveat.
+
+Using the `TMB_NONSYNONYMOUS` (mutations/Mb) attribute, measured per sample within a single consistently-processed cohort (the TCGA PanCancer Atlas studies):
+
+| Cancer type (subtype) | Samples | Mean TMB | Median TMB |
+|---|---|---|---|
+| **Uterine Endometrioid Carcinoma** | 388 | **41.3** | 4.92 |
+| Uterine Mixed Endometrial Carcinoma | 21 | 38.4 | 2.13 |
+| Mucinous Adenocarcinoma, Colon & Rectum | 56 | 28.3 | 5.12 |
+| Cutaneous Melanoma | 440 | 25.9 | **14.88** |
+| Uterine Serous / Papillary Serous Carcinoma | 108 | 14.8 | 1.82 |
+| Lung Squamous Cell Carcinoma | 484 | 9.4 | 7.67 |
+| Bladder Urothelial Carcinoma | 410 | 8.4 | 5.77 |
+
+### Interpretation matters here
+The **mean** for Uterine Endometrioid Carcinoma is high (41.3) but its **median** is low (4.92) — the distribution is strongly right-skewed, which is the classic microsatellite-instability (MSI/dMMR) signature: a small subset of high-TMB tumors pulls the average up. If you instead rank by the **median** (more robust to outliers), **Cutaneous Melanoma** leads at 14.88 mutations/Mb, which better reflects its broad, consistently elevated mutational load.
+
+So the short answer to "highest average mean TMB" is **Uterine Endometrioid Carcinoma**, but if you want the most reliably high-TMB cancer, it's **Cutaneous Melanoma**.
+
+### Two notes on the method
+- I scoped this to the **TCGA PanCancer Atlas** cohort and grouped by its `CANCER_TYPE_DETAILED` (subtype) labels rather than averaging across all ~540 heterogeneous studies, because TMB pipelines, panels, and units differ across studies — pooling them would combine incompatible measurements.
+- The small subtypes with low sample counts (e.g. Mucinous Stomach Adenocarcinoma, n=22) are sensitive to a few extreme samples.
+
+**Follow-ups I can run:** break out endometrial cancers by MSI status if a dMMR attribute exists, compare primary vs metastatic samples for a given cancer type, or look at TMB within one specific study (e.g. a particular uterine or melanoma cohort). Want me to do any of these?
