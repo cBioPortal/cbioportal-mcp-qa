@@ -1,0 +1,228 @@
+Q (qwen3.8-27b): How many patients have an EGFR amplification in the TCGA Lung Adenocarcinoma study?
+
+▶ read_guide
+{
+ "uri": "cbioportal://common-pitfalls"
+}
+
+◀ result
+# Common Query Pitfalls Guide
+
+## Overview
+This guide highlights frequent mistakes when analyzing cBioPortal data and provides solutions to avoid them.
+
+## Critical Pitfalls
+
+### 1. 🚨 CRITICAL MUTATION FREQUENCY ERRORS
+
+#### ❌ WRONG: Using study-wide totals for gene frequencies
+```sql
+-- INCORRECT - This gives wrong frequencies!
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples,
+    (SELECT COUNT(DISTINCT sample_unique_id)
+     FROM genomic_event_derived
+     WHERE cancer_study_identifier = 'your_study_id') as total_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND cancer_study_identifier = 'your_study_id'
+GROUP BY hugo_gene_symbol;
+```
+**Problem**: Different genes have different profiling coverage - you can't use study-wide totals!
+
+#### ❌ WRONG: Not using gene-specific profiling denominators
+```sql
+-- INCORRECT - Missing gene-specific denominators
+SELECT
+    hugo_gene_symbol,
+    COUNT(DISTINCT sample_unique_id) as altered_samples
+FROM genomic_event_derived
+WHERE variant_type = 'mutation'
+GROUP BY hugo_gene_symbol;
+-- Missing: WHERE ARE THE DENOMINATORS FOR EACH GENE?
+```
+
+#### ❌ WRONG: Skipping individual gene profiling queries
+**Problem**: Failing to run separate profiling queries for EACH gene in results.
+**Each gene has different coverage**: TP53 might be profiled in 25,040 samples, MUC16 in 23,000, etc.
+
+#### ✅ CORRECT: Complete gene-specific workflow
+```sql
+-- STEP 1: Get altered counts per gene
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id,
+    COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
+    COUNT(*) AS totalMutationEvents
+FROM genomic_event_derived
+WHERE variant_type = 'mutation' AND mutation_status != 'UNCALLED'
+GROUP BY entrez_gene_id, hugo_gene_symbol
+ORDER BY numberOfAlteredSamplesOnPanel DESC;
+
+-- STEP 2: FOR EACH GENE, run this profiling query:
+SELECT COUNT(DISTINCT stgp.sample_unique_id) AS numberOfProfiledSamples
+FROM sample_to_gene_panel_derived stgp
+JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
+JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
+JOIN gene g ON gpl.gene_id = g.entrez_gene_id
+WHERE stgp.alteration_type = 'MUTATION_EXTENDED'
+  AND g.hugo_gene_symbol = 'TP53'  -- Replace with each gene from Step 1
+  AND stgp.cancer_study_identifier = 'your_study_id';
+
+-- STEP 3: Calculate frequency = numberOfAlteredSamplesOnPanel / numberOfProfiledSamples * 100
+```
+
+#### 🚨 WORKFLOW REQUIREMENTS VIOLATIONS:
+- **Missing denominator columns**: Must show gene-specific profiled samples per row
+- **Wrong table format**: Should be | Gene | # Mutations | # Samples | Profiled Samples | Sample % |
+- **Not replacing gene symbols**: Must replace 'TP53' with actual gene for each query
+- **Using study totals**: Never use genomic_event_derived for total sample counts
+
+### 2. 🚨 OFF-PANEL MUTATION INCLUSION
+
+#### ❌ Wrong: Including off-panel mutations
+```sql
+-- INCORRECT - Includes mutations outside gene panels
+SELEC … (38012 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ list_studies
+{
+ "search": "TCGA lung adenocarcinoma",
+ "limit": 10
+}
+
+◀ result
+[{"cancer_study_identifier":"luad_tcga","name":"Lung Adenocarcinoma (TCGA, Firehose Legacy)","type_of_cancer_id":"luad","sample_count":586,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga"},{"cancer_study_identifier":"luad_tcga_gdc","name":"Lung Adenocarcinoma (TCGA GDC, 2025)","type_of_cancer_id":"luad","sample_count":571,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga_gdc"},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"luad","sample_count":566,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"luad_tcga_pub","name":"Lung Adenocarcinoma (TCGA, Nature 2014)","type_of_cancer_id":"luad","sample_count":230,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=luad_tcga_pub"}]
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT * FROM gene_cna_distribution_in_study(study = 'luad_tcga_pan_can_atlas_2018', gene = 'EGFR') ORDER BY profile_type, cna_value"
+}
+
+◀ result
+{"rows":[{"profile_type":"gistic","cna_value":"-1","cna_label":"Heterozygously deleted","samples":33,"profiled_samples":511,"pct_of_profiled":6.5},{"profile_type":"gistic","cna_value":"-2","cna_label":"Homozygously deleted","samples":3,"profiled_samples":511,"pct_of_profiled":0.6},{"profile_type":"gistic","cna_value":"0","cna_label":"Diploid","samples":206,"profiled_samples":511,"pct_of_profiled":40.3},{"profile_type":"gistic","cna_value":"1","cna_label":"Gained","samples":243,"profiled_samples":511,"pct_of_profiled":47.6},{"profile_type":"gistic","cna_value":"2","cna_label":"Amplified","samples":26,"profiled_samples":511,"pct_of_profiled":5.1},{"profile_type":"gistic","cna_value":"NA","cna_label":"NA","samples":55,"profiled_samples":511}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT countIf(ged.patient_unique_id != '') as patients\nFROM (SELECT DISTINCT patient_unique_id FROM genomic_event_derived\n      WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018' AND hugo_gene_symbol = 'EGFR'\n        AND variant_type = 'cna' AND cna_alteration = 2) x,\ngenomic_event_derived ged\nWHERE ged.cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018' AND ged.hugo_gene_symbol = 'EGFR'\n  AND ged.variant_type = 'cna' AND ged.cna_alteration = 2"
+}
+
+◀ result
+{"rows":[{"patients":676}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT count() AS patients\nFROM (\n    SELECT DISTINCT patient_unique_id\n    FROM genomic_event_derived\n    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'\n      AND hugo_gene_symbol = 'EGFR'\n      AND variant_type = 'cna'\n      AND cna_alteration = 2\n)"
+}
+
+◀ result
+{"rows":[{"patients":26}]}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+{"success":false,"error":"Invalid study ID(s): luad_tcga_pan_can_atlas_2018","details":{"invalidIds":["luad_tcga_pan_can_atlas_2018"],"providedIds":["luad_tcga_pan_can_atlas_2018"]}}
+
+▶ resolve_and_route
+{
+ "studyKeywords": [
+  "TCGA",
+  "lung",
+  "adenocarcinoma"
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/clinical-attributes/fetch?projection=SUMMARY","data":["luad_tcga_pub"],"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"date":"Thu, 15 Oct 2026 08:10:49 GMT","content-type":"application/json","transfer-encoding":"chunked","connection":"close","cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","elapsed-time":"0","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","cf-cache-status":"DYNAMIC","report-to":"{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=6n6YzX36aWL5b9ZMZIFYGVCtZAiyK0ZzQYBhKLw0PB8ShJIZ0HgGzlIH3cF3mpS%2Bvlr3ooI9cjkPO61758leFl4Vy9eX6U%2FL6eM4XMHADDiJUaJUCsSyjiRbMtL3Y1uo0qq7Hw%3D%3D\"}]}","nel":"{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}","server":"cloudflare","cf-ray":"a4ad589d0ac12a30-IAD"},"status":500,"text":"{\"timestamp\":1792051849407,\"status\":500,\"error\":\"Internal Server Error\",\"path\":\"/api/clinical-attributes/fetch\"}"}}}
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "luad_tcga"
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/clinical-attributes/fetch?projection=SUMMARY","data":["luad_tcga"],"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"date":"Thu, 15 Oct 2026 08:13:34 GMT","content-type":"application/json","transfer-encoding":"chunked","connection":"close","cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","elapsed-time":"12","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","cf-cache-status":"DYNAMIC","report-to":"{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=CBv6NJDCGyRiZuChR6Ym9QV2MY8KMaf%2F4ZHlSuJHlzWSeeqbCnk9d8UU7lSyL0L0V8jfJsqzNeDBcNr1wNOhm7JPt9lNIG%2F0xtXPwqQvMQHcntOKZ%2FnETnUgzz5HqJfLmpeRkA%3D%3D\"}]}","nel":"{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}","server":"cloudflare","cf-ray":"a4ad5cae3d59d645-IAD"},"status":500,"text":"{\"timestamp\":1792052014776,\"status\":500,\"error\":\"Internal Server Error\",\"path\":\"/api/clinical-attributes/fetch\"}"}}}
+
+═ answer (success)
+The link-generation service is temporarily returning errors, so I'll provide the direct study page link alongside the data.
+
+## EGFR amplification in TCGA Lung Adenocarcinoma
+
+I used the TCGA PanCancer Atlas build of this study (`luad_tcga_pan_can_atlas_2018`, 566 samples). There are several TCGA LUAD cohorts in cBioPortal — let me know if you want me to check the other builds (Firehose Legacy, GDC 2025, or Nature 2014).
+
+**Patients with EGFR amplification (AMP, copy number = +2): 26 patients**
+
+Copy-number distribution for EGFR in this study (511 samples profiled for discrete copy number):
+| CNA level | Samples | % profiled |
+|---|---|---|
+| Amplified (AMP, +2) | 26 | 5.1% |
+| Homozygous deletion (−2) | 3 | 0.6% |
+| Gained (+1) | 243 | 47.6% |
+| Shallow deletion (−1) | 33 | 6.5% |
+| Diploid (0) | 206 | 40.3% |
+| No value | 55 | — |
+
+Notes:
+- An "amplification" here is the discrete AMP (−2/+2) call. The 243 "Gained" samples are copy-number gains, not amplifications.
+- The 26 patients is the patient-level count (a patient with multiple amplified samples is counted once).
+- This count reflects the AMP definition only; it does not require the amplification to be annotated as a driver.
+
+**Explore in cBioPortal:**
+- [Study — Lung Adenocarcinoma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018)
+
+Want me to break this down by mutation co-occurrence, or compare EGFR-amp vs EGFR-wildtype survival/clinical attributes?

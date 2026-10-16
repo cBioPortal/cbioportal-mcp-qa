@@ -1,0 +1,357 @@
+Q (haiku-5.5): Help me rank TCGA cancer studies based on median CD3 expression
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-resolution-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://sample-filtering-guide"
+}
+
+◀ result
+# Gene Resolution Guide
+
+Use this guide before querying gene expression, mutation, copy-number, methylation, or structural-variant data when the user's gene term may be ambiguous.
+
+## Routing Triggers
+
+Read this guide when the user mentions:
+
+- a gene family shorthand: `CD3`, `HLA`, `KRT`, `MUC`, `MT-`, `IGH`, `IGK`, `IGL`
+- a marker name that may refer to multiple genes or proteins
+- a gene alias, old symbol, or informal name
+- a wildcard-like term such as "all CD3 genes"
+
+These examples are not exhaustive. Apply this guide to any gene term that may resolve to multiple symbols, aliases, paralogs, family members, or marker genes.
+
+## Core Rule
+
+Do not silently aggregate multiple genes when the user names an ambiguous symbol. Either ask for clarification or choose a clearly standard marker and state the choice.
+
+For example, "CD3 expression" can refer to `CD3D`, `CD3E`, or `CD3G`; in many immune-marker contexts `CD3E` is the standard marker, but the agent must not average all CD3 genes unless the user asks for a combined signature.
+
+## Gene Discovery Query
+
+After validating the gene table exists, search exact symbols first, then prefix/alias-like matches:
+
+```sql
+SELECT
+    hugo_gene_symbol,
+    entrez_gene_id
+FROM gene
+WHERE upper(hugo_gene_symbol) = upper('CD3')
+   OR upper(hugo_gene_symbol) LIKE upper('CD3%')
+ORDER BY hugo_gene_symbol
+LIMIT 50;
+```
+
+If aliases are available in this deployment, inspect the relevant alias table before assuming no match. If no alias table exists, state that alias resolution is limited to available gene symbols.
+
+## Answer Pattern
+
+If multiple plausible genes are found:
+
+> "CD3" is ambiguous in cBioPortal gene-symbol terms. I found `CD3D`, `CD3E`, and `CD3G`. Did you mean `CD3E` as a T-cell marker, or should I analyze all three separately?
+
+If the user clearly asks for a combined family/signature:
+
+- report each gene separately by default
+- only compute an average/signature if the user explicitly requests it
+- state exactly how the combined value was calculated
+
+## Do Not
+
+- Do not average multiple genes into one expression value without explicit permission.
+- Do not rewrite an ambiguous symbol to a single gene without telling the user.
+- Do not treat a prefix match as a validated gene symbol.
+
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+# Sample and Study Filtering Guide
+
+## Overview
+Proper filtering is essential for meaningful cBioPortal analysis. This guide covers filtering by studies, sample types, and other criteria.
+
+## Study-Level Filtering
+
+### 1. Always Filter by Study
+Every query should specify a study to ensure consistent results:
+
+```sql
+-- Always include study filtering
+SELECT *
+FROM your_table
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    -- Additional filters...
+```
+
+### 2. Find Available Studies
+
+```sql
+-- Discover available studies
+SELECT
+    cancer_study_identifier,
+    name,
+    description,
+    type_of_cancer_id
+FROM cancer_study
+ORDER BY cancer_study_identifier;
+```
+
+### 3. Study Information
+
+```sql
+-- Get detailed study information
+SELECT
+    cs.cancer_study_identifier,
+    cs.name as study_name,
+    cs.description,
+    cs.sample_count,
+    COUNT(DISTINCT p.internal_id) as patient_count
+FROM cancer_study cs
+LEFT JOIN patient p ON cs.cancer_study_id = p.cancer_study_id
+WHERE
+    cs.cancer_study_identifier = 'your_study_id'
+GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.sample_count;
+```
+
+### 4. Find Studies by Available Data Types
+
+Use this when the user asks *"which studies have mutation and copy-number data for X"*, *"studies with expression for Y"*, *"is there any imaging data"*, or any *"studies with Z data"* question. `cancer_study` has one precomputed sample count per data type — filter on them. No join and no schema exploration needed. These are the same counts as the portal's study list and its "Data type" filter.
+
+**Canonical query — studies with ALL requested data types for a cancer type:**
+
+```sql
+SELECT
+    cancer_study_identifier,
+    name,
+    sample_count,
+    mutation_sample_count,
+    cna_sample_count
+FROM cancer_study
+WHERE type_of_cancer_id = 'luad'          -- ← OncoTree code from search_oncotree
+  AND mutation_sample_count > 0           -- ← one condition per required data type
+  AND cna_sample_count > 0
+ORDER BY sample_count DESC;
+```
+
+**Data type → column** (a count of 0 means the study doesn't have that data):
+
+| Data type in the user's question | Column (portal "Data type" filter label) |
+|---|---|
+| samples in the study | `sample_count` |
+| mutation / mutations | `mutation_sample_count` ("Mutations") |
+| copy-number / CNA / amplification / deletion | `cna_sample_count` ("CNA") |
+| structural variant / fusion | `structural_variant_sample_count` |
+| RNA / mRNA / gene expression (any platform) | `mrna_expression_sample_count` — use this for "which studies have expression data" |
+| specifically the portal's "RNA-Seq" filter | `rna_seq_sample_count` ("RNA-Seq") — counts only the `<study>_rna_seq_v2_mrna` list; 0 for many GDC and iAtlas studies that do have RNA-Seq |
+| specifically the portal's "RNA (microarray)" filter | `mrna_microarray_sample_count` ("RNA (microarray)") — counts only the `<study>_mrna` list |
+| microRNA | `mirna_sample_count` ("miRNA") |
+| protein / RPPA | `rppa_sample_count` ("RPPA") |
+| mas … (7866 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT hugo_gene_symbol, entrez_gene_id FROM gene WHERE upper(hugo_gene_symbol) = 'CD3' OR upper(hugo_gene_symbol) LIKE 'CD3%' ORDER BY hugo_gene_symbol LIMIT 50"
+}
+
+◀ result
+{"rows":[{"hugo_gene_symbol":"CD300A","entrez_gene_id":11314},{"hugo_gene_symbol":"CD300C","entrez_gene_id":10871},{"hugo_gene_symbol":"CD300E","entrez_gene_id":342510},{"hugo_gene_symbol":"CD300H","entrez_gene_id":100130520},{"hugo_gene_symbol":"CD300LB","entrez_gene_id":124599},{"hugo_gene_symbol":"CD300LD","entrez_gene_id":100131439},{"hugo_gene_symbol":"CD300LD-AS1","entrez_gene_id":146723},{"hugo_gene_symbol":"CD300LF","entrez_gene_id":146722},{"hugo_gene_symbol":"CD300LG","entrez_gene_id":146894},{"hugo_gene_symbol":"CD302","entrez_gene_id":9936},{"hugo_gene_symbol":"CD320","entrez_gene_id":51293},{"hugo_gene_symbol":"CD33","entrez_gene_id":945},{"hugo_gene_symbol":"CD34","entrez_gene_id":947},{"hugo_gene_symbol":"CD36","entrez_gene_id":948},{"hugo_gene_symbol":"CD37","entrez_gene_id":951},{"hugo_gene_symbol":"CD38","entrez_gene_id":952},{"hugo_gene_symbol":"CD38-AS1","entrez_gene_id":143433680},{"hugo_gene_symbol":"CD3D","entrez_gene_id":915},{"hugo_gene_symbol":"CD3E","entrez_gene_id":916},{"hugo_gene_symbol":"CD3G","entrez_gene_id":917}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cs.cancer_study_identifier, cs.name, cs.type_of_cancer_id, cs.sample_count, cs.mrna_expression_sample_count FROM cancer_study cs WHERE cs.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga') ORDER BY cs.cancer_study_identifier",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"acc_tcga_pan_can_atlas_2018","name":"Adrenocortical Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"acc","sample_count":92,"mrna_expression_sample_count":78},{"cancer_study_identifier":"blca_tcga_pan_can_atlas_2018","name":"Bladder Urothelial Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"blca","sample_count":411,"mrna_expression_sample_count":407},{"cancer_study_identifier":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"brca","sample_count":1084,"mrna_expression_sample_count":1082},{"cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018","name":"Cervical Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"cesc","sample_count":297,"mrna_expression_sample_count":294},{"cancer_study_identifier":"chol_tcga_pan_can_atlas_2018","name":"Cholangiocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"chol","sample_count":36,"mrna_expression_sample_count":36},{"cancer_study_identifier":"coadread_tcga_pan_can_atlas_2018","name":"Colorectal Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"coadread","sample_count":594,"mrna_expression_sample_count":592},{"cancer_study_identifier":"dlbc_tcga_pan_can_atlas_2018","name":"Diffuse Large B-Cell Lymphoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"dlbclnos","sample_count":48,"mrna_expression_sample_count":48},{"cancer_study_identifier":"esca_tcga_pan_can_atlas_2018","name":"Esophageal Adenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"esca","sample_count":182,"mrna_expression_sample_count":181},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":592,"mrna_expression_sample_count":160},{"cancer_study_identifier":"hnsc_tcga_pan_can_atlas_2018","name":"Head and Neck Squamous Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"hnsc","sample_count":523,"mrna_expression_sample_count":515},{"cancer_study_identifier":"kich_tcga_pan_can_atlas_2018","name":"Kidney Chromophobe (TCGA, PanCancer Atlas)","type_of_cancer_id":"chrcc","sample_count":65,"mrna_expression_sample_count":65},{"cancer_study_identifier":"kirc_tcga_pan_can_atlas_2018","name":"Kidney Renal Clear Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"ccrcc","sample_count":512,"mrna_expression_sample_count":510},{"cancer_study_identifier":"kirp_tcga_pan_can_atlas_2018","name":"Kidney Renal Papillary Cell Carcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"prcc","sample_count":283,"mrna_expression_sample_count":283},{"cancer_study_identifier":"laml_tcga_pan_can_atlas_2018","name":"Acute Myeloid Leukemia (TCGA, PanCancer Atlas)","type_of_cancer_id":"aml","sample_count":200,"mrna_expression_sample_count":173},{"cancer_study_identifier":"lgg_tcga_pan_can_atlas_2018","name":"Brain Lower Grade Glioma (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":514,"mrna_expressi … (3365 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT g.cancer_study_identifier AS study,
+       count() AS samples,
+       round(median(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS median_log2_rsem,
+       round(quantile(0.25)(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS p25_log2_rsem,
+       round(quantile(0.75)(log2(toFloat64OrNull(g.alteration_value) + 1)), 2) AS p75_log2_rsem
+FROM genetic_alteration_derived g
+WHERE g.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = 'pan_cancer_tcga')
+  AND g.hugo_gene_symbol = 'CD3E'
+  AND g.profile_type = 'rna_seq_v2_mrna'
+  AND g.alteration_value NOT IN ('', 'NA')
+  AND toFloat64OrNull(g.alteration_value) IS NOT NULL
+GROUP BY study
+ORDER BY median_log2_rsem DESC",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"study":"thym_tcga_pan_can_atlas_2018","samples":119,"median_log2_rsem":13.05,"p25_log2_rsem":11.24,"p75_log2_rsem":14.29},{"study":"dlbc_tcga_pan_can_atlas_2018","samples":48,"median_log2_rsem":10.76,"p25_log2_rsem":9.23,"p75_log2_rsem":11.53},{"study":"tgct_tcga_pan_can_atlas_2018","samples":149,"median_log2_rsem":8.91,"p25_log2_rsem":7.73,"p75_log2_rsem":9.94},{"study":"kirc_tcga_pan_can_atlas_2018","samples":510,"median_log2_rsem":8.71,"p25_log2_rsem":7.97,"p75_log2_rsem":9.68},{"study":"luad_tcga_pan_can_atlas_2018","samples":510,"median_log2_rsem":8.58,"p25_log2_rsem":7.65,"p75_log2_rsem":9.35},{"study":"stad_tcga_pan_can_atlas_2018","samples":412,"median_log2_rsem":8.31,"p25_log2_rsem":7.25,"p75_log2_rsem":9.14},{"study":"cesc_tcga_pan_can_atlas_2018","samples":294,"median_log2_rsem":8.09,"p25_log2_rsem":7.11,"p75_log2_rsem":9.11},{"study":"laml_tcga_pan_can_atlas_2018","samples":173,"median_log2_rsem":8.05,"p25_log2_rsem":7.06,"p75_log2_rsem":9.05},{"study":"lusc_tcga_pan_can_atlas_2018","samples":484,"median_log2_rsem":8.02,"p25_log2_rsem":6.95,"p75_log2_rsem":8.95},{"study":"paad_tcga_pan_can_atlas_2018","samples":177,"median_log2_rsem":8.02,"p25_log2_rsem":6.81,"p75_log2_rsem":8.96},{"study":"skcm_tcga_pan_can_atlas_2018","samples":443,"median_log2_rsem":8.01,"p25_log2_rsem":6.02,"p75_log2_rsem":9.63},{"study":"meso_tcga_pan_can_atlas_2018","samples":87,"median_log2_rsem":8,"p25_log2_rsem":6.96,"p75_log2_rsem":8.75},{"study":"hnsc_tcga_pan_can_atlas_2018","samples":515,"median_log2_rsem":7.97,"p25_log2_rsem":6.9,"p75_log2_rsem":9},{"study":"brca_tcga_pan_can_atlas_2018","samples":1082,"median_log2_rsem":7.6,"p25_log2_rsem":6.38,"p75_log2_rsem":8.74},{"study":"chol_tcga_pan_can_atlas_2018","samples":36,"median_log2_rsem":7.25,"p25_log2_rsem":5.75,"p75_log2_rsem":8.36},{"study":"ucec_tcga_pan_can_atlas_2018","samples":527,"median_log2_rsem":7.21,"p25_log2_rsem":6.08,"p75_log2_rsem":8.29},{"study":"esca_tcga_pan_can_atlas_2018","samples":181,"median_log2_rsem":7.21,"p25_log2_rsem":6.11,"p75_log2_rsem":8.25},{"study":"kirp_tcga_pan_can_atlas_2018","samples":283,"median_log2_rsem":7.1,"p25_log2_rsem":5.9,"p75_log2_rsem":8.07},{"study":"prad_tcga_pan_can_atlas_2018","samples":493,"median_log2_rsem":7.08,"p25_log2_rsem":6.28,"p75_log2_rsem":7.82},{"study":"lihc_tcga_pan_can_atlas_2018","samples":366,"median_log2_rsem":7.08,"p25_log2_rsem":5.9,"p75_log2_rsem":8.28},{"study":"coadread_tcga_pan_can_atlas_2018","samples":592,"median_log2_rsem":7.05,"p25_log2_rsem":6.25,"p75_log2_rsem":7.81},{"study":"blca_tcga_pan_can_atlas_2018","samples":407,"median_log2_rsem":6.98,"p25_log2_rsem":5.59,"p75_log2_rsem":8.41},{"study":"thca_tcga_pan_can_atlas_2018","samples":498,"median_log2_rsem":6.85,"p25_log2_rsem":5.65,"p75_log2_rsem":7.96},{"study":"sarc_tcga_pan_can_atlas_2018","samples":253,"median_log2_rsem":6.73,"p25_log2_rsem":5.27,"p75_log2_rsem":8.33},{"study":"ov_tcga_pan_can_atlas_2018","samples":300,"median_log2_rsem":6.65,"p25_log2_rsem" … (865 more chars)
+
+▶ resolve_and_route
+{
+ "studyIds": [
+  "acc_tcga_pan_can_atlas_2018",
+  "blca_tcga_pan_can_atlas_2018",
+  "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018",
+  "chol_tcga_pan_can_atlas_2018",
+  "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018",
+  "esca_tcga_pan_can_atlas_2018",
+  "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018",
+  "kich_tcga_pan_can_atlas_2018",
+  "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018",
+  "laml_tcga_pan_can_atlas_2018",
+  "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018",
+  "luad_tcga_pan_can_atlas_2018",
+  "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018",
+  "ov_tcga_pan_can_atlas_2018",
+  "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018",
+  "prad_tcga_pan_can_atlas_2018",
+  "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018",
+  "stad_tcga_pan_can_atlas_2018",
+  "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018",
+  "thym_tcga_pan_can_atlas_2018",
+  "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018",
+  "uvm_tcga_pan_can_atlas_2018"
+ ]
+}
+
+◀ result
+Error: result (81,891 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /home/debruiji/.claude/projects/-gpfs-cdsi-ess-debruiji-tmp-mcp-qa-claude-p-7sb418/a14e1d0a-089f-4eed-91af-c5f971871fd5/tool-results/mcp-navigator-resolve_and_route-1792053827916.txt.
+Format: Plain text
+- For targeted searches (find a string): use grep on the file directly.
+- For analysis or summarization that requires reading the full content: the file's lines are too long for Read's offset/limit. Slice by character range via Bash instead — e.g. python3 -c 'print(open("/home/debruiji/.claude/projects/-gpfs-cdsi-ess-debruiji-tmp-mcp-qa-claude-p-7sb418/a14e1d0a-089f-4eed-91af-c5f971871fd5/tool-results/mcp-navigator-resolve_and_route-1792053827916.txt").read()[A:B])' in ~80,000-char spans until you have read 100% of it.
+- If the Agent tool is available, do this inside a subagent so the full output stays out of your main context. Give it the instruction above verbatim, and be explicit about what it must return — e.g. "Slice /home/debruiji/.claude/projects/-gpfs-cdsi-ess-debruiji-tmp-mcp-qa-claude-p-7sb418/a14e1d0a-089f-4eed-91af-c5f971871fd5/tool-results/mcp-navigator-resolve_and_route-1792053827916.txt in ~80,000-char spans via python (read()[A:B]) until you have read all 81,891 characters, then summarize and quote any key findings verbatim." A vague "summarize this" may lose detail.
+
+
+═ answer (success)
+## CD3E expression ranking across TCGA PanCancer Atlas studies
+
+"CD3" is a gene family (CD3D, CD3E, CD3G), and the guide asks me not to combine them without your go-ahead. I used **CD3E**, the standard T-cell marker, and ranked the 33 PanCancer Atlas studies by its median expression. Values are RSEM from `rna_seq_v2_mrna`, shown as log2(RSEM+1). I used the raw profile rather than Z-scores, since Z-scores are centered within each study and can't be compared across cancer types.
+
+| Rank | Study | Cancer type | Samples with mRNA | Median log2(RSEM+1) | IQR (25th–75th) |
+|---|---|---|---|---|---|
+| 1 | Thymoma | THYM | 119 | 13.05 | 11.24–14.29 |
+| 2 | Diffuse Large B-Cell Lymphoma | DLBCL | 48 | 10.76 | 9.23–11.53 |
+| 3 | Testicular Germ Cell Tumors | TGCT | 149 | 8.91 | 7.73–9.94 |
+| 4 | Kidney Renal Clear Cell Carcinoma | KIRC | 510 | 8.71 | 7.97–9.68 |
+| 5 | Lung Adenocarcinoma | LUAD | 510 | 8.58 | 7.65–9.35 |
+| 6 | Stomach Adenocarcinoma | STAD | 412 | 8.31 | 7.25–9.14 |
+| 7 | Cervical Squamous Cell Carcinoma | CESC | 294 | 8.09 | 7.11–9.11 |
+| 8 | Acute Myeloid Leukemia | LAML | 173 | 8.05 | 7.06–9.05 |
+| 9 | Lung Squamous Cell Carcinoma | LUSC | 484 | 8.02 | 6.95–8.95 |
+| 10 | Pancreatic Adenocarcinoma | PAAD | 177 | 8.02 | 6.81–8.96 |
+| 11 | Skin Cutaneous Melanoma | SKCM | 443 | 8.01 | 6.02–9.63 |
+| 12 | Mesothelioma | MESO | 87 | 8.00 | 6.96–8.75 |
+| 13 | Head and Neck Squamous Cell Carcinoma | HNSC | 515 | 7.97 | 6.90–9.00 |
+| 14 | Breast Invasive Carcinoma | BRCA | 1,082 | 7.60 | 6.38–8.74 |
+| 15 | Cholangiocarcinoma | CHOL | 36 | 7.25 | 5.75–8.36 |
+| 16 | Uterine Corpus Endometrial Carcinoma | UCEC | 527 | 7.21 | 6.08–8.29 |
+| 17 | Esophageal Adenocarcinoma | ESCA | 181 | 7.21 | 6.11–8.25 |
+| 18 | Kidney Renal Papillary Cell Carcinoma | KIRP | 283 | 7.10 | 5.90–8.07 |
+| 19 | Prostate Adenocarcinoma | PRAD | 493 | 7.08 | 6.28–7.82 |
+| 20 | Liver Hepatocellular Carcinoma | LIHC | 366 | 7.08 | 5.90–8.28 |
+| 21 | Colorectal Adenocarcinoma | COADREAD | 592 | 7.05 | 6.25–7.81 |
+| 22 | Bladder Urothelial Carcinoma | BLCA | 407 | 6.98 | 5.59–8.41 |
+| 23 | Thyroid Carcinoma | THCA | 498 | 6.85 | 5.65–7.96 |
+| 24 | Sarcoma | SARC | 253 | 6.73 | 5.27–8.33 |
+| 25 | Ovarian Serous Cystadenocarcinoma | OV | 300 | 6.65 | 5.34–7.73 |
+| 26 | Kidney Chromophobe | KICH | 65 | 5.42 | 4.28–6.44 |
+| 27 | Uterine Carcinosarcoma | UCS | 57 | 5.36 | 4.23–6.65 |
+| 28 | Pheochromocytoma and Paraganglioma | PCPG | 178 | 5.12 | 4.10–6.28 |
+| 29 | Glioblastoma Multiforme | GBM | 160 | 5.07 | 3.90–6.05 |
+| 30 | Uveal Melanoma | UVM | 80 | 4.72 | 2.88–6.83 |
+| 31 | Adrenocortical Carcinoma | ACC | 78 | 3.99 | 2.66–6.03 |
+| 32 | Brain Lower Grade Glioma | LGG | 514 | 2.98 | 1.92–4.38 |
+
+Notes:
+- **Counts:** Sample numbers are the samples with mRNA data, which can be fewer than the study totals (for example, GBM has 592 samples but only 160 with mRNA). Each study is a separate cohort, so I did not pool them.
+- **Interpretation:** This ranks the bulk-tissue median of CD3E, which reflects how much T-cell content each tumor type has. It is not a per-cell T-cell measure.
+- **Ties:** Several studies sit close together (ranks 9–12 and 16–17), so small differences there are not meaningful.
+- **Other CD3 genes:** I can run CD3D or CD3G separately, or the ranking for each, if you want them.
+
+Study pages: [Thymoma](https://www.cbioportal.org/study/summary?id=thym_tcga_pan_can_atlas_2018), [Breast Invasive Carcinoma](https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018), [Lung Adenocarcinoma](https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018), [Brain Lower Grade Glioma](https://www.cbioportal.org/study/summary?id=lgg_tcga_pan_can_atlas_2018). I couldn't generate a single link that opens all 33 studies together.

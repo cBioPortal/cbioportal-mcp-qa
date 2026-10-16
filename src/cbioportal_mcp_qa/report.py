@@ -12,7 +12,7 @@ from .checks import internal_leaks
 from .config import MODELS, PRICES_BY_BEDROCK_ID, TARGETS
 from .dataset import CATEGORIES, TRACKS, load_questions
 from .persist import write_json, write_rendered
-from .run import RESULTS_DIR, Run
+from .run import RESULTS_DIR, Run, run_order
 from .traces import SCHEMA_ERROR
 
 OUTCOMES = ["pass", "fail", "declined", "ungraded", "error"]
@@ -490,6 +490,9 @@ def run_setup(run: dict) -> dict:
     if run.get("runner") == "claude-code":
         cc = v.get("claude_code")
         runner = "Claude Code " + cc.split()[0] if isinstance(cc, str) else "Claude Code"
+    elif run.get("runner") == "openai":
+        backend = (run.get("openai") or {}).get("backend") or {}
+        runner = f"Ollama {backend['ollama']}" if backend.get("ollama") else "OpenAI-compatible"
     else:
         lc = v.get("librechat")
         runner = "LibreChat " + lc.split(":")[-1] if isinstance(lc, str) else "LibreChat"
@@ -518,7 +521,9 @@ def run_setup(run: dict) -> dict:
 
 def write_index() -> Path:
     runs = []
-    for path in sorted(RESULTS_DIR.glob("*/summary.json"), reverse=True):
+    for path in sorted(
+        RESULTS_DIR.glob("*/summary.json"), key=lambda p: run_order(p.parent.name), reverse=True
+    ):
         summary = json.loads(path.read_text())
         if not all(k in summary for k in RUN_SETUP_KEYS) and (path.parent / "run.json").exists():
             recorded = json.loads((path.parent / "run.json").read_text())

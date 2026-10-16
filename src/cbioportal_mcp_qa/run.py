@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +32,16 @@ def answered(rec: dict | None) -> bool:
     return (rec or {}).get("reply", {}).get("status") == 200
 
 
+RUN_ID = re.compile(r"(\d{8}-\d{4})(?:-(\d+))?")
+
+
+def run_order(name: str) -> tuple[str, int]:
+    """Sort key for run ids in start order: `20261015-0338` before `20261015-0338-2` before `-10`."""
+    if m := RUN_ID.fullmatch(name):
+        return m.group(1), int(m.group(2) or 1)
+    return name, 0
+
+
 class Run:
     def __init__(self, path: Path, data: dict):
         self.path = path
@@ -52,9 +63,19 @@ class Run:
         runner: str = "agents-api",
         extra: dict | None = None,
     ) -> "Run":
-        run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M")
+        # Runs started in the same minute get -2, -3, ...: each run owns its directory.
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        for n in range(1, 1000):
+            run_id = stamp if n == 1 else f"{stamp}-{n}"
+            try:
+                (RESULTS_DIR / run_id).mkdir()
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise RuntimeError(f"no free run id for {stamp} in {RESULTS_DIR}")
         path = RESULTS_DIR / run_id / "run.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "run_id": run_id,
             "target": target,

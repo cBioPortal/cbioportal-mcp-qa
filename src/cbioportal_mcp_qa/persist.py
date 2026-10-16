@@ -7,9 +7,12 @@ keys and values, lists, dataclasses, strings) and redacts every string. A report
 scrubbed copy, and its output is checked once more for known secret values.
 """
 
+import contextlib
 import copy
 import dataclasses
+import fcntl
 import json
+import os
 import re
 import tempfile
 from collections.abc import Callable
@@ -165,3 +168,27 @@ async def write_screenshot(page, path: Path) -> None:
     """A JPEG of a rendered page. Screenshots are pixels, so they can't be redacted: they are only taken of the
     public cBioPortal pages an answer linked to (`render --no-screenshots` skips them)."""
     await page.screenshot(path=path, type="jpeg", quality=60)
+
+
+def write_secret_json(path: Path, obj) -> None:
+    """A credentials file (the MCP OAuth tokens), never under results/: owner-only, replaced atomically, not
+    redacted."""
+    if Path(path).resolve().is_relative_to(Path("results").resolve()):
+        raise ValueError(f"credentials never go under results/: {path}")
+    tmp = Path(path).with_name(Path(path).name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def secret_file_lock(path: Path):
+    """An exclusive lock, shared by every process, on a credentials file (`<file>.lock` next to it)."""
+    fd = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)

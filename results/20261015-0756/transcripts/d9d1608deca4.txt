@@ -1,0 +1,140 @@
+Q (haiku-5.5): show me gbm with mgmt hypermethylation
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "glioblastoma"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"gbm_tcga","name":"Glioblastoma Multiforme (TCGA, Firehose Legacy)","type_of_cancer_id":"difg","sample_count":619,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga"},{"cancer_study_identifier":"gbm_tcga_gdc","name":"Glioblastoma Multiforme (TCGA GDC, 2025)","type_of_cancer_id":"difg","sample_count":611,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_gdc"},{"cancer_study_identifier":"gbm_tcga_pan_can_atlas_2018","name":"Glioblastoma Multiforme (TCGA, PanCancer Atlas)","type_of_cancer_id":"difg","sample_count":592,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pan_can_atlas_2018"},{"cancer_study_identifier":"gbm_tcga_pub2013","name":"Glioblastoma (TCGA, Cell 2013)","type_of_cancer_id":"difg","sample_count":577,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013"},{"cancer_study_identifier":"gbm_tcga_pub","name":"Glioblastoma (TCGA, Nature 2008)","type_of_cancer_id":"difg","sample_count":206,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_tcga_pub"},{"cancer_study_identifier":"gbm_cptac_2021","name":"Glioblastoma (CPTAC, Cell 2021)","type_of_cancer_id":"difg","sample_count":99,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_cptac_2021"},{"cancer_study_identifier":"gbm_columbia_2019","name":"Glioblastoma (Columbia, Nat Med. 2019)","type_of_cancer_id":"difg","sample_count":42,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_columbia_2019"},{"cancer_study_identifier":"gbm_iatlas_prins_2019","name":"Glioblastoma (Randomized Clinical Trial, Nat Med. 2019) - iAtlas Harmonized","type_of_cancer_id":"adifg","sample_count":30,"has_guide":false,"url":"https://www.cbioportal.org/study/summary?id=gbm_iatlas_prins_2019"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, count(DISTINCT sample_unique_id) AS samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier IN ('gbm_tcga','gbm_tcga_gdc','gbm_tcga_pan_can_atlas_2018','gbm_tcga_pub2013','gbm_tcga_pub','gbm_cptac_2021','gbm_columbia_2019','gbm_iatlas_prins_2019')
+  AND hugo_gene_symbol = 'MGMT'
+  AND profile_type LIKE 'methylation%'
+GROUP BY cancer_study_identifier, profile_type
+ORDER BY cancer_study_identifier, profile_type"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"gbm_cptac_2021","profile_type":"methylation_epic","samples":94},{"cancer_study_identifier":"gbm_tcga","profile_type":"methylation_hm27","samples":285},{"cancer_study_identifier":"gbm_tcga","profile_type":"methylation_hm450","samples":153},{"cancer_study_identifier":"gbm_tcga_pub","profile_type":"methylation_hm27","samples":58}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, attribute_name, count(DISTINCT sample_unique_id) AS samples
+FROM clinical_data_derived
+WHERE cancer_study_identifier IN ('gbm_tcga','gbm_tcga_gdc','gbm_tcga_pan_can_atlas_2018','gbm_tcga_pub2013','gbm_tcga_pub','gbm_cptac_2021','gbm_columbia_2019','gbm_iatlas_prins_2019')
+  AND (attribute_name ILIKE '%MGMT%' OR attribute_name ILIKE '%METHYL%')
+GROUP BY cancer_study_identifier, attribute_name
+ORDER BY cancer_study_identifier, attribute_name"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"gbm_tcga_pub2013","attribute_name":"G_CIMP_METHYLATION","samples":577},{"cancer_study_identifier":"gbm_tcga_pub2013","attribute_name":"METHYLATION_STATUS","samples":577},{"cancer_study_identifier":"gbm_tcga_pub2013","attribute_name":"MGMT_STATUS","samples":577}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT attribute_value, count(DISTINCT sample_unique_id) AS samples
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'gbm_tcga_pub2013' AND attribute_name = 'MGMT_STATUS'
+GROUP BY attribute_value
+ORDER BY samples DESC"
+}
+
+◀ result
+{"rows":[{"samples":227},{"attribute_value":"UNMETHYLATED","samples":180},{"attribute_value":"METHYLATED","samples":170}]}
+
+═ answer (success)
+I found several GBM studies, and MGMT data is in a few of them, so I need you to pick one before I build the view.
+
+**MGMT data by study**
+
+| Study | MGMT data available | Samples |
+|---|---|---|
+| [Glioblastoma (TCGA, Cell 2013)](https://www.cbioportal.org/study/summary?id=gbm_tcga_pub2013) | Clinical MGMT_STATUS call (METHYLATED / UNMETHYLATED) | 577 total: 170 methylated, 180 unmethylated, 227 blank |
+| [Glioblastoma Multiforme (TCGA, Firehose Legacy)](https://www.cbioportal.org/study/summary?id=gbm_tcga) | MGMT methylation, HM27 array | 285 |
+| | MGMT methylation, HM450 array | 153 |
+| [Glioblastoma (TCGA, Nature 2008)](https://www.cbioportal.org/study/summary?id=gbm_tcga_pub) | MGMT methylation, HM27 array | 58 |
+| [Glioblastoma (CPTAC, Cell 2021)](https://www.cbioportal.org/study/summary?id=gbm_cptac_2021) | MGMT methylation, EPIC array | 94 |
+
+The other GBM studies have no MGMT data in the database: [TCGA GDC 2025](https://www.cbioportal.org/study/summary?id=gbm_tcga_gdc), [TCGA PanCancer Atlas 2018](https://www.cbioportal.org/study/summary?id=gbm_tcga_pan_can_atlas_2018), [Columbia 2019](https://www.cbioportal.org/study/summary?id=gbm_columbia_2019), and [iAtlas Prins 2019](https://www.cbioportal.org/study/summary?id=gbm_iatlas_prins_2019).
+
+Two ways to define "hypermethylated" are possible:
+- **Clinical status:** use the MGMT_STATUS call. This is only in the Cell 2013 study, and it has 227 blank samples that would need to be excluded or shown separately.
+- **Methylation level:** use the MGMT probe beta values. This is available in the three studies above, but I'd need to choose a cutoff, which you should set.
+
+Which study should I use, and which definition do you want? I can then build the StudyView or Group Comparison link for the methylated vs. unmethylated groups.

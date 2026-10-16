@@ -1,0 +1,139 @@
+Q (sonnet-5.5): write me python code that can query the timeline files for msk-chord
+
+▶ list_studies
+{
+ "search": "chord"
+}
+
+◀ result
+{"result":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]}
+
+═ answer (success)
+Here's a Python script for MSK-CHORD (`msk_chord_2024`). It has two modes. One queries the public cBioPortal REST API. The other reads local `data_timeline_*.txt` files if you've downloaded the study. I haven't run it, and the patient-level endpoint is the one I'm least sure of, so check it against https://www.cbioportal.org/api/v3/api-docs.
+
+```python
+#!/usr/bin/env python3
+"""
+Query MSK-CHORD (msk_chord_2024) timeline data.
+
+Mode 1 (API):   python chord_timeline.py api  --patients P-0000004 P-0000012
+Mode 2 (files): python chord_timeline.py file --dir /path/to/msk_chord_2024 --event-type TREATMENT
+"""
+import argparse
+import glob
+import os
+import sys
+
+import pandas as pd
+import requests
+
+STUDY_ID = "msk_chord_2024"
+API = "https://www.cbioportal.org/api"
+
+
+# ---------- Mode 1: public REST API ----------
+def fetch_patient_timeline(patient_id: str, study_id: str = STUDY_ID) -> pd.DataFrame:
+    """Return all timeline (clinical) events for one patient as a flat DataFrame."""
+    url = f"{API}/studies/{study_id}/patients/{patient_id}/clinical-events"
+    r = requests.get(url, params={"projection": "DETAILED"},
+                     headers={"Accept": "application/json"}, timeout=60)
+    r.raise_for_status()
+    rows = []
+    for ev in r.json():
+        flat = {
+            "patientId": ev.get("patientId"),
+            "studyId": ev.get("studyId"),
+            "eventType": ev.get("eventType"),
+            "startNumberOfDaysSinceDiagnosis": ev.get("startNumberOfDaysSinceDiagnosis"),
+            "endNumberOfDaysSinceDiagnosis": ev.get("endNumberOfDaysSinceDiagnosis"),
+        }
+        # attributes come as [{"key": ..., "value": ...}, ...]
+        for a in ev.get("attributes", []):
+            flat[a["key"]] = a["value"]
+        rows.append(flat)
+    return pd.DataFrame(rows)
+
+
+def fetch_many(patient_ids, study_id: str = STUDY_ID) -> pd.DataFrame:
+    frames = []
+    for pid in patient_ids:
+        try:
+            frames.append(fetch_patient_timeline(pid, study_id))
+        except requests.HTTPError as e:
+            print(f"warning: {pid}: {e}", file=sys.stderr)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+# ---------- Mode 2: local timeline files ----------
+def load_timeline_files(study_dir: str) -> pd.DataFrame:
+    """Load every data_timeline_*.txt in a study folder into one DataFrame.
+    Adds EVENT_TYPE_FILE (source file name, e.g. 'treatment', 'specimen')."""
+    paths = sorted(glob.glob(os.path.join(study_dir, "data_timeline*.txt")))
+    if not paths:
+        raise FileNotFoundError(f"No data_timeline*.txt files in {study_dir}")
+    frames = []
+    for p in paths:
+        df = pd.read_csv(p, sep="\t", dtype=str, comment="#", low_memory=False)
+        df["SOURCE_FILE"] = os.path.basename(p)
+        frames.append(df)
+    out = pd.concat(frames, ignore_index=True)
+    for c in ("START_DATE", "STOP_DATE"):  # days relative to diagnosis/sequencing
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+def query(df: pd.DataFrame, patient=None, event_type=None, subtype=None,
+          start_min=None, start_max=None) -> pd.DataFrame:
+    """Simple filters on a timeline DataFrame (file-mode column names)."""
+    m = pd.Series(True, index=df.index)
+    if patient:
+        m &= df["PATIENT_ID"].isin(patient)
+    if event_type and "EVENT_TYPE" in df:
+        m &= df["EVENT_TYPE"].str.upper().isin([e.upper() for e in event_type])
+    if subtype and "SUBTYPE" in df:
+        m &= df["SUBTYPE"].isin(subtype)
+    if start_min is not None:
+        m &= df["START_DATE"] >= start_min
+    if start_max is not None:
+        m &= df["START_DATE"] <= start_max
+    return df[m]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="mode", required=True)
+
+    a = sub.add_parser("api")
+    a.add_argument("--patients", nargs="+", required=True)
+    a.add_argument("--study", default=STUDY_ID)
+
+    f = sub.add_parser("file")
+    f.add_argument("--dir", required=True)
+    f.add_argument("--patients", nargs="*")
+    f.add_argument("--event-type", nargs="*")
+    f.add_argument("--subtype", nargs="*")
+
+    args = ap.parse_args()
+    if args.mode == "api":
+        df = fetch_many(args.patients, args.study)
+    else:
+        df = query(load_timeline_files(args.dir), patient=args.patients,
+                   event_type=args.event_type, subtype=args.subtype)
+
+    pd.set_option("display.width", 200, "display.max_columns", 30)
+    print(df.head(50))
+    print(f"\n{len(df)} events, {df.iloc[:, 0].nunique() if len(df) else 0} unique values in first column")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Notes**
+- **Event types:** MSK-CHORD timelines include treatment, diagnosis, specimen, progression, surgery, labs and similar events. In file mode, run `df["EVENT_TYPE"].value_counts()` and `df.groupby("SOURCE_FILE")` to see what's there before filtering.
+- **Time units:** `START_DATE` and `STOP_DATE` are days relative to a reference point, not calendar dates. Check the `meta_timeline*.txt` file to see which reference point this study uses.
+- **Where the files are:** the study's data files can be downloaded from the [MSK-CHORD study page](https://www.cbioportal.org/study/summary?id=msk_chord_2024) and from the cBioPortal DataHub. Unpack them into a fresh, empty directory and pass it as `--dir`.
+- **Scale:** the study has about 25,000 samples. Per-patient API calls don't scale to the full cohort, so use the file mode for cohort-wide queries.
+
+If you tell me which questions you want to ask of the timelines, I can tailor the filters. Examples are treatment sequences, or time from diagnosis to a given therapy.

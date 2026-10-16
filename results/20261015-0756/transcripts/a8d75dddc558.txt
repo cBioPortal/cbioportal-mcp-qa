@@ -1,0 +1,189 @@
+Q (haiku-5.5): In the TCGA PanCancer Atlas ovarian cancer study, what is the correlation between EGFR mRNA expression and EGFR protein (RPPA) levels?
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ list_studies
+{
+ "search": "ovarian TCGA pan can atlas"
+}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+{"result":[{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","type_of_cancer_id":"hgsoc","sample_count":585,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=ov_tcga_pan_can_atlas_2018"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT profile_type, count() AS n FROM genetic_alteration_derived WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018' AND hugo_gene_symbol = 'EGFR' AND profile_type IN ('rna_seq_v2_mrna','rna_seq_v2_mrna_median_Zscores','rna_seq_v2_mrna_median_all_sample_Zscores','rpphosphosite','protein_quantification','rppa','rppa_Zscores') GROUP BY profile_type ORDER BY profile_type"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type FROM genetic_alteration_derived WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018' ORDER BY profile_type"
+}
+
+◀ result
+{"rows":[{"profile_type":"protein_quantification","n":121},{"profile_type":"rna_seq_v2_mrna","n":300},{"profile_type":"rna_seq_v2_mrna_median_Zscores","n":300},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n":300},{"profile_type":"rppa","n":414},{"profile_type":"rppa_Zscores","n":414}]}
+
+◀ result
+{"rows":[{"profile_type":"gistic"},{"profile_type":"log2CNA"},{"profile_type":"protein_quantification"},{"profile_type":"protein_quantification_zscores"},{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rppa"},{"profile_type":"rppa_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH m AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND hugo_gene_symbol = 'EGFR'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+p AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rppa'
+      AND hugo_gene_symbol = 'EGFR'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+SELECT rankCorr(m.v, p.v) AS spearman_correlation, count() AS num_paired_samples
+FROM m INNER JOIN p USING (sample_unique_id)"
+}
+
+◀ result
+{"rows":[{"spearman_correlation":0.45149383521936215,"num_paired_samples":236}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH m AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND hugo_gene_symbol = 'EGFR'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+p AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rppa'
+      AND hugo_gene_symbol = 'EGFR'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+SELECT round(corr(m.v, p.v), 3) AS pearson_correlation, count() AS n
+FROM m INNER JOIN p USING (sample_unique_id)"
+}
+
+◀ result
+{"rows":[{"pearson_correlation":0.508,"n":236}]}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "ov_tcga_pan_can_atlas_2018"
+ ],
+ "genes": [
+  "EGFR"
+ ],
+ "tab": "plots",
+ "plotsHorzSelection": {
+  "dataType": "mRNA",
+  "selectedGeneOption": "EGFR"
+ },
+ "plotsVertSelection": {
+  "dataType": "Protein level (RPPA)",
+  "selectedGeneOption": "EGFR"
+ },
+ "profileFilter": "rna_seq_v2_mrna,rppa"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=ov_tcga_pan_can_atlas_2018_all&profileFilter=rna_seq_v2_mrna%2Crppa&plots_horz_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22mRNA%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22Protein+level+%28RPPA%29%22%7D","url":"https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=ov_tcga_pan_can_atlas_2018_all&profileFilter=rna_seq_v2_mrna%2Crppa&plots_horz_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22mRNA%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22Protein+level+%28RPPA%29%22%7D","data":{"studyIds":["ov_tcga_pan_can_atlas_2018"],"studies":[{"studyId":"ov_tcga_pan_can_atlas_2018","name":"Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas)","sampleCount":585}],"genes":["EGFR"],"caseSetId":"ov_tcga_pan_can_atlas_2018_all","pageDescription":"Scatter/box plots: EGFR protein level (rppa) (y-axis) by EGFR mrna (x-axis)."}}
+
+═ answer (success)
+The correlation between EGFR mRNA and EGFR protein (RPPA) in the TCGA PanCancer Atlas ovarian cancer study is positive and moderate.
+
+**Study:** Ovarian Serous Cystadenocarcinoma (TCGA, PanCancer Atlas), `ov_tcga_pan_can_atlas_2018`. Counts are samples, and 236 samples have both measurements.
+
+| Measure | Value | n (paired samples) |
+|---|---|---|
+| Spearman rank correlation (rho) | 0.45 | 236 |
+| Pearson correlation (r) | 0.51 | 236 |
+
+I used the raw RSEM mRNA profile (`rna_seq_v2_mrna`) and the raw RPPA protein profile (`rppa`), not the z-score versions. The Spearman value is the more appropriate summary for this kind of data. I did not run a significance test, so I can't give a p-value.
+
+Only 236 of the 585 samples have both an mRNA and an RPPA measurement for EGFR. The RPPA profile itself covers 414 samples.
+
+You can view the scatter plot of EGFR protein against EGFR mRNA here: [View EGFR mRNA vs. protein plot](https://www.cbioportal.org/results/plots?cancer_study_list=ov_tcga_pan_can_atlas_2018&gene_list=EGFR&case_set_id=ov_tcga_pan_can_atlas_2018_all&profileFilter=rna_seq_v2_mrna%2Crppa&plots_horz_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22mRNA%22%7D&plots_vert_selection=%7B%22selectedGeneOption%22%3A%221956%22%2C%22dataType%22%3A%22Protein+level+%28RPPA%29%22%7D)

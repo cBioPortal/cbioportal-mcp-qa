@@ -1,0 +1,288 @@
+Q (haiku-5.5): In the TCGA PanCancer Atlas ovarian cancer study, do samples with TP53 truncating mutations have significantly lower TP53 mRNA expression compared to wild-type samples?
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 1",
+ "max_rows": 1
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+{"rows":[{"1":1}]}
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, profile_type, count() AS n_rows, uniqExact(sample_unique_id) AS samples
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'TP53'
+GROUP BY cancer_study_identifier, profile_type
+ORDER BY profile_type"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"gistic","n_rows":572,"samples":572},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"log2CNA","n_rows":572,"samples":572},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"protein_quantification","n_rows":118,"samples":118},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"protein_quantification_zscores","n_rows":118,"samples":118},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna","n_rows":300,"samples":300},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna_median_Zscores","n_rows":300,"samples":300},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores","n_rows":300,"samples":300},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"rppa","n_rows":414,"samples":414},{"cancer_study_identifier":"ov_tcga_pan_can_atlas_2018","profile_type":"rppa_Zscores","n_rows":414,"samples":414}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT mutation_type, mutation_status, count() AS n, uniqExact(sample_unique_id) AS samples
+FROM genomic_event_derived
+WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+  AND hugo_gene_symbol = 'TP53' AND variant_type = 'mutation'
+GROUP BY mutation_type, mutation_status
+ORDER BY n DESC"
+}
+
+◀ result
+{"rows":[{"mutation_type":"Missense_Mutation","mutation_status":".","n":229,"samples":227},{"mutation_type":"Nonsense_Mutation","mutation_status":".","n":43,"samples":43},{"mutation_type":"Frame_Shift_Del","mutation_status":".","n":43,"samples":43},{"mutation_type":"Splice_Site","mutation_status":".","n":34,"samples":34},{"mutation_type":"Frame_Shift_Ins","mutation_status":".","n":19,"samples":18},{"mutation_type":"In_Frame_Del","mutation_status":".","n":11,"samples":11},{"mutation_type":"Splice_Region","mutation_status":".","n":2,"samples":2},{"mutation_type":"In_Frame_Ins","mutation_status":".","n":1,"samples":1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH rna AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND hugo_gene_symbol = 'TP53'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+tp53 AS (
+    SELECT sample_unique_id,
+           max(mutation_type IN ('Nonsense_Mutation','Frame_Shift_Del','Frame_Shift_Ins','Splice_Site')) AS has_trunc,
+           count() AS n_muts
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND variant_type = 'mutation' AND hugo_gene_symbol = 'TP53'
+      AND mutation_status != 'UNCALLED' AND off_panel = 0
+    GROUP BY sample_unique_id
+)
+SELECT
+  if(t.sample_unique_id = '', 'x', if(tp.has_trunc = 1, 'TP53 truncating',
+     if(tp.n_muts > 0, 'TP53 non-truncating only', 'TP53 wild-type'))) AS grp,
+  count() AS samples,
+  round(avg(rna.v), 2) AS mean_rsem,
+  round(quantile(0.5)(log2(rna.v + 1)), 3) AS median_log2_rsem,
+  round(avg(log2(rna.v + 1)), 3) AS mean_log2_rsem,
+  round(stddevPop(log2(rna.v + 1)), 3) AS sd_log2
+FROM rna
+LEFT JOIN tp53 AS tp ON rna.sample_unique_id = tp.sample_unique_id
+GROUP BY grp
+ORDER BY grp\""
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 62\n Code: 62. DB::Exception: Double quoted string is not closed: Syntax error: failed at position 1308 (\") LIMIT 101\n FORMAT Native) (line 31, col 13): \") LIMIT 101\n FORMAT Native. . (SYNTAX_ERROR) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH rna AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND hugo_gene_symbol = 'TP53'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+tp53 AS (
+    SELECT sample_unique_id,
+           max(mutation_type IN ('Nonsense_Mutation','Frame_Shift_Del','Frame_Shift_Ins','Splice_Site')) AS has_trunc,
+           count() AS n_muts
+    FROM genomic_event_derived
+    WHERE cancer_study_identifier = 'ov_tcga_pan_can_atlas_2018'
+      AND variant_type = 'mutation' AND hugo_gene_symbol = 'TP53'
+      AND mutation_status != 'UNCALLED' AND off_panel = 0
+    GROUP BY sample_unique_id
+)
+SELECT
+  if(tp.has_trunc = 1, 'TP53 truncating',
+     if(tp.n_muts > 0, 'TP53 non-truncating only', 'TP53 wild-type')) AS grp,
+  count() AS samples,
+  round(avg(rna.v), 2) AS mean_rsem,
+  round(quantile(0.5)(log2(rna.v + 1)), 3) AS median_log2_rsem,
+  round(avg(log2(rna.v + 1)), 3) AS mean_log2_rsem,
+  round(stddevPop(log2(rna.v + 1)), 3) AS sd_log2
+FROM rna
+LEFT JOIN tp53 AS tp ON rna.sample_unique_id = tp.sample_unique_id
+GROUP BY grp
+ORDER BY grp"
+}
+
+◀ result
+{"rows":[{"grp":"TP53 non-truncating only","samples":116,"mean_rsem":3785.83,"median_log2_rsem":11.706,"mean_log2_rsem":11.741,"sd_log2":0.65},{"grp":"TP53 truncating","samples":77,"mean_rsem":805.56,"median_log2_rsem":9.097,"mean_log2_rsem":9.298,"sd_log2":0.922},{"grp":"TP53 wild-type","samples":107,"mean_rsem":2453.36,"median_log2_rsem":11.367,"mean_log2_rsem":10.819,"sd_log2":1.305}]}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "ov_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "TP53 truncating",
+   "studyViewFilter": {
+    "mutationDataFilters": [
+     {
+      "categorization": "MUTATION_TYPE",
+      "hugoGeneSymbol": "TP53",
+      "profileType": "mutations",
+      "values": [
+       [
+        {
+         "value": "Nonsense_Mutation"
+        },
+        {
+         "value": "Frame_Shift_Del"
+        },
+        {
+         "value": "Frame_Shift_Ins"
+        },
+        {
+         "value": "Splice_Site"
+        }
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "TP53 not truncating (rest)",
+   "isUnselected": true
+  }
+ ],
+ "tab": "mrna"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/mrna?comparisonId=6ad08bddc2115c492d888438","url":"https://www.cbioportal.org/comparison/mrna?comparisonId=6ad08bddc2115c492d888438","data":{"description":"Group comparison (2 custom groups)","studies":["ov_tcga_pan_can_atlas_2018"],"totalGroups":2,"groups":[{"name":"TP53 truncating","sampleCount":138},{"name":"TP53 not truncating (rest)","sampleCount":447}],"studyViewUrl":"https://www.cbioportal.org/study?id=ov_tcga_pan_can_atlas_2018","groupUrls":[{"groupName":"TP53 truncating","url":"https://www.cbioportal.org/study?id=ov_tcga_pan_can_atlas_2018#filterJson=%7B%22mutationDataFilters%22%3A%5B%7B%22categorization%22%3A%22MUTATION_TYPE%22%2C%22hugoGeneSymbol%22%3A%22TP53%22%2C%22profileType%22%3A%22mutations%22%2C%22values%22%3A%5B%5B%7B%22value%22%3A%22Nonsense_Mutation%22%7D%2C%7B%22value%22%3A%22Frame_Shift_Del%22%7D%2C%7B%22value%22%3A%22Frame_Shift_Ins%22%7D%2C%7B%22value%22%3A%22Splice_Site%22%7D%5D%5D%7D%5D%7D"}],"pageDescription":"mRNA expression for all genes compared across TP53 truncating (138) vs TP53 not truncating (rest) (447)."}}
+
+═ answer (success)
+**Short answer:** The data show a large difference in the expected direction, but I can't give you a significance test. In the TCGA PanCancer Atlas ovarian study (`ov_tcga_pan_can_atlas_2018`), TP53 mRNA is much lower in tumors with truncating TP53 mutations than in wild-type tumors. Whether that difference is statistically significant needs to be tested outside this database.
+
+**TP53 mRNA by TP53 mutation status (RNA-seq RSEM, `rna_seq_v2_mrna`, samples with expression data)**
+
+| TP53 group | Samples | Median log2(RSEM+1) | Mean log2(RSEM+1) | SD of log2 |
+|---|---|---|---|---|
+| Truncating (nonsense, frameshift del/ins, splice site) | 77 | 9.10 | 9.30 | 0.92 |
+| Non-truncating only (missense, in-frame) | 116 | 11.71 | 11.74 | 0.65 |
+| Wild-type (no TP53 mutation) | 107 | 11.37 | 10.82 | 1.31 |
+
+- The truncating group's median is about 2.3 log2 units below the wild-type median, roughly a 5-fold difference on the RSEM scale.
+- The wild-type group has a long low tail (mean below median), so a rank-based test may be more appropriate than a t-test here.
+- Mutation calls were restricted to on-panel, non-UNCALLED calls. Non-truncating-only samples are shown for reference and were not part of the comparison.
+
+**Testing it:** The portal's Group Comparison tab can run the mRNA test directly. The link below compares truncating against all other samples (n=138 vs 447). That is not the same as wild-type; it also includes the missense and in-frame group. Its mRNA tab uses the samples with expression data.
+
+[View TP53 truncating vs. rest mRNA comparison](https://www.cbioportal.org/comparison/mrna?comparisonId=6ad08bddc2115c492d888438)
+
+To get a p-value for truncating vs wild-type specifically, run a Wilcoxon rank-sum test on log2(RSEM+1) in R (`wilcox.test`) or Python (`scipy.stats.mannwhitneyu`) using the group sizes above. Use the Welch t-test if you prefer the portal's default.

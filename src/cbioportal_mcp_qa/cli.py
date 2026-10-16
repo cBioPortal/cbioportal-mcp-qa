@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import click
+import httpx
 from click.core import ParameterSource
 
 from .agent import AgentClient
@@ -25,6 +26,9 @@ from .dataset import (
 )
 from .grade import BaseJudge, Judge, JudgeStopped
 from .limits import LimitWaiter
+from .mcp_oauth import OAuthTokens
+from .mcp_oauth import login as oauth_login
+from .openai_chat import MAX_TOOL_ROUNDS, OpenAIChatClient
 from .persist import write_text
 from .redact import describe_error, redact
 from .report import write_index, write_report
@@ -47,6 +51,12 @@ def _models(value: str | None, target: str, runner: str = "agents-api") -> list[
     """The models to ask, checked against what the target offers (default: all of them).
 
     The claude-code runner doesn't go through the target's LibreChat specs, so any model with a Claude Code id works."""
+    if runner == "openai":
+        offered = [k for k, m in MODELS.items() if m.openai_id]
+        models = [m.strip() for m in value.split(",") if m.strip()] if value else offered[:1]
+        if unknown := [m for m in models if m not in offered]:
+            raise click.BadParameter(f"the openai runner has no model(s) {unknown}; choose from {offered}")
+        return models
     offered = list(TARGETS[target].specs)
     if runner == "claude-code":
         offered += [k for k, m in MODELS.items() if m.claude_code_id and k not in offered]
@@ -66,15 +76,45 @@ def _langfuse(settings) -> Langfuse:
     return langfuse
 
 
-RUNNERS = ["agents-api", "claude-code"]
+RUNNERS = ["agents-api", "claude-code", "openai"]
 runner_option = click.option(
     "--runner",
     type=click.Choice(RUNNERS),
     default="agents-api",
     show_default=True,
     help="agents-api: the deployed agent through LibreChat. claude-code: headless Claude Code with the "
-    "deployed agent's prompt and the same MCP servers (runs on the Claude subscription).",
+    "deployed agent's prompt and the same MCP servers (runs on the Claude subscription). openai: a model on an "
+    "OpenAI-compatible endpoint (OPENAI_BASE_URL: Ollama, vLLM) with the same prompt and MCP servers, the tool "
+    "loop run here.",
 )
+
+# Runners that answer with the agent's prompt and the MCP servers themselves (not the deployed agent).
+LOCAL_RUNNERS = {"claude-code", "openai"}
+
+
+def openai_options(f):
+    """The system prompt from a file, and options of the openai runner."""
+    f = click.option(
+        "--max-tool-rounds",
+        type=int,
+        default=MAX_TOOL_ROUNDS,
+        show_default=True,
+        help="openai runner: tool rounds before the model must answer without tools.",
+    )(f)
+    f = click.option(
+        "--reasoning-effort",
+        default=None,
+        help="openai runner: the request's reasoning_effort (e.g. none to turn a thinking model's reasoning off, "
+        "as the deployed agent runs). Default: not sent, the server's default.",
+    )(f)
+    f = click.option(
+        "--system-prompt-file",
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        default=None,
+        help="claude-code and openai runners: use this file as the agent's instructions instead of reading the "
+        "target agent's from its MongoDB via kubectl (e.g. a run's recorded results/<run>/agent-prompt.md).",
+    )(f)
+    return f
 
 
 def claude_code_options(f):
@@ -224,7 +264,7 @@ def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) 
     """Which database MCP (beta, prod, local, unknown, conflict) the claude-code runner reaches. Warns when a
     beta target would be answered from another one or it can't be told, and on any target when
     DATABASE_MCP_ENV contradicts the URL; with `require_beta`, a beta target fails instead."""
-    if runner != "claude-code":
+    if runner not in LOCAL_RUNNERS:
         return None
     env = database_mcp_env(settings)
     beta = target.startswith("beta")
@@ -254,6 +294,36 @@ def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) 
     return env
 
 
+def _check_runner_options(settings, runner: str, models: list[str], system_prompt_file) -> None:
+    """Options that only some runners use, refused where they would be recorded but not used."""
+    if system_prompt_file and runner not in LOCAL_RUNNERS:
+        raise click.UsageError(
+            f"--system-prompt-file needs --runner claude-code or openai: the {runner} runner asks the deployed "
+            "agent, which uses its own instructions"
+        )
+    if runner == "openai" and settings.openai_served_model and len(models) > 1:
+        raise click.UsageError(
+            f"OPENAI_SERVED_MODEL={settings.openai_served_model} would answer for every model in {models}: "
+            "run one model per run, or unset it to use each model's own name on the server"
+        )
+
+
+# What a resumed openai run must match to stay one configuration.
+OPENAI_SETUP_KEYS = ("base_url", "served_model", "backend", "reasoning_effort", "max_tool_rounds", "tools")
+
+
+def _record_openai_setup(bench, described: dict) -> None:
+    """The endpoint the run was started with stays its `openai` record; a resume against a different one is
+    warned about and kept in `openai_resumes`."""
+    first = bench.data.get("openai")
+    if not first:
+        bench.data["openai"] = described
+        return
+    if diff := [k for k in OPENAI_SETUP_KEYS if first.get(k) != described.get(k)]:
+        click.echo(f"Warning: this resume's endpoint differs from the run's ({', '.join(diff)})", err=True)
+    bench.data.setdefault("openai_resumes", []).append(described)
+
+
 def _client(
     settings,
     target: str,
@@ -264,7 +334,27 @@ def _client(
     user_settings: bool = False,
     trust_org_policy: bool = False,
     allow_plugins: bool = False,
+    reasoning_effort: str | None = None,
+    max_tool_rounds: int = MAX_TOOL_ROUNDS,
 ):
+    if runner == "openai":
+        try:
+            # The public database MCP needs the OAuth login (mcp-login); a DATABASE_MCP_URL (port-forward) doesn't.
+            token = None if settings.database_mcp_url else OAuthTokens(settings.database_connector_url)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        return OpenAIChatClient(
+            prompt or _agent_prompt(settings, target)["instructions"],
+            settings.openai_base_url,
+            settings.database_mcp_url or settings.database_connector_url,
+            settings.navigator_mcp_url,
+            database_token=token,
+            api_key=settings.openai_api_key,
+            served_model=settings.openai_served_model,
+            reasoning_effort=reasoning_effort,
+            max_tool_rounds=max_tool_rounds,
+            transcript_dir=transcript_dir,
+        )
     if runner == "claude-code":
         try:
             return ClaudeCodeClient(
@@ -398,17 +488,46 @@ def cli() -> None:
     """Benchmark cBioPortalChat by asking the deployed agent the questions in input/questions.yaml."""
 
 
+@cli.command("mcp-login")
+@click.option(
+    "--url",
+    default=None,
+    help="MCP endpoint to log in to. Default: DATABASE_CONNECTOR_URL (the public database MCP).",
+)
+def mcp_login(url: str | None) -> None:
+    """Log in to the database MCP for the openai runner (OAuth in a browser, once; the token is then refreshed)."""
+    settings = load_settings()
+    url = url or settings.database_connector_url
+    try:
+        path = oauth_login(url, ask=lambda prompt: click.prompt(prompt, prompt_suffix=""), say=click.echo)
+    except (RuntimeError, httpx.HTTPError) as exc:
+        raise click.ClickException(redact(str(exc))) from exc
+    click.echo(f"Logged in to {url}; tokens in {path} (keep it private, it is gitignored)")
+
+
 @cli.command()
 @click.argument("question")
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
-@click.option("--model", type=click.Choice(MODEL_CHOICES), default=None, help="Default: the target's first.")
+@click.option(
+    "--model",
+    type=click.Choice(
+        MODEL_CHOICES
+        + [k for k, m in MODELS.items() if k not in MODEL_CHOICES and (m.openai_id or m.claude_code_id)]
+    ),
+    default=None,
+    help="Default: the target's first.",
+)
 @runner_option
 @claude_code_options
+@openai_options
 def ask(
     question: str,
     target: str,
     model: str | None,
     runner: str,
+    system_prompt_file: Path | None,
+    reasoning_effort: str | None,
+    max_tool_rounds: int,
     claude_code_allow_api_billing: bool,
     claude_code_allow_plugins: bool,
     claude_code_trust_org_policy: bool,
@@ -418,6 +537,7 @@ def ask(
     """Ask the deployed agent a single question."""
     settings = load_settings()
     model = _models(model, target, runner)[0]
+    _check_runner_options(settings, runner, [model], system_prompt_file)
     _check_database_mcp(settings, target, runner, require_beta_mcp)
 
     async def go():
@@ -425,12 +545,17 @@ def ask(
             settings,
             target,
             runner,
+            system_prompt_file.read_text() if system_prompt_file else None,
             allow_api_billing=claude_code_allow_api_billing,
             user_settings=claude_code_user_settings,
             trust_org_policy=claude_code_trust_org_policy,
             allow_plugins=claude_code_allow_plugins,
+            reasoning_effort=reasoning_effort,
+            max_tool_rounds=max_tool_rounds,
         )
         try:
+            if runner == "openai":
+                await client.start()
             return await client.ask(question, model)
         finally:
             await client.aclose()
@@ -488,6 +613,7 @@ def ask(
 @screenshots_option
 @runner_option
 @claude_code_options
+@openai_options
 @wait_options
 def run(
     target,
@@ -510,6 +636,9 @@ def run(
     claude_code_trust_org_policy,
     claude_code_user_settings,
     require_beta_mcp,
+    system_prompt_file,
+    reasoning_effort,
+    max_tool_rounds,
     wait_on_limit,
     max_wait,
 ) -> None:
@@ -536,9 +665,14 @@ def run(
             render,
             screenshots,
             require_beta_mcp,
+            system_prompt_file,
+            reasoning_effort,
+            max_tool_rounds,
             wait_on_limit,
             max_wait,
         ) = (opts[name] for name in RESTORED_ON_RESUME)
+        if system_prompt_file:
+            system_prompt_file = Path(system_prompt_file)
     available = load_questions(questions_file)
     questions = parse_selection(selection, available)
     if resume:
@@ -559,17 +693,20 @@ def run(
         runner = bench.data.get("runner", "agents-api")
     else:
         models = _models(models_arg, target, runner)
+    _check_runner_options(settings, runner, bench.data["models"] if resume else models, system_prompt_file)
     agent = None
-    if runner == "claude-code" or not resume:
+    if system_prompt_file:
+        agent = {"instructions": system_prompt_file.read_text(), "source": str(system_prompt_file)}
+    elif runner in LOCAL_RUNNERS or not resume:
         try:
             agent = fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
         except Exception as exc:  # noqa: BLE001 - only the claude-code runner needs the prompt itself
-            if runner == "claude-code":
+            if runner in LOCAL_RUNNERS:
                 raise click.ClickException(
                     f"could not read the {target} agent's prompt via kubectl: {describe_error(exc, 2000)}"
                 ) from exc
             agent_error = describe_error(exc)
-    prompt = agent["instructions"] if agent and runner == "claude-code" else None
+    prompt = agent["instructions"] if agent and runner in LOCAL_RUNNERS else None
     mcp_env = _check_database_mcp(settings, target, runner, require_beta_mcp)
     # Before the run exists: the claude-code judge, like the runner, refuses to start on per-token billing.
     judge = None
@@ -592,6 +729,8 @@ def run(
         user_settings=claude_code_user_settings,
         trust_org_policy=claude_code_trust_org_policy,
         allow_plugins=claude_code_allow_plugins,
+        reasoning_effort=reasoning_effort,
+        max_tool_rounds=max_tool_rounds,
     )
     if resume:
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
@@ -603,6 +742,8 @@ def run(
             prompt_info |= prompt_fingerprint(agent["instructions"]) | {
                 "agent_updated_at": agent.get("updated_at")
             }
+            if agent.get("source"):
+                prompt_info["source"] = agent["source"]
         else:
             prompt_info["error"] = agent_error
         root = TARGETS[target].agent_id
@@ -610,7 +751,9 @@ def run(
             "agent_prompt": prompt_info,
             "target_config": {"url": TARGETS[target].url, "agent_id": root, "specs": TARGETS[target].specs},
             # The target agent and every agent it hands off to (the router's specialists).
-            "agents": describe_agents(
+            "agents": {}
+            if system_prompt_file
+            else describe_agents(
                 root,
                 settings.kube_context,
                 lambda agent_id, ctx: (
@@ -619,6 +762,10 @@ def run(
             ),
             "versions": collect_versions(settings, runner, target),
         }
+        if runner == "openai":
+            extra["database_mcp"] = settings.database_mcp_url or settings.database_connector_url
+            extra["database_mcp_env"] = mcp_env
+            extra["navigator_mcp"] = settings.navigator_mcp_url
         if runner == "claude-code":
             extra["database_mcp"] = client.setup.connector or settings.database_mcp_url
             extra["database_mcp_env"] = mcp_env
@@ -635,7 +782,8 @@ def run(
     # `--resume` keeps.
     bench.plan(questions)
     bench.data["options"] = {
-        name: str(opts[name]) if name == "questions_file" else opts[name] for name in RESTORED_ON_RESUME
+        name: str(opts[name]) if name in PATH_OPTIONS and opts[name] is not None else opts[name]
+        for name in RESTORED_ON_RESUME
     }
     bench.save()
     click.echo(
@@ -643,13 +791,17 @@ def run(
         f"{bench.data['repeats']} against {TARGETS[target].agent_id} ({target})"
     )
 
-    if runner == "claude-code":
+    if runner in LOCAL_RUNNERS:
         client.transcript_dir = bench.dir / "transcripts"
 
     waiter = _waiter(wait_on_limit, max_wait)
 
     async def go():
         try:
+            if runner == "openai":
+                await client.start()
+                _record_openai_setup(bench, client.describe())
+                bench.save()
             while True:
                 await collect_answers(bench, questions, client, concurrency)
                 # Only a usage limit resets by itself; the other stops need you.
@@ -720,9 +872,13 @@ RESTORED_ON_RESUME = (
     "render",
     "screenshots",
     "require_beta_mcp",
+    "system_prompt_file",
+    "reasoning_effort",
+    "max_tool_rounds",
     "wait_on_limit",
     "max_wait",
 )
+PATH_OPTIONS = {"questions_file", "system_prompt_file"}
 # Fixed by the run itself on --resume.
 NOT_IN_RESUME = {"target", "models_arg", "repeats", "runner", "resume"}
 

@@ -1,0 +1,194 @@
+Q (haiku-5.5): What percentage of patients in the MSK-CHORD Study have at least one TP53 mutation?
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, sample_count, mutation_sample_count FROM cancer_study WHERE cancer_study_identifier LIKE '%chord%'"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sample_count":25040,"mutation_sample_count":25040}]}
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation_panel_gene_coverage"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation_wes_coverage"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"gene_panel_id","type":"LowCardinality(String)"}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sample_patient AS (
+    SELECT DISTINCT sample_unique_id, patient_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+),
+profiled_samples AS (
+    SELECT sample_unique_id FROM mutation_panel_gene_coverage
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'TP53'
+    UNION ALL
+    SELECT sample_unique_id FROM mutation_wes_coverage
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+),
+profiled_patients AS (
+    SELECT DISTINCT sp.patient_unique_id
+    FROM profiled_samples ps
+    JOIN sample_patient sp USING (sample_unique_id)
+),
+tp53_patients AS (
+    SELECT DISTINCT ged.patient_unique_id
+    FROM genomic_event_derived ged
+    WHERE ged.cancer_study_identifier = 'msk_chord_2024'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.off_panel = 0
+      AND ged.hugo_gene_symbol = 'TP53'
+      AND ged.patient_unique_id IN (SELECT patient_unique_id FROM profiled_patients)
+)
+SELECT
+    (SELECT count() FROM profiled_patients) AS profiled_patients,
+    (SELECT count() FROM tp53_patients) AS tp53_mutated_patients,
+    round((SELECT count() FROM tp53_patients) * 100.0 / (SELECT count() FROM profiled_patients), 1) AS pct\""
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 62\n Code: 62. DB::Exception: Double quoted string is not closed: Syntax error: failed at position 1261 (\") LIMIT 101\n FORMAT Native) (line 31, col 107): \") LIMIT 101\n FORMAT Native. . (SYNTAX_ERROR) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH sample_patient AS (
+    SELECT DISTINCT sample_unique_id, patient_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+),
+profiled_samples AS (
+    SELECT sample_unique_id FROM mutation_panel_gene_coverage
+    WHERE cancer_study_identifier = 'msk_chord_2024' AND hugo_gene_symbol = 'TP53'
+    UNION ALL
+    SELECT sample_unique_id FROM mutation_wes_coverage
+    WHERE cancer_study_identifier = 'msk_chord_2024'
+),
+profiled_patients AS (
+    SELECT DISTINCT sp.patient_unique_id
+    FROM profiled_samples ps
+    JOIN sample_patient sp USING (sample_unique_id)
+),
+tp53_patients AS (
+    SELECT DISTINCT ged.patient_unique_id
+    FROM genomic_event_derived ged
+    WHERE ged.cancer_study_identifier = 'msk_chord_2024'
+      AND ged.variant_type = 'mutation'
+      AND ged.mutation_status != 'UNCALLED'
+      AND ged.off_panel = 0
+      AND ged.hugo_gene_symbol = 'TP53'
+      AND ged.patient_unique_id IN (SELECT patient_unique_id FROM profiled_patients)
+)
+SELECT
+    (SELECT count() FROM profiled_patients) AS profiled_patients,
+    (SELECT count() FROM tp53_patients) AS tp53_mutated_patients,
+    round((SELECT count() FROM tp53_patients) * 100.0 / (SELECT count() FROM profiled_patients), 1) AS pct"
+}
+
+◀ result
+{"rows":[{"profiled_patients":24950,"tp53_mutated_patients":13105,"pct":52.5}]}
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "genes": [
+  "TP53"
+ ],
+ "tab": "oncoprint"
+}
+
+✗ error
+The operation timed out.
+
+▶ navigate_to_results_view
+{
+ "studyIds": [
+  "msk_chord_2024"
+ ],
+ "genes": [
+  "TP53"
+ ],
+ "tab": "oncoprint"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/results/oncoprint?cancer_study_list=msk_chord_2024&gene_list=TP53&case_set_id=msk_chord_2024_all","url":"https://www.cbioportal.org/results/oncoprint?cancer_study_list=msk_chord_2024&gene_list=TP53&case_set_id=msk_chord_2024_all","data":{"studyIds":["msk_chord_2024"],"studies":[{"studyId":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","sampleCount":25040}],"genes":["TP53"],"caseSetId":"msk_chord_2024_all","pageDescription":"Visual summary of alterations in queried genes across samples."}}
+
+═ answer (success)
+About 52.5% of MSK-CHORD patients have at least one TP53 mutation: 13,105 of 24,950 profiled patients.
+
+- **Counting unit:** patients, since the question asks about the share of patients.
+- **Numerator:** patients with at least one TP53 mutation call (uncalled variants and off-panel mutations excluded).
+- **Denominator:** patients with at least one sample profiled for TP53, either on a targeted panel that covers TP53 or by whole-exome sequencing.
+
+Explore the TP53 alterations in the cohort on the [MSK-CHORD OncoPrint for TP53](https://www.cbioportal.org/results/oncoprint?cancer_study_list=msk_chord_2024&gene_list=TP53&case_set_id=msk_chord_2024_all).

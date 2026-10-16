@@ -141,6 +141,8 @@ def collect(settings, runner: str, target: str) -> dict:
         versions["cbioportal_mcp"] = _probe(lambda: mcp_server(settings.database_mcp_url))
     if runner == "claude-code":
         versions["claude_code"] = _probe(claude_code)
+    elif runner == "openai":
+        pass  # the endpoint and MCP servers are recorded by the runner (run.json `openai`)
     else:
         versions["librechat"] = _probe(lambda: librechat_image(target, settings.kube_context))
     return versions

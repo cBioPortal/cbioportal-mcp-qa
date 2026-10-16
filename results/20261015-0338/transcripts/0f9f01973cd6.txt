@@ -1,0 +1,261 @@
+Q (qwen3.8-27b): Which genomic alterations are associated with immunotherapy response in melanoma patients from the MSK-CHORD Study?
+
+▶ list_studies
+{
+ "search": "[\"MSK\", \"CHORD\"]"
+}
+
+◀ result
+[{"cancer_study_identifier":"msk_chord_2024","name":"MSK-CHORD (MSK, Nature 2024)","type_of_cancer_id":"mixed","sample_count":25040,"has_guide":true,"url":"https://www.cbioportal.org/study/summary?id=msk_chord_2024"}]
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+▶ read_guide
+{
+ "uri": "cbioportal://treatment-guide"
+}
+
+◀ result
+# Treatment Data Query Guide
+
+## Overview
+
+Treatment data in cBioPortal is stored in **clinical event tables**, separate from clinical attributes. This allows for timeline-based treatment records with start/stop dates.
+
+## Start Here: Treatment Views
+
+For "most common treatments / agents / regimens in study X", use the parameterized views (documented in `cbioportal://clinical-data-guide`, Study-View Chart Counts):
+
+```sql
+-- Patients per agent (the portal's Treatment chart), with type/subtype arrays
+SELECT * FROM treatment_counts_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 20;
+
+-- Same-day agent combinations (investigational, prior-medication and radiation events excluded)
+SELECT * FROM treatment_regimens_in_study(study='msk_chord_2024') ORDER BY patients DESC LIMIT 20;
+```
+
+Write raw event queries (below) only for subgroups, timelines or keys the views do not expose.
+
+## Key Tables
+
+| Table | Description |
+|-------|-------------|
+| `clinical_event` | Event records with patient_id, event_type, start_date, stop_date |
+| `clinical_event_data` | Key-value pairs linked to each clinical_event_id |
+
+## Schema
+
+```
+clinical_event
+├── clinical_event_id (PK)
+├── patient_id (FK → patient.internal_id)
+├── event_type (Treatment, TREATMENT, Diagnosis, SURGERY, etc.)
+├── start_date (days from diagnosis)
+└── stop_date (days from diagnosis)
+
+clinical_event_data
+├── clinical_event_id (FK)
+├── key (AGENT, SUBTYPE, etc.)
+└── value
+```
+
+## Event Types
+
+Not all studies have all event types. Common ones include:
+
+| Event Type | Description |
+|------------|-------------|
+| `Treatment` / `TREATMENT` | Drug/therapy administration |
+| `SURGERY` | Surgical procedures |
+| `Diagnosis` | Diagnosis events |
+| `LAB_TEST` | Laboratory results |
+| `Sequencing` | Sequencing events |
+| `Sample acquisition` | Sample collection |
+| `PATHOLOGY` / `Pathology` | Pathology reports |
+
+## Basic *** Queries
+
+### List Available Event Types in a Study
+
+```sql
+SELECT DISTINCT ce.event_type, COUNT(*) as event_count
+FROM clinical_event ce
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier = 'your_study_id'
+GROUP BY ce.event_type
+ORDER BY event_count DESC;
+```
+
+### List Treatment Data Keys in a Study
+
+```sql
+SELECT DISTINCT ced.key, COUNT(*) as cnt
+FROM clinical_event ce
+JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_study cs ON p.cancer_study_id = cs.cancer_study_id
+WHERE cs.cancer_study_identifier = 'your_study_id'
+  AND ce.event_type IN ('Treatment', 'TREATMENT')
+GROUP BY ced.key
+ORDER BY cnt DESC;
+```
+
+### Get Most Common Treatment Agents
+
+```sql
+SELECT 
+    ced.value as agent,
+    COUNT(DISTINCT ce.patient_id) as patient_count
+FROM clinical_event ce
+JOIN clinical_event_data ced ON ce.clinical_event_id = ced.clinical_event_id
+JOIN patient p ON ce.patient_id = p.internal_id
+JOIN cancer_stud … (6220 more chars)
+
+▶ get_study_guide
+{
+ "study_id": "msk_chord_2024"
+}
+
+◀ result
+# MSK-CHORD (MSK, Nature 2024)
+
+**Study ID:** `msk_chord_2024`
+
+## Overview
+Targeted sequencing via MSK-IMPACT panels. Clinical annotations include some derived from natural language processing (denoted NLP).
+
+**Exactly five cancer types** (`CANCER_TYPE`, patients): Non-Small Cell Lung Cancer 7,809, Colorectal Cancer 5,543, Breast Cancer 5,368, Prostate Cancer 3,211, Pancreatic Cancer 3,109. There is **no melanoma** or any other cancer type; say so up front if asked, instead of substituting another type.
+
+**No therapy-response variable.** There is no RECIST, objective response, or best-response attribute or event. For treatment-outcome questions (e.g. immunotherapy response), say this first; the only proxies are `OS_MONTHS`/`OS_STATUS`, or NLP radiology progression events (`Diagnosis` events with `SUBTYPE = 'Progression'`, key `PROGRESSION` = Y/N/Indeterminate), in patients with `Treatment` events of the relevant `SUBTYPE` (e.g. `Immuno`: 3,341 patients). Hand off the comparison to cBioPortal group comparison / survival.
+
+**Nearly one sample per patient: 24,950 patients / 25,040 samples.** Only 90 patients have more than one sample, and all 90 have samples from two different cancer types (second primaries); only 26 have both a `Primary` and a `Metastasis` sample. There is no meaningful same-patient (paired) primary-vs-metastasis cohort. For "same patient" / paired questions, say this up front, then offer the **unpaired** comparison of all `Primary` vs `Metastasis` samples (`SAMPLE_TYPE`), labelled as unpaired.
+```sql
+SELECT countIf(n > 1) AS multi_sample_patients,         -- 90
+       countIf(has_p AND has_m) AS primary_and_met      -- 26
+FROM (SELECT patient_unique_id, count() AS n,
+             has(groupArray(attribute_value), 'Primary') AS has_p,
+             has(groupArray(attribute_value), 'Metastasis') AS has_m
+      FROM clinical_data_derived
+      WHERE cancer_study_identifier = 'msk_chord_2024' AND attribute_name = 'SAMPLE_TYPE'
+      GROUP BY patient_unique_id);
+```
+
+## Gene Panels
+This study uses multiple MSK-IMPACT panel versions:
+- **IMPACT341**: Earlier version, 341 genes
+- **IMPACT410**: 410 genes
+- **IMPACT468**: 468 genes  
+- **IMPACT505**: Latest version, 505 genes
+
+**Important:** Different samples may have different gene coverage. Always use gene-specific denominators when calculating mutation frequencies.
+
+## Clinical Attributes - Semantic Guide
+
+### Cancer Classification
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `CANCER_TYPE` | Broad cancer category | e.g., "Non-Small Cell Lung Cancer", "Breast Cancer" |
+| `CANCER_TYPE_DETAILED` | Specific subtype | e.g., "Lung Adenocarcinoma", "Invasive Ductal Carcinoma" |
+| `ONCOTREE_CODE` | OncoTree classification code | Standardized cancer type codes |
+
+### Sample Information
+| Attribute | Description | Values |
+|-----------|-------------|--------|
+| `SAMPLE_TYPE` | Sample origin | Primary, Metastasis, Local Recurrence, Unknown |
+| `SAMPLE_CLASS` | Sample … (5439 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT\n  attribute_value AS can_type_detailed,\n  count(DISTINCT patient_unique_id) AS patients\nFROM clinical_data_derived\nWHERE cancer_study_identifier = 'msk_chord_2024'\n  AND attribute_name = 'CANCER_TYPE_DETAILED'\n  AND (attribute_value LIKE '%melanoma%' OR attribute_value LIKE '%Melanoma%' OR attribute_value LIKE '%MELANOMA%')\nGROUP BY attribute_value\nORDER BY patients DESC;"
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT count(DISTINCT patient_unique_id) AS patients\nFROM cancer_study\nWHERE cancer_study_identifier = 'msk_chord_2024';\n\nSELECT\n  attribute_value AS cancer_type,\n  count(DISTINCT patient_unique_id) AS patients\nFROM clinical_data_derived\nWHERE cancer_study_identifier = 'msk_chord_2024'\n  AND attribute_name = 'CANCER_TYPE'\nGROUP BY attribute_value\nORDER BY patients DESC;"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 62\n Code: 62. DB::Exception: Syntax error: failed at position 135 (end of query) (line 3, col 49): ;. Expected one of: OR, AND, IS NOT DISTINCT FROM, IS DISTINCT FROM, IS NOT UNKNOWN, IS UNKNOWN, IS NOT FALSE, IS FALSE, IS NOT TRUE, IS TRUE, IS NULL, IS NOT NULL, BETWEEN, NOT BETWEEN, LIKE, ILIKE, NOT LIKE, NOT ILIKE, REGEXP, IN, NOT IN, GLOBAL IN, GLOBAL NOT IN, MOD, DIV, alias, AS, GROUP BY, WITH, HAVING, WINDOW, QUALIFY, ORDER BY, LIMIT, OFFSET, FETCH, SETTINGS, UNION, EXCEPT, INTERSECT. (SYNTAX_ERROR) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT\n  attribute_value AS cancer_type,\n  count(DISTINCT patient_unique_id) AS patients\nFROM clinical_data_derived\nWHERE cancer_study_identifier = 'msk_chord_2024'\n  AND attribute_name = 'CANCER_TYPE'\nGROUP BY attribute_value\nORDER BY patients DESC;"
+}
+
+◀ result
+{"rows":[{"cancer_type":"Non-Small Cell Lung Cancer","patients":7809},{"cancer_type":"Colorectal Cancer","patients":5543},{"cancer_type":"Breast Cancer","patients":5368},{"cancer_type":"Prostate Cancer","patients":3211},{"cancer_type":"Pancreatic Cancer","patients":3109}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT\n  attribute_value AS oncotree_code,\n  count(DISTINCT patient_unique_id) AS patients\nFROM clinical_data_derived\nWHERE cancer_study_identifier = 'msk_chord_2024'\n  AND attribute_name = 'ONCOTREE_CODE'\nGROUP BY attribute_value\nORDER BY patients DESC;"
+}
+
+◀ result
+{"rows":[{"oncotree_code":"LUAD","patients":5957},{"oncotree_code":"COAD","patients":3352},{"oncotree_code":"IDC","patients":3350},{"oncotree_code":"PRAD","patients":3177},{"oncotree_code":"PAAD","patients":2703},{"oncotree_code":"READ","patients":1321},{"oncotree_code":"BRCA","patients":967},{"oncotree_code":"LUSC","patients":822},{"oncotree_code":"COADREAD","patients":716},{"oncotree_code":"ILC","patients":538},{"oncotree_code":"NSCLC","patients":499},{"oncotree_code":"PANET","patients":259},{"oncotree_code":"BRCNOS","patients":215},{"oncotree_code":"LUNE","patients":134},{"oncotree_code":"BRCANOS","patients":130},{"oncotree_code":"MACR","patients":113},{"oncotree_code":"LUCA","patients":91},{"oncotree_code":"MDLC","patients":86},{"oncotree_code":"NSCLCPD","patients":77},{"oncotree_code":"LUAS","patients":56},{"oncotree_code":"PAASC","patients":50},{"oncotree_code":"LUPC","patients":45},{"oncotree_code":"ALUCA","patients":43},{"oncotree_code":"PAAC","patients":43},{"oncotree_code":"LNET","patients":32},{"oncotree_code":"MBC","patients":31},{"oncotree_code":"UCP","patients":25},{"oncotree_code":"CMC","patients":21},{"oncotree_code":"PRNE","patients":19},{"oncotree_code":"SARCL","patients":19},{"oncotree_code":"SRCCR","patients":19},{"oncotree_code":"PRSCC","patients":15},{"oncotree_code":"IMMC","patients":14},{"oncotree_code":"IPMN","patients":10},{"oncotree_code":"ACBC","patients":10},{"oncotree_code":"LUACC","patients":7},{"oncotree_code":"PANEC","patients":7},{"oncotree_code":"LCLC","patients":7},{"oncotree_code":"LAIS","patients":6},{"oncotree_code":"BNNOS","patients":6},{"oncotree_code":"MMBC","patients":6},{"oncotree_code":"SPN","patients":5},{"oncotree_code":"LECLC","patients":5},{"oncotree_code":"SPCC","patients":4},{"oncotree_code":"PB","patients":3},{"oncotree_code":"DCIS","patients":2},{"oncotree_code":"CSNOS","patients":2},{"oncotree_code":"MCN","patients":2},{"oncotree_code":"LUMEC","patients":2},{"oncotree_code":"JSCB","patients":2},{"oncotree_code":"BRAME","patients":2},{"oncotree_code":"SPC","patients":2},{"oncotree_code":"MSCC","patients":1},{"oncotree_code":"ITPN","patients":1},{"oncotree_code":"MASC","patients":1},{"oncotree_code":"PPB","patients":1},{"oncotree_code":"OSGCT","patients":1},{"oncotree_code":"BLCLC","patients":1},{"oncotree_code":"PD","patients":1},{"oncotree_code":"MASCC","patients":1},{"oncotree_code":"NUTCL","patients":1},{"oncotree_code":"CAIS","patients":1},{"oncotree_code":"MCS","patients":1}]}
+
+═ answer (success)
+The MSK-CHORD cohort does not include melanoma, so I can't give you that specific analysis — and I won't substitute a different cancer type. Here's the verified picture:
+
+## What's actually in MSK-CHORD (Nature 2024)
+
+Confirmed from the study's own records — exactly five primary cancer types (patient counts):
+
+| Cancer type | Patients |
+|---|---|
+| Non-Small Cell Lung Cancer | 7,809 |
+| Colorectal Cancer | 5,543 |
+| Breast Cancer | 5,368 |
+| Prostate Cancer | 3,211 |
+| Pancreatic Cancer | 3,109 |
+
+There is **no melanoma** patient, and no "melanoma" value in the detailed-subtype list. The OncoTree codes present (LUAD, COAD, IDC, PRAD, PAAD, MACR, etc.) confirm this — `MACR` here is malignant carcinoid of the lung, not melanoma.
+
+## Two important limitations even if you pick one of the five types
+
+1. **No true "immunotherapy response" variable.** This study has no RECIST / objective-response / best-response attribute or event. The only available proxies for a patient who received an `Immuno` subtype treatment (~3,341 patients) are:
+   - Overall survival (`OS_MONTHS` / `OS_STATUS`) — a survival/outcome proxy, and any alteration-vs-survival comparison needs Kaplan–Meier + log-rank, not a raw frequency.
+   - NLP-extracted radiology progression events (`Diagnosis` events, `SUBTYPE = 'Progression'`).
+   
+   Neither is a validated "response" readout, so any "associated with response" answer would be an association with a survival/progression proxy at best — and I can only present the counts and hand off the actual statistical comparison to cBioPortal's Group Comparison (which applies the correct tests and multiple-testing control).
+
+2. **Multiple IMPACT panel versions** (341/410/468/505 genes) mean gene coverage varies by sample, so alteration frequencies need gene-specific denominators.
+
+## How I can help
+
+- **If melanoma is the real target:** I don't have a cBioPortal melanoma cohort loaded under MSK-CHORD. Let me know if you meant a different study (e.g., a TCGA melanoma cohort), and I'll verify what exists and whether it carries treatment/response data — melanoma cohorts in cBioPortal (like TCGA SKCM) are largely **without** immunotherapy-response labels, so I'd confirm before promising a response analysis.
+- **If you're happy to run it on one of MSK-CHORD's five types** (NSCLC being the most established setting for checkpoint-inhibitor response), tell me which type and I'll pull the genomic alterations in patients who received `Immuno` treatment and set up the alteration-vs-survival / progression comparison for the Group Comparison tab.
+
+Which direction would you like to take?

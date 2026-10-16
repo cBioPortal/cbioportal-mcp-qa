@@ -1,0 +1,368 @@
+Q (haiku-5.5): Which genes are enriched for mutations between NSCLC vs squamous cell carcinoma?
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT 1",
+ "max_rows": 1
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://mutation-frequency-guide"
+}
+
+◀ result
+{"rows":[{"1":1}]}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+# Mutation Frequency Analysis Guide
+
+## IMPORTANT: Reporting Mutation Frequencies
+- **ALWAYS report frequencies as percentages**, not raw counts: `frequency = (altered_samples / total_profiled_samples) × 100`
+- For quick frequency lookups, **prefer the TCGA Pan-Cancer Atlas study first**, then offer to expand to other studies
+- When reporting across multiple studies, show **ranges** (e.g., "TP53 is mutated in 30–60% of samples") rather than a single average
+- **NEVER** sum mutation events across studies to compute an aggregate frequency — this can exceed 100% due to double-counting
+- Warn users that samples may overlap across cohorts (e.g., MSK studies may share patients)
+- **Choose and state the counting unit**: use patient-level frequencies for prevalence/rate questions unless the user explicitly asks for samples; use sample-level frequencies when the user asks about samples.
+- **For "across cancer types" questions**, jump to the [Cross-Cancer-Type Mutation Frequency](#cross-cancer-type-mutation-frequency) section below — there is one correct recipe and several common wrong ones.
+
+## Counting Unit: Samples vs Patients
+
+Before answering any mutation count or frequency question, decide whether the unit is samples or patients and state that choice in the answer.
+
+| User wording | Counting unit |
+|--------------|---------------|
+| "prevalence", "rate", "fraction of patients", "patients with", "how common is" | Patient-level: `COUNT(DISTINCT patient_unique_id)` |
+| "samples", "specimens", "biopsies", sample-level cohort composition | Sample-level: `COUNT(DISTINCT sample_unique_id)` |
+| Ambiguous | Ask, or default to patient-level for prevalence/rate language and say so |
+
+### Cross-study sample-count caveat
+
+When an answer touches more than one study and reports a sample count, prepend a one-line caveat:
+
+> Sample IDs are unique within cBioPortal study prefixes, not guaranteed biological-sample identifiers across studies; overlapping cohorts can count the same patient/sample more than once.
+
+Prefer one of these safer approaches:
+
+- Use a shipped `cancer_study_query_preferences` cohort such as `pan_cancer_tcga` or `all_studies_non_redundant`.
+- Restrict to one named study.
+- Aggregate by `patient_unique_id` when the biological question is patient prevalence.
+
+## STOP rule: a frequency above 100% means your query is wrong
+
+If your query returns a frequency over 100%, **do not try to debug or explain the data inconsistency to the user**. The cause is always one of these query bugs:
+
+- Summing mutation events instead of `COUNT(DISTINCT sample_unique_id)` for the numerator
+- Using a study-wide sample count as the denominator instead of the gene-specific profiled count
+- Cross-study aggregation where the same biological sample appears under multiple `sample_unique_id` values (e.g., MSK-IMPACT and MSK-CHORD share patients)
+- **Joining the profiled CTE through `gene_panel` / `gene_panel_list` without a WES branch.** `gene_panel_id = 'WES'` is *not* a row in … (36467 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT preference_name, COUNT(*) AS studies FROM cancer_study_query_preferences GROUP BY preference_name ORDER BY preference_name"
+}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "luad_tcga_pan_can_atlas_2018",
+ "attributeIds": [
+  "CANCER_TYPE_DETAILED"
+ ]
+}
+
+◀ result
+{"rows":[{"preference_name":"all_studies_non_redundant","studies":241},{"preference_name":"large_genomic_cohort","studies":1},{"preference_name":"pan_cancer_tcga","studies":32},{"preference_name":"treatment_outcomes","studies":1}]}
+
+◀ result
+{"success":true,"message":"Successfully retrieved StudyView filter options","data":{"studyId":"luad_tcga_pan_can_atlas_2018","attributes":[{"attributeId":"CANCER_TYPE_DETAILED","displayName":"Cancer Type Detailed","description":"Cancer Type Detailed","datatype":"STRING","values":["Lung Adenocarcinoma"]}]}}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cd.cancer_study_identifier, cd.attribute_name, cd.attribute_value, uniqExact(cd.sample_unique_id) AS samples
+FROM clinical_data_derived cd
+WHERE cd.attribute_name IN ('CANCER_TYPE','CANCER_TYPE_DETAILED')
+  AND (lower(cd.attribute_value) LIKE '%squamous%' OR lower(cd.attribute_value) LIKE '%non-small%' OR lower(cd.attribute_value) LIKE '%nsclc%')
+  AND cd.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name IN ('pan_cancer_tcga','large_genomic_cohort'))
+GROUP BY 1,2,3
+ORDER BY samples DESC",
+ "max_rows": 100
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE","attribute_value":"Non-Small Cell Lung Cancer","samples":7867},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Lung Squamous Cell Carcinoma","samples":909},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","attribute_name":"CANCER_TYPE","attribute_value":"Non-Small Cell Lung Cancer","samples":566},{"cancer_study_identifier":"hnsc_tcga_pan_can_atlas_2018","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Head and Neck Squamous Cell Carcinoma","samples":523},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","attribute_name":"CANCER_TYPE","attribute_value":"Non-Small Cell Lung Cancer","samples":487},{"cancer_study_identifier":"lusc_tcga_pan_can_atlas_2018","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Lung Squamous Cell Carcinoma","samples":487},{"cancer_study_identifier":"cesc_tcga_pan_can_atlas_2018","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Cervical Squamous Cell Carcinoma","samples":251},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Oral Cavity Squamous Cell Carcinoma","samples":185},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Head and Neck Squamous Cell Carcinoma","samples":171},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Cervical Squamous Cell Carcinoma","samples":148},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Cutaneous Squamous Cell Carcinoma","samples":138},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Anal Squamous Cell Carcinoma","samples":137},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Oropharynx Squamous Cell Carcinoma","samples":127},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Esophageal Squamous Cell Carcinoma","samples":115},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Poorly Differentiated Non-Small Cell Lung Cancer","samples":113},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Squamous Cell Carcinoma, NOS","samples":102},{"cancer_study_identifier":"esca_tcga_pan_can_atlas_2018","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Esophageal Squamous Cell Carcinoma","samples":95},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Non-Small Cell Lung Cancer","samples":76},{"cancer_study_identifier":"msk_impact_50k_2026","attribute_name":"CANCER_TYPE_DETAILED","attribute_value":"Lung Adenosquamous Carcinoma","samp … (2723 more chars)
+
+▶ clickhouse_list_table_columns
+{
+ "table": "mutation_panel_gene_coverage"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "genomic_event_derived"
+}
+
+▶ clickhouse_list_table_columns
+{
+ "table": "clinical_data_derived"
+}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"hugo_gene_symbol","type":"String"},{"name":"gene_panel_id","type":"LowCardinality(String)"}]}
+
+◀ result
+{"columns":[{"name":"sample_unique_id","type":"String"},{"name":"hugo_gene_symbol","type":"String","comment":"HUGO gene symbol (e.g., TP53, KRAS, BRAF). Use for gene-specific queries."},{"name":"entrez_gene_id","type":"Int32"},{"name":"gene_panel_stable_id","type":"LowCardinality(String)"},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"genetic_profile_stable_id","type":"LowCardinality(String)"},{"name":"variant_type","type":"LowCardinality(String)","comment":"Type of genomic event: \"mutation\" for SNVs/indels, \"cna\" for copy number alterations, \"structural_variant\" for SVs. Always filter by this."},{"name":"mutation_variant","type":"String","comment":"Protein change notation (e.g., p.V600E, p.R175H). Use for specific variant queries. \"NA\" for non-mutation events."},{"name":"mutation_type","type":"LowCardinality(String)"},{"name":"mutation_status","type":"LowCardinality(String)","comment":"For mutations: Somatic, Germline, UNKNOWN, or UNCALLED. Filter mutation_status != \"UNCALLED\" to exclude uncertain calls. Include all other statuses."},{"name":"driver_filter","type":"LowCardinality(String)"},{"name":"driver_filter_annotation","type":"String"},{"name":"driver_tiers_filter","type":"LowCardinality(String)"},{"name":"driver_tiers_filter_annotation","type":"String"},{"name":"cna_alteration","type":"Nullable(Int8)","comment":"Copy number alteration: only 2 = amplification (AMP) and -2 = deep deletion (HOMDEL) are stored. Shallow deletion (-1), diploid (0) and gain (1) are not in this table; query genetic_alteration_derived WHERE profile_type = 'gistic' (alteration_value is a String, e.g. '-1'). NULL for non-CNA events."},{"name":"cna_cytoband","type":"String"},{"name":"sv_event_info","type":"String"},{"name":"patient_unique_id","type":"String"},{"name":"off_panel","type":"Bool","comment":"Boolean: 1 = mutation outside gene panel coverage (off-panel), 0 = within panel (on-panel). Filter off_panel = 0 for reliable frequency calculations."}]}
+
+◀ result
+{"columns":[{"name":"internal_id","type":"Int32"},{"name":"sample_unique_id","type":"String","comment":"Globally unique sample ID: cancer_study_identifier + \"_\" + sample.stable_id. Empty for patient-level attributes. Use this for sample filtering and joins."},{"name":"patient_unique_id","type":"String","comment":"Globally unique patient ID: cancer_study_identifier + \"_\" + patient.stable_id. Present for both sample and patient-level attributes."},{"name":"attribute_name","type":"LowCardinality(String)","comment":"Clinical attribute name (e.g., SAMPLE_TYPE, CANCER_TYPE, AGE, OS_MONTHS). Use with attribute_value for filtering. AGE may be floored or capped for de-identification (e.g. all children recorded as 18, or everyone 89+ recorded as 89 or 90): before age statistics check for a pile-up at the min/max, and if present compute age from DAYS_TO_BIRTH (-days / 365.25)."},{"name":"attribute_value","type":"String","comment":"Value of the clinical attribute (String). For SAMPLE_TYPE: Primary, Metastasis, Local Recurrence, Unknown. Missing values are empty strings, so use toFloat64OrNull(attribute_value) for numeric comparisons — CAST fails on them."},{"name":"cancer_study_identifier","type":"LowCardinality(String)"},{"name":"type","type":"LowCardinality(String)","comment":"Data level: \"sample\" for sample-level attributes (e.g., SAMPLE_TYPE), \"patient\" for patient-level attributes (e.g., AGE, OS_MONTHS)."}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH grp AS (
+  SELECT sample_unique_id,
+    any(if(attribute_name = 'CANCER_TYPE_DETAILED', attribute_value, '')) AS detailed,
+    any(if(attribute_name = 'CANCER_TYPE', attribute_value, '')) AS ct
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_impact_50k_2026' AND sample_unique_id != ''
+    AND attribute_name IN ('CANCER_TYPE', 'CANCER_TYPE_DETAILED')
+  GROUP BY sample_unique_id
+),
+cohort AS (
+  SELECT sample_unique_id,
+    multiIf(detailed = 'Lung Squamous Cell Carcinoma', 'LSCC',
+            ct = 'Non-Small Cell Lung Cancer', 'NSCLC_nonSQ', '') AS grp
+  FROM grp
+),
+prof AS (
+  SELECT c.grp AS grp, m.hugo_gene_symbol AS gene, uniqExact(c.sample_unique_id) AS profiled
+  FROM cohort c
+  JOIN mutation_panel_gene_coverage m ON m.sample_unique_id = c.sample_unique_id
+  WHERE c.grp != ''
+  GROUP BY grp, gene
+),
+alt AS (
+  SELECT c.grp AS grp, g.hugo_gene_symbol AS gene, uniqExact(g.sample_unique_id) AS altered
+  FROM genomic_event_derived g
+  JOIN cohort c ON c.sample_unique_id = g.sample_unique_id
+  WHERE g.cancer_study_identifier = 'msk_impact_50k_2026'
+    AND g.variant_type = 'mutation' AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = 0 AND c.grp != ''
+  GROUP BY grp, gene
+)
+SELECT gene, sq_alt, sq_prof, round(sq_alt * 100 / sq_prof, 1) AS lscc_pct,
+       nsq_alt, nsq_prof, round(nsq_alt * 100 / nsq_prof, 1) AS nsclc_nonsq_pct,
+       round(sq_alt * 100 / sq_prof - nsq_alt * 100 / nsq_prof, 1) AS diff_pts
+FROM (
+  SELECT gene,
+    sumIf(altered, grp = 'LSCC') AS sq_alt,
+    sumIf(profiled, grp = 'LSCC') AS sq_prof,
+    sumIf(altered, grp = 'NSCLC_nonSQ') AS nsq_alt,
+    sumIf(profiled, grp = 'NSCLC_nonSQ') AS nsq_prof
+  FROM (
+    SELECT grp, gene, profiled, toUInt64(0) AS altered FROM prof
+    UNION ALL
+    SELECT grp, gene, toUInt64(0) AS profiled, altered FROM alt
+  )
+  GROUP BY gene
+  HAVING sq_alt + nsq_alt >= 10 AND sq_prof >= 50 AND nsq_prof >= 50
+)
+ORDER BY abs(diff_pts) DESC
+LIMIT 40",
+ "max_rows": 60
+}
+
+◀ result
+{"rows":[]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH grp AS (
+  SELECT sample_unique_id,
+    any(if(attribute_name = 'CANCER_TYPE_DETAILED', attribute_value, '')) AS detailed,
+    any(if(attribute_name = 'CANCER_TYPE', attribute_value, '')) AS ct
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_impact_50k_2026' AND sample_unique_id != ''
+    AND attribute_name IN ('CANCER_TYPE', 'CANCER_TYPE_DETAILED')
+  GROUP BY sample_unique_id
+)
+SELECT multiIf(detailed = 'Lung Squamous Cell Carcinoma', 'LSCC', ct = 'Non-Small Cell Lung Cancer', 'NSCLC_nonSQ', '') AS grp, count() AS samples
+FROM grp GROUP BY grp
+UNION ALL
+SELECT 'coverage_rows', count() FROM mutation_panel_gene_coverage WHERE cancer_study_identifier = 'msk_impact_50k_2026'
+UNION ALL
+SELECT 'mut_rows', count() FROM genomic_event_derived WHERE cancer_study_identifier = 'msk_impact_50k_2026' AND variant_type = 'mutation'"
+}
+
+◀ result
+{"rows":[{"grp":"mut_rows","samples":478790},{"samples":46464},{"grp":"NSCLC_nonSQ","samples":7867},{"grp":"coverage_rows","samples":24877385}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH grp AS (
+  SELECT sample_unique_id,
+    max(if(attribute_name = 'CANCER_TYPE_DETAILED', attribute_value, '')) AS detailed,
+    max(if(attribute_name = 'CANCER_TYPE', attribute_value, '')) AS ct
+  FROM clinical_data_derived
+  WHERE cancer_study_identifier = 'msk_impact_50k_2026' AND sample_unique_id != ''
+    AND attribute_name IN ('CANCER_TYPE', 'CANCER_TYPE_DETAILED')
+  GROUP BY sample_unique_id
+),
+cohort AS (
+  SELECT sample_unique_id,
+    multiIf(detailed = 'Lung Squamous Cell Carcinoma', 'LSCC',
+            ct = 'Non-Small Cell Lung Cancer', 'NSCLC_nonSQ', '') AS grp
+  FROM grp
+),
+prof AS (
+  SELECT c.grp AS grp, m.hugo_gene_symbol AS gene, uniqExact(c.sample_unique_id) AS profiled
+  FROM cohort c
+  JOIN mutation_panel_gene_coverage m ON m.sample_unique_id = c.sample_unique_id
+  WHERE c.grp != ''
+  GROUP BY grp, gene
+),
+alt AS (
+  SELECT c.grp AS grp, g.hugo_gene_symbol AS gene, uniqExact(g.sample_unique_id) AS altered
+  FROM genomic_event_derived g
+  JOIN cohort c ON c.sample_unique_id = g.sample_unique_id
+  WHERE g.cancer_study_identifier = 'msk_impact_50k_2026'
+    AND g.variant_type = 'mutation' AND g.mutation_status != 'UNCALLED'
+    AND g.off_panel = 0 AND c.grp != ''
+  GROUP BY grp, gene
+)
+SELECT gene, sq_alt, sq_prof, round(sq_alt * 100 / sq_prof, 1) AS lscc_pct,
+       nsq_alt, nsq_prof, round(nsq_alt * 100 / nsq_prof, 1) AS nsclc_nonsq_pct,
+       round(sq_alt * 100 / sq_prof - nsq_alt * 100 / nsq_prof, 1) AS diff_pts
+FROM (
+  SELECT gene,
+    sumIf(altered, grp = 'LSCC') AS sq_alt,
+    sumIf(profiled, grp = 'LSCC') AS sq_prof,
+    sumIf(altered, grp = 'NSCLC_nonSQ') AS nsq_alt,
+    sumIf(profiled, grp = 'NSCLC_nonSQ') AS nsq_prof
+  FROM (
+    SELECT grp, gene, profiled, toUInt64(0) AS altered FROM prof
+    UNION ALL
+    SELECT grp, gene, toUInt64(0) AS profiled, altered FROM alt
+  )
+  GROUP BY gene
+  HAVING sq_alt + nsq_alt >= 10 AND sq_prof >= 50 AND nsq_prof >= 50
+)
+ORDER BY abs(diff_pts) DESC
+LIMIT 40",
+ "max_rows": 60
+}
+
+◀ result
+{"rows":[{"gene":"TP53","sq_alt":768,"sq_prof":909,"lscc_pct":84.5,"nsq_alt":3474,"nsq_prof":6958,"nsclc_nonsq_pct":49.9,"diff_pts":34.6},{"gene":"KRAS","sq_alt":47,"sq_prof":909,"lscc_pct":5.2,"nsq_alt":2104,"nsq_prof":6958,"nsclc_nonsq_pct":30.2,"diff_pts":-25.1},{"gene":"EGFR","sq_alt":59,"sq_prof":909,"lscc_pct":6.5,"nsq_alt":2001,"nsq_prof":6958,"nsclc_nonsq_pct":28.8,"diff_pts":-22.3},{"gene":"KMT2D","sq_alt":202,"sq_prof":909,"lscc_pct":22.2,"nsq_alt":437,"nsq_prof":6958,"nsclc_nonsq_pct":6.3,"diff_pts":15.9},{"gene":"CDKN2A","sq_alt":181,"sq_prof":909,"lscc_pct":19.9,"nsq_alt":381,"nsq_prof":6958,"nsclc_nonsq_pct":5.5,"diff_pts":14.4},{"gene":"NFE2L2","sq_alt":130,"sq_prof":909,"lscc_pct":14.3,"nsq_alt":96,"nsq_prof":6958,"nsclc_nonsq_pct":1.4,"diff_pts":12.9},{"gene":"STK11","sq_alt":24,"sq_prof":909,"lscc_pct":2.6,"nsq_alt":1055,"nsq_prof":6958,"nsclc_nonsq_pct":15.2,"diff_pts":-12.5},{"gene":"RBM10","sq_alt":36,"sq_prof":909,"lscc_pct":4,"nsq_alt":799,"nsq_prof":6958,"nsclc_nonsq_pct":11.5,"diff_pts":-7.5},{"gene":"PTEN","sq_alt":87,"sq_prof":909,"lscc_pct":9.6,"nsq_alt":185,"nsq_prof":6958,"nsclc_nonsq_pct":2.7,"diff_pts":6.9},{"gene":"RASA1","sq_alt":75,"sq_prof":909,"lscc_pct":8.3,"nsq_alt":123,"nsq_prof":6958,"nsclc_nonsq_pct":1.8,"diff_pts":6.5},{"gene":"PIK3CA","sq_alt":109,"sq_prof":909,"lscc_pct":12,"nsq_alt":422,"nsq_prof":6958,"nsclc_nonsq_pct":6.1,"diff_pts":5.9},{"gene":"FBXW7","sq_alt":64,"sq_prof":909,"lscc_pct":7,"nsq_alt":102,"nsq_prof":6958,"nsclc_nonsq_pct":1.5,"diff_pts":5.6},{"gene":"NOTCH1","sq_alt":72,"sq_prof":909,"lscc_pct":7.9,"nsq_alt":198,"nsq_prof":6958,"nsclc_nonsq_pct":2.8,"diff_pts":5.1},{"gene":"ARHGAP35","sq_alt":10,"sq_prof":155,"lscc_pct":6.5,"nsq_alt":16,"nsq_prof":926,"nsclc_nonsq_pct":1.7,"diff_pts":4.7},{"gene":"ROS1","sq_alt":63,"sq_prof":909,"lscc_pct":6.9,"nsq_alt":167,"nsq_prof":6958,"nsclc_nonsq_pct":2.4,"diff_pts":4.5},{"gene":"NOTCH3","sq_alt":62,"sq_prof":909,"lscc_pct":6.8,"nsq_alt":214,"nsq_prof":6958,"nsclc_nonsq_pct":3.1,"diff_pts":3.7},{"gene":"ARID1A","sq_alt":93,"sq_prof":909,"lscc_pct":10.2,"nsq_alt":483,"nsq_prof":6958,"nsclc_nonsq_pct":6.9,"diff_pts":3.3},{"gene":"ZFHX3","sq_alt":67,"sq_prof":859,"lscc_pct":7.8,"nsq_alt":300,"nsq_prof":6638,"nsclc_nonsq_pct":4.5,"diff_pts":3.3},{"gene":"RB1","sq_alt":78,"sq_prof":909,"lscc_pct":8.6,"nsq_alt":369,"nsq_prof":6958,"nsclc_nonsq_pct":5.3,"diff_pts":3.3},{"gene":"EP300","sq_alt":53,"sq_prof":909,"lscc_pct":5.8,"nsq_alt":174,"nsq_prof":6958,"nsclc_nonsq_pct":2.5,"diff_pts":3.3},{"gene":"CYLD","sq_alt":32,"sq_prof":705,"lscc_pct":4.5,"nsq_alt":65,"nsq_prof":5281,"nsclc_nonsq_pct":1.2,"diff_pts":3.3},{"gene":"KMT2C","sq_alt":79,"sq_prof":909,"lscc_pct":8.7,"nsq_alt":385,"nsq_prof":6958,"nsclc_nonsq_pct":5.5,"diff_pts":3.2},{"gene":"ATM","sq_alt":40,"sq_prof":909,"lscc_pct":4.4,"nsq_alt":530,"nsq_prof":6958,"nsclc_nonsq_pct":7.6,"diff_pts":-3.2},{"gene":"CUL3","sq_alt":42,"sq_prof":909,"lscc_pct":4.6,"nsq_alt":114,"nsq_prof":6958,"nsclc_no … (2015 more chars)
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "msk_impact_50k_2026"
+ ],
+ "studyViewFilter": {
+  "clinicalDataFilters": [
+   {
+    "attributeId": "CANCER_TYPE",
+    "values": [
+     {
+      "value": "Non-Small Cell Lung Cancer"
+     }
+    ]
+   }
+  ]
+ },
+ "groups": [
+  {
+   "name": "Lung Squamous Cell Carcinoma",
+   "studyViewFilter": {
+    "clinicalDataFilters": [
+     {
+      "attributeId": "CANCER_TYPE_DETAILED",
+      "values": [
+       {
+        "value": "Lung Squamous Cell Carcinoma"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "NSCLC (non-squamous)",
+   "isUnselected": true
+  }
+ ],
+ "tab": "alterations"
+}
+
+◀ result
+{"success":true,"message":"Navigating to https://www.cbioportal.org/comparison/alterations?comparisonId=6ad0978ec2115c492d88848d","url":"https://www.cbioportal.org/comparison/alterations?comparisonId=6ad0978ec2115c492d88848d","data":{"description":"Group comparison (2 custom groups)","studies":["msk_impact_50k_2026"],"totalGroups":2,"groups":[{"name":"Lung Squamous Cell Carcinoma","sampleCount":909},{"name":"NSCLC (non-squamous)","sampleCount":6958}],"studyViewUrl":"https://www.cbioportal.org/study?id=msk_impact_50k_2026#filterJson=%7B%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Non-Small%20Cell%20Lung%20Cancer%22%7D%5D%7D%5D%7D","groupUrls":[{"groupName":"Lung Squamous Cell Carcinoma","url":"https://www.cbioportal.org/study?id=msk_impact_50k_2026#filterJson=%7B%22studyIds%22%3A%5B%22msk_impact_50k_2026%22%5D%2C%22clinicalDataFilters%22%3A%5B%7B%22attributeId%22%3A%22CANCER_TYPE%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Non-Small%20Cell%20Lung%20Cancer%22%7D%5D%7D%2C%7B%22attributeId%22%3A%22CANCER_TYPE_DETAILED%22%2C%22values%22%3A%5B%7B%22value%22%3A%22Lung%20Squamous%20Cell%20Carcinoma%22%7D%5D%7D%5D%7D"}],"pageDescription":"Comparison of genomic alteration rates across Lung Squamous Cell Carcinoma (909) vs NSCLC (non-squamous) (6958)."}}
+
+═ answer (success)
+Using the MSK-IMPACT 2026 cohort (msk_impact_50k_2026), the genes with the largest frequency differences are:
+
+**Higher in lung squamous cell carcinoma (LSCC)**
+
+| Gene | LSCC altered / profiled (%) | Non-squamous NSCLC altered / profiled (%) | Difference (pts) |
+|---|---|---|---|
+| TP53 | 768 / 909 (84.5%) | 3,474 / 6,958 (49.9%) | +34.6 |
+| KMT2D | 202 / 909 (22.2%) | 437 / 6,958 (6.3%) | +15.9 |
+| CDKN2A | 181 / 909 (19.9%) | 381 / 6,958 (5.5%) | +14.4 |
+| NFE2L2 | 130 / 909 (14.3%) | 96 / 6,958 (1.4%) | +12.9 |
+| PTEN | 87 / 909 (9.6%) | 185 / 6,958 (2.7%) | +6.9 |
+| RASA1 | 75 / 909 (8.3%) | 123 / 6,958 (1.8%) | +6.5 |
+| PIK3CA | 109 / 909 (12.0%) | 422 / 6,958 (6.1%) | +5.9 |
+| FBXW7 | 64 / 909 (7.0%) | 102 / 6,958 (1.5%) | +5.6 |
+| NOTCH1 | 72 / 909 (7.9%) | 198 / 6,958 (2.8%) | +5.1 |
+
+**Higher in non-squamous NSCLC**
+
+| Gene | LSCC altered / profiled (%) | Non-squamous NSCLC altered / profiled (%) | Difference (pts) |
+|---|---|---|---|
+| KRAS | 47 / 909 (5.2%) | 2,104 / 6,958 (30.2%) | −25.1 |
+| EGFR | 59 / 909 (6.5%) | 2,001 / 6,958 (28.8%) | −22.3 |
+| STK11 | 24 / 909 (2.6%) | 1,055 / 6,958 (15.2%) | −12.5 |
+| RBM10 | 36 / 909 (4.0%) | 799 / 6,958 (11.5%) | −7.5 |
+| BRAF | 25 / 909 (2.8%) | 377 / 6,958 (5.4%) | −2.7 |
+
+These are descriptive differences only. I could not run a significance test, so I can't say which are statistically enriched. The Group Comparison tab computes Fisher's exact tests with multiple-testing correction:
+[View the alteration comparison in cBioPortal](https://www.cbioportal.org/comparison/alterations?comparisonId=6ad0978ec2115c492d88848d)
+
+**How I defined the groups and counted**
+- **Squamous group:** samples with CANCER_TYPE_DETAILED = "Lung Squamous Cell Carcinoma" (n = 909).
+- **NSCLC group:** samples with CANCER_TYPE = "Non-Small Cell Lung Cancer" that are not squamous (n = 6,958). I excluded squamous samples because all squamous samples are also NSCLC, so the two groups would otherwise overlap.
+- **Counting unit:** samples, not patients. Some patients contributed more than one sample.
+- **Denominators:** samples profiled for each gene on its panel. Mutations flagged as off-panel and UNCALLED mutations were excluded.
+- **Filters:** only genes with at least 10 altered samples and at least 50 profiled samples per group are shown.
+
+If you meant all NSCLC (LUAD + LUSC) versus squamous, the groups would overlap and the comparison would be less clean. I can also run the same comparison in the TCGA lung cohorts (LUAD vs LUSC) if that's more useful.

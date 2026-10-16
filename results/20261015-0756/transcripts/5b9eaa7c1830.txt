@@ -1,0 +1,442 @@
+Q (haiku-5.5): Do lung adenocarcinoma patients with high EGFR mRNA expression (top quartile) have different survival outcomes than those with low expression?
+
+▶ read_guide
+{
+ "uri": "cbioportal://statistical-tests-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://gene-expression-guide"
+}
+
+▶ read_guide
+{
+ "uri": "cbioportal://clinical-data-guide"
+}
+
+◀ result
+Statistical Test Selection Guide
+================================
+
+Purpose
+-------
+This guide ensures the correct statistical test is selected before performing any group comparison, matching cBioPortal's own Group Comparison defaults.
+
+HARD RULES — NEVER FABRICATE A STATISTIC
+----------------------------------------
+ClickHouse cannot run statistical tests. The agent therefore must NEVER produce a derived statistic that is not a literal column value from a SQL result. Specifically:
+
+1. **Never invent a p-value.** Not "p < 0.001", not "p ≈ 0.05", not any p-value. If the user asks "what is the p-value?", the answer is *"I can't compute that — here is the 2x2 contingency table (or group statistics). Run it in cBioPortal's Group Comparison tab, in R with `fisher.test(...)` / `wilcox.test(...)`, or in Python with `scipy.stats.fisher_exact(...)` / `mannwhitneyu(...)`."*
+2. **Never claim mutual exclusivity (or co-occurrence) from a contingency table alone.** A 2x2 table is not a test. The shape "altered/not altered × group A/group B" needs Fisher's exact + a defined direction (odds ratio < 1 with significant p). Without that test, the agent presents the table and stops. Descriptive phrasing is also a claim: "largely/mostly mutually exclusive", "rarely co-occur", "tend to co-occur" are forbidden without the test — point to cBioPortal's Mutual Exclusivity tab instead.
+3. **Never report a "median" that came from `AVG(...)` or any non-median aggregate.** "Median" and "mean" are different statistics; for skewed clinical distributions (especially survival) they differ substantially. Use ClickHouse's `quantile(0.5)(...)` for actual median, and label arithmetic averages as "mean", never "median".
+4. **Never report a hazard ratio, odds ratio, risk ratio, or relative risk** that wasn't computed by an external tool. These require regression / model fitting that ClickHouse does not do.
+5. **Never report median overall survival from `AVG(OS_MONTHS)` or even `quantile(0.5)(OS_MONTHS)`.** Median OS requires Kaplan-Meier estimation, which handles censoring (`OS_STATUS = 0:LIVING` means the event hasn't happened yet). Naive medians/means over `OS_MONTHS` ignore censoring and are systematically wrong. The correct handoff: return the raw `(OS_MONTHS, OS_STATUS)` pairs (or descriptive counts: N events, N censored, follow-up range) and tell the user to run KM in R (`survival::survfit`) or Python (`lifelines.KaplanMeierFitter`), or use cBioPortal's Survival comparison.
+
+If asked to do any of (1)–(5), respond with the appropriate handoff template from the "Approved Response Templates" section below — do not produce the number.
+
+Ambiguous-Term Clarification (before any analysis)
+--------------------------------------------------
+If the user's question uses an ambiguous term, ask before computing anything. Examples:
+
+- **"aggressive"** → could mean shorter overall survival, higher metastasis rate, higher grade/stage, higher TMB, or specific molecular features. Ask which definit … (9984 more chars)
+
+◀ result
+# Gene Expression Analysis Guide
+
+This guide covers continuous-value genomic data: gene **expression**, **copy number** values, **methylation**, and related profile types. Mutation/CNA/SV *frequency* analysis lives in `cbioportal://mutation-frequency-guide`.
+
+## Where this data lives
+
+Continuous per-sample-per-gene values are stored in `genetic_alteration_derived`:
+
+| Column | Description |
+|---|---|
+| `sample_unique_id` | `<study>_<sample_stable_id>` |
+| `cancer_study_identifier` | study scope |
+| `hugo_gene_symbol` | gene |
+| `profile_type` | which assay/normalization (see below) |
+| `alteration_value` | the actual value — stored as Nullable(String); cast with `toFloat64OrNull` |
+
+`alteration_value` is a string because the same column hosts many different value scales. The `''` and `'NA'` sentinels mean "missing"; always filter them out and use `toFloat64OrNull(alteration_value) IS NOT NULL` for downstream math.
+
+## Discovering profile types for a study
+
+Different studies expose different profile types depending on what assays were run and how the data was normalized. Always check what a specific study supports before picking one:
+
+```sql
+SELECT DISTINCT profile_type
+FROM genetic_alteration_derived
+WHERE cancer_study_identifier = 'brca_metabric'
+ORDER BY profile_type;
+```
+
+Common values across the public portal:
+
+| Family | Profile types |
+|---|---|
+| mRNA expression | `rna_seq_v2_mrna`, `rna_seq_v2_mrna_median_Zscores`, `rna_seq_v2_mrna_median_all_sample_Zscores` (TCGA PanCancer Atlas), `mrna`, `mrna_median_Zscores`, `mrna_seq_v2_rsem`, `mrna_seq_v2_rsem_Zscores`, `mrna_seq_cpm`, `mrna_seq_fpkm`, `mrna_U133`, `mrna_outliers` |
+| Copy number (continuous) | `cna`, `linear_CNA`, `log2CNA`, `cna_consensus`, `cna_rae`, `gistic` |
+| Methylation | `methylation_hm27`, `methylation_hm450`, `methylation_epic`, `methylation_promoters_rrbs` |
+| miRNA | `mirna`, `mirna_median_Zscores` |
+| Protein | `protein_quantification`, `protein_level`, `RPPA` |
+
+**Z-score vs raw choice.** When the user asks "is X correlated with Y", either works for Spearman (rank-based) — Pearson would care. Default to the non-Z-score variant if both exist, and call out which one in the response.
+
+## Canonical recipe — Spearman correlation between two genes
+
+```sql
+SELECT *
+FROM gene_pair_coexpression(
+    study        = 'brca_metabric',
+    gene_a       = 'TP53',
+    gene_b       = 'MYC',
+    profile_type = 'mrna'
+);
+```
+
+Returns one row: `(gene_a, gene_b, profile_type, spearman_correlation, num_samples)`.
+
+- `spearman_correlation` in [−1, 1]; `NULL` when fewer than 3 valid paired samples.
+- Mirrors cbioportal-backend's `ClickhouseCoExpressionMapper.getCoExpressions`, simplified to a pair lookup (the backend computes one ref gene vs ALL other genes for the coexpression page; here the agent asks about a specific pair).
+
+### Verified examples
+
+| Study | gene_a | gene_b | profile_type | spearman | n |
+|---|---|---|---|---|---|
+| `brca_metabric` | TP53 | MYC | `mrna` | 0.118 | 1980 |
+|  … (4931 more chars)
+
+◀ result
+# Clinical Data Query Guide
+
+## Overview
+Clinical data in cBioPortal is stored at both patient and sample levels. Understanding the distinction is crucial for accurate analysis.
+
+## Data Organization
+
+### Patient-Level vs Sample-Level Data
+- **Patient-level**: Demographics, overall survival, disease stage (stored once per patient)
+- **Sample-level**: Sample type, sequencing platform, purity (can have multiple per patient)
+
+### Key Tables
+- `clinical_patient`: Patient-level clinical attributes
+- `clinical_sample`: Sample-level clinical attributes
+- `clinical_data_derived`: Pre-joined view combining both levels
+- `clinical_attribute_meta`: Metadata about available clinical attributes
+
+## Recommended Approach: Use clinical_data_derived
+
+The `clinical_data_derived` table is pre-joined and optimized for most queries:
+
+```sql
+-- Get clinical data for specific attributes
+SELECT
+    sample_unique_id,
+    patient_unique_id,
+    attribute_name,
+    attribute_value
+FROM clinical_data_derived
+WHERE
+    cancer_study_identifier = 'your_study_id'
+    AND attribute_name IN ('CANCER_TYPE', 'SAMPLE_TYPE', 'TMB_NONSYNONYMOUS');
+```
+
+## Clinical Attribute Discovery
+
+### Use clinical_attribute_meta for Discovering Available Attributes
+**Always start here** to see what clinical attributes are available for a specific study:
+
+```sql
+-- Discover available clinical attributes for a study
+SELECT
+    attr_id,
+    description,
+    patient_attribute,
+    cancer_study_id
+FROM clinical_attribute_meta
+WHERE
+    cancer_study_id = (
+        SELECT cancer_study_id
+        FROM cancer_study
+        WHERE cancer_study_identifier = 'your_study_id'
+    )
+ORDER BY patient_attribute, attr_id;
+```
+
+**Key Fields:**
+- **attr_id**: matches attr_id in clinical_sample/clinical_patient tables
+- **description**: human-readable description of the attribute
+- **patient_attribute**: true = patient attribute, false = sample attribute
+- **cancer_study_id**: links to cancer_study table (filter by study)
+
+## Attribute Semantics and Matching
+
+### Case-Insensitive Matching for Attribute Values
+
+Clinical values are free text across studies and may differ only by case. For example, a controlled-looking value such as germline mutation status may appear as `GERMLINE`, `Germline`, or another case variant.
+
+When filtering `clinical_data_derived.attribute_value`, use case-insensitive matching unless you have already profiled the exact values in the target study:
+
+```sql
+-- Correct: case-insensitive clinical value filter
+SELECT DISTINCT sample_unique_id, patient_unique_id
+FROM clinical_data_derived
+WHERE cancer_study_identifier = 'your_study_id'
+  AND attribute_name = 'MUTATION_STATUS'
+  AND upper(attribute_value) = 'GERMLINE';
+```
+
+Do not write `attribute_value = 'GERMLINE'` without first checking all distinct values for that attribute in the study.
+
+### Query the Requested Attribute, Not a Proxy
+
+Do not infer one clinical attribute from a related subtype or marker. Query the actual requested attribute when it … (17073 more chars)
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT cancer_study_identifier, name, sample_count, mrna_expression_sample_count FROM cancer_study WHERE cancer_study_identifier LIKE 'luad%' OR lower(name) LIKE '%lung adenocarcinoma%' ORDER BY sample_count DESC"
+}
+
+▶ clickhouse_run_select_query
+{
+ "query": "SELECT DISTINCT profile_type FROM genetic_alteration_derived WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018' AND profile_type LIKE '%mrna%' ORDER BY profile_type"
+}
+
+◀ result
+{"rows":[{"cancer_study_identifier":"luad_mskcc_2023_met_organotropism","name":"Lung Adenocarcinoma Met Organotropism (MSK, Cancer Cell 2023)","sample_count":2653,"mrna_expression_sample_count":0},{"cancer_study_identifier":"luad_mskcc_2020","name":"Lung Adenocarcinoma (MSK, J Thorac Oncol 2020)","sample_count":604,"mrna_expression_sample_count":0},{"cancer_study_identifier":"luad_tcga","name":"Lung Adenocarcinoma (TCGA, Firehose Legacy)","sample_count":586,"mrna_expression_sample_count":517},{"cancer_study_identifier":"luad_tcga_gdc","name":"Lung Adenocarcinoma (TCGA GDC, 2025)","sample_count":571,"mrna_expression_sample_count":518},{"cancer_study_identifier":"luad_tcga_pan_can_atlas_2018","name":"Lung Adenocarcinoma (TCGA, PanCancer Atlas)","sample_count":566,"mrna_expression_sample_count":510},{"cancer_study_identifier":"luad_msk_npjpo_2021","name":"Lung Adenocarcinoma (MSK, NPJ Precision Oncology 2021)","sample_count":426,"mrna_expression_sample_count":0},{"cancer_study_identifier":"luad_oncosg_2020","name":"Lung Adenocarcinoma (OncoSG, Nat Genet 2020)","sample_count":305,"mrna_expression_sample_count":169},{"cancer_study_identifier":"lung_msk_mind_2020","name":"Lung Adenocarcinoma (MSK Mind,Nature Cancer 2022)","sample_count":247,"mrna_expression_sample_count":0},{"cancer_study_identifier":"luad_cptac_gdc","name":"Lung Adenocarcinoma (CPTAC GDC, 2025)","sample_count":241,"mrna_expression_sample_count":231},{"cancer_study_identifier":"luad_tcga_pub","name":"Lung Adenocarcinoma (TCGA, Nature 2014)","sample_count":230,"mrna_expression_sample_count":230},{"cancer_study_identifier":"luad_mskimpact_2021","name":"Lung Adenocarcinoma (MSK, 2021)","sample_count":186,"mrna_expression_sample_count":0},{"cancer_study_identifier":"luad_broad","name":"Lung Adenocarcinoma (Broad, Cell 2012)","sample_count":183,"mrna_expression_sample_count":0},{"cancer_study_identifier":"luad_tsp","name":"Lung Adenocarcinoma (TSP, Nature 2008)","sample_count":163,"mrna_expression_sample_count":0},{"cancer_study_identifier":"luad_cptac_2020","name":"Lung Adenocarcinoma (CPTAC, Cell 2020)","sample_count":110,"mrna_expression_sample_count":110},{"cancer_study_identifier":"luad_cas_2020","name":"Lung Adenocarcinoma (CAS, Cell 2020)","sample_count":103,"mrna_expression_sample_count":51},{"cancer_study_identifier":"luad_mskcc_2015","name":"Lung Adenocarcinoma (MSK, Science 2015)","sample_count":35,"mrna_expression_sample_count":0}]}
+
+◀ result
+{"rows":[{"profile_type":"rna_seq_v2_mrna"},{"profile_type":"rna_seq_v2_mrna_median_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_Zscores"},{"profile_type":"rna_seq_v2_mrna_median_all_sample_ref_normal_Zscores"}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH expr AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND hugo_gene_symbol = 'EGFR'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+q AS (SELECT quantile(0.25)(v) AS q1, quantile(0.75)(v) AS q3, count() AS n_expr FROM expr),
+os AS (
+    SELECT patient_unique_id,
+        maxIf(toFloat64OrNull(attribute_value), attribute_name = 'OS_MONTHS') AS os_months,
+        maxIf(attribute_value, attribute_name = 'OS_STATUS') AS os_status
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018' AND attribute_name IN ('OS_MONTHS','OS_STATUS')
+    GROUP BY patient_unique_id
+),
+grp AS (
+    SELECT sample_unique_id, patient_unique_id,
+        multiIf(v >= (SELECT q3 FROM q), 'Top quartile (high)', v <= (SELECT q1 FROM q), 'Bottom quartile (low)', 'Middle 50%') AS grp
+    FROM expr
+    JOIN (SELECT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018' AND attribute_name = 'CANCER_TYPE_DETAILED' ) USING (sample_unique_id)
+)
+SELECT g.grp AS group_name,
+    count() AS n_patients,
+    countIf(startsWith(o.os_status, '1')) AS n_deceased,
+    countIf(startsWith(o.os_status, '0')) AS n_censored,
+    round(min(o.os_months),1) AS min_followup_m,
+    round(max(o.os_months),1) AS max_followup_m
+FROM grp g JOIN os o USING (patient_unique_id)
+WHERE o.os_months IS NOT NULL AND o.os_status != ''
+GROUP BY group_name
+ORDER BY group_name"
+}
+
+◀ result
+{"error_message":"Query execution failed: HTTPDriver for https://dl96orhu96.us-east-1.aws.clickhouse.cloud:8443 received ClickHouse error code 206\n Code: 206. DB::Exception: JOIN  INNER JOIN ... USING (sample_unique_id) no alias for subquery or table function SELECT sample_unique_id, patient_unique_id FROM clinical_data_derived WHERE (cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018') AND (attribute_name = 'CANCER_TYPE_DETAILED'). In scope  grp AS g (set joined_subquery_requires_alias = 0 to disable restriction). (ALIAS_REQUIRED) (version 26.6.1.2326 (official build))\n"}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH expr AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND hugo_gene_symbol = 'EGFR'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+),
+q AS (SELECT quantile(0.25)(v) AS q1, quantile(0.75)(v) AS q3 FROM expr),
+smap AS (
+    SELECT DISTINCT sample_unique_id, patient_unique_id
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+),
+os AS (
+    SELECT patient_unique_id,
+        maxIf(toFloat64OrNull(attribute_value), attribute_name = 'OS_MONTHS') AS os_months,
+        maxIf(attribute_value, attribute_name = 'OS_STATUS') AS os_status
+    FROM clinical_data_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018' AND attribute_name IN ('OS_MONTHS','OS_STATUS')
+    GROUP BY patient_unique_id
+),
+grp AS (
+    SELECT s.patient_unique_id AS patient_unique_id,
+        multiIf(e.v >= (SELECT q3 FROM q), 'Top quartile (high)', e.v <= (SELECT q1 FROM q), 'Bottom quartile (low)', 'Middle 50%') AS grp
+    FROM expr e
+    INNER JOIN smap s USING (sample_unique_id)
+)
+SELECT g.grp AS group_name,
+    count() AS n_patients,
+    countIf(startsWith(o.os_status, '1')) AS n_deceased,
+    countIf(startsWith(o.os_status, '0')) AS n_censored,
+    round(min(o.os_months),1) AS min_followup_m,
+    round(max(o.os_months),1) AS max_followup_m
+FROM grp AS g
+INNER JOIN os AS o ON o.patient_unique_id = g.patient_unique_id
+WHERE o.os_months IS NOT NULL AND o.os_status != ''
+GROUP BY group_name
+ORDER BY group_name"
+}
+
+◀ result
+{"rows":[{"group_name":"Bottom quartile (low)","n_patients":127,"n_deceased":49,"n_censored":78,"min_followup_m":0.4,"max_followup_m":232.2},{"group_name":"Middle 50%","n_patients":248,"n_deceased":83,"n_censored":165,"min_followup_m":0,"max_followup_m":238.3},{"group_name":"Top quartile (high)","n_patients":126,"n_deceased":49,"n_censored":77,"min_followup_m":0,"max_followup_m":163.1}]}
+
+▶ clickhouse_run_select_query
+{
+ "query": "WITH expr AS (
+    SELECT sample_unique_id, toFloat64OrNull(alteration_value) AS v
+    FROM genetic_alteration_derived
+    WHERE cancer_study_identifier = 'luad_tcga_pan_can_atlas_2018'
+      AND profile_type = 'rna_seq_v2_mrna'
+      AND hugo_gene_symbol = 'EGFR'
+      AND alteration_value NOT IN ('', 'NA')
+      AND toFloat64OrNull(alteration_value) IS NOT NULL
+)
+SELECT count() AS n_samples_with_egfr_expr, round(quantile(0.25)(v),2) AS q1, round(quantile(0.5)(v),2) AS median, round(quantile(0.75)(v),2) AS q3
+FROM expr"
+}
+
+◀ result
+{"rows":[{"n_samples_with_egfr_expr":510,"q1":539.15,"median":994.6,"q3":1766.05}]}
+
+▶ get_studyviewfilter_options
+{
+ "studyId": "luad_tcga_pan_can_atlas_2018",
+ "geneSpecificQueries": [
+  {
+   "hugoGeneSymbol": "EGFR",
+   "profileType": "rna_seq_v2_mrna"
+  }
+ ]
+}
+
+◀ result
+{"success":false,"error":"Internal Server Error","details":{"status":500,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/molecular-profiles/fetch","data":{"studyIds":["luad_tcga_pan_can_atlas_2018"]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"date":"Thu, 15 Oct 2026 08:18:09 GMT","content-type":"application/json","transfer-encoding":"chunked","connection":"close","cache-control":"no-cache, no-store, max-age=0, must-revalidate","content-encoding":"gzip","elapsed-time":"57","expires":"0","pragma":"no-cache","strict-transport-security":"max-age=31536000 ; includeSubDomains","vary":"origin,access-control-request-method,access-control-request-headers,accept-encoding","x-content-type-options":"nosniff","x-frame-options":"DENY","x-xss-protection":"0","cf-cache-status":"DYNAMIC","report-to":"{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=e09samC3zEOHiCiWr1QzFT6co5kkTDkQAFhsuDjofqxQkzkl7UzcYWMXW6Dhit3WzwP2RTn1Vac6OkQga%2B9UATj%2Ftiu74Efrw3GxbJRDc2X3dMnJ8H8%2Br6Up4vjkEFlpAV%2B6nw%3D%3D\"}]}","nel":"{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}","server":"cloudflare","cf-ray":"a4ad6314cf69c580-IAD"},"status":500,"text":"{\"timestamp\":1792052288873,\"status\":500,\"error\":\"Internal Server Error\",\"path\":\"/api/molecular-profiles/fetch\"}"}}}
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "EGFR mRNA top quartile (high)",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "rna_seq_v2_mrna",
+      "values": [
+       {
+        "start": 1766.05
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFR mRNA bottom quartile (low)",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "rna_seq_v2_mrna",
+      "values": [
+       {
+        "end": 539.15
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "survival"
+}
+
+✗ error
+The operation timed out.
+
+▶ navigate_to_group_comparison
+{
+ "studyIds": [
+  "luad_tcga_pan_can_atlas_2018"
+ ],
+ "groups": [
+  {
+   "name": "EGFR mRNA top quartile (high)",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "rna_seq_v2_mrna",
+      "values": [
+       {
+        "start": 1766.05
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EGFR mRNA bottom quartile (low)",
+   "studyViewFilter": {
+    "genomicDataFilters": [
+     {
+      "hugoGeneSymbol": "EGFR",
+      "profileType": "rna_seq_v2_mrna",
+      "values": [
+       {
+        "end": 539.15
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "tab": "survival"
+}
+
+◀ result
+{"success":false,"error":"Service Unavailable","details":{"status":503,"response":{"req":{"method":"POST","url":"https://www.cbioportal.org/api/filtered-samples/fetch","data":{"genomicDataFilters":[{"hugoGeneSymbol":"EGFR","profileType":"rna_seq_v2_mrna","values":[{"start":1766.05}]}],"studyIds":["luad_tcga_pan_can_atlas_2018"]},"headers":{"user-agent":"node-superagent/3.8.3","accept":"application/json","content-type":"application/json"}},"header":{"date":"Thu, 15 Oct 2026 08:19:14 GMT","content-type":"text/plain; charset=utf-8","content-length":"20","connection":"close","x-content-type-options":"nosniff","cf-cache-status":"DYNAMIC","report-to":"{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=BVoTERfNi9Qc35zbx2qYxcRQYuEpT%2BiZAbyvNp1SP9qzBc70HhIAQwD6l9ShDr19QhGyuJWb24VsUhc6gCaZ61PyJSKS0Stb5yzTNpCl6eLfVTcEF4hwGeEuahiyUEnzX9RQGA%3D%3D\"}]}","nel":"{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}","server":"cloudflare","cf-ray":"a4ad65cf2d9cab5c-IAD"},"status":503,"text":"no available server\n"}}}
+
+═ answer (success)
+Based on the TCGA PanCancer Atlas lung adenocarcinoma cohort, the crude event rates are nearly identical in the high and low EGFR mRNA quartiles. ClickHouse can't run the survival test, so I can't say whether the curves differ.
+
+**Study:** Lung Adenocarcinoma (TCGA, PanCancer Atlas), `luad_tcga_pan_can_atlas_2018`. Counts are patients. EGFR expression is raw RSEM (`rna_seq_v2_mrna`), with 510 samples having a value.
+
+**EGFR quartile cutoffs (raw RSEM):** 25th percentile 539.15; 75th percentile 1766.05. These come from my own calculation, so the portal's bins may differ slightly.
+
+| Group | Patients with OS data | Deceased | Censored (alive at last follow-up) | Follow-up range (months) |
+|---|---|---|---|---|
+| Top quartile (high) | 126 | 49 (39%) | 77 | 0 – 163 |
+| Middle 50% | 248 | 83 (33%) | 165 | 0 – 238 |
+| Bottom quartile (low) | 127 | 49 (39%) | 78 | 0.4 – 232 |
+
+Fewer than half of each extreme group has had an event, so the Kaplan-Meier median is likely not reached in either group. A log-rank test and hazard ratio are needed before any conclusion about survival.
+
+**To run the survival comparison:** The Group Comparison link generator failed twice (a timeout, then a server error). You can set it up yourself:
+1. Open the [study summary](https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018).
+2. Go to Group Comparison and create two groups from the EGFR mRNA expression bins: top quartile and bottom quartile.
+3. Open the Survival tab for the Kaplan-Meier curves and log-rank p-value.
+
+Alternatively, export the per-patient OS time and status for each group and run `survival::survfit` and `coxph` in R, or `lifelines` in Python.
