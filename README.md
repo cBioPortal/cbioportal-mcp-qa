@@ -601,4 +601,4 @@ cBioAgent MongoDB and the LibreChat config, not in this repo.
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE) for details. To cite this benchmark, see the [cbioportal-mcp CITATION.cff](https://github.com/cBioPortal/cbioportal-mcp/blob/main/CITATION.cff).
+Apache License 2.0 - see [LICENSE](LICENSE) for details.
