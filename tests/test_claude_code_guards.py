@@ -381,6 +381,51 @@ def test_an_extra_body_that_isnt_a_json_object_is_refused(monkeypatch, tmp_path,
         ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp", isolate_settings=False)
 
 
+@pytest.mark.parametrize("model", ["haiku", "sonnet", "sonnet-5.5"])
+def test_other_models_keep_whatever_effort_they_inherit(monkeypatch, model):
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+    body = {"output_config": {"effort": "max"}}
+    monkeypatch.setenv("CLAUDE_CODE_EXTRA_BODY", json.dumps(body))
+    _, settings = _session_settings(monkeypatch, model)
+    assert "CLAUDE_CODE_EFFORT_LEVEL" not in settings["env"]
+    assert _extra_body(settings) == body
+
+
+def test_haiku_5_5_effort_is_pinned_over_the_shell(monkeypatch):
+    # The API rejects thinking "disabled" with effort xhigh or max.
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+    _, settings = _session_settings(monkeypatch, "haiku-5.5")
+    assert settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] == "medium"
+
+
+def test_haiku_5_5_effort_is_pinned_over_user_settings(monkeypatch, tmp_path):
+    _user_settings(tmp_path, {"CLAUDE_CODE_EFFORT_LEVEL": "xhigh"})
+    _, settings = _session_settings(monkeypatch, "haiku-5.5", isolate_settings=False)
+    assert settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] == "medium"
+
+
+@pytest.mark.parametrize(
+    "output, kept",
+    [
+        ({"effort": "max"}, {}),
+        ({"effort": "xhigh", "other": 1}, {"output_config": {"other": 1}}),
+        ({"x": 2}, None),
+    ],
+)
+def test_haiku_5_5_drops_an_extra_body_effort(monkeypatch, tmp_path, output, kept):
+    _user_settings(tmp_path, {"CLAUDE_CODE_EXTRA_BODY": json.dumps({"output_config": output, "metadata": 1})})
+    _, settings = _session_settings(monkeypatch, "haiku-5.5", isolate_settings=False)
+    kept = {"output_config": output} if kept is None else kept
+    assert _extra_body(settings) == {"metadata": 1, **kept, "thinking": {"type": "disabled"}}
+    assert settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] == "medium"
+
+
+def test_model_key_maps_claude_code_ids_to_models_keys():
+    assert claude_code.model_key("claude-haiku-5-5") == "haiku-5.5"
+    assert claude_code.model_key("haiku-5.5") == "haiku-5.5"
+    assert claude_code.model_key("claude-sonnet-4-6") == "claude-sonnet-4-6"
+
+
 def test_the_connector_probe_carries_the_request_body_too(monkeypatch):
     seen = []
 
