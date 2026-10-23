@@ -17,6 +17,7 @@ from cbioportal_mcp_qa import cli as cli_mod
 from cbioportal_mcp_qa.claude_code import (
     BUILTIN_PLUGINS,
     PREFLIGHT_MODEL,
+    THINKING_OFF_SETTINGS,
     ClaudeCodeClient,
     ToolSetup,
     claude_args,
@@ -120,7 +121,14 @@ def test_the_preflight_makes_no_model_call_and_turns_every_builtin_plugin_off(fa
     # A model no account has: the init event arrives, then model_not_found, before anything is generated.
     assert argv[argv.index("--model") + 1] == PREFLIGHT_MODEL
     assert argv[argv.index("--setting-sources") + 1] == "" and argv[argv.index("--tools") + 1] == ""
-    assert _settings(argv) == settings == {"enabledPlugins": {f"{n}@builtin": False for n in BUILTIN_PLUGINS}}
+    assert (
+        _settings(argv)
+        == settings
+        == {
+            **THINKING_OFF_SETTINGS,
+            "enabledPlugins": {f"{n}@builtin": False for n in BUILTIN_PLUGINS},
+        }
+    )
 
 
 def test_a_plugin_the_preflight_finds_is_turned_off_and_checked_again(fake_claude, tmp_path):
@@ -128,6 +136,7 @@ def test_a_plugin_the_preflight_finds_is_turned_off_and_checked_again(fake_claud
     settings, found = plugin_guard(dict(os.environ), str(tmp_path), False, False, {"disableAllHooks": True})
     assert found == [] and len(fake_claude.preflights) == 2
     assert settings["disableAllHooks"] is True
+    assert settings["env"] == {"MAX_THINKING_TOKENS": "0"} and settings["alwaysThinkingEnabled"] is False
     assert settings["enabledPlugins"]["new-builtin@builtin"] is False
     assert settings["enabledPlugins"]["skills@user-market"] is False
     assert "--setting-sources" not in fake_claude.calls[1]  # user settings, as the sessions load them
@@ -221,7 +230,7 @@ def test_runner_stops_when_a_session_loads_a_plugin_the_preflight_missed(fake_cl
 def test_claude_args_and_the_connector_probe_carry_the_settings():
     setup = ToolSetup({"navigator": "http://nav/mcp"})
     args = claude_args("q?", "haiku", "PROMPT", setup, "/tmp/mcp.json")
-    assert _settings(args) == claude_code.no_plugins_settings()
+    assert _settings(args) == claude_code.session_settings()
     custom = {"enabledPlugins": {"x@y": False}}
     assert _settings(claude_args("q?", "haiku", "PROMPT", setup, "/tmp/mcp.json", settings=custom)) == custom
 

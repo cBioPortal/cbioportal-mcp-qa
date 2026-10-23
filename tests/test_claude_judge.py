@@ -150,6 +150,7 @@ def test_the_judge_session_has_no_tools_no_mcp_and_the_same_prompt(fake_claude, 
     assert json.loads(argv[argv.index("--settings") + 1]) == {
         "disableAllHooks": True,
         "autoMemoryEnabled": False,
+        **claude_code.THINKING_OFF_SETTINGS,
         "enabledPlugins": {f"{name}@builtin": False for name in claude_code.BUILTIN_PLUGINS},
     }
     assert call["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
