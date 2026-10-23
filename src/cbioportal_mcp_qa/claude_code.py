@@ -74,6 +74,10 @@ THINKING_OFF_ENV = {"MAX_THINKING_TOKENS": "0", "CLAUDE_CODE_DISABLE_THINKING": 
 # its sessions send it through CLAUDE_CODE_EXTRA_BODY. Sonnet 5.5 rejects "disabled"; its `between_tools` only
 # drops the up-front thinking, so it stays adaptive.
 EXTRA_BODY_THINKING = {"haiku-5.5": {"type": "disabled"}}
+# The effort those sessions are pinned to: the API rejects "disabled" with effort xhigh or max, which an inherited
+# CLAUDE_CODE_EFFORT_LEVEL (shell or user settings) would send. medium is what Claude Code 2.1.309 sends Haiku 5.5
+# by default, so a default session's request is unchanged.
+THINKING_OFF_EFFORT = {"haiku-5.5": "medium"}
 # Each model's thinking in claude-code sessions, as captured from Claude Code 2.1.309's requests (PR #88).
 # Managed settings outrank the session's, so a managed `env` can still change it.
 THINKING_MODES = {
@@ -481,11 +485,27 @@ def session_settings(extra: list[str] = ()) -> dict:
     return THINKING_OFF_SETTINGS | no_plugins_settings(extra)
 
 
+def model_key(model_id: str) -> str:
+    """The MODELS key for a Claude Code model id ('claude-haiku-5-5' → 'haiku-5.5'); a key or unknown id as is."""
+    return next((k for k, m in MODELS.items() if m.claude_code_id == model_id), model_id)
+
+
 def model_settings(settings: dict, model: str, body: Mapping | None = None) -> dict:
-    """`settings` for a session on `model`: CLAUDE_CODE_EXTRA_BODY in their env is `body` (the inherited one, its
-    `thinking` taken out) plus the model's EXTRA_BODY_THINKING, so neither the shell nor user settings set it."""
+    """`settings` for a session on `model` (a MODELS key): CLAUDE_CODE_EXTRA_BODY in their env is `body` (the
+    inherited one, its `thinking` taken out) plus the model's EXTRA_BODY_THINKING, so neither the shell nor user
+    settings set it. A model with THINKING_OFF_EFFORT also gets that CLAUDE_CODE_EFFORT_LEVEL, and `body` loses
+    an `output_config.effort` that would override it."""
+    body = dict(body or {})
+    env = dict(settings.get("env", {}))
+    if model in THINKING_OFF_EFFORT:
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = THINKING_OFF_EFFORT[model]
+        if isinstance(output := body.get("output_config"), dict) and "effort" in output:
+            output = {k: v for k, v in output.items() if k != "effort"}
+            body = {k: v for k, v in body.items() if k != "output_config"} | (
+                {"output_config": output} if output else {}
+            )
     thinking = {"thinking": EXTRA_BODY_THINKING[model]} if model in EXTRA_BODY_THINKING else {}
-    env = settings.get("env", {}) | {"CLAUDE_CODE_EXTRA_BODY": json.dumps(dict(body or {}) | thinking)}
+    env["CLAUDE_CODE_EXTRA_BODY"] = json.dumps(body | thinking)
     return settings | {"env": env}
 
 

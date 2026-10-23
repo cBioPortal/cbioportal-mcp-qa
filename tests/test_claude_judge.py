@@ -150,7 +150,9 @@ def test_the_judge_session_has_no_tools_no_mcp_and_the_same_prompt(fake_claude, 
     assert json.loads(argv[argv.index("--settings") + 1]) == {
         "disableAllHooks": True,
         "autoMemoryEnabled": False,
-        **claude_code.THINKING_OFF_SETTINGS,
+        "alwaysThinkingEnabled": False,
+        # Sonnet 4.6 has no request body override.
+        "env": claude_code.THINKING_OFF_ENV | {"CLAUDE_CODE_EXTRA_BODY": "{}"},
         "enabledPlugins": {f"{name}@builtin": False for name in claude_code.BUILTIN_PLUGINS},
     }
     assert call["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
@@ -160,6 +162,24 @@ def test_the_judge_session_has_no_tools_no_mcp_and_the_same_prompt(fake_claude, 
     # An empty working directory: no project CLAUDE.md.
     assert os.listdir(call["cwd"]) == ["no-mcp.json"]
     judge.close()
+
+
+@pytest.mark.parametrize("model", ["haiku-5.5", "claude-haiku-5-5"])
+def test_a_haiku_5_5_judge_gets_the_runners_thinking_override_and_effort(
+    fake_claude, ungraded, monkeypatch, model
+):
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+    monkeypatch.setenv(
+        "CLAUDE_CODE_EXTRA_BODY", json.dumps({"output_config": {"effort": "max"}, "metadata": 1})
+    )
+    judge = ClaudeCodeJudge(model)
+    rec = ungraded.records[record_key(1, "haiku", 1)]
+    judge.grade(Question.from_dict(rec["question"]), "x", studies=None)
+    argv = fake_claude.calls[0]["argv"]
+    assert argv[argv.index("--model") + 1] == "claude-haiku-5-5"
+    env = json.loads(argv[argv.index("--settings") + 1])["env"]
+    assert json.loads(env["CLAUDE_CODE_EXTRA_BODY"]) == {"metadata": 1, "thinking": {"type": "disabled"}}
+    assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "medium"
 
 
 def test_billing_variables_never_reach_the_judge(fake_claude, ungraded):
