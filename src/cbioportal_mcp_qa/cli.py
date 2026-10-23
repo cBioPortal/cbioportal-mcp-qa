@@ -10,7 +10,7 @@ from click.core import ParameterSource
 
 from .agent import AgentClient
 from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
-from .claude_code import USAGE_LIMIT, ClaudeCodeClient, find_connector, prompt_parity
+from .claude_code import USAGE_LIMIT, ClaudeCodeClient, find_connector, prompt_parity, thinking_modes
 from .claude_judge import ClaudeCodeJudge
 from .compare import compare as compare_runs
 from .compare import write_compare
@@ -294,8 +294,22 @@ def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) 
     return env
 
 
+def _warn_thinking(runner: str, models: list[str]) -> None:
+    """The deployed agent runs with thinking off; say which claude-code models can't (Sonnet 5.5)."""
+    if runner != "claude-code":
+        return
+    for model, mode in thinking_modes(models).items():
+        if mode != "disabled":
+            click.echo(
+                f"Warning: {model} runs with {mode} thinking under claude-code (it can't have thinking fully "
+                "turned off), so its answers aren't a thinking-off comparison with the deployed agent",
+                err=True,
+            )
+
+
 def _check_runner_options(settings, runner: str, models: list[str], system_prompt_file) -> None:
     """Options that only some runners use, refused where they would be recorded but not used."""
+    _warn_thinking(runner, models)
     if system_prompt_file and runner not in LOCAL_RUNNERS:
         raise click.UsageError(
             f"--system-prompt-file needs --runner claude-code or openai: the {runner} runner asks the deployed "
@@ -771,7 +785,8 @@ def run(
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
             extra["claude_code"] = client.describe() | {
-                "prompt": prompt_parity(prompt, settings.database_mcp_url)
+                "prompt": prompt_parity(prompt, settings.database_mcp_url),
+                "thinking": thinking_modes(models),
             }
         judge_id = judge.model if judge else _bedrock_judge_model(settings, judge_model)
         bench = Run.create(target, models, repeats, judge_id, str(questions_file), runner, extra)

@@ -178,6 +178,7 @@ def test_client_strips_billing_env_and_records_the_auth_mode(monkeypatch):
             "allow_plugins": False,
             "plugins": [],
             "disabled_plugins": sorted(f"{name}@builtin" for name in claude_code.BUILTIN_PLUGINS),
+            "extra_body_keys": [],
         }
     finally:
         asyncio.run(client.aclose())
@@ -283,22 +284,130 @@ def test_client_passes_isolation_to_every_session(monkeypatch):
     assert client.env["MAX_THINKING_TOKENS"] == "0"
 
 
-def test_thinking_stays_off_when_user_settings_are_loaded(monkeypatch):
-    """With --claude-code-user-settings, an `env` or `alwaysThinkingEnabled` in ~/.claude/settings.json would
-    replace the session env's MAX_THINKING_TOKENS=0; --settings outranks user settings, so it carries it too."""
-    client = ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp", isolate_settings=False)
+def _session_settings(monkeypatch, model: str, **client_kwargs) -> tuple[ClaudeCodeClient, dict]:
+    """The client and the --settings of one session it runs on `model`."""
+    client = ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp", **client_kwargs)
     calls = _fake_exec(monkeypatch, iter([[_init("none"), json.dumps({"type": "result", "result": "ok"})]]))
     try:
-        asyncio.run(client.ask("q?", "haiku"))
+        asyncio.run(client.ask("q?", model))
     finally:
         asyncio.run(client.aclose())
     args = list(calls[0])
-    assert "--setting-sources" not in args
-    settings = json.loads(args[args.index("--settings") + 1])
-    assert settings["env"] == {"MAX_THINKING_TOKENS": "0"} and settings["alwaysThinkingEnabled"] is False
-    assert client.env["MAX_THINKING_TOKENS"] == "0"
+    return client, json.loads(args[args.index("--settings") + 1])
+
+
+def _user_settings(tmp_path, env: dict) -> None:
+    home = tmp_path / "claude-home"
+    home.mkdir(exist_ok=True)
+    (home / "settings.json").write_text(json.dumps({"alwaysThinkingEnabled": True, "env": env}))
+
+
+def _extra_body(settings: dict) -> dict:
+    return json.loads(settings["env"]["CLAUDE_CODE_EXTRA_BODY"])
+
+
+@pytest.mark.parametrize("model", ["haiku", "sonnet", "sonnet-5.5"])
+def test_only_haiku_5_5_gets_a_thinking_override_in_its_request_body(monkeypatch, model):
+    # Captured on 2.1.309: MAX_THINKING_TOKENS=0 already disables Haiku 4.5 and Sonnet 5; Sonnet 5.5 stays adaptive.
+    _, settings = _session_settings(monkeypatch, model)
+    assert _extra_body(settings) == {}
+
+
+def test_haiku_5_5_sends_thinking_disabled_through_the_extra_body(monkeypatch):
+    # MAX_THINKING_TOKENS=0 has no effect on Haiku 5.5; the API takes {type: disabled} at effort high or below.
+    _, settings = _session_settings(monkeypatch, "haiku-5.5")
+    assert _extra_body(settings) == {"thinking": {"type": "disabled"}}
+    assert claude_code.THINKING_MODES["haiku-5.5"] == "disabled"
+    assert claude_code.THINKING_MODES["sonnet-5.5"] == "adaptive"
+
+
+def test_thinking_settings_outrank_user_settings(monkeypatch, tmp_path):
+    """With --claude-code-user-settings, the user settings' `env` replaces the session env's, so
+    THINKING_OFF_ENV goes in --settings, which outranks them."""
+    _user_settings(tmp_path, {"MAX_THINKING_TOKENS": "16000", "CLAUDE_CODE_DISABLE_THINKING": "1"})
+    client, settings = _session_settings(monkeypatch, "sonnet", isolate_settings=False)
+    assert settings["env"]["MAX_THINKING_TOKENS"] == "0"
     # Leaving the thinking parameter out would let Sonnet 5, Sonnet 5.5 and Haiku 5.5 think by default.
-    assert "CLAUDE_CODE_DISABLE_THINKING" not in client.env
+    assert settings["env"]["CLAUDE_CODE_DISABLE_THINKING"] == "0"
+    assert settings["alwaysThinkingEnabled"] is False
+    assert client.env["MAX_THINKING_TOKENS"] == "0"
+
+
+def test_the_shell_cant_leave_the_thinking_parameter_out(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_THINKING", "1")
+    client, settings = _session_settings(monkeypatch, "sonnet")
+    assert client.env["CLAUDE_CODE_DISABLE_THINKING"] == "0"
+    assert settings["env"]["CLAUDE_CODE_DISABLE_THINKING"] == "0"
+
+
+@pytest.mark.parametrize(
+    "model, thinking", [("sonnet", {}), ("haiku-5.5", {"thinking": {"type": "disabled"}})]
+)
+def test_an_inherited_extra_body_loses_its_thinking_and_keeps_the_rest(monkeypatch, model, thinking):
+    monkeypatch.setenv(
+        "CLAUDE_CODE_EXTRA_BODY", json.dumps({"thinking": {"type": "adaptive"}, "metadata": {"a": 1}})
+    )
+    client, settings = _session_settings(monkeypatch, model)
+    assert json.loads(client.env["CLAUDE_CODE_EXTRA_BODY"]) == {"metadata": {"a": 1}}
+    assert _extra_body(settings) == {"metadata": {"a": 1}} | thinking
+    assert client.describe()["extra_body_keys"] == ["metadata"]
+
+
+def test_a_user_settings_extra_body_replaces_the_shells_and_loses_its_thinking(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CODE_EXTRA_BODY", json.dumps({"shell": True}))
+    _user_settings(
+        tmp_path, {"CLAUDE_CODE_EXTRA_BODY": json.dumps({"thinking": {"type": "adaptive"}, "user": 1})}
+    )
+    _, settings = _session_settings(monkeypatch, "sonnet", isolate_settings=False)
+    assert _extra_body(settings) == {"user": 1}
+    # Isolated sessions don't load user settings: the shell's (thinking-free) body applies.
+    _, isolated = _session_settings(monkeypatch, "sonnet")
+    assert _extra_body(isolated) == {"shell": True}
+
+
+def test_an_extra_body_that_only_set_thinking_is_dropped_from_the_env():
+    env, _ = session_env({"CLAUDE_CODE_EXTRA_BODY": json.dumps({"thinking": {"type": "adaptive"}})})
+    assert "CLAUDE_CODE_EXTRA_BODY" not in env
+
+
+@pytest.mark.parametrize("value", ["not json", "[1, 2]", '"text"'])
+def test_an_extra_body_that_isnt_a_json_object_is_refused(monkeypatch, tmp_path, value):
+    monkeypatch.setenv("CLAUDE_CODE_EXTRA_BODY", value)
+    with pytest.raises(RuntimeError, match="CLAUDE_CODE_EXTRA_BODY in the environment isn't a JSON object"):
+        ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp")
+    monkeypatch.delenv("CLAUDE_CODE_EXTRA_BODY")
+    _user_settings(tmp_path, {"CLAUDE_CODE_EXTRA_BODY": value})
+    with pytest.raises(RuntimeError, match="settings.json isn't a JSON object"):
+        ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp", isolate_settings=False)
+
+
+def test_the_connector_probe_carries_the_request_body_too(monkeypatch):
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return SimpleNamespace(stdout=_init("none", ["mcp__claude_ai_DB__x"]), stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_code.subprocess, "run", fake_run)
+    with tempfile.TemporaryDirectory() as workdir:
+        probe_mcp_servers(ToolSetup({"navigator": "http://nav/mcp"}), workdir, {}, extra_body={"metadata": 1})
+    settings = json.loads(seen[0][seen[0].index("--settings") + 1])
+    assert _extra_body(settings) == {"metadata": 1}
+    assert settings["env"]["MAX_THINKING_TOKENS"] == "0"
+
+
+def test_run_start_warns_about_and_records_the_thinking_mode(capsys):
+    cli._warn_thinking("claude-code", ["haiku", "sonnet-5.5"])
+    err = capsys.readouterr().err
+    assert "sonnet-5.5 runs with adaptive thinking" in err and "haiku" not in err
+    cli._warn_thinking("agents-api", ["sonnet-5.5"])
+    assert capsys.readouterr().err == ""
+    assert claude_code.thinking_modes(["haiku", "haiku-5.5", "sonnet-5.5", "unified"]) == {
+        "haiku": "disabled",
+        "haiku-5.5": "disabled",
+        "sonnet-5.5": "adaptive",
+        "unified": "unverified",
+    }
 
 
 # --- 3. Beta awareness ------------------------------------------------------------------------------------
@@ -493,6 +602,8 @@ def test_run_records_the_new_fields_through_the_persist_path(monkeypatch, result
     assert data["claude_code"]["auth_mode"] == "subscription"
     assert data["claude_code"]["stripped_env"] == sorted(BILLING_ENV)
     assert data["claude_code"]["setting_sources"] == "managed only"
+    assert data["claude_code"]["thinking"] == {"haiku": "disabled"}
+    assert data["claude_code"]["extra_body_keys"] == []
     assert data["claude_code"]["prompt"]["combined"]["chars"] == len("AGENT\n\nSERVER")
     assert kwargs["transcripts"] == run_json.parent / "transcripts"
     for value in BILLING_ENV.values():

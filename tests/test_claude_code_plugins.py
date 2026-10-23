@@ -136,7 +136,7 @@ def test_a_plugin_the_preflight_finds_is_turned_off_and_checked_again(fake_claud
     settings, found = plugin_guard(dict(os.environ), str(tmp_path), False, False, {"disableAllHooks": True})
     assert found == [] and len(fake_claude.preflights) == 2
     assert settings["disableAllHooks"] is True
-    assert settings["env"] == {"MAX_THINKING_TOKENS": "0"} and settings["alwaysThinkingEnabled"] is False
+    assert settings["env"] == claude_code.THINKING_OFF_ENV and settings["alwaysThinkingEnabled"] is False
     assert settings["enabledPlugins"]["new-builtin@builtin"] is False
     assert settings["enabledPlugins"]["skills@user-market"] is False
     assert "--setting-sources" not in fake_claude.calls[1]  # user settings, as the sessions load them
@@ -191,7 +191,10 @@ def test_runner_sessions_turn_plugins_off_and_record_them(fake_claude):
         asyncio.run(client.aclose())
     assert reply.error is None and reply.trace["plugins"] == []
     preflight, session = fake_claude.calls
-    assert PREFLIGHT_MODEL in preflight and _settings(session) == _settings(preflight) == client.settings
+    assert PREFLIGHT_MODEL in preflight and _settings(preflight) == client.settings
+    # The session's settings add only the request body for its model (Haiku 4.5: nothing to merge).
+    assert _settings(session) == claude_code.model_settings(client.settings, "haiku")
+    assert _settings(session)["env"]["CLAUDE_CODE_EXTRA_BODY"] == "{}"
     assert described["plugins"] == [] and described["allow_plugins"] is False
     assert described["disabled_plugins"] == sorted(f"{n}@builtin" for n in BUILTIN_PLUGINS)
 
@@ -230,9 +233,11 @@ def test_runner_stops_when_a_session_loads_a_plugin_the_preflight_missed(fake_cl
 def test_claude_args_and_the_connector_probe_carry_the_settings():
     setup = ToolSetup({"navigator": "http://nav/mcp"})
     args = claude_args("q?", "haiku", "PROMPT", setup, "/tmp/mcp.json")
-    assert _settings(args) == claude_code.session_settings()
+    assert _settings(args) == claude_code.model_settings(claude_code.session_settings(), "haiku")
     custom = {"enabledPlugins": {"x@y": False}}
-    assert _settings(claude_args("q?", "haiku", "PROMPT", setup, "/tmp/mcp.json", settings=custom)) == custom
+    assert _settings(
+        claude_args("q?", "haiku", "PROMPT", setup, "/tmp/mcp.json", settings=custom)
+    ) == custom | {"env": {"CLAUDE_CODE_EXTRA_BODY": "{}"}}
 
 
 # --- the judge --------------------------------------------------------------------------------------------------
