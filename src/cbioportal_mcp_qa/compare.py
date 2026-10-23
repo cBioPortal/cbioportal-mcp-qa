@@ -42,6 +42,7 @@ from .report import (
     outcome_of,
     pct,
     quantile,
+    reasoning_effort,
     record_cost,
 )
 from .run import RESULTS_DIR, Run
@@ -507,6 +508,7 @@ def compare(
             "runner": run.data.get("runner", "agents-api"),
             "model": model,
             "label": MODELS[model].label,
+            "reasoning_effort": reasoning_effort(run.data),
             "repeats": run.data.get("repeats", 1),
             "judge_model": ", ".join(map(str, judge_models)),
             "judge_models": judge_models,
@@ -554,7 +556,10 @@ def _fmt(value, fmt: str, signed: bool = False) -> str:
 
 
 def _side_name(side: dict) -> str:
-    return f"{side['run_id']} {side['label']} ({side['target']}, ×{side['repeats']})"
+    effort = side.get("reasoning_effort") or "–"
+    return (
+        f"{side['run_id']} {side['label']} ({side['target']}, ×{side['repeats']}, reasoning effort {effort})"
+    )
 
 
 def _counts_text(c: dict) -> str:
@@ -585,13 +590,14 @@ def to_markdown(result: dict, per_question_limit: int = 40) -> str:
         "",
         "## Turns",
         "",
-        "| | Expected | Completed | Failed | Missing | Ungraded | No reference | Eligible |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| | Reasoning effort | Expected | Completed | Failed | Missing | Ungraded | No reference | Eligible |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for key, side in (("A", a), ("B", b)):
         c = side["counts"]
         lines.append(
-            f"| {key} | {c['expected']} | {c['completed']} | {c['failed']} | {c['missing']} | {c['ungraded']} | "
+            f"| {key} | {side.get('reasoning_effort') or '–'} | {c['expected']} | {c['completed']} | "
+            f"{c['failed']} | {c['missing']} | {c['ungraded']} | "
             f"{c['no_reference']} | {c['eligible']} |"
         )
     lines += ["", "## Headline", "", "| Metric | A | B | Δ (B − A) |", "|---|---:|---:|---:|"]

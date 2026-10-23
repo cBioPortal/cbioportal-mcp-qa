@@ -763,10 +763,16 @@ def run(
             "versions": collect_versions(settings, runner, target),
         }
         if runner == "openai":
+            # The reasoning effort answers are asked with, for the report (agents-api: the deployed agent's own).
+            extra["reasoning_effort"] = reasoning_effort or "default"
             extra["database_mcp"] = settings.database_mcp_url or settings.database_connector_url
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
         if runner == "claude-code":
+            # Sessions run with MAX_THINKING_TOKENS=0; user settings can add their effortLevel.
+            extra["reasoning_effort"] = "thinking off" + (
+                ", user settings" if claude_code_user_settings else ""
+            )
             extra["database_mcp"] = client.setup.connector or settings.database_mcp_url
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
