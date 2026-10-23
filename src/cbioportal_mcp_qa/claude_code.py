@@ -1,9 +1,11 @@
 """Answer questions with headless Claude Code standing in for the deployed agent.
 
 The deployed agent's own instructions are the system prompt, the only tools are the same two MCP servers
-(no Claude Code built-ins), and extended thinking is off to match the deployment. It runs on the Claude
-subscription of the configured Claude home (CLAUDE_CONFIG_DIR) instead of per-token Bedrock billing, so it
-is the cheap loop for iterating on prompts and guides; the Agents API runner remains the release check.
+(no Claude Code built-ins), and extended thinking is off to match the deployment on every model but Sonnet 5.5,
+which can't have it turned off and thinks adaptively (see THINKING_MODES).
+It runs on the Claude subscription of the configured Claude home (CLAUDE_CONFIG_DIR) instead of per-token
+Bedrock billing, so it is the cheap loop for iterating on prompts and guides; the Agents API runner remains
+the release check.
 Credentials that would bill per token are kept out unless allowed, and so are the Claude home's user settings.
 """
 
@@ -62,10 +64,58 @@ NO_ORG_POLICY_PLANS = {"pro", "max"}
 NO_API_KEY_SOURCE = "none"
 
 
+# Thinking is off to match the deployed agent (thinking=false). MAX_THINKING_TOKENS=0 makes Claude Code 2.1.309
+# send `thinking: {type: disabled}` to Haiku 4.5 and Sonnet 5, but it has no effect on Sonnet 5.5 or Haiku 5.5
+# (https://code.claude.com/docs/en/model-config#extended-thinking), which get `{type: adaptive}`.
+# CLAUDE_CODE_DISABLE_THINKING=1 leaves the `thinking` parameter out, and Sonnet 5, Sonnet 5.5 and Haiku 5.5 think
+# by default, so it is pinned to 0.
+THINKING_OFF_ENV = {"MAX_THINKING_TOKENS": "0", "CLAUDE_CODE_DISABLE_THINKING": "0"}
+# The API accepts `{type: disabled}` from Haiku 5.5 at effort high or below (Claude Code's default is medium), so
+# its sessions send it through CLAUDE_CODE_EXTRA_BODY. Sonnet 5.5 rejects "disabled"; its `between_tools` only
+# drops the up-front thinking, so it stays adaptive.
+EXTRA_BODY_THINKING = {"haiku-5.5": {"type": "disabled"}}
+# The effort those sessions are pinned to: the API rejects "disabled" with effort xhigh or max, which an inherited
+# CLAUDE_CODE_EFFORT_LEVEL (shell or user settings) would send. medium is what Claude Code 2.1.309 sends Haiku 5.5
+# by default, so a default session's request is unchanged.
+THINKING_OFF_EFFORT = {"haiku-5.5": "medium"}
+# Each model's thinking in claude-code sessions, as captured from Claude Code 2.1.309's requests (PR #88).
+# Managed settings outrank the session's, so a managed `env` can still change it.
+THINKING_MODES = {
+    "haiku": "disabled",
+    "sonnet": "disabled",
+    "haiku-5.5": "disabled",
+    "sonnet-5.5": "adaptive",
+}
+
+
+def thinking_modes(models: list[str]) -> dict[str, str]:
+    """Each model's thinking mode in claude-code sessions, for run.json ("unverified" for one never captured)."""
+    return {m: THINKING_MODES.get(m, "unverified") for m in models}
+
+
+def extra_body(value: str | None, source: str) -> dict:
+    """A CLAUDE_CODE_EXTRA_BODY with its `thinking` key taken out, which would override the session's thinking;
+    its other keys are still merged into every request. One that isn't a JSON object is refused."""
+    if not value:
+        return {}
+    try:
+        body = json.loads(value)
+    except json.JSONDecodeError:
+        body = None
+    if not isinstance(body, dict):
+        raise RuntimeError(f"CLAUDE_CODE_EXTRA_BODY in {source} isn't a JSON object; fix or unset it")
+    return {k: v for k, v in body.items() if k != "thinking"}
+
+
 def session_env(base: Mapping[str, str], allow_api_billing: bool = False) -> tuple[dict, list[str]]:
-    """The environment for `claude`, and the names of the billing variables taken out of it. Thinking is off to
-    match the deployed agent (thinking=false); CLAUDE_CONFIG_DIR passes through."""
-    env = {**base, "MAX_THINKING_TOKENS": "0"}
+    """The environment for `claude`, and the names of the billing variables taken out of it. CLAUDE_CONFIG_DIR
+    passes through; THINKING_OFF_ENV is set, and an inherited CLAUDE_CODE_EXTRA_BODY loses its `thinking` key."""
+    env = {**base, **THINKING_OFF_ENV}
+    if "CLAUDE_CODE_EXTRA_BODY" in env:
+        if body := extra_body(env["CLAUDE_CODE_EXTRA_BODY"], "the environment"):
+            env["CLAUDE_CODE_EXTRA_BODY"] = json.dumps(body)
+        else:
+            del env["CLAUDE_CODE_EXTRA_BODY"]
     stripped = [] if allow_api_billing else sorted(k for k in env if API_BILLING_ENV.match(k))
     for name in stripped:
         del env[name]
@@ -74,6 +124,22 @@ def session_env(base: Mapping[str, str], allow_api_billing: bool = False) -> tup
 
 def config_dir(env: Mapping[str, str]) -> Path:
     return Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
+
+
+def session_extra_body(env: Mapping[str, str], isolate_settings: bool) -> dict:
+    """The CLAUDE_CODE_EXTRA_BODY sessions inherit, without its `thinking` key: the user settings' when they're
+    loaded and set one (it replaces the environment's), else the environment's."""
+    path = config_dir(env) / "settings.json"
+    if not isolate_settings and path.exists():
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"could not read {path}: {exc}") from exc
+        user_env = doc.get("env") if isinstance(doc, dict) and isinstance(doc.get("env"), dict) else {}
+        if "CLAUDE_CODE_EXTRA_BODY" in user_env:
+            value = user_env["CLAUDE_CODE_EXTRA_BODY"]
+            return extra_body(value if isinstance(value, str) else json.dumps(value), str(path))
+    return extra_body(env.get("CLAUDE_CODE_EXTRA_BODY"), "the environment")
 
 
 def settings_files(env: Mapping[str, str], isolate_settings: bool) -> list[Path]:
@@ -280,13 +346,14 @@ def tool_setup(
     allow_api_billing: bool = False,
     settings: dict | None = None,
     allow_plugins: bool = False,
+    extra_body: Mapping | None = None,
 ) -> ToolSetup:
     if not connector:
         return ToolSetup({"cbioportal-database": database_url, NAVIGATOR_SERVER: navigator_url})
     setup = ToolSetup({NAVIGATOR_SERVER: navigator_url}, connector)
     wanted = connector_tool_prefix(connector)
     loaded = probe_mcp_servers(
-        setup, workdir, env, isolate_settings, allow_api_billing, settings, allow_plugins
+        setup, workdir, env, isolate_settings, allow_api_billing, settings, allow_plugins, extra_body
     )
     if wanted not in loaded:
         raise RuntimeError(
@@ -332,10 +399,46 @@ BUILTIN_PLUGINS = (
 PREFLIGHT_MODEL = "claude-mcp-qa-preflight-no-such-model"
 
 
+# An `env` in the user settings (loaded with --claude-code-user-settings) replaces the session env's value, so
+# THINKING_OFF_ENV or `alwaysThinkingEnabled` there would turn thinking back on; --settings outranks them (managed
+# settings still outrank --settings).
+THINKING_OFF_SETTINGS = {"alwaysThinkingEnabled": False, "env": dict(THINKING_OFF_ENV)}
+
+
 def no_plugins_settings(extra: list[str] = ()) -> dict:
     """--settings that turn off the built-in plugins and `extra` (plugin ids a preflight found)."""
     ids = [f"{name}@builtin" for name in BUILTIN_PLUGINS] + list(extra)
     return {"enabledPlugins": dict.fromkeys(ids, False)}
+
+
+def session_settings(extra: list[str] = ()) -> dict:
+    """--settings for a session: THINKING_OFF_SETTINGS (thinking off on the models Claude Code can turn it off
+    for, unless managed settings say otherwise) and the plugins (and `extra`) turned off."""
+    return THINKING_OFF_SETTINGS | no_plugins_settings(extra)
+
+
+def model_key(model_id: str) -> str:
+    """The MODELS key for a Claude Code model id ('claude-haiku-5-5' → 'haiku-5.5'); a key or unknown id as is."""
+    return next((k for k, m in MODELS.items() if m.claude_code_id == model_id), model_id)
+
+
+def model_settings(settings: dict, model: str, body: Mapping | None = None) -> dict:
+    """`settings` for a session on `model` (a MODELS key): CLAUDE_CODE_EXTRA_BODY in their env is `body` (the
+    inherited one, its `thinking` taken out) plus the model's EXTRA_BODY_THINKING, so neither the shell nor user
+    settings set it. A model with THINKING_OFF_EFFORT also gets that CLAUDE_CODE_EFFORT_LEVEL, and `body` loses
+    an `output_config.effort` that would override it."""
+    body = dict(body or {})
+    env = dict(settings.get("env", {}))
+    if model in THINKING_OFF_EFFORT:
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = THINKING_OFF_EFFORT[model]
+        if isinstance(output := body.get("output_config"), dict) and "effort" in output:
+            output = {k: v for k, v in output.items() if k != "effort"}
+            body = {k: v for k, v in body.items() if k != "output_config"} | (
+                {"output_config": output} if output else {}
+            )
+    thinking = {"thinking": EXTRA_BODY_THINKING[model]} if model in EXTRA_BODY_THINKING else {}
+    env["CLAUDE_CODE_EXTRA_BODY"] = json.dumps(body | thinking)
+    return settings | {"env": env}
 
 
 def stream_events(lines: list[str]) -> list[dict]:
@@ -440,13 +543,13 @@ def plugin_guard(
     allow_plugins: bool,
     base: dict | None = None,
 ) -> tuple[dict, list[str]]:
-    """The --settings for every session (`base` plus every plugin turned off that can be) and the plugins the
-    sessions still load. A plugin the first preflight finds is turned off and checked again; whatever stays
-    can't be turned off from a session and is refused unless plugins are allowed."""
-    settings = (base or {}) | no_plugins_settings()
+    """The --settings for every session (`base`, THINKING_OFF_SETTINGS, and every plugin turned off that can be)
+    and the plugins the sessions still load. A plugin the first preflight finds is turned off and checked again; whatever
+    stays can't be turned off from a session and is refused unless plugins are allowed."""
+    settings = (base or {}) | session_settings()
     found = preflight_plugins(env, workdir, settings, isolate_settings)
     if new := [p for p in found if p not in settings["enabledPlugins"]]:
-        settings = (base or {}) | no_plugins_settings(new)
+        settings = (base or {}) | session_settings(new)
         found = preflight_plugins(env, workdir, settings, isolate_settings)
     if found and not allow_plugins:
         raise RuntimeError(
@@ -486,6 +589,7 @@ def probe_mcp_servers(
     allow_api_billing: bool = False,
     settings: dict | None = None,
     allow_plugins: bool = False,
+    extra_body: Mapping | None = None,
 ) -> set[str]:
     """The MCP servers a Claude Code session loads, read from the stream-json init event of a trivial call."""
     config = os.path.join(workdir, "probe-mcp.json")
@@ -504,7 +608,7 @@ def probe_mcp_servers(
     cmd += ["--verbose", "--no-session-persistence", "--model", MODELS["haiku"].claude_code_id]
     cmd += [
         "--settings",
-        json.dumps(settings or no_plugins_settings()),
+        json.dumps(model_settings(settings or session_settings(), "haiku", extra_body)),
         *setting_sources_args(isolate_settings),
     ]
     # claude.ai connectors load only some of the time in headless mode, so retry until one shows up.
@@ -535,6 +639,7 @@ def claude_args(
     mcp_config_path: str,
     isolate_settings: bool = True,
     settings: dict | None = None,
+    extra_body: Mapping | None = None,
 ) -> list[str]:
     args = [
         "claude",
@@ -555,7 +660,7 @@ def claude_args(
         "--verbose",
         "--no-session-persistence",
         "--settings",
-        json.dumps(settings or no_plugins_settings()),
+        json.dumps(model_settings(settings or session_settings(), model, extra_body)),
         *setting_sources_args(isolate_settings),
     ]
     if setup.connector is None:
@@ -771,6 +876,7 @@ class ClaudeCodeClient:
         self.env, self.stripped_env = session_env(os.environ, allow_api_billing)
         self.trust_org_policy = trust_org_policy
         self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
+        self.extra_body = session_extra_body(self.env, isolate_settings)
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
         self.allow_plugins = allow_plugins
         # Before the first model call (the connector probe included): plugins are turned off, and one that can't
@@ -792,6 +898,7 @@ class ClaudeCodeClient:
             allow_api_billing,
             self.settings,
             allow_plugins,
+            self.extra_body,
         )
         self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
         write_private_json(self.mcp_config_path, self.setup.mcp_config())
@@ -812,6 +919,8 @@ class ClaudeCodeClient:
             "allow_plugins": self.allow_plugins,
             "plugins": self.plugins,
             "disabled_plugins": sorted(self.settings["enabledPlugins"]),
+            # The inherited CLAUDE_CODE_EXTRA_BODY's keys, still merged into every request (names only).
+            "extra_body_keys": sorted(self.extra_body),
         }
 
     def signin_message(self) -> str:
@@ -878,6 +987,7 @@ class ClaudeCodeClient:
                 self.mcp_config_path,
                 self.isolate_settings,
                 self.settings,
+                self.extra_body,
             ),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
