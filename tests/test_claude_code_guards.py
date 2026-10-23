@@ -283,6 +283,24 @@ def test_client_passes_isolation_to_every_session(monkeypatch):
     assert client.env["MAX_THINKING_TOKENS"] == "0"
 
 
+def test_thinking_stays_off_when_user_settings_are_loaded(monkeypatch):
+    """With --claude-code-user-settings, an `env` or `alwaysThinkingEnabled` in ~/.claude/settings.json would
+    replace the session env's MAX_THINKING_TOKENS=0; --settings outranks user settings, so it carries it too."""
+    client = ClaudeCodeClient("PROMPT", "http://db/mcp", "http://nav/mcp", isolate_settings=False)
+    calls = _fake_exec(monkeypatch, iter([[_init("none"), json.dumps({"type": "result", "result": "ok"})]]))
+    try:
+        asyncio.run(client.ask("q?", "haiku"))
+    finally:
+        asyncio.run(client.aclose())
+    args = list(calls[0])
+    assert "--setting-sources" not in args
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings["env"] == {"MAX_THINKING_TOKENS": "0"} and settings["alwaysThinkingEnabled"] is False
+    assert client.env["MAX_THINKING_TOKENS"] == "0"
+    # Leaving the thinking parameter out would let Sonnet 5, Sonnet 5.5 and Haiku 5.5 think by default.
+    assert "CLAUDE_CODE_DISABLE_THINKING" not in client.env
+
+
 # --- 3. Beta awareness ------------------------------------------------------------------------------------
 
 

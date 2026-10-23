@@ -1,9 +1,11 @@
 """Answer questions with headless Claude Code standing in for the deployed agent.
 
 The deployed agent's own instructions are the system prompt, the only tools are the same two MCP servers
-(no Claude Code built-ins), and extended thinking is off to match the deployment. It runs on the Claude
-subscription of the configured Claude home (CLAUDE_CONFIG_DIR) instead of per-token Bedrock billing, so it
-is the cheap loop for iterating on prompts and guides; the Agents API runner remains the release check.
+(no Claude Code built-ins), and extended thinking is off to match the deployment on the models where Claude
+Code can turn it off (Haiku 4.5, Sonnet 5); Sonnet 5.5 and Haiku 5.5 think adaptively (see session_env).
+It runs on the Claude subscription of the configured Claude home (CLAUDE_CONFIG_DIR) instead of per-token
+Bedrock billing, so it is the cheap loop for iterating on prompts and guides; the Agents API runner remains
+the release check.
 Credentials that would bill per token are kept out unless allowed, and so are the Claude home's user settings.
 """
 
@@ -63,8 +65,13 @@ NO_API_KEY_SOURCE = "none"
 
 
 def session_env(base: Mapping[str, str], allow_api_billing: bool = False) -> tuple[dict, list[str]]:
-    """The environment for `claude`, and the names of the billing variables taken out of it. Thinking is off to
-    match the deployed agent (thinking=false); CLAUDE_CONFIG_DIR passes through."""
+    """The environment for `claude`, and the names of the billing variables taken out of it. CLAUDE_CONFIG_DIR
+    passes through. MAX_THINKING_TOKENS=0 turns thinking off to match the deployed agent (thinking=false): Claude
+    Code 2.1.309 then sends `thinking: {type: disabled}` to Haiku 4.5 and Sonnet 5. It can't turn thinking off on
+    Sonnet 5.5 or Haiku 5.5 (https://code.claude.com/docs/en/model-config#extended-thinking), which still get
+    `{type: adaptive}`. CLAUDE_CODE_DISABLE_THINKING=1 isn't a fix: it leaves the `thinking` parameter out, and
+    Sonnet 5, Sonnet 5.5 and Haiku 5.5 think by default. THINKING_OFF_SETTINGS keeps user settings from undoing
+    this."""
     env = {**base, "MAX_THINKING_TOKENS": "0"}
     stripped = [] if allow_api_billing else sorted(k for k in env if API_BILLING_ENV.match(k))
     for name in stripped:
@@ -400,10 +407,20 @@ BUILTIN_PLUGINS = (
 PREFLIGHT_MODEL = "claude-mcp-qa-preflight-no-such-model"
 
 
+# An `env` in the user settings (loaded with --claude-code-user-settings) replaces the session env's value, so
+# `MAX_THINKING_TOKENS` or `alwaysThinkingEnabled` there would turn thinking back on; --settings outranks them.
+THINKING_OFF_SETTINGS = {"alwaysThinkingEnabled": False, "env": {"MAX_THINKING_TOKENS": "0"}}
+
+
 def no_plugins_settings(extra: list[str] = ()) -> dict:
     """--settings that turn off the built-in plugins and `extra` (plugin ids a preflight found)."""
     ids = [f"{name}@builtin" for name in BUILTIN_PLUGINS] + list(extra)
     return {"enabledPlugins": dict.fromkeys(ids, False)}
+
+
+def session_settings(extra: list[str] = ()) -> dict:
+    """--settings for a session: thinking stays off and the plugins (and `extra`) are turned off."""
+    return THINKING_OFF_SETTINGS | no_plugins_settings(extra)
 
 
 def stream_events(lines: list[str]) -> list[dict]:
@@ -508,13 +525,13 @@ def plugin_guard(
     allow_plugins: bool,
     base: dict | None = None,
 ) -> tuple[dict, list[str]]:
-    """The --settings for every session (`base` plus every plugin turned off that can be) and the plugins the
-    sessions still load. A plugin the first preflight finds is turned off and checked again; whatever stays
-    can't be turned off from a session and is refused unless plugins are allowed."""
-    settings = (base or {}) | no_plugins_settings()
+    """The --settings for every session (`base`, thinking off, and every plugin turned off that can be) and the
+    plugins the sessions still load. A plugin the first preflight finds is turned off and checked again; whatever
+    stays can't be turned off from a session and is refused unless plugins are allowed."""
+    settings = (base or {}) | session_settings()
     found = preflight_plugins(env, workdir, settings, isolate_settings)
     if new := [p for p in found if p not in settings["enabledPlugins"]]:
-        settings = (base or {}) | no_plugins_settings(new)
+        settings = (base or {}) | session_settings(new)
         found = preflight_plugins(env, workdir, settings, isolate_settings)
     if found and not allow_plugins:
         raise RuntimeError(
@@ -572,7 +589,7 @@ def probe_mcp_servers(
     cmd += ["--verbose", "--no-session-persistence", "--model", MODELS["haiku"].claude_code_id]
     cmd += [
         "--settings",
-        json.dumps(settings or no_plugins_settings()),
+        json.dumps(settings or session_settings()),
         *setting_sources_args(isolate_settings),
     ]
     # claude.ai connectors load only some of the time in headless mode, so retry until one shows up.
@@ -623,7 +640,7 @@ def claude_args(
         "--verbose",
         "--no-session-persistence",
         "--settings",
-        json.dumps(settings or no_plugins_settings()),
+        json.dumps(settings or session_settings()),
         *setting_sources_args(isolate_settings),
     ]
     if setup.connector is None:

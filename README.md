@@ -183,7 +183,16 @@ Claude Code (`claude -p`) instead of the deployed agent:
 - **System prompt:** the deployed agent's instructions, read from the cBioAgent MongoDB via `kubectl` at the
   start of the run (`--target beta` → the beta agent). Only its hash is stored in `run.json`.
 - **Tools:** only the two MCP servers (the database MCP and the navigator); Claude Code's built-in
-  tools are disabled and extended thinking is off, matching the deployment.
+  tools are disabled.
+- **Thinking:** off where Claude Code can turn it off, matching the deployment (`thinking=false`). Sessions get
+  `MAX_THINKING_TOKENS=0`, which makes Claude Code send `thinking: {type: disabled}` to Haiku 4.5 and Sonnet 5.
+  It is also set in `--settings` (with `alwaysThinkingEnabled: false`), which outranks user settings, so an
+  `env` or `alwaysThinkingEnabled` in `~/.claude/settings.json` can't turn thinking back on under
+  `--claude-code-user-settings` (before this guard it did, for Haiku 4.5 and Sonnet 5). Claude Code
+  [can't turn thinking off](https://code.claude.com/docs/en/model-config#extended-thinking) on Sonnet 5.5 or
+  Haiku 5.5: they get `thinking: {type: adaptive}` and decide per step whether to think, so their claude-code
+  results (all of them so far) are not thinking-off comparisons. `CLAUDE_CODE_DISABLE_THINKING=1` doesn't
+  help: it leaves the `thinking` parameter out, and Sonnet 5, Sonnet 5.5 and Haiku 5.5 think by default.
 - **Models:** the same Haiku 4.5 / Sonnet 5.
 - **Cost:** runs on the Claude subscription of the Claude home it's started with, so point
   `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock,
