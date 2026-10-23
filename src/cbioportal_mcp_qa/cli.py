@@ -17,7 +17,15 @@ from .agent_prompt import (
     fetch_model_specs,
     prompt_fingerprint,
 )
-from .claude_code import USAGE_LIMIT, ClaudeCodeClient, find_connector, prompt_parity
+from .claude_code import (
+    EFFORT_LEVELS,
+    NO_EFFORT,
+    USAGE_LIMIT,
+    ClaudeCodeClient,
+    configured_effort,
+    find_connector,
+    prompt_parity,
+)
 from .claude_judge import ClaudeCodeJudge
 from .compare import compare as compare_runs
 from .compare import write_compare
@@ -113,7 +121,10 @@ def openai_options(f):
         "--reasoning-effort",
         default=None,
         help="openai runner: the request's reasoning_effort (e.g. none to turn a thinking model's reasoning off, "
-        "as the deployed agent runs). Default: not sent, the server's default.",
+        "as the deployed agent runs). Default: not sent, the server's default. claude-code runner: the effort level "
+        "(low, medium, high, xhigh, max) of every session, set as CLAUDE_CODE_EFFORT_LEVEL in the sessions' "
+        "--settings; a model without effort levels records n/a. Default: not set, sessions run at whatever their "
+        "settings resolve and the effort is recorded as unknown.",
     )(f)
     f = click.option(
         "--system-prompt-file",
@@ -316,13 +327,35 @@ def _check_runner_options(settings, runner: str, models: list[str], system_promp
         )
 
 
-def _session_efforts(runner: str, reasoning_effort: str | None, client, models: list[str]) -> dict:
+def _claude_code_effort(model: str, effort: str | None) -> str | None:
+    """A claude-code model's effort: the --reasoning-effort its sessions are given, n/a for a model without
+    effort levels, None (unknown) when none is given."""
+    return NO_EFFORT if not MODELS[model].effort_levels else effort
+
+
+def _check_claude_code_effort(runner: str, models: list[str], effort: str | None) -> None:
+    """A claude-code --reasoning-effort every effort-capable model accepts (Claude Code ignores an unknown level and
+    lowers one a model lacks, silently)."""
+    if runner != "claude-code" or not effort:
+        return
+    if effort not in EFFORT_LEVELS:
+        raise click.UsageError(
+            f"--reasoning-effort {effort!r} isn't a Claude Code effort level ({', '.join(EFFORT_LEVELS)})"
+        )
+    if unsupported := [
+        m for m in models if MODELS[m].effort_levels and effort not in MODELS[m].effort_levels
+    ]:
+        raise click.UsageError(f"--reasoning-effort {effort} isn't a level of {', '.join(unsupported)}")
+
+
+def _session_efforts(runner: str, reasoning_effort: str | None, models: list[str]) -> dict:
     """The reasoning effort this invocation asks each model with, for a runner that sets it (openai: the request's
-    reasoning_effort; claude-code: the level its sessions resolve). Empty for the deployed agent's own."""
+    reasoning_effort; claude-code: the --reasoning-effort sessions are given, None if none). Empty for the
+    deployed agent's own."""
     if runner == "openai":
         return {m: reasoning_effort or "default" for m in models}
     if runner == "claude-code":
-        return {m: client.effort_for(m) for m in models}
+        return {m: _claude_code_effort(m, reasoning_effort) for m in models}
     return {}
 
 
@@ -342,17 +375,22 @@ def _current_deployed_efforts(settings, target: str, models: list[str]) -> dict:
     return _deployed_efforts(settings, target, models, agents)[0]
 
 
-def _check_resume_effort(settings, bench, runner: str, target: str, reasoning_effort, client) -> None:
+def _check_resume_effort(settings, bench, runner: str, target: str, reasoning_effort) -> None:
     """Refuse a resume that would ask a model at another effort than the run recorded for it: the report has one
     row per model, so the answers would be pooled. A deployed effort that can't be read again only warns."""
     models = bench.data["models"]
     if runner in LOCAL_RUNNERS:
-        now = _session_efforts(runner, reasoning_effort, client, models)
+        now = _session_efforts(runner, reasoning_effort, models)
     else:
         now = _current_deployed_efforts(settings, target, models)
     changed, unread = [], []
     for m in models:
         before = recorded_effort(bench.data, m)
+        if runner == "claude-code":
+            # The --reasoning-effort given, or unknown both times.
+            if before != now[m]:
+                changed.append(f"{m}: {before or 'unknown'!r} → {now[m] or 'unknown'!r}")
+            continue
         if before is None:
             continue
         if now.get(m) is None:
@@ -446,6 +484,7 @@ def _client(
                 isolate_settings=not user_settings,
                 trust_org_policy=trust_org_policy,
                 allow_plugins=allow_plugins,
+                effort=reasoning_effort,
             )
         except RuntimeError as exc:
             raise click.ClickException(redact(str(exc))) from exc
@@ -617,6 +656,7 @@ def ask(
     settings = load_settings()
     model = _models(model, target, runner)[0]
     _check_runner_options(settings, runner, [model], system_prompt_file)
+    _check_claude_code_effort(runner, [model], reasoning_effort)
     _check_database_mcp(settings, target, runner, require_beta_mcp)
 
     async def go():
@@ -773,6 +813,7 @@ def run(
     else:
         models = _models(models_arg, target, runner)
     _check_runner_options(settings, runner, bench.data["models"] if resume else models, system_prompt_file)
+    _check_claude_code_effort(runner, bench.data["models"] if resume else models, reasoning_effort)
     agent = None
     if system_prompt_file:
         agent = {"instructions": system_prompt_file.read_text(), "source": str(system_prompt_file)}
@@ -812,7 +853,7 @@ def run(
         max_tool_rounds=max_tool_rounds,
     )
     if resume:
-        _check_resume_effort(settings, bench, runner, target, reasoning_effort, client)
+        _check_resume_effort(settings, bench, runner, target, reasoning_effort)
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
         if prompt and recorded and prompt_fingerprint(prompt)["sha256"] != recorded:
             click.echo("Warning: the agent's prompt changed since this run started", err=True)
@@ -846,7 +887,9 @@ def run(
         if runner == "openai":
             extra["reasoning_effort"] = reasoning_effort or "default"
         elif runner == "claude-code":
-            extra["reasoning_efforts"] = _session_efforts(runner, reasoning_effort, client, models)
+            extra["reasoning_efforts"] = _session_efforts(runner, reasoning_effort, models)
+            # Where sessions could pick an effort up from: what is configured, not the effort they run at.
+            extra["claude_code_configured_effort"] = configured_effort(client.env, client.isolate_settings)
         else:
             # The deployed agent's own, per model (its modelSpec can change it).
             extra["reasoning_efforts"], extra["model_specs"] = _deployed_efforts(
