@@ -309,7 +309,7 @@ def test_failed_and_missing_turns_count_against_recall_and_are_reported(incomple
     assert cats["Alteration frequency"]["ungraded"] == 1
 
     md = to_markdown(r)
-    assert "| B | 9 | 7 | 1 | 1 | 1 | 0 | 8 |" in md
+    assert "| B | – | 9 | 7 | 1 | 1 | 1 | 0 | 8 |" in md
     assert "4/6 (1, 1, 0)" in md  # Study discovery for B: completed/expected (failed, missing, ungraded)
     html = write_compare(r).read_text()
     assert "is incomplete" in html and "✓!✓" in html

@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from jinja2 import Environment, PackageLoader, select_autoescape
+from markupsafe import escape
 
 from .checks import internal_leaks
 from .config import MODELS, PRICES_BY_BEDROCK_ID, TARGETS
@@ -111,6 +112,25 @@ def number_disagreement(grade: dict) -> bool:
     )
 
 
+def reasoning_effort(run: dict, model: str | None = None) -> str | None:
+    """The reasoning effort a run's answers (a model's, if given) were asked with, or None when it isn't known.
+
+    Runs record it at the start. Per model in `reasoning_efforts`: agents-api runs from the deployed agent's model
+    parameters and its modelSpec's preset (None where those couldn't be read), claude-code runs the
+    --reasoning-effort every session was given (None, unknown, without one; "n/a" for a model without effort
+    levels). Run-wide in `reasoning_effort`: the openai runner's
+    --reasoning-effort ("default" when none was sent). Older openai runs have it in their `openai` endpoint
+    record; other older runs have none."""
+    if model is not None and model in (run.get("reasoning_efforts") or {}):
+        return run["reasoning_efforts"][model]
+    if run.get("reasoning_effort"):
+        return run["reasoning_effort"]
+    openai = run.get("openai") or {}
+    if run.get("runner") == "openai" and "reasoning_effort" in openai:
+        return openai["reasoning_effort"] or "default"
+    return None
+
+
 def record_leaks(rec: dict) -> list[str]:
     reply = rec["reply"]
     if reply.get("status") != 200 or rec["question"].get("technical"):
@@ -122,6 +142,7 @@ def record_leaks(rec: dict) -> list[str]:
 class ModelStats:
     key: str
     label: str
+    reasoning_effort: str | None = None
     answers: int = 0
     outcomes: Counter = field(default_factory=Counter)
     by_track: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
@@ -280,7 +301,7 @@ class ModelStats:
 
 def summarize(run: Run) -> dict:
     models = run.data["models"]
-    stats = {m: ModelStats(m, MODELS[m].label) for m in models}
+    stats = {m: ModelStats(m, MODELS[m].label, reasoning_effort(run.data, m)) for m in models}
     questions: dict[int, dict] = {}
     judge_tokens = Counter()
     renders = run.data.get("renders", {})
@@ -372,6 +393,8 @@ def _env() -> Environment:
     env.filters["usd"] = lambda v: "–" if v is None else (f"${v:,.2f}" if v >= 1 else f"${v:.3f}")
     env.filters["pct"] = lambda v: "–" if v is None else f"{v:.0f}%"
     env.filters["secs"] = lambda v: "–" if v is None else f"{v:.0f}s"
+    # Escaped here: the report and index templates aren't autoescaped (they don't match select_autoescape()).
+    env.filters["effort"] = lambda v: escape(v or "–")
     return env
 
 
@@ -390,12 +413,14 @@ def _headline(summary: dict) -> dict:
         "target": summary["run"]["target"],
         "runner": summary["run"].get("runner", "agents-api"),
         **{k: summary["run"].get(k) for k in RUN_SETUP_KEYS},
+        "reasoning_effort": reasoning_effort(summary["run"]),
         "created_at": summary["run"]["created_at"],
         "n_questions": summary["n_questions"],
         "n_gradeable": summary["n_gradeable"],
         "models": {
             s.key: {
                 "label": s.label,
+                "reasoning_effort": s.reasoning_effort,
                 "pass_rate": s.pass_rate,
                 "precision": s.precision,
                 "coverage": s.coverage,
@@ -525,9 +550,18 @@ def write_index() -> Path:
         RESULTS_DIR.glob("*/summary.json"), key=lambda p: run_order(p.parent.name), reverse=True
     ):
         summary = json.loads(path.read_text())
-        if not all(k in summary for k in RUN_SETUP_KEYS) and (path.parent / "run.json").exists():
-            recorded = json.loads((path.parent / "run.json").read_text())
+        # Summaries written before a setup key or the per-model reasoning effort was recorded take it from run.json.
+        missing_effort = any("reasoning_effort" not in m for m in summary["models"].values())
+        recorded = None
+        if not all(k in summary for k in RUN_SETUP_KEYS) or missing_effort:
+            recorded = (
+                json.loads(run_json.read_text()) if (run_json := path.parent / "run.json").exists() else {}
+            )
+        if not all(k in summary for k in RUN_SETUP_KEYS) and recorded:
             summary |= {k: recorded.get(k) for k in RUN_SETUP_KEYS}
+        for key, m in summary["models"].items():
+            if "reasoning_effort" not in m:
+                m["reasoning_effort"] = reasoning_effort(recorded or {}, key)
         summary["setup"] = run_setup(summary)
         runs.append(summary)
     sets: dict[str, list[dict]] = {}

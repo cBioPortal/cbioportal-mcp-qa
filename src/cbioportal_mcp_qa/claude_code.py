@@ -91,6 +91,75 @@ def settings_files(env: Mapping[str, str], isolate_settings: bool) -> list[Path]
     return [p for p in files if p.is_file()]
 
 
+EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
+# The levels Claude Code accepts for CLAUDE_CODE_EFFORT_LEVEL (besides `auto`).
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# What a model without effort levels records: Claude Code sends it no effort.
+NO_EFFORT = "n/a"
+
+
+def effort_settings(effort: str) -> dict:
+    """--settings that run every session at `effort`. A --settings `env` value outranks the inherited variable,
+    --effort and the user's effortLevel, modelSettings and env; only managed settings rank above it, and a
+    maxEffortLevel cap still applies (`effort_overrides` refuses both)."""
+    return {"env": {EFFORT_ENV: effort}}
+
+
+def _settings_doc(path: Path):
+    raw = path.read_bytes()
+    return plistlib.loads(raw) if path.suffix == ".plist" else json.loads(raw)
+
+
+def _effort_entries(obj, prefix: str = ""):
+    """(key path, value) of every effort setting in a settings document, however nested."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            path = f"{prefix}{key}"
+            if key in ("effortLevel", "maxEffortLevel", EFFORT_ENV) and isinstance(value, str):
+                yield path, value
+            else:
+                yield from _effort_entries(value, path + ".")
+
+
+def configured_effort(env: Mapping[str, str], isolate_settings: bool) -> list[dict]:
+    """Effort settings configured where sessions read them (the environment and the settings files they load),
+    for debugging only: Claude Code resolves the effective effort itself and doesn't report it, and a server-managed
+    policy fetched fresh isn't in its local cache."""
+    found = (
+        [{"source": "environment", "key": EFFORT_ENV, "value": env[EFFORT_ENV]}]
+        if env.get(EFFORT_ENV)
+        else []
+    )
+    for path in settings_files(env, isolate_settings):
+        try:
+            doc = _settings_doc(path)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+        found += [{"source": str(path), "key": key, "value": value} for key, value in _effort_entries(doc)]
+    return found
+
+
+def effort_overrides(env: Mapping[str, str], isolate_settings: bool) -> list[str]:
+    """Settings that would (or might) change an effort set with `effort_settings`: a maxEffortLevel cap in any
+    file sessions load, CLAUDE_CODE_EFFORT_LEVEL in managed settings' `env` (ranked above --settings), or a managed
+    policyHelper, whose output becomes managed settings that can't be read here."""
+    user = str(config_dir(env) / "settings.json")
+    found = [
+        f"{c['source']}: {c['key']}"
+        for c in configured_effort(env, isolate_settings)
+        if c["key"].endswith("maxEffortLevel")
+        or (c["key"].endswith(EFFORT_ENV) and c["source"] not in ("environment", user))
+    ]
+    for path in settings_files(env, isolate_settings=True):  # the managed sources
+        try:
+            doc = _settings_doc(path)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+        if any(d.get("policyHelper") for d in _dicts(doc)):
+            found.append(f"{path}: policyHelper")
+    return found
+
+
 def _dicts(obj):
     """Every dict in a settings document, however nested (the server-managed cache wraps the settings)."""
     if isinstance(obj, dict):
@@ -108,8 +177,7 @@ def api_billing_settings(files: list[Path]) -> list[str]:
     found = []
     for path in files:
         try:
-            raw = path.read_bytes()
-            doc = plistlib.loads(raw) if path.suffix == ".plist" else json.loads(raw)
+            doc = _settings_doc(path)
         except (OSError, ValueError, plistlib.InvalidFileException):
             found.append(f"{path}: unreadable")
             continue
@@ -753,6 +821,7 @@ class ClaudeCodeClient:
         isolate_settings: bool = True,
         trust_org_policy: bool = False,
         allow_plugins: bool = False,
+        effort: str | None = None,
     ):
         self.system_prompt = system_prompt
         self.transcript_dir = transcript_dir
@@ -771,13 +840,24 @@ class ClaudeCodeClient:
         self.env, self.stripped_env = session_env(os.environ, allow_api_billing)
         self.trust_org_policy = trust_org_policy
         self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
+        # Every session at this effort (through --settings), or none set: sessions resolve their own.
+        self.effort = effort
+        if effort and (overrides := effort_overrides(self.env, isolate_settings)):
+            raise RuntimeError(
+                f"--reasoning-effort {effort} would not be the effort sessions run at: {', '.join(overrides)} "
+                "changes it; remove that setting or run without --reasoning-effort"
+            )
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
         self.allow_plugins = allow_plugins
         # Before the first model call (the connector probe included): plugins are turned off, and one that can't
         # be is refused unless allowed.
         try:
             self.settings, self.plugins = plugin_guard(
-                self.env, self._workdir.name, isolate_settings, allow_plugins
+                self.env,
+                self._workdir.name,
+                isolate_settings,
+                allow_plugins,
+                effort_settings(effort) if effort else None,
             )
         except BaseException:
             self._workdir.cleanup()
