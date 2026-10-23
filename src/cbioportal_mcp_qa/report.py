@@ -112,12 +112,16 @@ def number_disagreement(grade: dict) -> bool:
     )
 
 
-def reasoning_effort(run: dict) -> str | None:
-    """The reasoning effort a run's answers were asked with, or None when it isn't known.
+def reasoning_effort(run: dict, model: str | None = None) -> str | None:
+    """The reasoning effort a run's answers (a model's, if given) were asked with, or None when it isn't known.
 
-    Runs record it as `reasoning_effort`: the openai runner's --reasoning-effort ("default" when none was sent),
-    "thinking off" for the claude-code runner. Older openai runs have it in their `openai` endpoint record; other
-    older runs and agents-api runs (the deployed agent decides) have none."""
+    Runs record it at the start: agents-api runs per model in `reasoning_efforts`, resolved from the deployed
+    agent's model parameters and its modelSpec's preset (None where those couldn't be read); the openai runner's
+    --reasoning-effort ("default" when none was sent) and the claude-code sessions' effort level ("default": the
+    model's) as `reasoning_effort`. Older openai runs have it in their `openai` endpoint record; other older runs
+    have none."""
+    if model is not None and model in (run.get("reasoning_efforts") or {}):
+        return run["reasoning_efforts"][model]
     if run.get("reasoning_effort"):
         return run["reasoning_effort"]
     openai = run.get("openai") or {}
@@ -296,8 +300,7 @@ class ModelStats:
 
 def summarize(run: Run) -> dict:
     models = run.data["models"]
-    effort = reasoning_effort(run.data)
-    stats = {m: ModelStats(m, MODELS[m].label, effort) for m in models}
+    stats = {m: ModelStats(m, MODELS[m].label, reasoning_effort(run.data, m)) for m in models}
     questions: dict[int, dict] = {}
     judge_tokens = Counter()
     renders = run.data.get("renders", {})
@@ -546,19 +549,18 @@ def write_index() -> Path:
         RESULTS_DIR.glob("*/summary.json"), key=lambda p: run_order(p.parent.name), reverse=True
     ):
         summary = json.loads(path.read_text())
-        # Summaries written before a setup key (or the reasoning effort) was recorded take it from run.json.
+        # Summaries written before a setup key or the per-model reasoning effort was recorded take it from run.json.
+        missing_effort = any("reasoning_effort" not in m for m in summary["models"].values())
         recorded = None
-        if not all(k in summary for k in (*RUN_SETUP_KEYS, "reasoning_effort")):
+        if not all(k in summary for k in RUN_SETUP_KEYS) or missing_effort:
             recorded = (
                 json.loads(run_json.read_text()) if (run_json := path.parent / "run.json").exists() else {}
             )
         if not all(k in summary for k in RUN_SETUP_KEYS) and recorded:
             summary |= {k: recorded.get(k) for k in RUN_SETUP_KEYS}
-        if "reasoning_effort" not in summary:
-            summary["reasoning_effort"] = reasoning_effort(recorded or {})
-        # Summaries from before per-model effort take the run's.
-        for m in summary["models"].values():
-            m.setdefault("reasoning_effort", summary.get("reasoning_effort"))
+        for key, m in summary["models"].items():
+            if "reasoning_effort" not in m:
+                m["reasoning_effort"] = reasoning_effort(recorded or {}, key)
         summary["setup"] = run_setup(summary)
         runs.append(summary)
     sets: dict[str, list[dict]] = {}

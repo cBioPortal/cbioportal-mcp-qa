@@ -9,7 +9,13 @@ import httpx
 from click.core import ParameterSource
 
 from .agent import AgentClient
-from .agent_prompt import describe_agents, fetch_agent_prompt, prompt_fingerprint
+from .agent_prompt import (
+    deployed_effort,
+    describe_agents,
+    fetch_agent_prompt,
+    fetch_model_specs,
+    prompt_fingerprint,
+)
 from .claude_code import USAGE_LIMIT, ClaudeCodeClient, find_connector, prompt_parity
 from .claude_judge import ClaudeCodeJudge
 from .compare import compare as compare_runs
@@ -31,6 +37,7 @@ from .mcp_oauth import login as oauth_login
 from .openai_chat import MAX_TOOL_ROUNDS, OpenAIChatClient
 from .persist import write_text
 from .redact import describe_error, redact
+from .report import reasoning_effort as recorded_effort
 from .report import write_index, write_report
 from .run import (
     Run,
@@ -306,6 +313,30 @@ def _check_runner_options(settings, runner: str, models: list[str], system_promp
             f"OPENAI_SERVED_MODEL={settings.openai_served_model} would answer for every model in {models}: "
             "run one model per run, or unset it to use each model's own name on the server"
         )
+
+
+def _session_effort(runner: str, reasoning_effort: str | None, client) -> str | None:
+    """The reasoning effort this invocation's answers are asked with (None for the deployed agent's own)."""
+    if runner == "openai":
+        return reasoning_effort or "default"
+    if runner == "claude-code":
+        return client.effort_level or "default"
+    return None
+
+
+def _deployed_efforts(settings, target: str, models: list[str], agents: dict) -> tuple[dict, dict]:
+    """The effort each model of the deployed agent answers with (None where it couldn't be read), and the
+    modelSpecs' effort parameters they were resolved from (or the error reading them)."""
+    t = TARGETS[target]
+    agent_params = (agents.get(t.agent_id) or {}).get("effort_parameters")
+    specs: dict = {}
+    if any(t.specs[m] for m in models):
+        try:
+            specs = fetch_model_specs(t.librechat_deployment, settings.kube_context)
+        except Exception as exc:  # noqa: BLE001 - recorded, never fatal: the effort shows as unknown
+            specs = {"error": describe_error(exc)}
+    readable = None if "error" in specs else specs
+    return {m: deployed_effort(agent_params, t.specs[m], readable) for m in models}, specs
 
 
 # What a resumed openai run must match to stay one configuration.
@@ -733,6 +764,13 @@ def run(
         max_tool_rounds=max_tool_rounds,
     )
     if resume:
+        # One run, one effort: its report has one row per model, so answers at another effort would be pooled in.
+        before, now = recorded_effort(bench.data), _session_effort(runner, reasoning_effort, client)
+        if before and now and before != now:
+            raise click.ClickException(
+                f"run {bench.data['run_id']} was answered at reasoning effort {before!r}, this resume would ask at "
+                f"{now!r}; resume with the run's effort, or start a new run for {now!r}"
+            )
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
         if prompt and recorded and prompt_fingerprint(prompt)["sha256"] != recorded:
             click.echo("Warning: the agent's prompt changed since this run started", err=True)
@@ -762,17 +800,21 @@ def run(
             ),
             "versions": collect_versions(settings, runner, target),
         }
+        # The reasoning effort answers are asked with, for the report and for --resume to keep.
+        if runner in LOCAL_RUNNERS:
+            extra["reasoning_effort"] = _session_effort(runner, reasoning_effort, client)
+        else:
+            # The deployed agent's own, per model (its modelSpec can change it).
+            extra["reasoning_efforts"], extra["model_specs"] = _deployed_efforts(
+                settings, target, models, extra["agents"]
+            )
         if runner == "openai":
-            # The reasoning effort answers are asked with, for the report (agents-api: the deployed agent's own).
-            extra["reasoning_effort"] = reasoning_effort or "default"
             extra["database_mcp"] = settings.database_mcp_url or settings.database_connector_url
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
         if runner == "claude-code":
-            # Sessions run with MAX_THINKING_TOKENS=0; user settings can add their effortLevel.
-            extra["reasoning_effort"] = "thinking off" + (
-                ", user settings" if claude_code_user_settings else ""
-            )
+            # Sessions run with MAX_THINKING_TOKENS=0, whatever their effort level.
+            extra["thinking"] = "off"
             extra["database_mcp"] = client.setup.connector or settings.database_mcp_url
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url

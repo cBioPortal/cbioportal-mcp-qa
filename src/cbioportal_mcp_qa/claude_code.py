@@ -91,6 +91,36 @@ def settings_files(env: Mapping[str, str], isolate_settings: bool) -> list[Path]
     return [p for p in files if p.is_file()]
 
 
+EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
+
+
+def _settings_doc(path: Path):
+    raw = path.read_bytes()
+    return plistlib.loads(raw) if path.suffix == ".plist" else json.loads(raw)
+
+
+def effort_level(env: Mapping[str, str], isolate_settings: bool) -> str | None:
+    """The effort level sessions run at, as Claude Code resolves it without --effort: CLAUDE_CODE_EFFORT_LEVEL
+    from the environment, else from a loaded settings file's `env` block, else the `effortLevel` of the first
+    loaded settings file that sets one (managed before user settings). None: the model's default."""
+    if env.get(EFFORT_ENV):
+        return env[EFFORT_ENV]
+    docs = []
+    for path in settings_files(env, isolate_settings):
+        try:
+            docs.append(list(_dicts(_settings_doc(path))))
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+    for settings in (d for doc in docs for d in doc):
+        block = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+        if block.get(EFFORT_ENV):
+            return str(block[EFFORT_ENV])
+    for settings in (d for doc in docs for d in doc):
+        if settings.get("effortLevel"):
+            return str(settings["effortLevel"])
+    return None
+
+
 def _dicts(obj):
     """Every dict in a settings document, however nested (the server-managed cache wraps the settings)."""
     if isinstance(obj, dict):
@@ -108,8 +138,7 @@ def api_billing_settings(files: list[Path]) -> list[str]:
     found = []
     for path in files:
         try:
-            raw = path.read_bytes()
-            doc = plistlib.loads(raw) if path.suffix == ".plist" else json.loads(raw)
+            doc = _settings_doc(path)
         except (OSError, ValueError, plistlib.InvalidFileException):
             found.append(f"{path}: unreadable")
             continue
@@ -771,6 +800,8 @@ class ClaudeCodeClient:
         self.env, self.stripped_env = session_env(os.environ, allow_api_billing)
         self.trust_org_policy = trust_org_policy
         self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
+        # Recorded only: sessions get no --effort, so this is what they resolve themselves.
+        self.effort_level = effort_level(self.env, isolate_settings)
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
         self.allow_plugins = allow_plugins
         # Before the first model call (the connector probe included): plugins are turned off, and one that can't
@@ -809,6 +840,7 @@ class ClaudeCodeClient:
             "trust_org_policy": self.trust_org_policy,
             "stripped_env": self.stripped_env,
             "setting_sources": "managed only" if self.isolate_settings else "user, project, local",
+            "effort_level": self.effort_level,
             "allow_plugins": self.allow_plugins,
             "plugins": self.plugins,
             "disabled_plugins": sorted(self.settings["enabledPlugins"]),

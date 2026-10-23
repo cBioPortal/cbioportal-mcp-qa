@@ -508,7 +508,7 @@ def compare(
             "runner": run.data.get("runner", "agents-api"),
             "model": model,
             "label": MODELS[model].label,
-            "reasoning_effort": reasoning_effort(run.data),
+            "reasoning_effort": reasoning_effort(run.data, model),
             "repeats": run.data.get("repeats", 1),
             "judge_model": ", ".join(map(str, judge_models)),
             "judge_models": judge_models,

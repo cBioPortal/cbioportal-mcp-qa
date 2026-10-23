@@ -33,3 +33,14 @@ def subscription_login(monkeypatch, tmp_path):
     monkeypatch.setattr(claude_code, "MANAGED_SETTINGS_DIRS", (tmp_path / "no-managed-settings",))
     monkeypatch.setattr(claude_code, "MANAGED_PREFERENCES_DIR", tmp_path / "no-managed-preferences")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home"))
+
+
+@pytest.fixture(autouse=True)
+def no_librechat_config(monkeypatch):
+    """agents-api runs read the modelSpecs from LibreChat's deployment via kubectl: never in tests."""
+    from cbioportal_mcp_qa import cli
+
+    def refuse(deployment, context=None):
+        raise RuntimeError("kubectl is not run in tests")
+
+    monkeypatch.setattr(cli, "fetch_model_specs", refuse)

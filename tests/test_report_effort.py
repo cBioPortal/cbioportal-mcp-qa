@@ -3,9 +3,10 @@ the same model at two efforts kept apart and runs from before it was recorded sh
 
 import json
 
+import pytest
 from click.testing import CliRunner
 
-from cbioportal_mcp_qa import cli
+from cbioportal_mcp_qa import agent_prompt, claude_code, cli
 from cbioportal_mcp_qa import report as report_mod
 from cbioportal_mcp_qa.compare import compare, to_markdown, write_compare
 from cbioportal_mcp_qa.report import reasoning_effort, summarize, write_report
@@ -158,14 +159,66 @@ def test_compare_names_each_sides_effort(results_dir):
     assert "| A | – |" in to_markdown(compare(legacy, high, MODEL, MODEL))
 
 
-def _cli_run(monkeypatch, runner: str, args: list[str], client) -> dict:
+def test_tool_table_headers_name_each_models_effort(results_dir):
+    bench = _run("20261020-0000", results_dir, {"reasoning_effort": "<i>high</i>"})
+    for rec in bench.records.values():
+        rec["trace"] = {"llm_calls": 1, "tool_calls": [{"name": "run_sql", "ok": True}]}
+    html = write_report(bench).read_text()
+    assert "<th>Qwen3.8 27B (&lt;i&gt;high&lt;/i&gt;) calls</th>" in html
+    legacy = _run("20260101-0000", results_dir, {}, model="haiku", runner="agents-api")
+    for rec in legacy.records.values():
+        rec["trace"] = {"llm_calls": 1, "tool_calls": [{"name": "run_sql", "ok": True}]}
+    assert "<th>Haiku 4.5 (–) calls</th>" in write_report(legacy).read_text()
+
+
+# claude-code: the effort level sessions resolve themselves, recorded apart from thinking (always off).
+
+
+def test_claude_code_effort_level_follows_the_settings_sessions_load(tmp_path, monkeypatch):
+    home = tmp_path / "claude-home"
+    home.mkdir(exist_ok=True)
+    env = {"CLAUDE_CONFIG_DIR": str(home)}
+    assert claude_code.effort_level(env, isolate_settings=False) is None
+    for level in ("low", "high"):
+        (home / "settings.json").write_text(json.dumps({"effortLevel": level}))
+        assert claude_code.effort_level(env, isolate_settings=False) == level
+        # Isolated sessions don't load user settings.
+        assert claude_code.effort_level(env, isolate_settings=True) is None
+    (home / "settings.json").write_text(
+        json.dumps({"effortLevel": "low", "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}})
+    )
+    assert claude_code.effort_level(env, isolate_settings=False) == "max"
+    assert (
+        claude_code.effort_level(env | {"CLAUDE_CODE_EFFORT_LEVEL": "medium"}, isolate_settings=False)
+        == "medium"
+    )
+    # Managed settings apply to isolated sessions too, and come before user settings.
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "managed-settings.json").write_text(json.dumps({"effortLevel": "xhigh"}))
+    monkeypatch.setattr(claude_code, "MANAGED_SETTINGS_DIRS", (managed,))
+    assert claude_code.effort_level(env, isolate_settings=True) == "xhigh"
+    (home / "settings.json").write_text(json.dumps({"effortLevel": "low"}))
+    assert claude_code.effort_level(env, isolate_settings=False) == "xhigh"
+
+
+def _cli(monkeypatch, args: list[str], client, exit_code: int = 0, specs=None):
     monkeypatch.setattr("cbioportal_mcp_qa.config.load_dotenv", lambda: None)
     monkeypatch.setenv("DATABASE_MCP_URL", "http://localhost:18081/db/mcp")
     monkeypatch.setenv("DATABASE_MCP_ENV", "beta")
-    monkeypatch.setattr(cli, "fetch_agent_prompt", lambda agent_id, ctx=None: {"instructions": "AGENT"})
-    monkeypatch.setattr(cli, "describe_agents", lambda *a: {})
+    monkeypatch.setattr(
+        cli,
+        "fetch_agent_prompt",
+        lambda agent_id, ctx=None: {"instructions": "AGENT", "model_parameters": {"thinking": False}},
+    )
     monkeypatch.setattr(cli, "collect_versions", lambda *a: {})
+    monkeypatch.setattr(cli, "prompt_parity", lambda *a: {})
     monkeypatch.setattr(cli, "write_report", lambda bench: bench.dir / "report.html")
+    monkeypatch.setattr(cli, "wait_for_ingestion", lambda: None)
+    monkeypatch.setattr(cli, "attach_traces", lambda bench, langfuse: 0)
+    monkeypatch.setattr(cli, "_langfuse", lambda settings: None)
+    if specs is not None:
+        monkeypatch.setattr(cli, "fetch_model_specs", specs)
     seen = {}
 
     def fake_client(*a, **kwargs):
@@ -180,19 +233,22 @@ def _cli_run(monkeypatch, runner: str, args: list[str], client) -> dict:
                 bench.records[record_key(q.id, model, 1)] = _rec(q.id, model)
 
     monkeypatch.setattr(cli, "collect_answers", answer_all)
-    result = CliRunner().invoke(
-        cli.cli,
-        ["run", "--runner", runner, "--target", "beta", "--questions", "1", "--no-grade", "--no-render"]
-        + args,
-    )
-    assert result.exit_code == 0, result.output
-    return seen
+    result = CliRunner().invoke(cli.cli, ["run", "--questions", "1", "--no-grade", "--no-render", *args])
+    assert result.exit_code == exit_code, result.output
+    return seen, result
+
+
+def _run_json(results_dir, run_id=None) -> dict:
+    if run_id:
+        return json.loads((results_dir / run_id / "run.json").read_text())
+    (path,) = results_dir.glob("*/run.json")
+    return json.loads(path.read_text())
 
 
 class FakeOpenAI:
     stops = []
 
-    def __init__(self, effort):
+    def __init__(self, effort=None):
         self.effort = effort
 
     async def start(self):
@@ -205,36 +261,192 @@ class FakeOpenAI:
         pass
 
 
-def test_openai_run_records_its_effort(monkeypatch, results_dir):
-    seen = _cli_run(
-        monkeypatch, "openai", ["--models", MODEL, "--reasoning-effort", "low"], FakeOpenAI("low")
-    )
-    # The request is unchanged: the client is given the same effort it was before.
-    assert seen["reasoning_effort"] == "low"
-    (run_json,) = results_dir.glob("*/run.json")
-    assert json.loads(run_json.read_text())["reasoning_effort"] == "low"
-
-
-def test_openai_run_without_an_effort_records_the_default(monkeypatch, results_dir):
-    seen = _cli_run(monkeypatch, "openai", ["--models", MODEL], FakeOpenAI(None))
-    assert seen["reasoning_effort"] is None
-    (run_json,) = results_dir.glob("*/run.json")
-    assert json.loads(run_json.read_text())["reasoning_effort"] == "default"
-
-
 class FakeClaudeCode:
     stops = []
     setup = type("Setup", (), {"connector": None})()
 
+    def __init__(self, effort_level=None):
+        self.effort_level = effort_level
+
     def describe(self):
-        return {}
+        return {"effort_level": self.effort_level}
 
     async def aclose(self):
         pass
 
 
-def test_claude_code_run_records_thinking_off(monkeypatch, results_dir):
-    monkeypatch.setattr(cli, "prompt_parity", lambda *a: {})
-    _cli_run(monkeypatch, "claude-code", ["--models", "haiku"], FakeClaudeCode())
-    (run_json,) = results_dir.glob("*/run.json")
-    assert json.loads(run_json.read_text())["reasoning_effort"] == "thinking off"
+class FakeAgent:
+    stops = []
+
+    async def aclose(self):
+        pass
+
+
+OPENAI = ["--runner", "openai", "--target", "beta", "--models", MODEL]
+
+
+def test_openai_run_records_its_effort(monkeypatch, results_dir):
+    seen, _ = _cli(monkeypatch, [*OPENAI, "--reasoning-effort", "low"], FakeOpenAI("low"))
+    # The request is unchanged: the client is given the same effort it was before.
+    assert seen["reasoning_effort"] == "low"
+    assert _run_json(results_dir)["reasoning_effort"] == "low"
+
+
+def test_openai_run_without_an_effort_records_the_default(monkeypatch, results_dir):
+    seen, _ = _cli(monkeypatch, OPENAI, FakeOpenAI())
+    assert seen["reasoning_effort"] is None
+    assert _run_json(results_dir)["reasoning_effort"] == "default"
+
+
+def test_claude_code_runs_at_different_effort_levels_are_told_apart(monkeypatch, results_dir):
+    base = ["--runner", "claude-code", "--target", "beta", "--models", "haiku"]
+    _cli(monkeypatch, base, FakeClaudeCode("low"))
+    (first,) = results_dir.glob("*/run.json")
+    first.rename(first.parent / "low.json")
+    _cli(monkeypatch, [*base, "--claude-code-user-settings"], FakeClaudeCode("high"))
+    recorded = _run_json(results_dir)
+    low = json.loads((first.parent / "low.json").read_text())
+    assert (low["reasoning_effort"], recorded["reasoning_effort"]) == ("low", "high")
+    assert low["thinking"] == recorded["thinking"] == "off"
+    _cli(monkeypatch, base, FakeClaudeCode(None))
+    assert sorted(
+        r["reasoning_effort"]
+        for r in map(json.loads, (p.read_text() for p in results_dir.glob("*/run.json")))
+    ) == ["default", "high"]
+
+
+# --resume keeps a run at one effort.
+
+
+def test_resume_at_another_effort_is_refused(monkeypatch, results_dir):
+    _cli(monkeypatch, [*OPENAI, "--reasoning-effort", "low"], FakeOpenAI("low"))
+    run_id = _run_json(results_dir)["run_id"]
+    before = (results_dir / run_id / "run.json").read_text()
+    seen, result = _cli(
+        monkeypatch, ["--resume", run_id, "--reasoning-effort", "high"], FakeOpenAI("high"), exit_code=1
+    )
+    assert "reasoning effort 'low'" in result.output and "'high'" in result.output
+    # Refused before anything is asked or recorded.
+    assert (results_dir / run_id / "run.json").read_text() == before
+    # The run's own effort (restored when not given) resumes.
+    seen, _ = _cli(monkeypatch, ["--resume", run_id], FakeOpenAI("low"))
+    assert seen["reasoning_effort"] == "low"
+
+
+def test_resume_of_a_claude_code_run_whose_effort_level_changed_is_refused(monkeypatch, results_dir):
+    base = ["--runner", "claude-code", "--target", "beta", "--models", "haiku"]
+    _cli(monkeypatch, base, FakeClaudeCode("low"))
+    run_id = _run_json(results_dir)["run_id"]
+    _, result = _cli(monkeypatch, ["--resume", run_id], FakeClaudeCode("high"), exit_code=1)
+    assert "reasoning effort 'low'" in result.output
+
+
+def test_resume_of_a_legacy_run_without_an_effort_is_not_refused(monkeypatch, results_dir):
+    _cli(monkeypatch, [*OPENAI, "--reasoning-effort", "low"], FakeOpenAI("low"))
+    run_id = _run_json(results_dir)["run_id"]
+    path = results_dir / run_id / "run.json"
+    data = json.loads(path.read_text())
+    del data["reasoning_effort"], data["openai"]
+    path.write_text(json.dumps(data))
+    _cli(monkeypatch, ["--resume", run_id, "--reasoning-effort", "high"], FakeOpenAI("high"))
+
+
+# agents-api: the deployed agent's model parameters, overridden by the model's modelSpec preset.
+
+
+def test_describe_effort_and_deployed_effort():
+    assert agent_prompt.describe_effort({}) == "default"
+    assert agent_prompt.describe_effort({"thinking": False}) == "thinking off"
+    assert (
+        agent_prompt.describe_effort({"thinking": True, "thinkingBudget": 2000}) == "thinking on, budget 2000"
+    )
+    assert agent_prompt.describe_effort({"effort": "high", "thinking": True}) == "high, thinking on"
+    assert agent_prompt.describe_effort({"reasoning_effort": "low"}) == "low"
+    specs = {"Sonnet": {"thinking": True}, "Plain": {}}
+    assert agent_prompt.deployed_effort({"thinking": False}, None, None) == "thinking off"
+    assert agent_prompt.deployed_effort({"thinking": False}, "Sonnet", specs) == "thinking on"
+    assert agent_prompt.deployed_effort({"thinking": False}, "Plain", specs) == "thinking off"
+    # Unknown when the agent or the spec couldn't be read.
+    assert agent_prompt.deployed_effort(None, None, specs) is None
+    assert agent_prompt.deployed_effort({}, "Sonnet", None) is None
+    assert agent_prompt.deployed_effort({}, "Missing", specs) is None
+
+
+def test_fetch_model_specs_keeps_only_effort_parameters(monkeypatch):
+    config = """
+endpoints: {anthropic: {apiKey: sk-secret}}
+modelSpecs:
+  list:
+    - name: cBioPortalChatBeta
+      preset: {endpoint: agents, agent_id: a, thinking: false, temperature: 0}
+    - name: cBioPortalChatBetaSonnet
+      preset: {endpoint: agents, agent_id: a, thinking: true, thinkingBudget: 4000}
+"""
+    calls = []
+    monkeypatch.setattr(agent_prompt, "_kubectl", lambda args, ctx: calls.append(args) or config)
+    assert agent_prompt.fetch_model_specs("cbioagent-librechat-beta") == {
+        "cBioPortalChatBeta": {"thinking": False},
+        "cBioPortalChatBetaSonnet": {"thinking": True, "thinkingBudget": 4000},
+    }
+    assert calls[0][:2] == ["exec", "deploy/cbioagent-librechat-beta"]
+    monkeypatch.setattr(agent_prompt, "_kubectl", lambda args, ctx: "a: [sk-secret")
+    with pytest.raises(RuntimeError) as exc:
+        agent_prompt.fetch_model_specs("d")
+    assert "sk-secret" not in str(exc.value)
+
+
+def test_describe_agents_records_effort_parameters():
+    agents = agent_prompt.describe_agents(
+        "root",
+        fetch=lambda agent_id, ctx: {
+            "instructions": "x",
+            "model_parameters": {"thinking": True, "thinkingBudget": 2000, "temperature": 1, "maxTokens": 9},
+        },
+    )
+    assert agents["root"]["effort_parameters"] == {"thinking": True, "thinkingBudget": 2000}
+
+
+def test_agents_api_run_records_each_models_deployed_effort(monkeypatch, results_dir):
+    specs = {"cBioPortalChatBeta": {}, "cBioPortalChatBetaSonnet": {"thinking": True, "thinkingBudget": 4000}}
+    _cli(
+        monkeypatch,
+        ["--target", "beta", "--models", "haiku,sonnet"],
+        FakeAgent(),
+        specs=lambda deployment, ctx: specs,
+    )
+    recorded = _run_json(results_dir)
+    assert recorded["reasoning_efforts"] == {"haiku": "thinking off", "sonnet": "thinking on, budget 4000"}
+    assert reasoning_effort(recorded, "sonnet") == "thinking on, budget 4000"
+    assert reasoning_effort(recorded) is None
+
+
+def test_agents_api_effort_is_unknown_when_the_specs_cant_be_read(monkeypatch, results_dir):
+    def refused(deployment, ctx):
+        raise RuntimeError("kubectl: forbidden")
+
+    _cli(monkeypatch, ["--target", "beta", "--models", "haiku"], FakeAgent(), specs=refused)
+    recorded = _run_json(results_dir)
+    assert recorded["reasoning_efforts"] == {"haiku": None}
+    assert "forbidden" in recorded["model_specs"]["error"]
+
+
+def test_agents_api_effort_without_a_spec_is_the_agents_own(monkeypatch, results_dir):
+    def never(deployment, ctx):
+        raise AssertionError("no spec, no librechat.yaml")
+
+    _cli(monkeypatch, ["--target", "beta-unified", "--models", "unified"], FakeAgent(), specs=never)
+    assert _run_json(results_dir)["reasoning_efforts"] == {"unified": "thinking off"}
+
+
+def test_report_and_index_show_per_model_deployed_effort(results_dir):
+    bench = _run("20261020-0000", results_dir, {}, model="haiku", runner="agents-api")
+    bench.data["models"] = ["haiku", "sonnet"]
+    bench.data["reasoning_efforts"] = {"haiku": "thinking off", "sonnet": None}
+    for qid in (1, 2):
+        bench.records[record_key(qid, "sonnet", 1)] = _rec(qid, "sonnet")
+    bench.save()
+    html = write_report(bench).read_text()
+    assert "Haiku 4.5</td><td>thinking off</td>" in html and "Sonnet 5</td><td>–</td>" in html
+    index = (results_dir / "index.html").read_text()
+    assert "Haiku 4.5</td>\n      <td>thinking off</td>" in index
+    assert "Sonnet 5</td>\n      <td>–</td>" in index
