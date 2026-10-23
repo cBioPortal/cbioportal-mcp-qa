@@ -53,7 +53,7 @@ def _run(run_id: str, results_dir, extra: dict, model: str = MODEL, runner: str 
 
 def test_reasoning_effort_from_run_metadata():
     assert reasoning_effort({"runner": "openai", "reasoning_effort": "high"}) == "high"
-    assert reasoning_effort({"runner": "claude-code", "reasoning_effort": "thinking off"}) == "thinking off"
+    assert reasoning_effort({"runner": "claude-code", "reasoning_effort": "high"}) == "high"
     # openai runs from before the top-level field: the endpoint record, None meaning none was sent.
     assert reasoning_effort({"runner": "openai", "openai": {"reasoning_effort": "none"}}) == "none"
     assert reasoning_effort({"runner": "openai", "openai": {"reasoning_effort": None}}) == "default"
@@ -353,7 +353,8 @@ def test_claude_code_run_records_the_explicit_effort(monkeypatch, results_dir):
     recorded = _run_json(results_dir)
     # Haiku 4.5 has no effort levels: Claude Code sends it none.
     assert recorded["reasoning_efforts"] == {"sonnet": "high", "haiku": "n/a"}
-    assert recorded["thinking"] == "off"
+    # No thinking claim: MAX_THINKING_TOKENS=0 doesn't turn thinking off on every model.
+    assert "thinking" not in recorded
 
 
 def test_claude_code_run_without_an_effort_records_it_as_unknown(monkeypatch, results_dir):
@@ -601,3 +602,49 @@ def test_agents_api_resume_warns_when_the_configuration_cant_be_read(monkeypatch
             monkeypatch, ["--resume", run_id], FakeAgent(), specs=refused, fetch_agent=fetch_agent
         )
         assert "couldn't read the deployed reasoning effort of haiku, sonnet again" in result.output
+
+
+@pytest.mark.parametrize("allow_api_billing", [False, True])
+def test_a_managed_policy_helper_refuses_an_explicit_effort(tmp_path, monkeypatch, allow_api_billing):
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "managed-settings.json").write_text(
+        json.dumps({"policyHelper": {"command": "/usr/bin/policy"}})
+    )
+    monkeypatch.setattr(claude_code, "MANAGED_SETTINGS_DIRS", (managed,))
+    # Refused either way: by the billing guard, or (with per-token billing allowed) by the effort guard.
+    with pytest.raises(RuntimeError, match="policyHelper") as exc:
+        _client(effort="high", allow_api_billing=allow_api_billing)
+    if allow_api_billing:
+        assert "--reasoning-effort high would not be the effort" in str(exc.value)
+        # Without an explicit effort the policyHelper doesn't matter to the effort record (unknown).
+        asyncio.run(_client(allow_api_billing=True).aclose())
+
+
+def test_report_notes_the_requested_effort_only_for_explicit_claude_code_runs(results_dir):
+    note = "the level the benchmark requested of every Claude Code session"
+    explicit = _run(
+        "20261020-0000",
+        results_dir,
+        {"reasoning_efforts": {"sonnet": "high"}},
+        model="sonnet",
+        runner="claude-code",
+    )
+    explicit.data["options"] = {"reasoning_effort": "high"}
+    explicit.save()
+    html = write_report(explicit).read_text()
+    assert note in html and "thinking off" not in html
+    unset = _run(
+        "20261020-0001",
+        results_dir,
+        {"reasoning_efforts": {"sonnet": None}},
+        model="sonnet",
+        runner="claude-code",
+    )
+    unset.data["options"] = {"reasoning_effort": None}
+    unset.save()
+    assert note not in write_report(unset).read_text()
+    openai = _run("20261020-0002", results_dir, {"reasoning_effort": "high"})
+    openai.data["options"] = {"reasoning_effort": "high"}
+    openai.save()
+    assert note not in write_report(openai).read_text()

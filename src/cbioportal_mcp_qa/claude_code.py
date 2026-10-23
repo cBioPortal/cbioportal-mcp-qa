@@ -140,15 +140,24 @@ def configured_effort(env: Mapping[str, str], isolate_settings: bool) -> list[di
 
 
 def effort_overrides(env: Mapping[str, str], isolate_settings: bool) -> list[str]:
-    """Settings that would change an effort set with `effort_settings`: a maxEffortLevel cap in any file sessions
-    load, or CLAUDE_CODE_EFFORT_LEVEL in managed settings' `env` (ranked above --settings)."""
+    """Settings that would (or might) change an effort set with `effort_settings`: a maxEffortLevel cap in any
+    file sessions load, CLAUDE_CODE_EFFORT_LEVEL in managed settings' `env` (ranked above --settings), or a managed
+    policyHelper, whose output becomes managed settings that can't be read here."""
     user = str(config_dir(env) / "settings.json")
-    return [
+    found = [
         f"{c['source']}: {c['key']}"
         for c in configured_effort(env, isolate_settings)
         if c["key"].endswith("maxEffortLevel")
         or (c["key"].endswith(EFFORT_ENV) and c["source"] not in ("environment", user))
     ]
+    for path in settings_files(env, isolate_settings=True):  # the managed sources
+        try:
+            doc = _settings_doc(path)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+        if any(d.get("policyHelper") for d in _dicts(doc)):
+            found.append(f"{path}: policyHelper")
+    return found
 
 
 def _dicts(obj):

@@ -900,8 +900,6 @@ def run(
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
         if runner == "claude-code":
-            # Sessions run with MAX_THINKING_TOKENS=0, whatever their effort level.
-            extra["thinking"] = "off"
             extra["database_mcp"] = client.setup.connector or settings.database_mcp_url
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
