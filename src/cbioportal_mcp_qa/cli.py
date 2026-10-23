@@ -12,6 +12,7 @@ from .agent import AgentClient
 from .agent_prompt import (
     deployed_effort,
     describe_agents,
+    effort_parameters,
     fetch_agent_prompt,
     fetch_model_specs,
     prompt_fingerprint,
@@ -315,13 +316,60 @@ def _check_runner_options(settings, runner: str, models: list[str], system_promp
         )
 
 
-def _session_effort(runner: str, reasoning_effort: str | None, client) -> str | None:
-    """The reasoning effort this invocation's answers are asked with (None for the deployed agent's own)."""
+def _session_efforts(runner: str, reasoning_effort: str | None, client, models: list[str]) -> dict:
+    """The reasoning effort this invocation asks each model with, for a runner that sets it (openai: the request's
+    reasoning_effort; claude-code: the level its sessions resolve). Empty for the deployed agent's own."""
     if runner == "openai":
-        return reasoning_effort or "default"
+        return {m: reasoning_effort or "default" for m in models}
     if runner == "claude-code":
-        return client.effort_level or "default"
-    return None
+        return {m: client.effort_for(m) for m in models}
+    return {}
+
+
+def _current_deployed_efforts(settings, target: str, models: list[str]) -> dict:
+    """Each model's deployed effort as the agent and LibreChat are configured now (None where it can't be read)."""
+    root = TARGETS[target].agent_id
+    try:
+        agents = {
+            root: {
+                "effort_parameters": effort_parameters(
+                    fetch_agent_prompt(root, settings.kube_context).get("model_parameters")
+                )
+            }
+        }
+    except Exception:  # noqa: BLE001 - the resume only warns when the configuration can't be read
+        agents = {}
+    return _deployed_efforts(settings, target, models, agents)[0]
+
+
+def _check_resume_effort(settings, bench, runner: str, target: str, reasoning_effort, client) -> None:
+    """Refuse a resume that would ask a model at another effort than the run recorded for it: the report has one
+    row per model, so the answers would be pooled. A deployed effort that can't be read again only warns."""
+    models = bench.data["models"]
+    if runner in LOCAL_RUNNERS:
+        now = _session_efforts(runner, reasoning_effort, client, models)
+    else:
+        now = _current_deployed_efforts(settings, target, models)
+    changed, unread = [], []
+    for m in models:
+        before = recorded_effort(bench.data, m)
+        if before is None:
+            continue
+        if now.get(m) is None:
+            unread.append(m)
+        elif now[m] != before:
+            changed.append(f"{m}: {before!r} → {now[m]!r}")
+    if changed:
+        raise click.ClickException(
+            f"run {bench.data['run_id']} was answered at another reasoning effort than this resume would ask at "
+            f"({'; '.join(changed)}); resume at the run's effort, or start a new run"
+        )
+    if unread:
+        click.echo(
+            f"Warning: couldn't read the deployed reasoning effort of {', '.join(unread)} again; resuming without "
+            "checking it",
+            err=True,
+        )
 
 
 def _deployed_efforts(settings, target: str, models: list[str], agents: dict) -> tuple[dict, dict]:
@@ -764,13 +812,7 @@ def run(
         max_tool_rounds=max_tool_rounds,
     )
     if resume:
-        # One run, one effort: its report has one row per model, so answers at another effort would be pooled in.
-        before, now = recorded_effort(bench.data), _session_effort(runner, reasoning_effort, client)
-        if before and now and before != now:
-            raise click.ClickException(
-                f"run {bench.data['run_id']} was answered at reasoning effort {before!r}, this resume would ask at "
-                f"{now!r}; resume with the run's effort, or start a new run for {now!r}"
-            )
+        _check_resume_effort(settings, bench, runner, target, reasoning_effort, client)
         recorded = (bench.data.get("agent_prompt") or {}).get("sha256")
         if prompt and recorded and prompt_fingerprint(prompt)["sha256"] != recorded:
             click.echo("Warning: the agent's prompt changed since this run started", err=True)
@@ -801,8 +843,10 @@ def run(
             "versions": collect_versions(settings, runner, target),
         }
         # The reasoning effort answers are asked with, for the report and for --resume to keep.
-        if runner in LOCAL_RUNNERS:
-            extra["reasoning_effort"] = _session_effort(runner, reasoning_effort, client)
+        if runner == "openai":
+            extra["reasoning_effort"] = reasoning_effort or "default"
+        elif runner == "claude-code":
+            extra["reasoning_efforts"] = _session_efforts(runner, reasoning_effort, client, models)
         else:
             # The deployed agent's own, per model (its modelSpec can change it).
             extra["reasoning_efforts"], extra["model_specs"] = _deployed_efforts(

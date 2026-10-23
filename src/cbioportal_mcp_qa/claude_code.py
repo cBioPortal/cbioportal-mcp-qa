@@ -92,6 +92,28 @@ def settings_files(env: Mapping[str, str], isolate_settings: bool) -> list[Path]
 
 
 EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_ALL_LEVELS = EFFORT_LEVELS
+# Effort levels each model supports and the level it runs at when nothing sets one
+# (https://code.claude.com/docs/en/model-config#set-the-effort-level). Other models have no effort levels.
+MODEL_EFFORT = {
+    "claude-fable-5-1": (_ALL_LEVELS, "high"),
+    "claude-fable-5": (_ALL_LEVELS, "high"),
+    "claude-opus-5-5": (_ALL_LEVELS, "medium"),
+    "claude-sonnet-5-5": (_ALL_LEVELS, "medium"),
+    "claude-haiku-5-5": (_ALL_LEVELS, "medium"),
+    "claude-opus-5": (_ALL_LEVELS, "high"),
+    "claude-sonnet-5": (_ALL_LEVELS, "high"),
+    "claude-opus-4-8": (_ALL_LEVELS, "high"),
+    "claude-opus-4-7": (_ALL_LEVELS, "xhigh"),
+    "claude-opus-4-6": (("low", "medium", "high", "max"), "high"),
+    "claude-sonnet-4-6": (("low", "medium", "high", "max"), "high"),
+}
+# A top-level effortLevel in *user* settings doesn't apply to these (in other files it applies to every model).
+USER_EFFORT_LEVEL_IGNORED = {"claude-opus-5-5"}
+NO_EFFORT = "n/a"
+# Settings keys that don't make a managed source count as delivering a policy.
+CONTROL_KEYS = {"wslInheritsWindowsSettings", "managedSourcesBehavior"}
 
 
 def _settings_doc(path: Path):
@@ -99,26 +121,134 @@ def _settings_doc(path: Path):
     return plistlib.loads(raw) if path.suffix == ".plist" else json.loads(raw)
 
 
-def effort_level(env: Mapping[str, str], isolate_settings: bool) -> str | None:
-    """The effort level sessions run at, as Claude Code resolves it without --effort: CLAUDE_CODE_EFFORT_LEVEL
-    from the environment, else from a loaded settings file's `env` block, else the `effortLevel` of the first
-    loaded settings file that sets one (managed before user settings). None: the model's default."""
-    if env.get(EFFORT_ENV):
-        return env[EFFORT_ENV]
-    docs = []
-    for path in settings_files(env, isolate_settings):
-        try:
-            docs.append(list(_dicts(_settings_doc(path))))
-        except (OSError, ValueError, plistlib.InvalidFileException):
-            continue
-    for settings in (d for doc in docs for d in doc):
-        block = settings.get("env") if isinstance(settings.get("env"), dict) else {}
-        if block.get(EFFORT_ENV):
-            return str(block[EFFORT_ENV])
-    for settings in (d for doc in docs for d in doc):
-        if settings.get("effortLevel"):
-            return str(settings["effortLevel"])
-    return None
+def canonical_model(model_id: str) -> str:
+    """The name Claude Code keys modelSettings by: `claude-haiku-4-5-20251001[1m]` -> `claude-haiku-4-5`."""
+    name = model_id.lower().removesuffix("[1m]").rsplit("/", 1)[-1]
+    name = re.sub(r"^((us|eu|apac|global)\.)?(anthropic\.)?", "", name)
+    name = re.sub(r"-v\d+(:\d+)?$", "", name)
+    return re.sub(r"-\d{8}$", "", name)
+
+
+def _merge(base: dict, over: dict) -> dict:
+    """Merge settings as managed-settings drop-ins do: a later single value replaces, lists combine without
+    duplicates, nested blocks merge key by key."""
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        elif isinstance(value, list) and isinstance(out.get(key), list):
+            out[key] = out[key] + [v for v in value if v not in out[key]]
+        else:
+            out[key] = value
+    return out
+
+
+def _read_settings(path: Path) -> dict:
+    try:
+        doc = _settings_doc(path)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    # The server-managed cache may wrap the settings.
+    return doc["settings"] if isinstance(doc.get("settings"), dict) else doc
+
+
+def managed_sources(env: Mapping[str, str]) -> list[dict]:
+    """The admin sources a session reads, highest-ranked first: server-managed (its cache), the MDM profile,
+    and managed-settings.json merged with its managed-settings.d/*.json drop-ins in alphabetical order."""
+    remote = _read_settings(config_dir(env) / "remote-settings.json")
+    plists = [MANAGED_PREFERENCES_DIR / MDM_PLIST, *sorted(MANAGED_PREFERENCES_DIR.glob(f"*/{MDM_PLIST}"))]
+    mdm = next((d for d in map(_read_settings, plists) if d), {})
+    files: dict = {}
+    for d in MANAGED_SETTINGS_DIRS:
+        for f in [d / "managed-settings.json", *sorted(d.glob("managed-settings.d/*.json"))]:
+            if f.is_file() and not f.name.startswith("."):
+                files = _merge(files, _read_settings(f))
+    return [remote, mdm, files]
+
+
+def managed_settings(env: Mapping[str, str]) -> dict:
+    """The managed settings a session applies: the first admin source that delivers a policy key ("first-wins"),
+    or every one, higher-ranked values first, when that source sets managedSourcesBehavior "merge". `env` merges
+    per variable across all admin sources either way (https://code.claude.com/docs/en/managed-settings)."""
+    sources = managed_sources(env)
+    with_policy = [s for s in sources if set(s) - CONTROL_KEYS]
+    if not with_policy:
+        return {}
+    selected = with_policy[0]
+    if selected.get("managedSourcesBehavior") == "merge":
+        for lower in with_policy[1:]:
+            selected = _merge(lower, selected)
+    merged_env: dict = {}
+    for source in reversed(sources):
+        if isinstance(source.get("env"), dict):
+            merged_env |= source["env"]
+    return selected | ({"env": merged_env} if merged_env else {})
+
+
+def effort_settings(env: Mapping[str, str], isolate_settings: bool, cli_settings: dict | None = None) -> list:
+    """(scope, settings) a session resolves effort from, highest precedence first: managed, --settings, and user
+    settings when they're loaded (the session's working directory is empty: no project or local settings)."""
+    docs = [("managed", managed_settings(env)), ("cli", cli_settings or {})]
+    if not isolate_settings:
+        docs.append(("user", _read_settings(config_dir(env) / "settings.json")))
+    return [(scope, d) for scope, d in docs if d]
+
+
+def _clamp(level: str, supported: tuple[str, ...]) -> str:
+    """The highest supported level at or below `level`."""
+    rank = EFFORT_LEVELS.index(level)
+    return [s for s in supported if EFFORT_LEVELS.index(s) <= rank][-1] if level in EFFORT_LEVELS else level
+
+
+def effort_for(
+    model_id: str, env: Mapping[str, str], isolate_settings: bool, cli_settings: dict | None = None
+) -> str:
+    """The effort level a session on `model_id` runs at, as Claude Code resolves it without --effort
+    (https://code.claude.com/docs/en/model-config#adjust-effort-level):
+
+    1. CLAUDE_CODE_EFFORT_LEVEL: a settings `env` value (highest-precedence file) replaces the inherited one; an
+       empty value unsets it, `auto` means the model's default.
+    2. Settings: the highest-precedence file that sets the model's modelSettings effortLevel or a top-level
+       effortLevel that applies to the model (in user settings not to Opus 5.5); within a file the model's wins.
+    3. The model's default.
+
+    Then clamped to the model's levels and capped by maxEffortLevel (the lowest cap across files; a model's
+    modelSettings cap replaces its file's top-level one). An organization's server-side effort limits aren't
+    visible here. NO_EFFORT for a model without effort levels."""
+    model = canonical_model(model_id)
+    if model not in MODEL_EFFORT:
+        return NO_EFFORT
+    supported, default = MODEL_EFFORT[model]
+    docs = effort_settings(env, isolate_settings, cli_settings)
+    value = next(
+        (d["env"][EFFORT_ENV] for _, d in docs if isinstance(d.get("env"), dict) and EFFORT_ENV in d["env"]),
+        env.get(EFFORT_ENV),
+    )
+    level = None
+    if value and value != "auto":
+        level = value
+    elif not value:
+        for scope, d in docs:
+            entry = (d.get("modelSettings") or {}).get(model) or {}
+            if entry.get("effortLevel"):
+                level = entry["effortLevel"]
+                break
+            if d.get("effortLevel") and not (scope == "user" and model in USER_EFFORT_LEVEL_IGNORED):
+                level = d["effortLevel"]
+                break
+    level = _clamp(level or default, supported)
+    for _, d in docs:
+        entry = (d.get("modelSettings") or {}).get(model) or {}
+        cap = entry.get("maxEffortLevel") or d.get("maxEffortLevel")
+        if (
+            cap in EFFORT_LEVELS
+            and level in EFFORT_LEVELS
+            and EFFORT_LEVELS.index(cap) < EFFORT_LEVELS.index(level)
+        ):
+            level = _clamp(cap, supported)
+    return level
 
 
 def _dicts(obj):
@@ -800,8 +930,6 @@ class ClaudeCodeClient:
         self.env, self.stripped_env = session_env(os.environ, allow_api_billing)
         self.trust_org_policy = trust_org_policy
         self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
-        # Recorded only: sessions get no --effort, so this is what they resolve themselves.
-        self.effort_level = effort_level(self.env, isolate_settings)
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
         self.allow_plugins = allow_plugins
         # Before the first model call (the connector probe included): plugins are turned off, and one that can't
@@ -827,6 +955,13 @@ class ClaudeCodeClient:
         self.mcp_config_path = os.path.join(self._workdir.name, "mcp.json")
         write_private_json(self.mcp_config_path, self.setup.mcp_config())
 
+    def effort_for(self, model: str) -> str:
+        """The effort level this client's sessions on `model` run at. Recorded only: sessions get no --effort,
+        so it is what they resolve from the environment and the settings they load."""
+        return effort_for(
+            MODELS[model].claude_code_id or model, self.env, self.isolate_settings, self.settings
+        )
+
     async def aclose(self) -> None:
         self._workdir.cleanup()
 
@@ -840,7 +975,6 @@ class ClaudeCodeClient:
             "trust_org_policy": self.trust_org_policy,
             "stripped_env": self.stripped_env,
             "setting_sources": "managed only" if self.isolate_settings else "user, project, local",
-            "effort_level": self.effort_level,
             "allow_plugins": self.allow_plugins,
             "plugins": self.plugins,
             "disabled_plugins": sorted(self.settings["enabledPlugins"]),

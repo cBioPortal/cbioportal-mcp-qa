@@ -171,46 +171,155 @@ def test_tool_table_headers_name_each_models_effort(results_dir):
     assert "<th>Haiku 4.5 (–) calls</th>" in write_report(legacy).read_text()
 
 
-# claude-code: the effort level sessions resolve themselves, recorded apart from thinking (always off).
+# claude-code: the effort level sessions resolve themselves (Claude Code doesn't report it), per model, recorded
+# apart from thinking (always off).
+
+SONNET5, SONNET55, OPUS55, OPUS46 = (
+    "claude-sonnet-5",
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-opus-4-6",
+)
 
 
-def test_claude_code_effort_level_follows_the_settings_sessions_load(tmp_path, monkeypatch):
+@pytest.fixture
+def claude_home(tmp_path):
     home = tmp_path / "claude-home"
     home.mkdir(exist_ok=True)
-    env = {"CLAUDE_CONFIG_DIR": str(home)}
-    assert claude_code.effort_level(env, isolate_settings=False) is None
+    return home
+
+
+@pytest.fixture
+def managed(tmp_path, monkeypatch):
+    d = tmp_path / "managed"
+    (d / "managed-settings.d").mkdir(parents=True)
+    monkeypatch.setattr(claude_code, "MANAGED_SETTINGS_DIRS", (d,))
+    return d
+
+
+def _effort(model, home, isolate=False, extra_env=None):
+    env = {"CLAUDE_CONFIG_DIR": str(home), **(extra_env or {})}
+    return claude_code.effort_for(model, env, isolate)
+
+
+def _write(path, doc):
+    path.write_text(json.dumps(doc))
+
+
+def test_effort_defaults_per_model(claude_home):
+    assert _effort(SONNET5, claude_home) == "high"
+    assert _effort(SONNET55, claude_home) == "medium"
+    # A model without effort levels, matched through its dated id.
+    assert _effort("claude-haiku-4-5-20251001", claude_home) == claude_code.NO_EFFORT
+    assert claude_code.canonical_model("us.anthropic.claude-sonnet-5-v1:0") == SONNET5
+    assert claude_code.canonical_model("claude-opus-4-7-20260101[1m]") == "claude-opus-4-7"
+
+
+def test_user_settings_at_different_levels_are_told_apart(claude_home):
     for level in ("low", "high"):
-        (home / "settings.json").write_text(json.dumps({"effortLevel": level}))
-        assert claude_code.effort_level(env, isolate_settings=False) == level
+        _write(claude_home / "settings.json", {"effortLevel": level})
+        assert _effort(SONNET5, claude_home) == level
         # Isolated sessions don't load user settings.
-        assert claude_code.effort_level(env, isolate_settings=True) is None
-    (home / "settings.json").write_text(
-        json.dumps({"effortLevel": "low", "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}})
-    )
-    assert claude_code.effort_level(env, isolate_settings=False) == "max"
-    assert (
-        claude_code.effort_level(env | {"CLAUDE_CODE_EFFORT_LEVEL": "medium"}, isolate_settings=False)
-        == "medium"
-    )
-    # Managed settings apply to isolated sessions too, and come before user settings.
-    managed = tmp_path / "managed"
-    managed.mkdir()
-    (managed / "managed-settings.json").write_text(json.dumps({"effortLevel": "xhigh"}))
-    monkeypatch.setattr(claude_code, "MANAGED_SETTINGS_DIRS", (managed,))
-    assert claude_code.effort_level(env, isolate_settings=True) == "xhigh"
-    (home / "settings.json").write_text(json.dumps({"effortLevel": "low"}))
-    assert claude_code.effort_level(env, isolate_settings=False) == "xhigh"
+        assert _effort(SONNET5, claude_home, isolate=True) == "high"
+    # A user-settings top-level effortLevel doesn't apply to Opus 5.5.
+    assert _effort(OPUS55, claude_home) == "medium"
 
 
-def _cli(monkeypatch, args: list[str], client, exit_code: int = 0, specs=None):
+def test_settings_env_wins_over_the_inherited_variable(claude_home):
+    inherited = {"CLAUDE_CODE_EFFORT_LEVEL": "low"}
+    assert _effort(SONNET5, claude_home, extra_env=inherited) == "low"
+    _write(
+        claude_home / "settings.json", {"env": {"CLAUDE_CODE_EFFORT_LEVEL": "xhigh"}, "effortLevel": "medium"}
+    )
+    assert _effort(SONNET5, claude_home, extra_env=inherited) == "xhigh"
+    # Isolated: the user file's env isn't applied, so the inherited value is.
+    assert _effort(SONNET5, claude_home, isolate=True, extra_env=inherited) == "low"
+    # An empty settings value unsets it; `auto` is the model's default, not the settings' level.
+    _write(claude_home / "settings.json", {"env": {"CLAUDE_CODE_EFFORT_LEVEL": ""}, "effortLevel": "medium"})
+    assert _effort(SONNET5, claude_home, extra_env=inherited) == "medium"
+    _write(claude_home / "settings.json", {"effortLevel": "medium"})
+    assert _effort(SONNET5, claude_home, extra_env={"CLAUDE_CODE_EFFORT_LEVEL": "auto"}) == "high"
+
+
+def test_managed_env_wins_over_user_env(claude_home, managed):
+    _write(claude_home / "settings.json", {"env": {"CLAUDE_CODE_EFFORT_LEVEL": "low"}})
+    _write(managed / "managed-settings.json", {"env": {"CLAUDE_CODE_EFFORT_LEVEL": "xhigh"}})
+    assert _effort(SONNET5, claude_home) == "xhigh"
+
+
+def test_managed_drop_ins_merge_over_the_base_file(claude_home, managed):
+    _write(managed / "managed-settings.json", {"effortLevel": "low"})
+    _write(managed / "managed-settings.d" / "20-effort.json", {"effortLevel": "high"})
+    _write(managed / "managed-settings.d" / ".hidden.json", {"effortLevel": "medium"})
+    assert _effort(SONNET5, claude_home) == "high"
+    # Alphabetical: a later drop-in replaces an earlier one.
+    _write(managed / "managed-settings.d" / "30-effort.json", {"effortLevel": "medium"})
+    assert _effort(SONNET5, claude_home) == "medium"
+    # Nested blocks merge key by key.
+    _write(
+        managed / "managed-settings.d" / "40-models.json",
+        {"modelSettings": {SONNET55: {"effortLevel": "low"}}},
+    )
+    _write(
+        managed / "managed-settings.d" / "50-models.json", {"modelSettings": {OPUS46: {"effortLevel": "low"}}}
+    )
+    assert (_effort(SONNET55, claude_home), _effort(OPUS46, claude_home)) == ("low", "low")
+    # Managed outranks user settings, which still can't override it.
+    _write(claude_home / "settings.json", {"effortLevel": "xhigh"})
+    assert _effort(SONNET5, claude_home) == "medium"
+
+
+def test_first_managed_source_with_a_policy_wins(claude_home, managed):
+    _write(managed / "managed-settings.json", {"effortLevel": "low"})
+    # The server-managed cache ranks above the file and is selected: the file's effortLevel is skipped.
+    _write(claude_home / "remote-settings.json", {"channelsEnabled": True})
+    assert _effort(SONNET5, claude_home) == "high"
+    # Unless the selected source merges every admin source.
+    _write(claude_home / "remote-settings.json", {"channelsEnabled": True, "managedSourcesBehavior": "merge"})
+    assert _effort(SONNET5, claude_home) == "low"
+    # A source with only control keys isn't selected.
+    _write(claude_home / "remote-settings.json", {"managedSourcesBehavior": "first-wins"})
+    assert _effort(SONNET5, claude_home) == "low"
+
+
+def test_model_settings_apply_per_model(claude_home):
+    _write(
+        claude_home / "settings.json",
+        {
+            "effortLevel": "low",
+            "modelSettings": {SONNET55: {"effortLevel": "xhigh"}, OPUS55: {"effortLevel": "high"}},
+        },
+    )
+    # The model's own entry wins over the file's top-level level; other models get the top-level one.
+    assert _effort(SONNET55, claude_home) == "xhigh"
+    assert _effort(OPUS55, claude_home) == "high"
+    assert _effort(SONNET5, claude_home) == "low"
+    # Matched through a dated or [1m] id.
+    assert _effort(SONNET55 + "-20260901[1m]", claude_home) == "xhigh"
+
+
+def test_effort_is_clamped_and_capped(claude_home, managed):
+    _write(claude_home / "settings.json", {"effortLevel": "xhigh"})
+    # Opus 4.6 has no xhigh: the highest level at or below it.
+    assert _effort(OPUS46, claude_home) == "high"
+    _write(
+        managed / "managed-settings.json",
+        {"maxEffortLevel": "medium", "modelSettings": {SONNET55: {"maxEffortLevel": "max"}}},
+    )
+    assert _effort(SONNET5, claude_home) == "medium"
+    _write(claude_home / "settings.json", {"modelSettings": {SONNET55: {"effortLevel": "xhigh"}}})
+    assert _effort(SONNET55, claude_home) == "xhigh"
+
+
+def _agent(agent_id, ctx=None):
+    return {"instructions": "AGENT", "model_parameters": {"thinking": False}}
+
+
+def _cli(monkeypatch, args: list[str], client, exit_code: int = 0, specs=None, fetch_agent=_agent):
     monkeypatch.setattr("cbioportal_mcp_qa.config.load_dotenv", lambda: None)
     monkeypatch.setenv("DATABASE_MCP_URL", "http://localhost:18081/db/mcp")
     monkeypatch.setenv("DATABASE_MCP_ENV", "beta")
-    monkeypatch.setattr(
-        cli,
-        "fetch_agent_prompt",
-        lambda agent_id, ctx=None: {"instructions": "AGENT", "model_parameters": {"thinking": False}},
-    )
+    monkeypatch.setattr(cli, "fetch_agent_prompt", fetch_agent)
     monkeypatch.setattr(cli, "collect_versions", lambda *a: {})
     monkeypatch.setattr(cli, "prompt_parity", lambda *a: {})
     monkeypatch.setattr(cli, "write_report", lambda bench: bench.dir / "report.html")
@@ -265,11 +374,14 @@ class FakeClaudeCode:
     stops = []
     setup = type("Setup", (), {"connector": None})()
 
-    def __init__(self, effort_level=None):
-        self.effort_level = effort_level
+    def __init__(self, efforts=None):
+        self.efforts = efforts or {}
+
+    def effort_for(self, model):
+        return self.efforts.get(model, "high")
 
     def describe(self):
-        return {"effort_level": self.effort_level}
+        return {}
 
     async def aclose(self):
         pass
@@ -298,21 +410,28 @@ def test_openai_run_without_an_effort_records_the_default(monkeypatch, results_d
     assert _run_json(results_dir)["reasoning_effort"] == "default"
 
 
-def test_claude_code_runs_at_different_effort_levels_are_told_apart(monkeypatch, results_dir):
-    base = ["--runner", "claude-code", "--target", "beta", "--models", "haiku"]
-    _cli(monkeypatch, base, FakeClaudeCode("low"))
-    (first,) = results_dir.glob("*/run.json")
-    first.rename(first.parent / "low.json")
-    _cli(monkeypatch, [*base, "--claude-code-user-settings"], FakeClaudeCode("high"))
+def test_claude_code_runs_record_each_models_effort(monkeypatch, results_dir):
+    base = ["--runner", "claude-code", "--target", "beta", "--models", "sonnet,sonnet-5.5"]
+    _cli(monkeypatch, base, FakeClaudeCode({"sonnet": "low", "sonnet-5.5": "xhigh"}))
     recorded = _run_json(results_dir)
-    low = json.loads((first.parent / "low.json").read_text())
-    assert (low["reasoning_effort"], recorded["reasoning_effort"]) == ("low", "high")
-    assert low["thinking"] == recorded["thinking"] == "off"
-    _cli(monkeypatch, base, FakeClaudeCode(None))
-    assert sorted(
-        r["reasoning_effort"]
-        for r in map(json.loads, (p.read_text() for p in results_dir.glob("*/run.json")))
-    ) == ["default", "high"]
+    assert recorded["reasoning_efforts"] == {"sonnet": "low", "sonnet-5.5": "xhigh"}
+    assert recorded["thinking"] == "off" and "reasoning_effort" not in recorded
+    assert (reasoning_effort(recorded, "sonnet"), reasoning_effort(recorded, "sonnet-5.5")) == (
+        "low",
+        "xhigh",
+    )
+
+
+def test_claude_code_client_resolves_effort_from_its_settings(monkeypatch, tmp_path):
+    home = tmp_path / "claude-home"
+    home.mkdir(exist_ok=True)
+    (home / "settings.json").write_text(json.dumps({"modelSettings": {SONNET55: {"effortLevel": "low"}}}))
+    client = claude_code.ClaudeCodeClient.__new__(claude_code.ClaudeCodeClient)
+    client.env, client.settings = {"CLAUDE_CONFIG_DIR": str(home)}, {"enabledPlugins": {}}
+    client.isolate_settings = False
+    assert (client.effort_for("sonnet-5.5"), client.effort_for("sonnet")) == ("low", "high")
+    client.isolate_settings = True
+    assert client.effort_for("sonnet-5.5") == "medium"
 
 
 # --resume keeps a run at one effort.
@@ -325,7 +444,7 @@ def test_resume_at_another_effort_is_refused(monkeypatch, results_dir):
     seen, result = _cli(
         monkeypatch, ["--resume", run_id, "--reasoning-effort", "high"], FakeOpenAI("high"), exit_code=1
     )
-    assert "reasoning effort 'low'" in result.output and "'high'" in result.output
+    assert f"{MODEL}: 'low' → 'high'" in result.output
     # Refused before anything is asked or recorded.
     assert (results_dir / run_id / "run.json").read_text() == before
     # The run's own effort (restored when not given) resumes.
@@ -334,11 +453,17 @@ def test_resume_at_another_effort_is_refused(monkeypatch, results_dir):
 
 
 def test_resume_of_a_claude_code_run_whose_effort_level_changed_is_refused(monkeypatch, results_dir):
-    base = ["--runner", "claude-code", "--target", "beta", "--models", "haiku"]
-    _cli(monkeypatch, base, FakeClaudeCode("low"))
+    base = ["--runner", "claude-code", "--target", "beta", "--models", "sonnet,sonnet-5.5"]
+    _cli(monkeypatch, base, FakeClaudeCode({"sonnet": "low", "sonnet-5.5": "medium"}))
     run_id = _run_json(results_dir)["run_id"]
-    _, result = _cli(monkeypatch, ["--resume", run_id], FakeClaudeCode("high"), exit_code=1)
-    assert "reasoning effort 'low'" in result.output
+    _, result = _cli(
+        monkeypatch,
+        ["--resume", run_id],
+        FakeClaudeCode({"sonnet": "low", "sonnet-5.5": "high"}),
+        exit_code=1,
+    )
+    assert "sonnet-5.5: 'medium' → 'high'" in result.output and "sonnet:" not in result.output
+    _cli(monkeypatch, ["--resume", run_id], FakeClaudeCode({"sonnet": "low", "sonnet-5.5": "medium"}))
 
 
 def test_resume_of_a_legacy_run_without_an_effort_is_not_refused(monkeypatch, results_dir):
@@ -450,3 +575,58 @@ def test_report_and_index_show_per_model_deployed_effort(results_dir):
     index = (results_dir / "index.html").read_text()
     assert "Haiku 4.5</td>\n      <td>thinking off</td>" in index
     assert "Sonnet 5</td>\n      <td>–</td>" in index
+
+
+# An agents-api resume reads the deployed configuration again (kubectl mocked) before anything is asked.
+
+
+def _agents_run(monkeypatch, results_dir, sonnet_spec):
+    monkeypatch.setattr(cli, "_current_deployed_efforts", REAL_CURRENT_DEPLOYED_EFFORTS)
+    specs = {"cBioPortalChatBeta": {}, "cBioPortalChatBetaSonnet": sonnet_spec}
+    _cli(monkeypatch, ["--target", "beta", "--models", "haiku,sonnet"], FakeAgent(), specs=lambda d, c: specs)
+    run_json = results_dir / _run_json(results_dir)["run_id"] / "run.json"
+    return run_json.parent.name, run_json.read_text()
+
+
+REAL_CURRENT_DEPLOYED_EFFORTS = cli._current_deployed_efforts
+
+
+def test_agents_api_resume_refuses_a_changed_deployed_effort(monkeypatch, results_dir):
+    run_id, before = _agents_run(monkeypatch, results_dir, {"thinking": False})
+    changed = {
+        "cBioPortalChatBeta": {},
+        "cBioPortalChatBetaSonnet": {"thinking": True, "thinkingBudget": 4000},
+    }
+    _, result = _cli(monkeypatch, ["--resume", run_id], FakeAgent(), exit_code=1, specs=lambda d, c: changed)
+    assert "sonnet: 'thinking off' → 'thinking on, budget 4000'" in result.output
+    assert "haiku:" not in result.output
+    # Refused before anything is planned, saved or asked.
+    assert (results_dir / run_id / "run.json").read_text() == before
+
+
+def test_agents_api_resume_at_the_same_deployed_effort_continues(monkeypatch, results_dir):
+    run_id, _ = _agents_run(monkeypatch, results_dir, {"thinking": False})
+    same = {"cBioPortalChatBeta": {}, "cBioPortalChatBetaSonnet": {"thinking": False}}
+    _, result = _cli(monkeypatch, ["--resume", run_id], FakeAgent(), specs=lambda d, c: same)
+    assert "Warning: couldn't read" not in result.output
+
+
+def test_agents_api_resume_warns_when_the_configuration_cant_be_read(monkeypatch, results_dir):
+    run_id, _ = _agents_run(monkeypatch, results_dir, {"thinking": False})
+    # Sonnet's spec is gone from librechat.yaml: only Haiku is checked.
+    only_haiku = {"cBioPortalChatBeta": {}}
+    _, result = _cli(monkeypatch, ["--resume", run_id], FakeAgent(), specs=lambda d, c: only_haiku)
+    assert "couldn't read the deployed reasoning effort of sonnet again" in result.output
+
+    def refused(deployment, ctx):
+        raise RuntimeError("kubectl: forbidden")
+
+    def no_agent(agent_id, ctx=None):
+        raise RuntimeError("no cbioagent-mongodb pod")
+
+    # Neither librechat.yaml nor the agent can be read: every model is unchecked, the resume still runs.
+    for fetch_agent in (_agent, no_agent):
+        _, result = _cli(
+            monkeypatch, ["--resume", run_id], FakeAgent(), specs=refused, fetch_agent=fetch_agent
+        )
+        assert "couldn't read the deployed reasoning effort of haiku, sonnet again" in result.output
