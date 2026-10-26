@@ -74,10 +74,12 @@ THINKING_OFF_ENV = {"MAX_THINKING_TOKENS": "0", "CLAUDE_CODE_DISABLE_THINKING": 
 # its sessions send it through CLAUDE_CODE_EXTRA_BODY. Sonnet 5.5 rejects "disabled"; its `between_tools` only
 # drops the up-front thinking, so it stays adaptive.
 EXTRA_BODY_THINKING = {"haiku-5.5": {"type": "disabled"}}
-# The effort those sessions are pinned to: the API rejects "disabled" with effort xhigh or max, which an inherited
-# CLAUDE_CODE_EFFORT_LEVEL (shell or user settings) would send. medium is what Claude Code 2.1.309 sends Haiku 5.5
-# by default, so a default session's request is unchanged.
+# The effort those sessions are pinned to without a --reasoning-effort: the API rejects "disabled" with effort xhigh
+# or max, which an inherited CLAUDE_CODE_EFFORT_LEVEL (shell or user settings) would send. medium is what Claude
+# Code 2.1.309 sends Haiku 5.5 by default, so a default session's request is unchanged. A --reasoning-effort
+# replaces it, and only THINKING_OFF_EFFORT_LEVELS are accepted for these models.
 THINKING_OFF_EFFORT = {"haiku-5.5": "medium"}
+THINKING_OFF_EFFORT_LEVELS = ("low", "medium", "high")
 # Each model's thinking in claude-code sessions, as captured from Claude Code 2.1.309's requests (PR #88).
 # Managed settings outrank the session's, so a managed `env` can still change it.
 THINKING_MODES = {
@@ -485,6 +487,19 @@ def session_settings(extra: list[str] = ()) -> dict:
     return THINKING_OFF_SETTINGS | no_plugins_settings(extra)
 
 
+def thinking_off_effort_error(effort: str, models: list[str]) -> str:
+    return (
+        f"--reasoning-effort {effort} can't be used with {', '.join(models)}: its sessions run with thinking off, "
+        f"and the API rejects that above effort high; use {', '.join(THINKING_OFF_EFFORT_LEVELS)}"
+    )
+
+
+def session_effort(model: str, effort: str | None) -> str | None:
+    """The effort a claude-code session on `model` sends: `effort` (--reasoning-effort), else the model's pinned
+    THINKING_OFF_EFFORT, else None (sessions resolve their own)."""
+    return effort or THINKING_OFF_EFFORT.get(model)
+
+
 def model_key(model_id: str) -> str:
     """The MODELS key for a Claude Code model id ('claude-haiku-5-5' → 'haiku-5.5'); a key or unknown id as is."""
     return next((k for k, m in MODELS.items() if m.claude_code_id == model_id), model_id)
@@ -493,12 +508,15 @@ def model_key(model_id: str) -> str:
 def model_settings(settings: dict, model: str, body: Mapping | None = None) -> dict:
     """`settings` for a session on `model` (a MODELS key): CLAUDE_CODE_EXTRA_BODY in their env is `body` (the
     inherited one, its `thinking` taken out) plus the model's EXTRA_BODY_THINKING, so neither the shell nor user
-    settings set it. A model with THINKING_OFF_EFFORT also gets that CLAUDE_CODE_EFFORT_LEVEL, and `body` loses
-    an `output_config.effort` that would override it."""
+    settings set it. A model with THINKING_OFF_EFFORT runs at the effort `settings` set (--reasoning-effort, one of
+    THINKING_OFF_EFFORT_LEVELS) or else that pinned one, and `body` loses an `output_config.effort` that would
+    override it."""
     body = dict(body or {})
     env = dict(settings.get("env", {}))
     if model in THINKING_OFF_EFFORT:
-        env["CLAUDE_CODE_EFFORT_LEVEL"] = THINKING_OFF_EFFORT[model]
+        env.setdefault(EFFORT_ENV, THINKING_OFF_EFFORT[model])
+        if env[EFFORT_ENV] not in THINKING_OFF_EFFORT_LEVELS:
+            raise ValueError(thinking_off_effort_error(env[EFFORT_ENV], [model]))
         if isinstance(output := body.get("output_config"), dict) and "effort" in output:
             output = {k: v for k, v in output.items() if k != "effort"}
             body = {k: v for k, v in body.items() if k != "output_config"} | (
@@ -604,6 +622,15 @@ def preflight_plugins(
     return plugins
 
 
+def _merge_settings(base: dict | None, settings: dict) -> dict:
+    """`base` (e.g. an --reasoning-effort's env) with `settings` on top, their `env` blocks merged."""
+    base = base or {}
+    merged = base | settings
+    if "env" in base or "env" in settings:
+        merged["env"] = base.get("env", {}) | settings.get("env", {})
+    return merged
+
+
 def plugin_guard(
     env: Mapping[str, str],
     workdir: str,
@@ -614,10 +641,10 @@ def plugin_guard(
     """The --settings for every session (`base`, THINKING_OFF_SETTINGS, and every plugin turned off that can be)
     and the plugins the sessions still load. A plugin the first preflight finds is turned off and checked again; whatever
     stays can't be turned off from a session and is refused unless plugins are allowed."""
-    settings = (base or {}) | session_settings()
+    settings = _merge_settings(base, session_settings())
     found = preflight_plugins(env, workdir, settings, isolate_settings)
     if new := [p for p in found if p not in settings["enabledPlugins"]]:
-        settings = (base or {}) | session_settings(new)
+        settings = _merge_settings(base, session_settings(new))
         found = preflight_plugins(env, workdir, settings, isolate_settings)
     if found and not allow_plugins:
         raise RuntimeError(

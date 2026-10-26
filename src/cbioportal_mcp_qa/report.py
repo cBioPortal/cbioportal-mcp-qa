@@ -117,8 +117,8 @@ def reasoning_effort(run: dict, model: str | None = None) -> str | None:
 
     Runs record it at the start. Per model in `reasoning_efforts`: agents-api runs from the deployed agent's model
     parameters and its modelSpec's preset (None where those couldn't be read), claude-code runs the
-    --reasoning-effort every session was given (None, unknown, without one; "n/a" for a model without effort
-    levels). Run-wide in `reasoning_effort`: the openai runner's
+    --reasoning-effort every session was given (None, unknown, without one, except Haiku 5.5's pinned "medium";
+    "n/a" for a model without effort levels). Run-wide in `reasoning_effort`: the openai runner's
     --reasoning-effort ("default" when none was sent). Older openai runs have it in their `openai` endpoint
     record; other older runs have none."""
     if model is not None and model in (run.get("reasoning_efforts") or {}):

@@ -192,11 +192,17 @@ Claude Code (`claude -p`) instead of the deployed agent:
     [no effect](https://code.claude.com/docs/en/model-config#extended-thinking), so its sessions add
     `{"thinking": {"type": "disabled"}}` through
     [`CLAUDE_CODE_EXTRA_BODY`](https://code.claude.com/docs/en/env-vars). The API rejects that combined with
-    effort `xhigh` or `max`, so Haiku 5.5 sessions also pin `CLAUDE_CODE_EFFORT_LEVEL=medium` in `--settings`,
-    and an inherited extra body loses its `output_config.effort`. That overrides an effort from the shell or user
-    settings. `medium` is what Claude Code sends Haiku 5.5 by default, so a default session's request is
-    unchanged. Claude Code judge sessions on Haiku 5.5 get the same settings. Earlier claude-code runs of
-    Haiku 5.5 thought adaptively, so they aren't comparable with runs after this change.
+    effort `xhigh` or `max`, so Haiku 5.5's effort is set in `--settings` too, overriding an effort from the
+    shell or user settings, and an inherited extra body loses its `output_config.effort`:
+    - With `--reasoning-effort`, it runs at that level, and only `low`, `medium` and `high` are accepted:
+      `xhigh` or `max` with Haiku 5.5 among the models is refused before the run starts.
+    - Without one, it is pinned to `medium`, which is what Claude Code sends Haiku 5.5 by default, so a default
+      session's request is unchanged.
+    - Either way, `run.json` (`reasoning_efforts`) and the report's effort column show the level it sends:
+      `medium` when pinned, not `–`. `--resume` compares against it.
+
+    Claude Code judge sessions on Haiku 5.5 get the same settings, pinned to `medium`. Earlier claude-code runs
+    of Haiku 5.5 thought adaptively, so they aren't comparable with runs after this change.
   - Sonnet 5.5: the one model that can't match the deployment. The API rejects `disabled`, and its
     `between_tools` only drops the up-front thinking, so sessions keep `thinking: {type: adaptive}` and the
     model decides per step whether to think. `run` and `ask` warn when it's selected.

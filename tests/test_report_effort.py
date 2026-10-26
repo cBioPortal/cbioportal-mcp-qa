@@ -194,9 +194,14 @@ def _client(**kwargs):
 def test_an_explicit_effort_goes_to_every_session_through_settings():
     client = _client(effort="high")
     try:
-        assert client.settings["env"] == {"CLAUDE_CODE_EFFORT_LEVEL": "high"}
+        # Next to the thinking-off env (PR #88): neither replaces the other.
+        assert client.settings["env"] == {"CLAUDE_CODE_EFFORT_LEVEL": "high", **claude_code.THINKING_OFF_ENV}
         args = claude_code.claude_args("q", "sonnet-5.5", "P", client.setup, "m.json", True, client.settings)
-        assert json.loads(args[args.index("--settings") + 1])["env"] == {"CLAUDE_CODE_EFFORT_LEVEL": "high"}
+        assert json.loads(args[args.index("--settings") + 1])["env"] == {
+            "CLAUDE_CODE_EFFORT_LEVEL": "high",
+            **claude_code.THINKING_OFF_ENV,
+            "CLAUDE_CODE_EXTRA_BODY": "{}",
+        }
     finally:
         asyncio.run(client.aclose())
 
@@ -204,7 +209,8 @@ def test_an_explicit_effort_goes_to_every_session_through_settings():
 def test_without_an_effort_the_sessions_settings_are_unchanged():
     client = _client()
     try:
-        assert client.settings == claude_code.no_plugins_settings() and client.effort is None
+        assert client.settings == claude_code.session_settings() and client.effort is None
+        assert "CLAUDE_CODE_EFFORT_LEVEL" not in client.settings["env"]
     finally:
         asyncio.run(client.aclose())
 
@@ -648,3 +654,110 @@ def test_report_notes_the_requested_effort_only_for_explicit_claude_code_runs(re
     openai.data["options"] = {"reasoning_effort": "high"}
     openai.save()
     assert note not in write_report(openai).read_text()
+
+
+# Haiku 5.5 runs with thinking disabled (PR #88), which the API rejects above effort high: an explicit
+# --reasoning-effort (low, medium, high) replaces its pinned medium, xhigh and max are refused before the run, and
+# the effort it actually sends is what run.json and the report record.
+
+HAIKU_55 = ["--runner", "claude-code", "--target", "beta", "--models", "haiku-5.5,sonnet"]
+
+
+def _haiku_55_session_env(client) -> dict:
+    args = claude_code.claude_args("q", "haiku-5.5", "P", client.setup, "m.json", True, client.settings)
+    return json.loads(args[args.index("--settings") + 1])["env"]
+
+
+@pytest.mark.parametrize("effort", ["low", "high"])
+def test_an_explicit_effort_replaces_haiku_5_5s_pinned_medium(effort):
+    client = _client(effort=effort)
+    try:
+        env = _haiku_55_session_env(client)
+    finally:
+        asyncio.run(client.aclose())
+    assert env["CLAUDE_CODE_EFFORT_LEVEL"] == effort
+    assert json.loads(env["CLAUDE_CODE_EXTRA_BODY"]) == {"thinking": {"type": "disabled"}}
+
+
+def test_without_an_effort_haiku_5_5_stays_pinned_at_medium():
+    client = _client()
+    try:
+        assert _haiku_55_session_env(client)["CLAUDE_CODE_EFFORT_LEVEL"] == "medium"
+        # Other models get no effort.
+        args = claude_code.claude_args("q", "sonnet", "P", client.setup, "m.json", True, client.settings)
+        assert "CLAUDE_CODE_EFFORT_LEVEL" not in json.loads(args[args.index("--settings") + 1])["env"]
+    finally:
+        asyncio.run(client.aclose())
+
+
+@pytest.mark.parametrize("effort", ["xhigh", "max"])
+def test_haiku_5_5_refuses_xhigh_and_max_before_the_run(monkeypatch, results_dir, effort):
+    seen, result = _cli(monkeypatch, [*HAIKU_55, "--reasoning-effort", effort], FakeClaudeCode(), exit_code=2)
+    assert f"--reasoning-effort {effort} can't be used with haiku-5.5" in result.output
+    assert "rejects that above effort high" in result.output
+    assert seen == {} and not list(results_dir.glob("*/run.json"))
+    # Without Haiku 5.5 the level is fine.
+    cli._check_claude_code_effort("claude-code", ["sonnet", "sonnet-5.5"], effort)
+    # A session built directly never sends it either.
+    with pytest.raises(ValueError, match="can't be used with haiku-5.5"):
+        claude_code.model_settings(claude_code.effort_settings(effort), "haiku-5.5")
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_haiku_5_5_accepts_low_medium_and_high(effort):
+    cli._check_claude_code_effort("claude-code", ["haiku-5.5"], effort)
+
+
+def test_haiku_5_5_records_and_reports_its_pinned_medium(monkeypatch, results_dir):
+    seen, _ = _cli(monkeypatch, HAIKU_55, FakeClaudeCode())
+    assert seen["reasoning_effort"] is None
+    recorded = _run_json(results_dir)
+    # The level it sends, not unknown; other models without an effort stay unknown.
+    assert recorded["reasoning_efforts"] == {"haiku-5.5": "medium", "sonnet": None}
+    html = write_report(Run.load(str(results_dir / recorded["run_id"]))).read_text()
+    assert "Haiku 5.5</td><td>medium</td>" in html and "Sonnet 5</td><td>–</td>" in html
+    assert "without --reasoning-effort its sessions are pinned to medium" in html
+    assert "the level the benchmark requested of every Claude Code session" not in html
+
+
+def test_haiku_5_5_records_an_explicit_effort(monkeypatch, results_dir):
+    _cli(monkeypatch, [*HAIKU_55, "--reasoning-effort", "low"], FakeClaudeCode())
+    recorded = _run_json(results_dir)
+    assert recorded["reasoning_efforts"] == {"haiku-5.5": "low", "sonnet": "low"}
+    html = write_report(Run.load(str(results_dir / recorded["run_id"]))).read_text()
+    assert "Haiku 5.5</td><td>low</td>" in html
+    assert "the level the benchmark requested of every Claude Code session" in html
+    assert "pinned to medium" not in html
+
+
+def test_haiku_5_5_resume_compares_the_effort_it_sends(monkeypatch, results_dir):
+    _cli(monkeypatch, HAIKU_55, FakeClaudeCode())
+    run_id = _run_json(results_dir)["run_id"]
+    before = (results_dir / run_id / "run.json").read_text()
+    # Pinned medium both times resumes.
+    _cli(monkeypatch, ["--resume", run_id], FakeClaudeCode())
+    before = (results_dir / run_id / "run.json").read_text()
+    # An explicit level changes what it sends: refused before anything is asked.
+    _, result = _cli(
+        monkeypatch, ["--resume", run_id, "--reasoning-effort", "high"], FakeClaudeCode(), exit_code=1
+    )
+    assert "haiku-5.5: 'medium' → 'high'" in result.output
+    assert (results_dir / run_id / "run.json").read_text() == before
+    # An explicit medium is the level it already sent: Haiku 5.5 matches, Sonnet 5's unknown doesn't.
+    _, result = _cli(
+        monkeypatch, ["--resume", run_id, "--reasoning-effort", "medium"], FakeClaudeCode(), exit_code=1
+    )
+    assert "haiku-5.5:" not in result.output and "sonnet: 'unknown' → 'medium'" in result.output
+
+
+def test_haiku_5_5_resume_of_an_explicit_low_refuses_the_pinned_medium(monkeypatch, results_dir):
+    _cli(monkeypatch, [*HAIKU_55, "--reasoning-effort", "low"], FakeClaudeCode())
+    run_id = _run_json(results_dir)["run_id"]
+    # Not given again: the run's own effort is restored, so it resumes at low.
+    seen, _ = _cli(monkeypatch, ["--resume", run_id], FakeClaudeCode())
+    assert seen["reasoning_effort"] == "low"
+    # Asked for a level Haiku 5.5 can't run at with thinking disabled: refused before the resume is checked.
+    _, result = _cli(
+        monkeypatch, ["--resume", run_id, "--reasoning-effort", "max"], FakeClaudeCode(), exit_code=2
+    )
+    assert "can't be used with haiku-5.5" in result.output
