@@ -20,11 +20,16 @@ from .agent_prompt import (
 from .claude_code import (
     EFFORT_LEVELS,
     NO_EFFORT,
+    THINKING_OFF_EFFORT,
+    THINKING_OFF_EFFORT_LEVELS,
     USAGE_LIMIT,
     ClaudeCodeClient,
     configured_effort,
     find_connector,
     prompt_parity,
+    session_effort,
+    thinking_modes,
+    thinking_off_effort_error,
 )
 from .claude_judge import ClaudeCodeJudge
 from .compare import compare as compare_runs
@@ -123,8 +128,9 @@ def openai_options(f):
         help="openai runner: the request's reasoning_effort (e.g. none to turn a thinking model's reasoning off, "
         "as the deployed agent runs). Default: not sent, the server's default. claude-code runner: the effort level "
         "(low, medium, high, xhigh, max) of every session, set as CLAUDE_CODE_EFFORT_LEVEL in the sessions' "
-        "--settings; a model without effort levels records n/a. Default: not set, sessions run at whatever their "
-        "settings resolve and the effort is recorded as unknown.",
+        "--settings; a model without effort levels records n/a. Haiku 5.5 runs with thinking disabled, so it takes "
+        "only low, medium or high, and without one it is pinned to medium. Default: not set, sessions run at "
+        "whatever their settings resolve and the effort is recorded as unknown.",
     )(f)
     f = click.option(
         "--system-prompt-file",
@@ -313,8 +319,22 @@ def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) 
     return env
 
 
+def _warn_thinking(runner: str, models: list[str]) -> None:
+    """The deployed agent runs with thinking off; say which claude-code models can't (Sonnet 5.5)."""
+    if runner != "claude-code":
+        return
+    for model, mode in thinking_modes(models).items():
+        if mode != "disabled":
+            click.echo(
+                f"Warning: {model} runs with {mode} thinking under claude-code (it can't have thinking fully "
+                "turned off), so its answers aren't a thinking-off comparison with the deployed agent",
+                err=True,
+            )
+
+
 def _check_runner_options(settings, runner: str, models: list[str], system_prompt_file) -> None:
     """Options that only some runners use, refused where they would be recorded but not used."""
+    _warn_thinking(runner, models)
     if system_prompt_file and runner not in LOCAL_RUNNERS:
         raise click.UsageError(
             f"--system-prompt-file needs --runner claude-code or openai: the {runner} runner asks the deployed "
@@ -328,9 +348,10 @@ def _check_runner_options(settings, runner: str, models: list[str], system_promp
 
 
 def _claude_code_effort(model: str, effort: str | None) -> str | None:
-    """A claude-code model's effort: the --reasoning-effort its sessions are given, n/a for a model without
-    effort levels, None (unknown) when none is given."""
-    return NO_EFFORT if not MODELS[model].effort_levels else effort
+    """A claude-code model's effort: the --reasoning-effort its sessions are given, or the level a thinking-off
+    model is pinned to without one (Haiku 5.5: medium); n/a for a model without effort levels, None (unknown)
+    otherwise."""
+    return NO_EFFORT if not MODELS[model].effort_levels else session_effort(model, effort)
 
 
 def _check_claude_code_effort(runner: str, models: list[str], effort: str | None) -> None:
@@ -346,6 +367,9 @@ def _check_claude_code_effort(runner: str, models: list[str], effort: str | None
         m for m in models if MODELS[m].effort_levels and effort not in MODELS[m].effort_levels
     ]:
         raise click.UsageError(f"--reasoning-effort {effort} isn't a level of {', '.join(unsupported)}")
+    # Their sessions run with thinking off, which the API rejects above effort high.
+    if effort not in THINKING_OFF_EFFORT_LEVELS and (off := [m for m in models if m in THINKING_OFF_EFFORT]):
+        raise click.UsageError(thinking_off_effort_error(effort, off))
 
 
 def _session_efforts(runner: str, reasoning_effort: str | None, models: list[str]) -> dict:
@@ -387,7 +411,7 @@ def _check_resume_effort(settings, bench, runner: str, target: str, reasoning_ef
     for m in models:
         before = recorded_effort(bench.data, m)
         if runner == "claude-code":
-            # The --reasoning-effort given, or unknown both times.
+            # The --reasoning-effort given (or a thinking-off model's pinned level), or unknown both times.
             if before != now[m]:
                 changed.append(f"{m}: {before or 'unknown'!r} → {now[m] or 'unknown'!r}")
             continue
@@ -398,9 +422,24 @@ def _check_resume_effort(settings, bench, runner: str, target: str, reasoning_ef
         elif now[m] != before:
             changed.append(f"{m}: {before!r} → {now[m]!r}")
     if changed:
+        # A run from before Haiku 5.5's effort was pinned (unknown, and adaptive thinking): no resume matches it.
+        legacy = [
+            m
+            for m in models
+            if runner == "claude-code"
+            and m in THINKING_OFF_EFFORT
+            and recorded_effort(bench.data, m) is None
+            and now[m] is not None
+        ]
+        hint = (
+            f"; its {', '.join(legacy)} answers predate thinking-disabled sessions at a pinned effort, so it can't "
+            "be resumed: start a new run"
+            if legacy
+            else "; resume at the run's effort, or start a new run"
+        )
         raise click.ClickException(
             f"run {bench.data['run_id']} was answered at another reasoning effort than this resume would ask at "
-            f"({'; '.join(changed)}); resume at the run's effort, or start a new run"
+            f"({'; '.join(changed)}){hint}"
         )
     if unread:
         click.echo(
@@ -453,6 +492,7 @@ def _client(
     allow_plugins: bool = False,
     reasoning_effort: str | None = None,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
+    models: list[str] = (),
 ):
     if runner == "openai":
         try:
@@ -485,6 +525,7 @@ def _client(
                 trust_org_policy=trust_org_policy,
                 allow_plugins=allow_plugins,
                 effort=reasoning_effort,
+                models=models,
             )
         except RuntimeError as exc:
             raise click.ClickException(redact(str(exc))) from exc
@@ -671,6 +712,7 @@ def ask(
             allow_plugins=claude_code_allow_plugins,
             reasoning_effort=reasoning_effort,
             max_tool_rounds=max_tool_rounds,
+            models=[model],
         )
         try:
             if runner == "openai":
@@ -851,6 +893,7 @@ def run(
         allow_plugins=claude_code_allow_plugins,
         reasoning_effort=reasoning_effort,
         max_tool_rounds=max_tool_rounds,
+        models=bench.data["models"] if resume else models,
     )
     if resume:
         _check_resume_effort(settings, bench, runner, target, reasoning_effort)
@@ -904,7 +947,8 @@ def run(
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
             extra["claude_code"] = client.describe() | {
-                "prompt": prompt_parity(prompt, settings.database_mcp_url)
+                "prompt": prompt_parity(prompt, settings.database_mcp_url),
+                "thinking": thinking_modes(models),
             }
         judge_id = judge.model if judge else _bedrock_judge_model(settings, judge_model)
         bench = Run.create(target, models, repeats, judge_id, str(questions_file), runner, extra)

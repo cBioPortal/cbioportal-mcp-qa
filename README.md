@@ -183,7 +183,46 @@ Claude Code (`claude -p`) instead of the deployed agent:
 - **System prompt:** the deployed agent's instructions, read from the cBioAgent MongoDB via `kubectl` at the
   start of the run (`--target beta` → the beta agent). Only its hash is stored in `run.json`.
 - **Tools:** only the two MCP servers (the database MCP and the navigator); Claude Code's built-in
-  tools are disabled and extended thinking is off, matching the deployment.
+  tools are disabled.
+- **Thinking:** off to match the deployment (`thinking=false`) on every model but Sonnet 5.5, as captured from
+  Claude Code 2.1.309's requests. Managed settings outrank everything the runner sets, so a managed `env` can
+  still change this.
+  - Haiku 4.5 and Sonnet 5: `MAX_THINKING_TOKENS=0` makes Claude Code send `thinking: {type: disabled}`.
+  - Haiku 5.5: `MAX_THINKING_TOKENS=0` has
+    [no effect](https://code.claude.com/docs/en/model-config#extended-thinking), so its sessions add
+    `{"thinking": {"type": "disabled"}}` through
+    [`CLAUDE_CODE_EXTRA_BODY`](https://code.claude.com/docs/en/env-vars). The API rejects that combined with
+    effort `xhigh` or `max`, so Haiku 5.5's effort is set in `--settings` too, overriding an effort from the
+    shell or user settings, and an inherited extra body loses its `output_config.effort`:
+    - With `--reasoning-effort`, it runs at that level, and only `low`, `medium` and `high` are accepted:
+      `xhigh` or `max` with Haiku 5.5 among the models is refused before the run starts.
+    - Without one, it is pinned to `medium`, which is what Claude Code sends Haiku 5.5 by default, so a default
+      session's request is unchanged.
+    - Either way, `run.json` (`reasoning_efforts`) and the report's effort column show the level it sends:
+      `medium` when pinned, not `–`. `--resume` compares against it.
+    - Since `run.json` records the pinned `medium` as the level sent, the run is refused before it starts if
+      settings would change it: an effort cap (`maxEffortLevel`) in user settings loaded with
+      `--claude-code-user-settings` or in managed settings, a managed `env` `CLAUDE_CODE_EFFORT_LEVEL`, or a
+      managed `policyHelper`. These are the same checks as for an explicit `--reasoning-effort`. A Haiku 5.5
+      judge is checked the same way (managed settings only). Runs without Haiku 5.5 or an explicit effort aren't
+      checked, as before.
+    - **Compatibility:** a claude-code run with Haiku 5.5 started before this change recorded its effort as
+      unknown (and thought adaptively), so `--resume` refuses it; start a new run.
+
+    Claude Code judge sessions on Haiku 5.5 get the same settings, pinned to `medium`. Earlier claude-code runs
+    of Haiku 5.5 thought adaptively, so they aren't comparable with runs after this change.
+  - Sonnet 5.5: the one model that can't match the deployment. The API rejects `disabled`, and its
+    `between_tools` only drops the up-front thinking, so sessions keep `thinking: {type: adaptive}` and the
+    model decides per step whether to think. `run` and `ask` warn when it's selected.
+  - Neither the shell nor user settings can undo this. `CLAUDE_CODE_DISABLE_THINKING` is pinned to `0`, because
+    leaving the parameter out lets Sonnet 5, Sonnet 5.5 and Haiku 5.5 think by default. It goes in the session
+    env and in `--settings`, which outranks user settings (`--claude-code-user-settings`), along with
+    `MAX_THINKING_TOKENS=0`, `alwaysThinkingEnabled: false`, and each model's `CLAUDE_CODE_EXTRA_BODY`. An
+    inherited `CLAUDE_CODE_EXTRA_BODY` from the shell or user settings loses its `thinking` key and keeps the
+    rest; one that isn't a JSON object is refused.
+  - `run.json` records each model's thinking mode (`claude_code.thinking`, e.g.
+    `{"haiku-5.5": "disabled", "sonnet-5.5": "adaptive"}`) and the inherited extra body's keys
+    (`claude_code.extra_body_keys`).
 - **Models:** the same Haiku 4.5 / Sonnet 5.
 - **Cost:** runs on the Claude subscription of the Claude home it's started with, so point
   `CLAUDE_CONFIG_DIR` at the Claude home you want billed (default `~/.claude`). Only the judge bills Bedrock,
@@ -305,9 +344,11 @@ the opt-ins.
 
 Sessions run with `--setting-sources ""`: the Claude home's user settings (and project/local ones) aren't
 loaded, so `effortLevel`, hooks, enabled plugins and an `apiKeyHelper` in `~/.claude/settings.json` stay out of
-the benchmark. Managed settings still apply. The login and the claude.ai connectors aren't settings, so the
+the benchmark. Managed settings still apply, and they outrank the runner's `--settings` too (a managed `env`
+setting `MAX_THINKING_TOKENS` would change thinking). The login and the claude.ai connectors aren't settings, so the
 connector path keeps working; if the connector ever fails to load, the runner stops with an error rather
-than answering without the database. `--claude-code-user-settings` loads the user settings again.
+than answering without the database. `--claude-code-user-settings` loads the user settings again; their `env` still can't change thinking (see
+**Thinking** above).
 
 ### Built-in plugins
 

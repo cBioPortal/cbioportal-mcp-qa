@@ -25,9 +25,13 @@ from .claude_code import (
     api_key_source,
     bills_per_token,
     check_billing,
+    check_effort,
+    model_key,
+    model_settings,
     plugin_guard,
     plugins_problem,
     session_env,
+    session_extra_body,
     session_plugins,
     setting_sources_args,
     settings_files,
@@ -213,6 +217,8 @@ class ClaudeCodeJudge(BaseJudge):
                 "judge, or pass --judge-allow-managed-customizations to grade with them anyway (recorded in "
                 "run.json)"
             )
+        # A Haiku 5.5 judge runs at a pinned effort (thinking disabled); refused if managed settings change it.
+        check_effort(self.env, True, None, [model_key(self.claude_model)])
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-judge-")
         self.allow_plugins = allow_plugins
         try:
@@ -222,6 +228,10 @@ class ClaudeCodeJudge(BaseJudge):
         except BaseException:
             self._workdir.cleanup()
             raise
+        # The runner's per-model request body and effort (Haiku 5.5's thinking off); user settings are never loaded.
+        self.session_settings = model_settings(
+            self.settings, model_key(self.claude_model), session_extra_body(self.env, True)
+        )
         self.mcp_config_path = os.path.join(self._workdir.name, "no-mcp.json")
         write_private_json(self.mcp_config_path, {"mcpServers": {}})
         self.stopped: str | None = None
@@ -262,7 +272,7 @@ class ClaudeCodeJudge(BaseJudge):
         raise JudgeOutputError(f"{problem} (after {ATTEMPTS} attempts)")
 
     def _call(self, prompt: str) -> tuple[dict, int, int]:
-        args = judge_args(self.claude_model, self.mcp_config_path, self.settings)
+        args = judge_args(self.claude_model, self.mcp_config_path, self.session_settings)
         # The stop check and the launch are one step: no judge call starts once another thread recorded a stop.
         with self._lock:
             if self.stopped:
