@@ -18,7 +18,7 @@ import re
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -226,6 +226,27 @@ def effort_overrides(env: Mapping[str, str], isolate_settings: bool) -> list[str
         if any(d.get("policyHelper") for d in _dicts(doc)):
             found.append(f"{path}: policyHelper")
     return found
+
+
+def check_effort(
+    env: Mapping[str, str], isolate_settings: bool, effort: str | None, models: list[str] = ()
+) -> None:
+    """Refuse, before any session, an effort the sessions set that settings would change (`effort_overrides`): an
+    explicit --reasoning-effort, or else the pinned THINKING_OFF_EFFORT of a model among `models` (Haiku 5.5),
+    which run.json records as the level sent. Nothing is checked when neither is set: the effort is unknown."""
+    pinned = [] if effort else [m for m in models if m in THINKING_OFF_EFFORT]
+    if not (effort or pinned) or not (overrides := effort_overrides(env, isolate_settings)):
+        return
+    if effort:
+        raise RuntimeError(
+            f"--reasoning-effort {effort} would not be the effort sessions run at: {', '.join(overrides)} "
+            "changes it; remove that setting or run without --reasoning-effort"
+        )
+    levels = ", ".join(f"{m} at {THINKING_OFF_EFFORT[m]}" for m in pinned)
+    raise RuntimeError(
+        f"sessions pin the effort of models that run with thinking disabled ({levels}), and "
+        f"{', '.join(overrides)} would change it; remove that setting or leave {', '.join(pinned)} out of the run"
+    )
 
 
 def _dicts(obj):
@@ -954,6 +975,7 @@ class ClaudeCodeClient:
         trust_org_policy: bool = False,
         allow_plugins: bool = False,
         effort: str | None = None,
+        models: Sequence[str] = (),
     ):
         self.system_prompt = system_prompt
         self.transcript_dir = transcript_dir
@@ -973,13 +995,10 @@ class ClaudeCodeClient:
         self.trust_org_policy = trust_org_policy
         self.auth = check_billing(self.env, isolate_settings, allow_api_billing, trust_org_policy)
         self.extra_body = session_extra_body(self.env, isolate_settings)
-        # Every session at this effort (through --settings), or none set: sessions resolve their own.
+        # Every session at this effort (through --settings), or none set: sessions resolve their own, except a
+        # thinking-off model's pinned one. Either is refused here if settings would change it.
         self.effort = effort
-        if effort and (overrides := effort_overrides(self.env, isolate_settings)):
-            raise RuntimeError(
-                f"--reasoning-effort {effort} would not be the effort sessions run at: {', '.join(overrides)} "
-                "changes it; remove that setting or run without --reasoning-effort"
-            )
+        check_effort(self.env, isolate_settings, effort, list(models))
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-claude-")
         self.allow_plugins = allow_plugins
         # Before the first model call (the connector probe included): plugins are turned off, and one that can't

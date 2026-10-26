@@ -200,6 +200,14 @@ Claude Code (`claude -p`) instead of the deployed agent:
       session's request is unchanged.
     - Either way, `run.json` (`reasoning_efforts`) and the report's effort column show the level it sends:
       `medium` when pinned, not `–`. `--resume` compares against it.
+    - Since `run.json` records the pinned `medium` as the level sent, the run is refused before it starts if
+      settings would change it: an effort cap (`maxEffortLevel`) in user settings loaded with
+      `--claude-code-user-settings` or in managed settings, a managed `env` `CLAUDE_CODE_EFFORT_LEVEL`, or a
+      managed `policyHelper`. These are the same checks as for an explicit `--reasoning-effort`. A Haiku 5.5
+      judge is checked the same way (managed settings only). Runs without Haiku 5.5 or an explicit effort aren't
+      checked, as before.
+    - **Compatibility:** a claude-code run with Haiku 5.5 started before this change recorded its effort as
+      unknown (and thought adaptively), so `--resume` refuses it; start a new run.
 
     Claude Code judge sessions on Haiku 5.5 get the same settings, pinned to `medium`. Earlier claude-code runs
     of Haiku 5.5 thought adaptively, so they aren't comparable with runs after this change.

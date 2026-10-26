@@ -422,9 +422,24 @@ def _check_resume_effort(settings, bench, runner: str, target: str, reasoning_ef
         elif now[m] != before:
             changed.append(f"{m}: {before!r} → {now[m]!r}")
     if changed:
+        # A run from before Haiku 5.5's effort was pinned (unknown, and adaptive thinking): no resume matches it.
+        legacy = [
+            m
+            for m in models
+            if runner == "claude-code"
+            and m in THINKING_OFF_EFFORT
+            and recorded_effort(bench.data, m) is None
+            and now[m] is not None
+        ]
+        hint = (
+            f"; its {', '.join(legacy)} answers predate thinking-disabled sessions at a pinned effort, so it can't "
+            "be resumed: start a new run"
+            if legacy
+            else "; resume at the run's effort, or start a new run"
+        )
         raise click.ClickException(
             f"run {bench.data['run_id']} was answered at another reasoning effort than this resume would ask at "
-            f"({'; '.join(changed)}); resume at the run's effort, or start a new run"
+            f"({'; '.join(changed)}){hint}"
         )
     if unread:
         click.echo(
@@ -477,6 +492,7 @@ def _client(
     allow_plugins: bool = False,
     reasoning_effort: str | None = None,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
+    models: list[str] = (),
 ):
     if runner == "openai":
         try:
@@ -509,6 +525,7 @@ def _client(
                 trust_org_policy=trust_org_policy,
                 allow_plugins=allow_plugins,
                 effort=reasoning_effort,
+                models=models,
             )
         except RuntimeError as exc:
             raise click.ClickException(redact(str(exc))) from exc
@@ -695,6 +712,7 @@ def ask(
             allow_plugins=claude_code_allow_plugins,
             reasoning_effort=reasoning_effort,
             max_tool_rounds=max_tool_rounds,
+            models=[model],
         )
         try:
             if runner == "openai":
@@ -875,6 +893,7 @@ def run(
         allow_plugins=claude_code_allow_plugins,
         reasoning_effort=reasoning_effort,
         max_tool_rounds=max_tool_rounds,
+        models=bench.data["models"] if resume else models,
     )
     if resume:
         _check_resume_effort(settings, bench, runner, target, reasoning_effort)

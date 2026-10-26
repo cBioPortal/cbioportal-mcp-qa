@@ -25,6 +25,7 @@ from .claude_code import (
     api_key_source,
     bills_per_token,
     check_billing,
+    check_effort,
     model_key,
     model_settings,
     plugin_guard,
@@ -216,6 +217,8 @@ class ClaudeCodeJudge(BaseJudge):
                 "judge, or pass --judge-allow-managed-customizations to grade with them anyway (recorded in "
                 "run.json)"
             )
+        # A Haiku 5.5 judge runs at a pinned effort (thinking disabled); refused if managed settings change it.
+        check_effort(self.env, True, None, [model_key(self.claude_model)])
         self._workdir = tempfile.TemporaryDirectory(prefix="mcp-qa-judge-")
         self.allow_plugins = allow_plugins
         try:
