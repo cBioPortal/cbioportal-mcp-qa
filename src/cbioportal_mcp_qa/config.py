@@ -37,6 +37,8 @@ class Model:
     claude_code_id: str | None = None
     # The model's name on an OpenAI-compatible server (Ollama, vLLM) for the openai runner.
     openai_id: str | None = None
+    # The effort levels Claude Code can run the model at (claude-code runner); none: it sends the model no effort.
+    effort_levels: tuple[str, ...] = ()
 
 
 # Self-hosted models cost nothing per token.
@@ -51,12 +53,31 @@ MODELS = {
         "claude-haiku-4-5-20251001",
     ),
     "sonnet": Model(
-        "sonnet", "Sonnet 5", "us.anthropic.claude-sonnet-5", Price(2.0, 10.0, 2.5, 0.20), "claude-sonnet-5"
+        "sonnet",
+        "Sonnet 5",
+        "us.anthropic.claude-sonnet-5",
+        Price(2.0, 10.0, 2.5, 0.20),
+        "claude-sonnet-5",
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
     ),
     # Claude Code runner only (no Bedrock id configured); Claude API list price, same as Sonnet 5.
-    "sonnet-5.5": Model("sonnet-5.5", "Sonnet 5.5", None, Price(2.0, 10.0, 2.5, 0.20), "claude-sonnet-5-5"),
+    "sonnet-5.5": Model(
+        "sonnet-5.5",
+        "Sonnet 5.5",
+        None,
+        Price(2.0, 10.0, 2.5, 0.20),
+        "claude-sonnet-5-5",
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+    ),
     # Claude Code runner only; Claude API list price for prompts up to 100k tokens (longer prompts cost 5x).
-    "haiku-5.5": Model("haiku-5.5", "Haiku 5.5", None, Price(0.10, 0.50, 0.125, 0.01), "claude-haiku-5-5"),
+    "haiku-5.5": Model(
+        "haiku-5.5",
+        "Haiku 5.5",
+        None,
+        Price(0.10, 0.50, 0.125, 0.01),
+        "claude-haiku-5-5",
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+    ),
     "sonnet-4.6": Model(
         "sonnet-4.6",
         "Sonnet 4.6",
