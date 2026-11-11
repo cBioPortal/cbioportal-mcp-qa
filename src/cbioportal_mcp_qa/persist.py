@@ -19,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import redact as redact_mod
+from . import secret_scan
 from .redact import MASK, add_env_secrets, mask_known, redact
 
 # A run is saved after every answer and grade: redact each distinct string once, until the known values change.
@@ -148,6 +149,12 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(scrub(text))
 
 
+def append_text(path: Path, text: str) -> None:
+    """Appended (e.g. to $GITHUB_STEP_SUMMARY, which collects every step's output), scrubbed like the rest."""
+    with path.open("a") as f:
+        f.write(scrub(text))
+
+
 def write_rendered(path: Path, render: Callable[..., str], **context) -> None:
     """Render a document (HTML, Markdown) from scrubbed data, then mask any known secret left in the output
     (a template can join or escape values). Only the data is pattern-redacted: the document's own markup
@@ -192,3 +199,114 @@ def secret_file_lock(path: Path):
         yield
     finally:
         os.close(fd)
+
+
+# Files an artifact may keep: text, which can be scrubbed. Anything else (screenshots, archives) is removed.
+TEXT_SUFFIXES = {".json", ".md", ".html", ".txt", ".log", ".yaml", ".yml", ".csv", ".tsv"}
+# Lines of a multi-line secret (a system prompt) at least this long are masked on their own too, so a quoted
+# excerpt of it doesn't survive.
+SECRET_LINE_CHARS = 24
+
+
+def secret_pieces(value: str) -> list[str]:
+    """A secret value and, for a multi-line one, each of its long lines."""
+    pieces = [value] if value else []
+    if "\n" in value:
+        pieces += [line.strip() for line in value.splitlines() if len(line.strip()) >= SECRET_LINE_CHARS]
+    return pieces
+
+
+JSON_SUFFIXES = {".json", ".jsonl"}
+
+
+def _json_documents(text: str, suffix: str) -> list:
+    """The parsed document (.json), or one per non-empty line (.jsonl). Raises ValueError when it isn't JSON."""
+    if suffix == ".jsonl":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    return [json.loads(text)]
+
+
+def _scrub_json(text: str, suffix: str, found) -> str:
+    """Structure-aware: every string and key holding a named secret in any decoded layer is replaced whole, then
+    the usual `scrub`; numbers, booleans and null are left alone. Re-serialized and checked to parse."""
+    docs = [scrub(secret_scan.redact_json(doc, found)) for doc in _json_documents(text, suffix)]
+    if suffix == ".jsonl":
+        out = "".join(json.dumps(d, ensure_ascii=False) + "\n" for d in docs)
+    else:
+        out = json.dumps(docs[0], indent=1, ensure_ascii=False)
+    _json_documents(out, suffix)  # still valid JSON, or ValueError
+    return out
+
+
+def _scrub_plain(text: str, found) -> str:
+    """Every form of each named secret masked where it can be located (escapes, base64, line wraps); then any line
+    that still holds one in a decoded layer (encodings stacked deeper than the patterns) is replaced whole."""
+    for m in found:
+        text = m.mask(text)
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if secret_scan.secret_in(line, found):
+            lines[i] = secret_scan.MASK
+    return scrub("\n".join(lines))
+
+
+def _plain_leaks(text: str, found) -> list[str]:
+    names = {name for line in text.split("\n") if (name := secret_scan.secret_in(line, found))}
+    views = secret_scan.text_views(text)
+    names |= {m.name for m in found if m.found_in(text, views)}
+    return sorted(names)
+
+
+def scrub_tree(root: Path, secrets: list[tuple[str, str]]) -> tuple[int, list[str], list[str]]:
+    """Make `root` safe to upload.
+
+    - .json / .jsonl: parsed; every string value and key is decoded to a fixpoint (JSON and \\uXXXX unescaping,
+      URL- and HTML-decoding, line unwrapping, base64), and one holding a named secret in any layer is replaced
+      whole; non-string values are never touched. Then re-serialized and checked to parse.
+    - other text files: each named secret masked in every form `secret_scan` can locate, then any line still holding
+      one in a decoded layer replaced whole; then the usual `scrub`.
+    - anything else is removed.
+
+    A final pass checks every file again (JSON structurally, text line by line and as a whole, normalized).
+    Returns (files scrubbed, files removed, problems). A problem — a secret too short to mask safely, a JSON file
+    that doesn't parse, or a secret still found — names the secret and the file, never the value; the caller must
+    not upload on any."""
+    found, problems = secret_scan.matchers(secrets)
+    for _name, value in secrets:
+        if value:
+            redact_mod.add_secret(value)
+    scrubbed, removed = 0, []
+    for path in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
+        rel = str(path.relative_to(root))
+        suffix = path.suffix.lower()
+        if path.is_symlink() or suffix not in TEXT_SUFFIXES | JSON_SUFFIXES:
+            path.unlink()
+            removed.append(rel)
+            continue
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        if suffix in JSON_SUFFIXES:
+            try:
+                text = _scrub_json(text, suffix, found)
+            except ValueError:
+                # Can't be scrubbed by structure: not uploaded.
+                path.unlink()
+                removed.append(rel)
+                problems.append(f"{rel} isn't valid JSON, so it can't be scrubbed")
+                continue
+        else:
+            text = _scrub_plain(text, found)
+        path.write_text(text)
+        scrubbed += 1
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        rel = str(path.relative_to(root))
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        if path.suffix.lower() in JSON_SUFFIXES:
+            try:
+                docs = _json_documents(text, path.suffix.lower())
+            except ValueError:
+                problems.append(f"{rel} isn't valid JSON after scrubbing")
+                continue
+            problems += [f"{leak} in {rel}" for doc in docs for leak in secret_scan.json_leaks(doc, found)]
+        else:
+            problems += [f"{name} still found in {rel}" for name in _plain_leaks(text, found)]
+    return scrubbed, removed, problems

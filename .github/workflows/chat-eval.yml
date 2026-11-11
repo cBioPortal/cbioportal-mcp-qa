@@ -1,0 +1,548 @@
+# Reusable workflow: behavioral regression test of the cBioPortal database MCP, as the chat uses it.
+#
+# chat.cbioportal.org is a LibreChat agent that calls the database MCP with `serverInstructions` on, so a change to
+# the server's instructions (system-prompt.md), tools, tool descriptions or result format changes how the chat
+# answers without raising an error. mcp-regression.yml compares fixed tool calls; this asks an LLM agent the
+# 26-question subset (input/questions-subset.yaml) through the caller's PR image (the candidate) and through the
+# released image (the baseline), against the same ClickHouse, grades every answer with an LLM judge, and fails when
+# the candidate does worse:
+#   - pass rate more than `max-pass-drop` percentage points below the baseline's, or
+#   - more tool errors than the baseline beyond `max-tool-error-increase`, or
+#   - more distinct nonexistent study ids linked than the baseline beyond `max-invalid-study-increase`.
+#
+# The agent is Claude through the Anthropic SDK (`cbioportal-mcp-qa run --runner api`): no LibreChat, kubectl or
+# Claude Code. Its system prompt is the CHAT_SYSTEM_PROMPT secret (prod's agent instructions, optional) followed by
+# each MCP server's served instructions, LibreChat's order. Credentials: ANTHROPIC_API_KEY, or Bedrock through an
+# AWS role assumed with GitHub OIDC (secret AWS_ROLE_ARN; the caller job needs `permissions: id-token: write`).
+#
+# Called from cBioPortal/cbioportal-mcp, e.g.
+#   jobs:
+#     chat-eval:
+#       permissions: {contents: read, id-token: write}
+#       uses: cBioPortal/cbioportal-mcp-qa/.github/workflows/chat-eval.yml@<ref>
+#       with: {qa-ref: <ref>, require-secrets: true}
+#       secrets: inherit
+#
+# Hardening: every input reaches a shell through an environment variable and is validated first (paths are
+# repo-relative without `..`; numbers are bounded). The run is capped (questions, answers per server) before any
+# model call. The CHAT_SYSTEM_PROMPT secret is written outside the upload directory and only its hash is recorded;
+# logs, results and the summary are scrubbed of every secret value before they are printed, published or uploaded.
+name: Chat eval
+
+on:
+  workflow_call:
+    inputs:
+      qa-ref:
+        description: "Ref of cbioportal-mcp-qa to run the benchmark from (keep in sync with the @ref in `uses:`)"
+        required: false
+        type: string
+        default: main
+      baseline-image:
+        description: "Database MCP image to compare against"
+        required: false
+        type: string
+        default: cbioportal/mcp:latest
+      dockerfile:
+        description: "Dockerfile of the candidate, relative to the caller's repository root"
+        required: false
+        type: string
+        default: docker/Dockerfile
+      questions-file:
+        description: "Questions file in cbioportal-mcp-qa (under input/)"
+        required: false
+        type: string
+        default: input/questions-subset.yaml
+      repeats:
+        description: "Times each question is asked per server (1-5)"
+        required: false
+        type: number
+        default: 2
+      concurrency:
+        description: "Questions answered in parallel per server (1-6)"
+        required: false
+        type: number
+        default: 3
+      max-questions:
+        description: "Refuse to run more questions than this (1-60)"
+        required: false
+        type: number
+        default: 30
+      max-answers:
+        description: "Refuse to run more answers per server (questions × repeats) than this (1-300)"
+        required: false
+        type: number
+        default: 130
+      agent-model:
+        description: "Agent model: a model key of cbioportal-mcp-qa (haiku = Haiku 4.5, what prod's chat runs; haiku-5.5 is Claude API only) or a provider model id"
+        required: false
+        type: string
+        default: haiku
+      judge-model:
+        description: "Judge model key or id"
+        required: false
+        type: string
+        default: sonnet-4.6
+      provider:
+        description: "auto (ANTHROPIC_API_KEY if set, else Bedrock via AWS_ROLE_ARN), anthropic or bedrock"
+        required: false
+        type: string
+        default: auto
+      aws-region:
+        description: "Bedrock region"
+        required: false
+        type: string
+        default: us-east-1
+      navigator-url:
+        description: "Navigator MCP both servers' agents use (https)"
+        required: false
+        type: string
+        default: https://mcp.cbioportal.org/navigator/mcp
+      system-prompt-file:
+        description: "Agent prompt file in the caller's repository, used when the CHAT_SYSTEM_PROMPT secret is empty"
+        required: false
+        type: string
+        default: ""
+      max-pass-drop:
+        description: "Fail when the candidate's pass rate is more than this many points below the baseline's (0-100)"
+        required: false
+        type: number
+        default: 10
+      max-tool-error-increase:
+        description: "Fail when the candidate has more than this many more tool errors (all turns)"
+        required: false
+        type: number
+        default: 8
+      max-invalid-study-increase:
+        description: "Fail when the candidate links more than this many more distinct nonexistent study ids"
+        required: false
+        type: number
+        default: 1
+      require-secrets:
+        description: "Fail (instead of skipping) when the ClickHouse or model credentials are missing"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CLICKHOUSE_HOST:
+        required: false
+      CLICKHOUSE_PORT:
+        required: false
+      CLICKHOUSE_USER:
+        required: false
+      CLICKHOUSE_PASSWORD:
+        required: false
+      CLICKHOUSE_DATABASE:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      AWS_ROLE_ARN:
+        required: false
+      CHAT_SYSTEM_PROMPT:
+        required: false
+    outputs:
+      result:
+        description: "pass, regression or skipped"
+        value: ${{ jobs.chat-eval.outputs.result }}
+
+jobs:
+  chat-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      result: ${{ steps.gate.outputs.result || steps.cfg.outputs.result }}
+    steps:
+      - name: Validate inputs and secrets
+        id: cfg
+        shell: bash
+        env:
+          REQUIRE: ${{ inputs.require-secrets }}
+          PROVIDER: ${{ inputs.provider }}
+          BASELINE_IMAGE: ${{ inputs.baseline-image }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          QUESTIONS: ${{ inputs.questions-file }}
+          PROMPT_FILE: ${{ inputs.system-prompt-file }}
+          REPEATS: ${{ inputs.repeats }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          MAX_QUESTIONS: ${{ inputs.max-questions }}
+          MAX_ANSWERS: ${{ inputs.max-answers }}
+          MODEL: ${{ inputs.agent-model }}
+          JUDGE: ${{ inputs.judge-model }}
+          AWS_REGION_INPUT: ${{ inputs.aws-region }}
+          NAVIGATOR_URL: ${{ inputs.navigator-url }}
+          MAX_PASS_DROP: ${{ inputs.max-pass-drop }}
+          MAX_TOOL_ERRORS: ${{ inputs.max-tool-error-increase }}
+          MAX_INVALID: ${{ inputs.max-invalid-study-increase }}
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          CLICKHOUSE_DATABASE: ${{ secrets.CLICKHOUSE_DATABASE }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          bad=()
+          # A repo-relative path: no absolute path, no `..` segment, no shell or option characters.
+          relpath() { [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] && [[ ! "$1" =~ (^|/)\.\.(/|$) ]]; }
+          int_in() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 )); }
+          relpath "$DOCKERFILE" || bad+=("dockerfile")
+          { relpath "$QUESTIONS" && [[ "$QUESTIONS" =~ ^input/.*\.ya?ml$ ]]; } || bad+=("questions-file")
+          [ -z "$PROMPT_FILE" ] || relpath "$PROMPT_FILE" || bad+=("system-prompt-file")
+          [[ "$BASELINE_IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]{1,128})?(@sha256:[a-f0-9]{64})?$ ]] || bad+=("baseline-image")
+          [[ "$MODEL" =~ ^[A-Za-z0-9._:-]{1,100}$ ]] || bad+=("agent-model")
+          [[ "$JUDGE" =~ ^[A-Za-z0-9._:-]{1,100}$ ]] || bad+=("judge-model")
+          [[ "$AWS_REGION_INPUT" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] || bad+=("aws-region")
+          [[ "$NAVIGATOR_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] || bad+=("navigator-url")
+          int_in "$REPEATS" 1 5 || bad+=("repeats (1-5)")
+          int_in "$CONCURRENCY" 1 6 || bad+=("concurrency (1-6)")
+          int_in "$MAX_QUESTIONS" 1 60 || bad+=("max-questions (1-60)")
+          int_in "$MAX_ANSWERS" 1 300 || bad+=("max-answers (1-300)")
+          { [[ "$MAX_PASS_DROP" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v v="$MAX_PASS_DROP" 'BEGIN{exit !(v <= 100)}'; } || bad+=("max-pass-drop (0-100)")
+          int_in "$MAX_TOOL_ERRORS" 0 1000 || bad+=("max-tool-error-increase (0-1000)")
+          int_in "$MAX_INVALID" 0 1000 || bad+=("max-invalid-study-increase (0-1000)")
+          if [ ${#bad[@]} -gt 0 ]; then
+            echo "::error::Invalid chat-eval inputs: $(IFS=,; echo "${bad[*]}")"
+            exit 1
+          fi
+          missing=()
+          for name in CLICKHOUSE_HOST CLICKHOUSE_USER CLICKHOUSE_PASSWORD CLICKHOUSE_DATABASE; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          case "$PROVIDER" in
+            auto)
+              if [ -n "$ANTHROPIC_API_KEY" ]; then PROVIDER=anthropic
+              elif [ -n "$AWS_ROLE_ARN" ]; then PROVIDER=bedrock
+              else missing+=("ANTHROPIC_API_KEY or AWS_ROLE_ARN"); fi ;;
+            anthropic) [ -n "$ANTHROPIC_API_KEY" ] || missing+=("ANTHROPIC_API_KEY") ;;
+            bedrock) [ -n "$AWS_ROLE_ARN" ] || missing+=("AWS_ROLE_ARN") ;;
+            *) echo "::error::provider must be auto, anthropic or bedrock"; exit 1 ;;
+          esac
+          if [ ${#missing[@]} -gt 0 ]; then
+            list=$(IFS=,; echo "${missing[*]}")
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::Chat eval needs these secrets, which are missing: $list"
+              echo "Chat eval **failed**: missing secrets $list." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            # PRs from forks get no secrets.
+            echo "::notice::Chat eval skipped: missing secrets $list (e.g. a PR from a fork)."
+            echo "Chat eval skipped: missing secrets $list." >> "$GITHUB_STEP_SUMMARY"
+            { echo "skip=true"; echo "result=skipped"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          { echo "skip=false"; echo "provider=$PROVIDER"; } >> "$GITHUB_OUTPUT"
+
+      - name: Mask secret values in the log
+        if: steps.cfg.outputs.skip != 'true'
+        shell: bash
+        env:
+          CHAT_SYSTEM_PROMPT: ${{ secrets.CHAT_SYSTEM_PROMPT }}
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          # Defense in depth: the log is also only ever printed after scrubbing. GitHub masks single-line secrets
+          # itself; this adds each long line of a multi-line one and base64 forms.
+          mask() {
+            local v="$1" line
+            [ -n "$v" ] || return 0
+            if [[ "$v" == *$'\n'* ]]; then
+              while IFS= read -r line; do
+                line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+                [ ${#line} -ge 8 ] && echo "::add-mask::$line"
+              done <<< "$v"
+            elif [ ${#v} -ge 4 ]; then
+              echo "::add-mask::$v"
+              b64=$(printf '%s' "$v" | base64 | tr -d '\n')
+              [ -n "$b64" ] && echo "::add-mask::$b64"
+            fi
+            return 0
+          }
+          for name in CHAT_SYSTEM_PROMPT CLICKHOUSE_HOST CLICKHOUSE_USER CLICKHOUSE_PASSWORD ANTHROPIC_API_KEY AWS_ROLE_ARN; do
+            mask "${!name}"
+          done
+
+      - name: Check out the server under test
+        if: steps.cfg.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          path: server
+          persist-credentials: false
+
+      - name: Check out the benchmark
+        if: steps.cfg.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: cBioPortal/cbioportal-mcp-qa
+          ref: ${{ inputs.qa-ref }}
+          path: qa
+          persist-credentials: false
+
+      - name: Assume the Bedrock role (OIDC)
+        if: steps.cfg.outputs.skip != 'true' && steps.cfg.outputs.provider == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: cbioportal-chat-eval
+
+      - name: Agent prompt
+        id: prompt
+        if: steps.cfg.outputs.skip != 'true'
+        shell: bash
+        env:
+          CHAT_SYSTEM_PROMPT: ${{ secrets.CHAT_SYSTEM_PROMPT }}
+          PROMPT_FILE: ${{ inputs.system-prompt-file }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CHAT_SYSTEM_PROMPT" ]; then
+            # Outside the upload directory, private; the run records only its hash.
+            dir="$RUNNER_TEMP/secret"
+            mkdir -p "$dir" && chmod 700 "$dir"
+            path="$dir/agent-prompt.md"
+            (umask 077; printf '%s' "$CHAT_SYSTEM_PROMPT" > "$path")
+            echo "source=CHAT_SYSTEM_PROMPT secret" >> "$GITHUB_OUTPUT"
+          elif [ -n "$PROMPT_FILE" ]; then
+            path="$GITHUB_WORKSPACE/server/$PROMPT_FILE"
+            [ -f "$path" ] || { echo "::error::system-prompt-file not found in the caller's repository"; exit 1; }
+            echo "source=caller's system-prompt-file" >> "$GITHUB_OUTPUT"
+          else
+            path=""
+            echo "::notice::No CHAT_SYSTEM_PROMPT secret: the agent's prompt is the MCP servers' own instructions only."
+            echo "source=MCP server instructions only" >> "$GITHUB_OUTPUT"
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Build the candidate
+        if: steps.cfg.outputs.skip != 'true'
+        shell: bash
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: docker build -q -t mcp-candidate -f "server/$DOCKERFILE" server
+
+      - name: Start candidate and baseline
+        if: steps.cfg.outputs.skip != 'true'
+        shell: bash
+        env:
+          BASELINE_IMAGE: ${{ inputs.baseline-image }}
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          CLICKHOUSE_DATABASE: ${{ secrets.CLICKHOUSE_DATABASE }}
+        run: |
+          set -euo pipefail
+          env_file="$RUNNER_TEMP/secret/server.env"
+          mkdir -p "$RUNNER_TEMP/secret" && chmod 700 "$RUNNER_TEMP/secret"
+          (umask 077; {
+            echo "CLICKHOUSE_HOST=$CLICKHOUSE_HOST"
+            echo "CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}"
+            echo "CLICKHOUSE_USER=$CLICKHOUSE_USER"
+            echo "CLICKHOUSE_PASSWORD=$CLICKHOUSE_PASSWORD"
+            echo "CLICKHOUSE_DATABASE=$CLICKHOUSE_DATABASE"
+            echo "CLICKHOUSE_SECURE=true"
+            echo "CLICKHOUSE_VERIFY=true"
+            echo "CLICKHOUSE_MCP_SERVER_TRANSPORT=http"
+            echo "CLICKHOUSE_MCP_BIND_HOST=0.0.0.0"
+            echo "CLICKHOUSE_MCP_BIND_PORT=8000"
+            # Served where the chat reaches it in prod.
+            echo "CLICKHOUSE_MCP_HTTP_PATH=/db/mcp"
+          } > "$env_file")
+          docker pull -q "$BASELINE_IMAGE"
+          echo "baseline digest: $(docker image inspect --format '{{index .RepoDigests 0}}' "$BASELINE_IMAGE")"
+          docker run -d --name candidate --env-file "$env_file" -p 8001:8000 mcp-candidate
+          docker run -d --name baseline --env-file "$env_file" -p 8002:8000 "$BASELINE_IMAGE"
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"chat-eval","version":"0"}}}'
+          # Ready = a JSON-RPC initialize result (JSON or one SSE event), not just any HTTP 200.
+          initialized() {
+            python3 - "$1" <<'PY'
+          import json, sys
+          text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          try:
+              events = [line[5:] for line in text.splitlines() if line.startswith("data:")]
+              msg = json.loads(events[0] if events else text)
+          except (ValueError, IndexError):
+              sys.exit(1)
+          result = msg.get("result") if isinstance(msg, dict) else None
+          ok = msg.get("jsonrpc") == "2.0" and msg.get("id") == 1 and "error" not in msg
+          sys.exit(0 if ok and isinstance(result, dict) and result.get("protocolVersion") else 1)
+          PY
+          }
+          body="$RUNNER_TEMP/init.out"
+          for host_port in 8001 8002; do
+            ready=false
+            for _ in $(seq 90); do
+              code=$(curl -s --connect-timeout 5 --max-time 15 -o "$body" -w '%{http_code}' -X POST \
+                "http://localhost:${host_port}/db/mcp" \
+                -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+                -d "$init" || true)
+              if [ "$code" = "200" ] && initialized "$body"; then ready=true; break; fi
+              sleep 2
+            done
+            $ready || { echo "::error::MCP server on port $host_port didn't answer initialize at /db/mcp (last HTTP $code)"; exit 1; }
+          done
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.cfg.outputs.skip != 'true'
+
+      - name: Ask and grade (baseline and candidate in parallel)
+        id: eval
+        if: steps.cfg.outputs.skip != 'true'
+        working-directory: qa
+        shell: bash
+        env:
+          QA_PROVIDER: ${{ steps.cfg.outputs.provider }}
+          ANTHROPIC_API_KEY: ${{ steps.cfg.outputs.provider == 'anthropic' && secrets.ANTHROPIC_API_KEY || '' }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          NAVIGATOR_MCP_URL: ${{ inputs.navigator-url }}
+          DATABASE_MCP_ENV: local
+          MODEL: ${{ inputs.agent-model }}
+          JUDGE: ${{ inputs.judge-model }}
+          QUESTIONS: ${{ inputs.questions-file }}
+          REPEATS: ${{ inputs.repeats }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          MAX_QUESTIONS: ${{ inputs.max-questions }}
+          MAX_ANSWERS: ${{ inputs.max-answers }}
+          PROMPT_FILE: ${{ steps.prompt.outputs.path }}
+        run: |
+          set -uo pipefail
+          # Pinned: the newest interpreter on the runner has no wheels for some locked dependencies.
+          uv sync --python 3.13 --frozen -q
+          # One model per run, so the answer cap is questions × repeats; both are refused before any model call.
+          args=(run --runner api --target prod --models "$MODEL" --questions-file "$QUESTIONS"
+                --repeats "$REPEATS" --concurrency "$CONCURRENCY" --judge-runner api --judge-model "$JUDGE"
+                --judge-concurrency 4 --no-render --max-questions "$MAX_QUESTIONS" --max-answers "$MAX_ANSWERS")
+          [ -n "$PROMPT_FILE" ] && args+=(--system-prompt-file "$PROMPT_FILE")
+          out="$RUNNER_TEMP/chat-eval"
+          mkdir -p "$out/results"
+          # Logs are printed only after scrubbing (a later step).
+          DATABASE_MCP_URL=http://localhost:8002/db/mcp uv run --python 3.13 --frozen cbioportal-mcp-qa "${args[@]}" \
+            > "$out/baseline.log" 2>&1 &
+          baseline_pid=$!
+          DATABASE_MCP_URL=http://localhost:8001/db/mcp uv run --python 3.13 --frozen cbioportal-mcp-qa "${args[@]}" \
+            > "$out/candidate.log" 2>&1 &
+          candidate_pid=$!
+          wait "$baseline_pid"; baseline_status=$?
+          wait "$candidate_pid"; candidate_status=$?
+          run_id() { grep -oE '^Run [0-9]{8}-[0-9]{4}(-[0-9]+)? \(api\)' "$out/$1.log" | head -1 | cut -d' ' -f2; }
+          baseline_run=$(run_id baseline); candidate_run=$(run_id candidate)
+          for side in baseline candidate; do
+            id=$([ "$side" = baseline ] && echo "$baseline_run" || echo "$candidate_run")
+            [ -n "$id" ] && [ -d "results/$id" ] && cp -r "results/$id" "$out/results/$side-$id"
+          done
+          # A run that exits 1 after grading (some answers failed) still counts: failed turns count as not passed.
+          check_run() {  # side, run id, exit status
+            if [ -z "$2" ] || [ ! -f "results/$2/run.json" ]; then
+              echo "::error::the $1 run didn't start (exit $3); its log is printed after scrubbing"; exit 1
+            fi
+            [ "$3" = "0" ] || echo "::warning::the $1 run exited $3 (failed answers count as not passed)"
+          }
+          check_run baseline "$baseline_run" "$baseline_status"
+          check_run candidate "$candidate_run" "$candidate_status"
+          { echo "baseline=$baseline_run"; echo "candidate=$candidate_run"; } >> "$GITHUB_OUTPUT"
+
+      - name: Gate
+        id: gate
+        if: steps.cfg.outputs.skip != 'true' && steps.eval.outcome == 'success'
+        working-directory: qa
+        shell: bash
+        env:
+          BASELINE_RUN: ${{ steps.eval.outputs.baseline }}
+          CANDIDATE_RUN: ${{ steps.eval.outputs.candidate }}
+          BASELINE_IMAGE: ${{ inputs.baseline-image }}
+          MODEL: ${{ inputs.agent-model }}
+          JUDGE: ${{ inputs.judge-model }}
+          PROVIDER: ${{ steps.cfg.outputs.provider }}
+          REPEATS: ${{ inputs.repeats }}
+          QUESTIONS: ${{ inputs.questions-file }}
+          PROMPT_SOURCE: ${{ steps.prompt.outputs.source }}
+          MAX_PASS_DROP: ${{ inputs.max-pass-drop }}
+          MAX_TOOL_ERRORS: ${{ inputs.max-tool-error-increase }}
+          MAX_INVALID: ${{ inputs.max-invalid-study-increase }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/chat-eval"
+          {
+            echo "Candidate: this PR's image (\`${GITHUB_SHA::12}\`) · baseline: \`$BASELINE_IMAGE\` · agent \`$MODEL\`, judge \`$JUDGE\` on $PROVIDER · \`$QUESTIONS\` × $REPEATS · agent prompt: $PROMPT_SOURCE"
+            echo
+          } > "$out/summary.md"
+          # The summary goes to a file first: it reaches the job summary only after scrubbing.
+          uv run --python 3.13 --frozen cbioportal-mcp-qa chat-eval-gate "$BASELINE_RUN" "$CANDIDATE_RUN" \
+            --max-pass-drop "$MAX_PASS_DROP" --max-tool-error-increase "$MAX_TOOL_ERRORS" \
+            --max-invalid-study-increase "$MAX_INVALID" \
+            --summary "$out/summary.md" --json "$out/verdict.json" > /dev/null 2> "$out/gate.log"
+          status=$?
+          if [ "$status" = "0" ]; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=regression" >> "$GITHUB_OUTPUT"
+            echo "::error::Chat eval: the candidate MCP regressed against the baseline, or the runs aren't comparable (see the job summary)"
+          fi
+          exit "$status"
+
+      - name: Capture server logs
+        if: always() && steps.cfg.outputs.skip != 'true'
+        shell: bash
+        run: |
+          # Into the directory that is scrubbed next; printed (on failure) only after scrubbing succeeds.
+          out="$RUNNER_TEMP/chat-eval"
+          mkdir -p "$out"
+          for name in candidate baseline; do
+            docker logs --tail 2000 "$name" > "$out/server-$name.log" 2>&1 || true
+          done
+
+      - name: Scrub results and logs of secrets
+        id: scrub
+        if: always() && steps.cfg.outputs.skip != 'true'
+        working-directory: qa
+        shell: bash
+        env:
+          CHAT_SYSTEM_PROMPT: ${{ secrets.CHAT_SYSTEM_PROMPT }}
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/chat-eval"
+          [ -d "$out" ] || { echo "scrubbed=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          if uv run --python 3.13 --frozen cbioportal-mcp-qa scrub-artifacts "$out" \
+              --secret-env CHAT_SYSTEM_PROMPT --secret-env CLICKHOUSE_PASSWORD --secret-env CLICKHOUSE_USER \
+              --secret-env CLICKHOUSE_HOST --secret-env ANTHROPIC_API_KEY --secret-env AWS_ROLE_ARN \
+              --secret-env AWS_ACCESS_KEY_ID --secret-env AWS_SECRET_ACCESS_KEY --secret-env AWS_SESSION_TOKEN; then
+            echo "scrubbed=true" >> "$GITHUB_OUTPUT"
+          else
+            # Nothing unscrubbed is printed or uploaded.
+            rm -rf "$out"
+            echo "scrubbed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::scrubbing the chat-eval results failed: they are neither printed nor uploaded"
+            exit 1
+          fi
+
+      - name: Logs and summary
+        if: always() && steps.scrub.outputs.scrubbed == 'true'
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          out="$RUNNER_TEMP/chat-eval"
+          logs=(baseline candidate gate)
+          # The servers' own logs only when something failed.
+          [ "$JOB_STATUS" = "success" ] || logs+=(server-candidate server-baseline)
+          for log in "${logs[@]}"; do
+            [ -f "$out/$log.log" ] || continue
+            echo "::group::$log log"; grep -v '%|' "$out/$log.log" | tail -200; echo "::endgroup::"
+          done
+          [ -f "$out/summary.md" ] && cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Upload results
+        if: always() && steps.scrub.outputs.scrubbed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat-eval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chat-eval
+          if-no-files-found: ignore
+          retention-days: 30

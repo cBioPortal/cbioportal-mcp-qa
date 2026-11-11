@@ -132,16 +132,20 @@ def claude_code() -> str:
 def collect(settings, runner: str, target: str) -> dict:
     versions = {
         "cbioportal_api": _probe(cbioportal_api),
-        "deployments": deployments(target),
-        "image_digests": _probe(lambda: image_digests(settings.kube_context, target)),
-        "image_tags": _probe(lambda: image_tags(settings.kube_context, target)),
         "cbioportal_navigator": _probe(lambda: mcp_server(settings.navigator_mcp_url)),
     }
+    if runner != "api":
+        # The api runner (CI) never reads the cluster: its database MCP is the one at DATABASE_MCP_URL.
+        versions |= {
+            "deployments": deployments(target),
+            "image_digests": _probe(lambda: image_digests(settings.kube_context, target)),
+            "image_tags": _probe(lambda: image_tags(settings.kube_context, target)),
+        }
     if settings.database_mcp_url:
         versions["cbioportal_mcp"] = _probe(lambda: mcp_server(settings.database_mcp_url))
     if runner == "claude-code":
         versions["claude_code"] = _probe(claude_code)
-    elif runner == "openai":
+    elif runner in ("openai", "api"):
         pass  # the endpoint and MCP servers are recorded by the runner (run.json `openai`)
     else:
         versions["librechat"] = _probe(lambda: librechat_image(target, settings.kube_context))

@@ -557,6 +557,81 @@ truncated by the server") rather than grade an answer to a prompt it never saw: 
 more. A tool loop can outgrow the window too: Ollama then drops the oldest messages, the question with them, and
 the answer fails with "prompt exceeded the context window"; ask those again with a larger window (`--resume`). `--concurrency` should not exceed the server's parallel slots (`OLLAMA_NUM_PARALLEL`).
 
+## CI: the Anthropic API runner (`--runner api`) and the chat eval gate
+
+`--runner api` answers with Claude through the Anthropic SDK and runs the tool loop here, like the openai runner:
+no LibreChat, kubectl, Claude Code or subscription, so it runs in CI. `--judge-runner api` grades the same way.
+
+- **Credentials** (`--provider`, or `QA_PROVIDER`; default `auto`): `anthropic` uses `ANTHROPIC_API_KEY`;
+  `bedrock` uses whatever AWS credentials boto3 finds (access keys, `AWS_PROFILE`, or a role assumed with GitHub
+  OIDC) in `AWS_REGION`. `auto` picks the Claude API when `ANTHROPIC_API_KEY` is set, else Bedrock when AWS
+  credentials are, else refuses to start.
+- **Models:** model keys resolve to each provider's id. The agent defaults to `haiku` (Haiku 4.5:
+  `claude-haiku-4-5-20251001` / `us.anthropic.claude-haiku-4-5-20251001-v1:0`), the model prod's default spec
+  runs, with thinking off as deployed; `haiku-5.5` is cheaper but Claude API only. The api judge defaults to
+  `sonnet-4.6` (`claude-sonnet-4-6` / `us.anthropic.claude-sonnet-4-6`) at temperature 0. Grades record the
+  provider's id, so runs graded on different providers aren't compared.
+- **System prompt:** `--system-prompt-file` (optional: prod's agent instructions live in the cBioAgent MongoDB,
+  not here), then each MCP server's served `instructions`, in LibreChat's `serverInstructions` order. Without
+  a file the agent runs on the servers' instructions alone. Either way the database MCP's own prompt
+  (cbioportal-mcp's `system-prompt.md`) is whatever the server under test serves.
+- **MCP servers:** `DATABASE_MCP_URL` (required) and `NAVIGATOR_MCP_URL`. Tools are the servers' own; system
+  prompt and tools are prompt-cached.
+
+```bash
+ANTHROPIC_API_KEY=... DATABASE_MCP_URL=http://localhost:8001/db/mcp DATABASE_MCP_ENV=local \
+  uv run cbioportal-mcp-qa run --runner api --target prod --questions-file input/questions-subset.yaml \
+  --repeats 2 --judge-runner api --no-render
+```
+
+With the api runner, a `--system-prompt-file` is treated as a secret: `agent-prompt.md` isn't written, only its
+hash is recorded, and the prompt (and each long line of it) is masked anywhere results are written.
+`--max-questions` and `--max-answers` (questions × models × repeats) refuse an oversized run before any model call.
+
+`chat-eval-gate BASELINE CANDIDATE` compares two such runs and refuses to pass runs that don't measure the same
+thing. It checks:
+
+- the runner, target, models, repeats (a positive integer), questions file, provider and max tool rounds;
+- the agent prompt's hash, and the navigator MCP with its instructions' hash;
+- one judge across every grade;
+- every question's normalized text, history and references (as planned, as asked, and as each grade's snapshot);
+- that every record is a planned question × model × repeat.
+
+Only the database MCP under test (its instructions, tools and version) may differ. Runs where most turns failed
+or went ungraded are refused too. The gate exits 1
+when the candidate's pass rate is more than `--max-pass-drop` points (default 10) below the baseline's, or its
+tool errors (`--max-tool-error-increase`, default 8) or distinct nonexistent study ids linked
+(`--max-invalid-study-increase`, default 1) rose by more than allowed. Pass rate = passed turns / turns of
+questions with a reference; a failed request, a missing turn or an ungraded answer counts as not passed. It
+prints a markdown summary (per track, per repeat, per-question regressions with the judge's rationale), and
+`--summary` appends it to a file such as `$GITHUB_STEP_SUMMARY`.
+
+[`.github/workflows/chat-eval.yml`](.github/workflows/chat-eval.yml) is the reusable workflow cbioportal-mcp
+calls on PRs. It builds the PR's database MCP image and starts it next to `cbioportal/mcp:latest`, both on the
+same ClickHouse at `/db/mcp`. It runs the subset against both in parallel (2 repeats by default), gates with
+`chat-eval-gate`, and uploads both runs (run.json, report.html, transcripts) as an artifact. Every input reaches
+the shell through an environment variable and is validated: repo-relative paths only, and bounded repeats (≤5),
+concurrency (≤6), questions (≤60) and answers per server (≤300). Logs (the servers' too), results and the summary are scrubbed of
+the secret values (`scrub-artifacts`: prompt, ClickHouse credentials, API key, AWS credentials) before they are
+printed, published to the job summary or uploaded. Non-text files are dropped. Each value is also masked:
+
+- with any character JSON-`\uXXXX`, URL-`%XX` or HTML-escaped;
+- as base64 (both alphabets, padded or not, at every alignment inside a larger blob);
+- broken across lines.
+
+JSON files (run.json, the verdict) are scrubbed by structure: each string value and key is decoded to a
+fixpoint, up to 5 rounds of JSON/`\uXXXX` unescaping, URL- and HTML-decoding, line unwrapping and base64. A string
+holding a secret in any layer is replaced whole. Numbers, booleans and null are never touched, so grades and counts
+survive and the JSON stays valid; it is re-parsed after scrubbing. In other text files, a line that still holds a
+secret in a decoded layer is replaced whole. A final pass re-checks every file the same way and fails the step on
+any hit (or on a JSON file that doesn't parse), and then nothing is uploaded. An explicitly named
+secret shorter than 4 characters can't be masked safely, so it also fails the step: use a ClickHouse user name of
+4+ characters. The secrets are also `::add-mask::`ed at the start of the job. Secrets:
+`CLICKHOUSE_HOST/PORT/USER/PASSWORD/DATABASE`; `ANTHROPIC_API_KEY`, or `AWS_ROLE_ARN` (a role with Bedrock
+access that trusts GitHub's OIDC provider; the calling job needs `id-token: write`); optionally
+`CHAT_SYSTEM_PROMPT` (prod's agent instructions). Without them it skips with a notice, or fails with
+`require-secrets: true`.
+
 ## Adding questions
 
 Append to `input/questions.yaml` with the next unused `id` (ids are stable; never renumber or reuse):
