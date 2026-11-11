@@ -59,8 +59,8 @@ from .limits import LimitWaiter
 from .mcp_oauth import OAuthTokens
 from .mcp_oauth import login as oauth_login
 from .openai_chat import MAX_TOOL_ROUNDS, OpenAIChatClient
-from .persist import append_text, write_json, write_text
-from .redact import describe_error, redact
+from .persist import append_text, scrub_tree, secret_pieces, write_json, write_text
+from .redact import add_secret, describe_error, redact
 from .report import reasoning_effort as recorded_effort
 from .report import write_index, write_report
 from .run import (
@@ -380,6 +380,20 @@ def _claude_code_effort(model: str, effort: str | None) -> str | None:
     model is pinned to without one (Haiku 5.5: medium); n/a for a model without effort levels, None (unknown)
     otherwise."""
     return NO_EFFORT if not MODELS[model].effort_levels else session_effort(model, effort)
+
+
+def _check_cost_caps(
+    questions: int, models: int, repeats: int, max_questions: int | None, max_answers: int | None
+) -> None:
+    """Refuse a run larger than its caps before anything is asked."""
+    if max_questions is not None and questions > max_questions:
+        raise click.UsageError(f"{questions} questions selected, more than --max-questions {max_questions}")
+    answers = questions * models * repeats
+    if max_answers is not None and answers > max_answers:
+        raise click.UsageError(
+            f"{questions} questions × {models} models × {repeats} repeats = {answers} answers, more than "
+            f"--max-answers {max_answers}"
+        )
 
 
 def _check_claude_code_effort(runner: str, models: list[str], effort: str | None) -> None:
@@ -815,7 +829,23 @@ def ask(
     show_default=True,
 )
 @click.option(
-    "--repeats", type=int, default=1, show_default=True, help="Times to ask each question per model."
+    "--repeats",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Times to ask each question per model.",
+)
+@click.option(
+    "--max-questions",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Refuse to start (before any model call) when more questions than this are selected. A cost cap for CI.",
+)
+@click.option(
+    "--max-answers",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Refuse to start (before any model call) when questions × models × repeats exceeds this. A cost cap.",
 )
 @click.option("--concurrency", type=int, default=2, show_default=True, help="Parallel requests to the agent.")
 @click.option(
@@ -869,6 +899,8 @@ def run(
     wait_on_limit,
     max_wait,
     provider,
+    max_questions,
+    max_answers,
 ) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
@@ -924,9 +956,20 @@ def run(
         models = _models(models_arg, target, runner)
     _check_runner_options(settings, runner, bench.data["models"] if resume else models, system_prompt_file)
     _check_claude_code_effort(runner, bench.data["models"] if resume else models, reasoning_effort)
+    _check_cost_caps(
+        len(questions),
+        len(bench.data["models"] if resume else models),
+        bench.data["repeats"] if resume else repeats,
+        max_questions,
+        max_answers,
+    )
     agent = None
     if system_prompt_file:
         agent = {"instructions": system_prompt_file.read_text(), "source": str(system_prompt_file)}
+        if runner == "api":
+            # Masked wherever it could surface (an answer quoting it, a transcript), also line by line.
+            for piece in secret_pieces(agent["instructions"]):
+                add_secret(piece)
     elif runner == "api":
         # No kubectl: the agent's prompt is only what --system-prompt-file gives; the MCP servers add their own.
         agent = None
@@ -1031,7 +1074,9 @@ def run(
         bench = Run.create(target, models, repeats, judge_id, str(questions_file), runner, extra)
         if agent:
             # A record of the prompt this run tested (the benchmark itself always reads the live agent).
-            write_text(bench.dir / "agent-prompt.md", agent["instructions"])
+            # The api runner's prompt can be a secret (CI's CHAT_SYSTEM_PROMPT): only its hash is recorded.
+            if runner != "api":
+                write_text(bench.dir / "agent-prompt.md", agent["instructions"])
     # What the run means to ask (the report and `compare` count unasked turns as missing), and the options
     # `--resume` keeps.
     bench.plan(questions)
@@ -1407,3 +1452,25 @@ def chat_eval_gate(
     if not verdict.ok:
         failed = [c.name for c in verdict.checks if not c.ok] + verdict.problems
         raise click.ClickException(f"chat eval regression: {'; '.join(failed)}")
+
+
+@cli.command("scrub-artifacts")
+@click.argument("root", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--secret-env",
+    "secret_envs",
+    multiple=True,
+    help="An environment variable whose value must not appear in any file (repeatable): e.g. CHAT_SYSTEM_PROMPT, "
+    "CLICKHOUSE_PASSWORD. Missing or empty variables are skipped.",
+)
+def scrub_artifacts(root: Path, secret_envs: tuple[str, ...]) -> None:
+    """Make ROOT safe to upload: mask the named secrets (and every secret-looking environment variable) in every
+    text file under it, remove every other file, and exit 1 if a secret is still found anywhere."""
+    import os
+
+    load_settings()  # registers the environment's secret-looking variables too
+    values = [os.environ.get(name, "") for name in secret_envs]
+    scrubbed, removed, leaks = scrub_tree(root, [v for v in values if v])
+    click.echo(f"Scrubbed {scrubbed} files under {root}; removed {len(removed)} non-text files")
+    if leaks:
+        raise click.ClickException(f"secrets still present after scrubbing in: {', '.join(leaks)}")

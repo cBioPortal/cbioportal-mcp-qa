@@ -257,3 +257,122 @@ def test_api_judge_uses_provider_model_and_schema():
     assert sent[0]["output_config"]["format"]["type"] == "json_schema"
     assert sent[0]["extra_body"] == {"temperature": 0}
     assert APIJudge("sonnet-4.6", "anthropic", client=object()).model == "claude-sonnet-4-6"
+
+
+def test_whole_answer_timeout_is_a_failed_answer(tmp_path):
+    class Slow(FakeMessages):
+        async def create(self, **kwargs):
+            await asyncio.sleep(5)
+
+    client = _client(tmp_path, [], timeout_s=0.05)
+    client.client.messages = Slow([])
+
+    async def go():
+        await client.start()
+        return await client.ask("q", "haiku")
+
+    reply = asyncio.run(go())
+    assert reply.status is None and reply.answer == ""
+    assert "timed out" in reply.error
+
+
+def test_mcp_transport_error_is_a_tool_error_the_model_sees(tmp_path):
+    import httpx
+
+    class Down(FakeMCP):
+        async def call_tool(self, name, args):
+            raise httpx.ConnectError("connection refused")
+
+    call = Block(type="tool_use", id="t", name="clickhouse_run_select_query", input={"query": "SELECT 1"})
+    replies = [
+        _response([call], "tool_use"),
+        _response([Block(type="text", text="The database is down.")], "end_turn"),
+    ]
+    client = _client(tmp_path, replies)
+
+    async def go():
+        await client.start()
+        client.servers["cbioportal-database"] = Down(client.servers["cbioportal-database"].tools, {})
+        return await client.ask("q", "haiku")
+
+    reply = asyncio.run(go())
+    assert reply.status == 200 and reply.answer == "The database is down."
+    (result,) = client.client.messages.sent[1]["messages"][-1]["content"]
+    assert result["is_error"] is True and "connection refused" in result["content"]
+    assert reply.trace["tool_calls"][0]["ok"] is False
+
+
+# --- the run command: cost caps, and a secret prompt never written -------------------------------------------
+
+from click.testing import CliRunner  # noqa: E402
+
+from cbioportal_mcp_qa import cli as cli_mod  # noqa: E402
+
+SUBSET = "input/questions-subset.yaml"
+
+
+def _no_client(*args, **kwargs):
+    raise AssertionError("a model client was created")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--repeats", "2", "--max-answers", "10"],  # 26 × 1 × 2 = 52
+        ["--max-questions", "5"],
+        ["--repeats", "0"],
+    ],
+)
+def test_run_refuses_over_its_caps_before_any_model_call(args, monkeypatch, results_dir):
+    monkeypatch.setattr(cli_mod, "_client", _no_client)
+    monkeypatch.setattr(cli_mod, "_make_judge", _no_client)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-real")
+    out = CliRunner().invoke(
+        cli_mod.cli,
+        ["run", "--runner", "api", "--target", "prod", "--questions-file", SUBSET, "--no-grade", *args],
+    )
+    assert out.exit_code == 2, out.output
+    assert not list(results_dir.iterdir())
+
+
+def test_api_run_records_only_the_prompts_hash(tmp_path, monkeypatch, results_dir):
+    secret = "TOP SECRET AGENT PROMPT: you are the cBioPortal chat assistant, internal rules follow.\nRule two is long enough to mask."
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text(secret)
+
+    def fake_client(settings, target, runner, prompt=None, transcript_dir=None, **kw):
+        assert prompt == secret
+        # The model quotes its prompt back: the transcript and answer must not keep it.
+        replies = [_response([Block(type="text", text=f"My instructions: {secret}")], "end_turn")]
+        return _client(tmp_path, replies, agent_prompt=prompt)
+
+    monkeypatch.setattr(cli_mod, "_client", fake_client)
+    monkeypatch.setattr(cli_mod, "collect_versions", lambda *a: {})
+    out = CliRunner().invoke(
+        cli_mod.cli,
+        [
+            "run",
+            "--runner",
+            "api",
+            "--target",
+            "prod",
+            "--questions-file",
+            SUBSET,
+            "--questions",
+            "2001",
+            "--no-grade",
+            "--no-render",
+            "--system-prompt-file",
+            str(prompt_file),
+        ],
+    )
+    assert out.exit_code == 0, out.output
+    (run_dir,) = [p for p in results_dir.iterdir() if p.is_dir()]
+    assert not (run_dir / "agent-prompt.md").exists()
+    data = __import__("json").loads((run_dir / "run.json").read_text())
+    assert data["agent_prompt"]["sha256"]
+    files = [p for p in run_dir.rglob("*") if p.is_file()]
+    assert any(p.parent.name == "transcripts" for p in files)
+    for path in files:
+        text = path.read_text(errors="replace")
+        assert "TOP SECRET AGENT PROMPT" not in text and "Rule two is long" not in text, path

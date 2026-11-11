@@ -13,10 +13,11 @@ The gate fails when
   baseline's, by more than `max_invalid_study_increase`.
 """
 
+import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
-from .dataset import Question
+from .dataset import Question, asked_question, definition_fields
 from .run import Run, record_key
 
 TRACK_ORDER = ("data", "navigation", "analysis", "out_of_scope")
@@ -26,17 +27,150 @@ def load_run_data(run_id_or_path: str) -> dict:
     return Run.load(run_id_or_path).data
 
 
+def _repeats(data: dict) -> int | None:
+    r = data.get("repeats")
+    return r if isinstance(r, int) and not isinstance(r, bool) and r >= 1 else None
+
+
+def _expected_keys(data: dict) -> dict[str, tuple[dict, str, int]]:
+    """The run's planned turns (question × model × repeat), by record key."""
+    repeats = _repeats(data) or 0
+    models = [m for m in data.get("models") or [] if isinstance(m, str)]
+    return {
+        record_key(q["id"], model, r): (q, model, r)
+        for q in data.get("planned_questions") or []
+        for model in models
+        for r in range(1, repeats + 1)
+    }
+
+
+def validate_run(data: dict) -> list[str]:
+    """Why a run can't be gated on: no positive integer repeats, no models or planned questions, or records
+    that aren't one of its planned turns (an out-of-range repeat, another model, an unplanned question)."""
+    rid = data.get("run_id", "?")
+    problems = []
+    if _repeats(data) is None:
+        problems.append(f"run {rid}: repeats must be a positive integer, got {data.get('repeats')!r}")
+    models = data.get("models")
+    if not isinstance(models, list) or not models or not all(isinstance(m, str) and m for m in models):
+        problems.append(f"run {rid}: no models recorded")
+    if not data.get("planned_questions"):
+        problems.append(f"run {rid}: no planned questions")
+    expected = _expected_keys(data)
+    unexpected = []
+    for key, rec in (data.get("records") or {}).items():
+        if key not in expected:
+            unexpected.append(key)
+            continue
+        q, model, r = expected[key]
+        if (
+            rec.get("model") != model
+            or rec.get("repeat") != r
+            or (rec.get("question") or {}).get("id") != q["id"]
+        ):
+            unexpected.append(key)
+    if unexpected:
+        shown = ", ".join(sorted(unexpected)[:5]) + (" …" if len(unexpected) > 5 else "")
+        problems.append(f"run {rid}: {len(unexpected)} records aren't planned turns ({shown})")
+    return problems
+
+
 def _turns(data: dict) -> list[dict]:
-    """Every planned turn of the run: its record, or a placeholder (failed) when it has none."""
+    """Every planned turn of the run: its record, or a placeholder (failed) when it has none. Records that aren't
+    planned turns are left out (and `validate_run` refuses the run)."""
     records = data.get("records") or {}
-    planned = {q["id"]: q for q in data.get("planned_questions") or []}
-    turns = list(records.values())
-    for qid, q in planned.items():
-        for model in data.get("models") or []:
-            for r in range(1, (data.get("repeats") or 1) + 1):
-                if record_key(qid, model, r) not in records:
-                    turns.append({"question": q, "model": model, "repeat": r, "missing": True, "reply": {}})
+    turns = []
+    for key, (q, model, r) in _expected_keys(data).items():
+        rec = records.get(key)
+        if rec is not None and rec.get("model") == model and rec.get("repeat") == r:
+            turns.append(rec)
+        else:
+            turns.append({"question": q, "model": model, "repeat": r, "missing": True, "reply": {}})
     return turns
+
+
+def _fingerprint(value) -> str | None:
+    if isinstance(value, dict):
+        return value.get("sha256")
+    return value
+
+
+# What must be the same for both runs to be comparable: everything but the database MCP under test (its own
+# instructions, tools and version may differ: that is the change being tested).
+INVARIANTS = {
+    "runner": lambda d: d.get("runner"),
+    "target": lambda d: d.get("target"),
+    "models": lambda d: d.get("models"),
+    "repeats": lambda d: d.get("repeats"),
+    "questions file": lambda d: d.get("questions_file"),
+    "judge": lambda d: d.get("judge_model"),
+    "provider": lambda d: (d.get("api") or {}).get("provider"),
+    "max tool rounds": lambda d: (d.get("api") or {}).get("max_tool_rounds"),
+    "reasoning effort": lambda d: d.get("reasoning_efforts"),
+    "agent prompt": lambda d: (
+        (d.get("agent_prompt") or {}).get("sha256"),
+        (d.get("agent_prompt") or {}).get("source"),
+        _fingerprint((((d.get("api") or {}).get("prompt")) or {}).get("system_prompt")),
+    ),
+    "navigator MCP": lambda d: (
+        d.get("navigator_mcp"),
+        _fingerprint(
+            ((((d.get("api") or {}).get("prompt")) or {}).get("server_instructions") or {}).get("navigator")
+        ),
+    ),
+}
+
+
+def _definitions(data: dict, model: str | None) -> dict[int, set[str]]:
+    """Per question: every definition it was asked and graded with in this run (planned, each record as asked,
+    each grade's snapshot), normalized."""
+    out: dict[int, set[str]] = defaultdict(set)
+
+    def add(qid, q):
+        out[qid].add(json.dumps(definition_fields(q), sort_keys=True, ensure_ascii=False))
+
+    for q in data.get("planned_questions") or []:
+        add(q["id"], q)
+    for rec in _turns(data):
+        if model and rec.get("model") != model:
+            continue
+        q = rec["question"]
+        add(q["id"], asked_question(rec))
+        if graded := (rec.get("grade") or {}).get("graded"):
+            add(q["id"], graded)
+    return out
+
+
+def _judges(data: dict, model: str | None) -> set[str]:
+    found = {
+        (rec.get("grade") or {}).get("judge_model") or data.get("judge_model")
+        for rec in _turns(data)
+        if rec.get("grade") and (not model or rec.get("model") == model)
+    }
+    return found or {data.get("judge_model")}
+
+
+def comparability(baseline: dict, candidate: dict, model: str | None = None) -> list[str]:
+    """Why the two runs don't measure the same thing (empty when they do)."""
+    problems = []
+    for name, get in INVARIANTS.items():
+        b, c = get(baseline), get(candidate)
+        if b != c:
+            problems.append(f"the runs differ in {name} ({b!r} vs {c!r}): not comparable")
+    judges = _judges(baseline, model) | _judges(candidate, model)
+    if len(judges) != 1:
+        problems.append(f"answers were graded by different judges ({', '.join(sorted(map(str, judges)))})")
+    bdef, cdef = _definitions(baseline, model), _definitions(candidate, model)
+    if set(bdef) != set(cdef):
+        problems.append("the runs planned different questions")
+    differing = sorted(q for q in set(bdef) & set(cdef) if len(bdef[q] | cdef[q]) != 1)
+    if differing:
+        problems.append(
+            "questions were asked or graded with different text, history or references: "
+            + ", ".join(f"Q{q}" for q in differing[:10])
+            + (" …" if len(differing) > 10 else "")
+        )
+    return problems
 
 
 def _has_reference(q: dict) -> bool:
@@ -179,17 +313,19 @@ def evaluate(
     model: str | None = None,
 ) -> Verdict:
     """Compare a candidate run against the baseline run and decide whether the candidate regressed."""
-    problems = []
-    for key in ("judge_model", "questions_file", "repeats", "models"):
-        if baseline.get(key) != candidate.get(key):
-            problems.append(
-                f"the runs differ in {key} ({baseline.get(key)!r} vs {candidate.get(key)!r}): not comparable"
-            )
+    problems = validate_run(baseline) + validate_run(candidate) + comparability(baseline, candidate, model)
     base, cand = run_metrics(baseline, model), run_metrics(candidate, model)
-    if not base.eligible or not cand.eligible:
-        problems.append("a run has no graded turns with a reference")
-    if set(base.by_question) != set(cand.by_question):
-        problems.append("the runs asked different questions")
+    for side, m in (("baseline", base), ("candidate", cand)):
+        graded = m.eligible - m.failed_requests - m.ungraded
+        if not m.eligible:
+            problems.append(f"the {side} run has no turns of a question with a reference")
+        elif graded * 2 < m.eligible:
+            # Most turns failed or went ungraded: the infrastructure (model API, judge, server) broke, and two
+            # broken runs would compare equal.
+            problems.append(
+                f"the {side} run graded only {graded} of {m.eligible} turns: too few to compare (failed requests "
+                f"{m.failed_requests}, ungraded {m.ungraded})"
+            )
     checks = []
     if base.pass_rate is not None and cand.pass_rate is not None:
         drop = base.pass_rate - cand.pass_rate

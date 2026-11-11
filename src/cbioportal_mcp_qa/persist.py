@@ -198,3 +198,48 @@ def secret_file_lock(path: Path):
         yield
     finally:
         os.close(fd)
+
+
+# Files an artifact may keep: text, which can be scrubbed. Anything else (screenshots, archives) is removed.
+TEXT_SUFFIXES = {".json", ".md", ".html", ".txt", ".log", ".yaml", ".yml", ".csv", ".tsv"}
+# Lines of a multi-line secret (a system prompt) at least this long are masked on their own too, so a quoted
+# excerpt of it doesn't survive.
+SECRET_LINE_CHARS = 24
+
+
+def secret_pieces(value: str) -> list[str]:
+    """A secret value and, for a multi-line one, each of its long lines."""
+    pieces = [value] if value else []
+    if "\n" in value:
+        pieces += [line.strip() for line in value.splitlines() if len(line.strip()) >= SECRET_LINE_CHARS]
+    return pieces
+
+
+def scrub_tree(root: Path, secrets: list[str]) -> tuple[int, list[str], list[str]]:
+    """Rewrite every text file under `root` with `secrets` (and every other known secret) masked, remove every
+    other file, then check no file still contains a secret. Returns (files scrubbed, files removed, files that
+    still leak), paths relative to `root`; the leaks name files, never values."""
+    pieces = [p for value in secrets if value for p in secret_pieces(value)]
+    for piece in pieces:
+        redact_mod.add_secret(piece)
+    scrubbed, removed = 0, []
+    for path in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
+        rel = str(path.relative_to(root))
+        if path.is_symlink() or path.suffix.lower() not in TEXT_SUFFIXES:
+            path.unlink()
+            removed.append(rel)
+            continue
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        path.write_text(scrub(text))
+        scrubbed += 1
+    leaks = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        data = path.read_bytes().decode("utf-8", errors="replace")
+        if any(
+            form in data
+            for piece in pieces
+            for form in redact_mod._forms(piece)
+            if len(form) >= redact_mod.MIN_SECRET
+        ):
+            leaks.append(str(path.relative_to(root)))
+    return scrubbed, removed, leaks

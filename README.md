@@ -584,7 +584,21 @@ ANTHROPIC_API_KEY=... DATABASE_MCP_URL=http://localhost:8001/db/mcp DATABASE_MCP
   --repeats 2 --judge-runner api --no-render
 ```
 
-`chat-eval-gate BASELINE CANDIDATE` compares two such runs (same questions, model, judge, repeats) and exits 1
+With the api runner, a `--system-prompt-file` is treated as a secret: `agent-prompt.md` isn't written, only its
+hash is recorded, and the prompt (and each long line of it) is masked anywhere results are written.
+`--max-questions` and `--max-answers` (questions × models × repeats) refuse an oversized run before any model call.
+
+`chat-eval-gate BASELINE CANDIDATE` compares two such runs and refuses to pass runs that don't measure the same
+thing. It checks:
+
+- the runner, target, models, repeats (a positive integer), questions file, provider and max tool rounds;
+- the agent prompt's hash, and the navigator MCP with its instructions' hash;
+- one judge across every grade;
+- every question's normalized text, history and references (as planned, as asked, and as each grade's snapshot);
+- that every record is a planned question × model × repeat.
+
+Only the database MCP under test (its instructions, tools and version) may differ. Runs where most turns failed
+or went ungraded are refused too. The gate exits 1
 when the candidate's pass rate is more than `--max-pass-drop` points (default 10) below the baseline's, or its
 tool errors (`--max-tool-error-increase`, default 8) or distinct nonexistent study ids linked
 (`--max-invalid-study-increase`, default 1) rose by more than allowed. Pass rate = passed turns / turns of
@@ -595,7 +609,12 @@ prints a markdown summary (per track, per repeat, per-question regressions with 
 [`.github/workflows/chat-eval.yml`](.github/workflows/chat-eval.yml) is the reusable workflow cbioportal-mcp
 calls on PRs. It builds the PR's database MCP image and starts it next to `cbioportal/mcp:latest`, both on the
 same ClickHouse at `/db/mcp`. It runs the subset against both in parallel (2 repeats by default), gates with
-`chat-eval-gate`, and uploads both runs (run.json, report.html, transcripts) as an artifact. Secrets:
+`chat-eval-gate`, and uploads both runs (run.json, report.html, transcripts) as an artifact. Every input reaches
+the shell through an environment variable and is validated: repo-relative paths only, and bounded repeats (≤5),
+concurrency (≤6), questions (≤60) and answers per server (≤300). Logs, results and the summary are scrubbed of
+the secret values (`scrub-artifacts`: prompt, ClickHouse credentials, API key, AWS credentials) before they are
+printed, published to the job summary or uploaded. Non-text files are dropped, and nothing is uploaded if a
+value survives. Secrets:
 `CLICKHOUSE_HOST/PORT/USER/PASSWORD/DATABASE`; `ANTHROPIC_API_KEY`, or `AWS_ROLE_ARN` (a role with Bedrock
 access that trusts GitHub's OIDC provider; the calling job needs `id-token: write`); optionally
 `CHAT_SYSTEM_PROMPT` (prod's agent instructions). Without them it skips with a notice, or fails with
