@@ -4,7 +4,8 @@ import re
 import pytest
 
 from .client import ToolInfo
-from .conftest import record_change
+from .conftest import load_calls, record_change
+from .golden import assert_golden
 
 GUIDE_URI_RE = re.compile(r"cbioportal://[a-z0-9-]+(?:/[a-z0-9_]+)?")
 
@@ -15,8 +16,12 @@ def _schema_text(tool: ToolInfo) -> str:
     )
 
 
-def test_tools_are_listed(candidate):
-    assert candidate.list_tools(), "server lists no tools"
+def test_tools_are_listed(candidate, server):
+    expected = {c["tool"] for c in load_calls(server)}
+    if server == "mcp":
+        expected.add("read_guide")
+    missing = expected - candidate.list_tools().keys()
+    assert not missing, f"missing expected tools: {sorted(missing)}"
 
 
 def test_tool_contract_matches_baseline(candidate, baseline, allow_changes):
@@ -37,14 +42,29 @@ def test_tool_contract_matches_baseline(candidate, baseline, allow_changes):
         )
 
 
-def test_call(call, candidate, baseline, allow_changes):
-    result = candidate.call(call["tool"], call.get("args") or {})
+@pytest.fixture
+def result(call, candidate):
+    return candidate.call(call["tool"], call.get("args") or {})
+
+
+def test_call_hard_checks(call, result):
+    intentional_drop = (
+        call["id"] == "sql_invalid_rejected"
+        and call["tool"] == "clickhouse_run_select_query"
+        and call.get("args") == {"query": "DROP TABLE cancer_study"}
+    )
+    if intentional_drop:
+        assert result.is_error, "DROP must be rejected"
+    else:
+        assert not result.is_error, result.normalized()[:2000]
+    if "golden" in call:
+        assert_golden(result.content, call["golden"])
+
+
+def test_call_baseline_diff(call, result, baseline, allow_changes):
     if baseline is None:
-        assert not result.is_error or call.get("expect_error"), result.normalized()[:2000]
-        return
+        pytest.skip("no --baseline-url")
     expected = baseline.call(call["tool"], call.get("args") or {})
-    if result.is_error and not expected.is_error:
-        pytest.fail(f"call now errors (baseline succeeds):\n{result.normalized()[:2000]}")
     if result.normalized() != expected.normalized():
         record_change(
             f"`{call['id']}` ({call['tool']})", expected.normalized(), result.normalized(), blocking=True

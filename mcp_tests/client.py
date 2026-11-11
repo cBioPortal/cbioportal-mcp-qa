@@ -2,9 +2,12 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
+import httpx2
 from mcp.client.client import Client
+from mcp.client.streamable_http import streamable_http_client
 
 
 @dataclass(frozen=True)
@@ -33,19 +36,32 @@ def _parse(text: str):
 
 def _reports_failure(item) -> bool:
     """Both servers report tool failures as data rather than MCP errors."""
-    if not isinstance(item, dict):
-        return False
-    return "error_message" in item or item.get("success") is False
+    if isinstance(item, list):
+        return any(map(_reports_failure, item))
+    if isinstance(item, dict):
+        return (
+            any(key in item for key in ("error_message", "exception", "error"))
+            or item.get("success") is False
+            or any(map(_reports_failure, item.values()))
+        )
+    return False
 
 
 class McpClient:
-    def __init__(self, url: str, timeout_s: float = 120.0):
+    def __init__(self, url: str, timeout_s: float = 120.0, headers: dict | None = None):
         self.url = url
         self.timeout_s = timeout_s
+        self.headers = headers or {}
 
     def _run(self, fn):
         async def go():
-            async with Client(self.url, read_timeout_seconds=self.timeout_s) as client:
+            @asynccontextmanager
+            async def transport():
+                async with httpx2.AsyncClient(headers=self.headers, timeout=self.timeout_s) as http:
+                    async with streamable_http_client(self.url, http_client=http) as streams:
+                        yield streams
+
+            async with Client(transport(), read_timeout_seconds=self.timeout_s, mode="legacy") as client:
                 return await fn(client)
 
         return asyncio.run(go())
