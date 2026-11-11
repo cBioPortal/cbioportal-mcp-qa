@@ -148,6 +148,12 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(scrub(text))
 
 
+def append_text(path: Path, text: str) -> None:
+    """Appended (e.g. to $GITHUB_STEP_SUMMARY, which collects every step's output), scrubbed like the rest."""
+    with path.open("a") as f:
+        f.write(scrub(text))
+
+
 def write_rendered(path: Path, render: Callable[..., str], **context) -> None:
     """Render a document (HTML, Markdown) from scrubbed data, then mask any known secret left in the output
     (a template can join or escape values). Only the data is pattern-redacted: the document's own markup

@@ -17,6 +17,16 @@ from .agent_prompt import (
     fetch_model_specs,
     prompt_fingerprint,
 )
+from .anthropic_api import (
+    DEFAULT_AGENT_MODEL,
+    DEFAULT_JUDGE_MODEL,
+    PROVIDERS,
+    AnthropicAPIClient,
+    APIJudge,
+    NoCredentials,
+    detect_provider,
+)
+from .chat_eval import evaluate, load_run_data, render_markdown, verdict_json
 from .claude_code import (
     EFFORT_LEVELS,
     NO_EFFORT,
@@ -49,7 +59,7 @@ from .limits import LimitWaiter
 from .mcp_oauth import OAuthTokens
 from .mcp_oauth import login as oauth_login
 from .openai_chat import MAX_TOOL_ROUNDS, OpenAIChatClient
-from .persist import write_text
+from .persist import append_text, write_json, write_text
 from .redact import describe_error, redact
 from .report import reasoning_effort as recorded_effort
 from .report import write_index, write_report
@@ -72,6 +82,12 @@ def _models(value: str | None, target: str, runner: str = "agents-api") -> list[
     """The models to ask, checked against what the target offers (default: all of them).
 
     The claude-code runner doesn't go through the target's LibreChat specs, so any model with a Claude Code id works."""
+    if runner == "api":
+        offered = [k for k, m in MODELS.items() if m.claude_code_id or m.bedrock_id]
+        models = [m.strip() for m in value.split(",") if m.strip()] if value else [DEFAULT_AGENT_MODEL]
+        if unknown := [m for m in models if m not in offered]:
+            raise click.BadParameter(f"the api runner has no model(s) {unknown}; choose from {offered}")
+        return models
     if runner == "openai":
         offered = [k for k, m in MODELS.items() if m.openai_id]
         models = [m.strip() for m in value.split(",") if m.strip()] if value else offered[:1]
@@ -97,7 +113,7 @@ def _langfuse(settings) -> Langfuse:
     return langfuse
 
 
-RUNNERS = ["agents-api", "claude-code", "openai"]
+RUNNERS = ["agents-api", "claude-code", "openai", "api"]
 runner_option = click.option(
     "--runner",
     type=click.Choice(RUNNERS),
@@ -106,11 +122,22 @@ runner_option = click.option(
     help="agents-api: the deployed agent through LibreChat. claude-code: headless Claude Code with the "
     "deployed agent's prompt and the same MCP servers (runs on the Claude subscription). openai: a model on an "
     "OpenAI-compatible endpoint (OPENAI_BASE_URL: Ollama, vLLM) with the same prompt and MCP servers, the tool "
-    "loop run here.",
+    "loop run here. api: Claude through the Anthropic SDK (ANTHROPIC_API_KEY or Bedrock, see --provider), the "
+    "tool loop run here, with --system-prompt-file (optional) plus the MCP servers' served instructions; no "
+    "kubectl or Claude Code (the CI runner). Default model: haiku.",
+)
+
+provider_option = click.option(
+    "--provider",
+    type=click.Choice(PROVIDERS),
+    default=None,
+    help="api runner and judge: anthropic (ANTHROPIC_API_KEY) or bedrock (AWS credentials, AWS_REGION). "
+    "Default: QA_PROVIDER, else auto (the Claude API when ANTHROPIC_API_KEY is set, else Bedrock when AWS "
+    "credentials are).",
 )
 
 # Runners that answer with the agent's prompt and the MCP servers themselves (not the deployed agent).
-LOCAL_RUNNERS = {"claude-code", "openai"}
+LOCAL_RUNNERS = {"claude-code", "openai", "api"}
 
 
 def openai_options(f):
@@ -194,7 +221,7 @@ def claude_code_billing_options(f):
     return f
 
 
-JUDGE_RUNNERS = ["bedrock", "claude-code"]
+JUDGE_RUNNERS = ["bedrock", "claude-code", "api"]
 
 
 def judge_options(f):
@@ -212,7 +239,8 @@ def judge_options(f):
         help="bedrock: the Bedrock judge at temperature 0 (bills AWS). claude-code: the same prompt through "
         "`claude -p` on the Claude subscription, no tools; grades are recorded as claude-code:<model>, can't be "
         "at temperature 0, and aren't comparable with Bedrock grades. Takes the --claude-code-trust-org-policy "
-        "and --claude-code-allow-api-billing options; user settings are never loaded.",
+        "and --claude-code-allow-api-billing options; user settings are never loaded. api: the Anthropic SDK on "
+        "the Claude API or Bedrock (see --provider), temperature 0; default judge sonnet-4.6.",
     )(f)
     f = click.option(
         "--judge-allow-managed-customizations",
@@ -337,7 +365,7 @@ def _check_runner_options(settings, runner: str, models: list[str], system_promp
     _warn_thinking(runner, models)
     if system_prompt_file and runner not in LOCAL_RUNNERS:
         raise click.UsageError(
-            f"--system-prompt-file needs --runner claude-code or openai: the {runner} runner asks the deployed "
+            f"--system-prompt-file needs --runner claude-code, openai or api: the {runner} runner asks the deployed "
             "agent, which uses its own instructions"
         )
     if runner == "openai" and settings.openai_served_model and len(models) > 1:
@@ -357,6 +385,8 @@ def _claude_code_effort(model: str, effort: str | None) -> str | None:
 def _check_claude_code_effort(runner: str, models: list[str], effort: str | None) -> None:
     """A claude-code --reasoning-effort every effort-capable model accepts (Claude Code ignores an unknown level and
     lowers one a model lacks, silently)."""
+    if runner == "api" and effort:
+        raise click.UsageError("--reasoning-effort isn't supported by the api runner (it runs thinking off)")
     if runner != "claude-code" or not effort:
         return
     if effort not in EFFORT_LEVELS:
@@ -378,6 +408,8 @@ def _session_efforts(runner: str, reasoning_effort: str | None, models: list[str
     deployed agent's own."""
     if runner == "openai":
         return {m: reasoning_effort or "default" for m in models}
+    if runner == "api":
+        return {m: "default" for m in models}
     if runner == "claude-code":
         return {m: _claude_code_effort(m, reasoning_effort) for m in models}
     return {}
@@ -493,7 +525,26 @@ def _client(
     reasoning_effort: str | None = None,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
     models: list[str] = (),
+    provider: str | None = None,
 ):
+    if runner == "api":
+        if not settings.database_mcp_url:
+            raise click.ClickException(
+                "the api runner needs DATABASE_MCP_URL (e.g. http://localhost:8000/db/mcp)"
+            )
+        try:
+            resolved = detect_provider(provider)
+        except (NoCredentials, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        return AnthropicAPIClient(
+            prompt or "",
+            settings.database_mcp_url,
+            settings.navigator_mcp_url,
+            resolved,
+            aws_region=settings.aws_region,
+            max_tool_rounds=max_tool_rounds,
+            transcript_dir=transcript_dir,
+        )
     if runner == "openai":
         try:
             # The public database MCP needs the OAuth login (mcp-login); a DATABASE_MCP_URL (port-forward) doesn't.
@@ -544,7 +595,15 @@ def _make_judge(
     trust_org_policy: bool = False,
     allow_managed_customizations: bool = False,
     allow_plugins: bool = False,
+    provider: str | None = None,
 ) -> BaseJudge:
+    if judge_runner == "api":
+        try:
+            return APIJudge(
+                judge_model or DEFAULT_JUDGE_MODEL, detect_provider(provider), settings.aws_region
+            )
+        except (NoCredentials, ValueError) as exc:
+            raise click.ClickException(f"api judge: {exc}") from exc
     if judge_runner == "claude-code":
         try:
             judge = ClaudeCodeJudge(
@@ -619,6 +678,7 @@ def _grade_command(
     allow_api_billing: bool = False,
     allow_managed_customizations: bool = False,
     allow_plugins: bool = False,
+    provider: str | None = None,
 ) -> str:
     """The `grade` command that continues grading this run (as it was named: id or path) with the same judge."""
     cmd = ["uv", "run", "cbioportal-mcp-qa", "grade", run]
@@ -628,6 +688,8 @@ def _grade_command(
         cmd += ["--judge-model", judge_model]
     if concurrency != 1:
         cmd += ["--concurrency", str(concurrency)]
+    if judge_runner == "api" and provider:
+        cmd += ["--provider", provider]
     if judge_runner == "claude-code":
         cmd += [
             flag
@@ -677,6 +739,7 @@ def mcp_login(url: str | None) -> None:
     help="Default: the target's first.",
 )
 @runner_option
+@provider_option
 @claude_code_options
 @openai_options
 def ask(
@@ -692,6 +755,7 @@ def ask(
     claude_code_trust_org_policy: bool,
     claude_code_user_settings: bool,
     require_beta_mcp: bool,
+    provider: str | None,
 ) -> None:
     """Ask the deployed agent a single question."""
     settings = load_settings()
@@ -713,9 +777,10 @@ def ask(
             reasoning_effort=reasoning_effort,
             max_tool_rounds=max_tool_rounds,
             models=[model],
+            provider=provider,
         )
         try:
-            if runner == "openai":
+            if runner in ("openai", "api"):
                 await client.start()
             return await client.ask(question, model)
         finally:
@@ -773,6 +838,7 @@ def ask(
 )
 @screenshots_option
 @runner_option
+@provider_option
 @claude_code_options
 @openai_options
 @wait_options
@@ -802,6 +868,7 @@ def run(
     max_tool_rounds,
     wait_on_limit,
     max_wait,
+    provider,
 ) -> None:
     """Ask every selected question with each model, attach traces, grade, and write the report."""
     settings = load_settings()
@@ -831,6 +898,7 @@ def run(
             max_tool_rounds,
             wait_on_limit,
             max_wait,
+            provider,
         ) = (opts[name] for name in RESTORED_ON_RESUME)
         if system_prompt_file:
             system_prompt_file = Path(system_prompt_file)
@@ -859,6 +927,9 @@ def run(
     agent = None
     if system_prompt_file:
         agent = {"instructions": system_prompt_file.read_text(), "source": str(system_prompt_file)}
+    elif runner == "api":
+        # No kubectl: the agent's prompt is only what --system-prompt-file gives; the MCP servers add their own.
+        agent = None
     elif runner in LOCAL_RUNNERS or not resume:
         try:
             agent = fetch_agent_prompt(TARGETS[target].agent_id, settings.kube_context)
@@ -872,7 +943,7 @@ def run(
     mcp_env = _check_database_mcp(settings, target, runner, require_beta_mcp)
     # Before the run exists: the claude-code judge, like the runner, refuses to start on per-token billing.
     judge = None
-    if not no_grade and judge_runner == "claude-code":
+    if not no_grade and judge_runner in ("claude-code", "api"):
         judge = _make_judge(
             settings,
             judge_runner,
@@ -881,6 +952,7 @@ def run(
             claude_code_trust_org_policy,
             judge_allow_managed_customizations,
             claude_code_allow_plugins,
+            provider,
         )
     client = _client(
         settings,
@@ -894,6 +966,7 @@ def run(
         reasoning_effort=reasoning_effort,
         max_tool_rounds=max_tool_rounds,
         models=bench.data["models"] if resume else models,
+        provider=provider,
     )
     if resume:
         _check_resume_effort(settings, bench, runner, target, reasoning_effort)
@@ -908,6 +981,8 @@ def run(
             }
             if agent.get("source"):
                 prompt_info["source"] = agent["source"]
+        elif runner == "api":
+            prompt_info["source"] = "mcp-server-instructions-only"
         else:
             prompt_info["error"] = agent_error
         root = TARGETS[target].agent_id
@@ -916,7 +991,7 @@ def run(
             "target_config": {"url": TARGETS[target].url, "agent_id": root, "specs": TARGETS[target].specs},
             # The target agent and every agent it hands off to (the router's specialists).
             "agents": {}
-            if system_prompt_file
+            if system_prompt_file or runner == "api"
             else describe_agents(
                 root,
                 settings.kube_context,
@@ -929,6 +1004,8 @@ def run(
         # The reasoning effort answers are asked with, for the report and for --resume to keep.
         if runner == "openai":
             extra["reasoning_effort"] = reasoning_effort or "default"
+        elif runner == "api":
+            extra["reasoning_efforts"] = _session_efforts(runner, reasoning_effort, models)
         elif runner == "claude-code":
             extra["reasoning_efforts"] = _session_efforts(runner, reasoning_effort, models)
             # Where sessions could pick an effort up from: what is configured, not the effort they run at.
@@ -938,7 +1015,7 @@ def run(
             extra["reasoning_efforts"], extra["model_specs"] = _deployed_efforts(
                 settings, target, models, extra["agents"]
             )
-        if runner == "openai":
+        if runner in ("openai", "api"):
             extra["database_mcp"] = settings.database_mcp_url or settings.database_connector_url
             extra["database_mcp_env"] = mcp_env
             extra["navigator_mcp"] = settings.navigator_mcp_url
@@ -979,6 +1056,10 @@ def run(
                 await client.start()
                 _record_openai_setup(bench, client.describe())
                 bench.save()
+            elif runner == "api":
+                await client.start()
+                bench.data.setdefault("api", client.describe())
+                bench.save()
             while True:
                 await collect_answers(bench, questions, client, concurrency)
                 # Only a usage limit resets by itself; the other stops need you.
@@ -1009,7 +1090,7 @@ def run(
         rendered = render_navigation_links(bench, settings.chromium_path, screenshots=screenshots)
         click.echo(f"Rendered {rendered} navigation links")
     if not no_grade:
-        judge = judge or _make_judge(settings, judge_runner, judge_model)
+        judge = judge or _make_judge(settings, judge_runner, judge_model, provider=provider)
         _grade(
             bench,
             judge,
@@ -1023,6 +1104,7 @@ def run(
                 claude_code_allow_api_billing,
                 judge_allow_managed_customizations,
                 claude_code_allow_plugins,
+                provider,
             ),
             waiter,
         )
@@ -1054,6 +1136,7 @@ RESTORED_ON_RESUME = (
     "max_tool_rounds",
     "wait_on_limit",
     "max_wait",
+    "provider",
 )
 PATH_OPTIONS = {"questions_file", "system_prompt_file"}
 # Fixed by the run itself on --resume.
@@ -1136,6 +1219,7 @@ def traces(run_id: str) -> None:
     "file, then regrade (implies --regrade). The question text and history stay as they were asked.",
 )
 @judge_options
+@provider_option
 @click.option("--concurrency", type=int, default=1, show_default=True, help="Answers graded in parallel.")
 @claude_code_billing_options
 @wait_options
@@ -1152,6 +1236,7 @@ def grade(
     claude_code_trust_org_policy: bool,
     wait_on_limit: bool,
     max_wait: float,
+    provider: str | None,
 ) -> None:
     """Grade answers that don't have a grade yet (and answers the judge left ungraded)."""
     bench = Run.load(run_id)
@@ -1164,6 +1249,7 @@ def grade(
         claude_code_trust_org_policy,
         judge_allow_managed_customizations,
         claude_code_allow_plugins,
+        provider,
     )
     if refresh_questions:
         current = {q.id: asdict(q) for q in load_questions(Path(bench.data["questions_file"]))}
@@ -1201,6 +1287,7 @@ def grade(
             claude_code_allow_api_billing,
             judge_allow_managed_customizations,
             claude_code_allow_plugins,
+            provider,
         ),
         _waiter(wait_on_limit, max_wait),
     )
@@ -1247,3 +1334,76 @@ def compare(
     for warning in result["warnings"]:
         click.echo(f"Warning: {warning}", err=True)
     click.echo(f"Report: {html}")
+
+
+@cli.command("chat-eval-gate")
+@click.argument("baseline_run")
+@click.argument("candidate_run")
+@click.option(
+    "--max-pass-drop",
+    type=float,
+    default=10.0,
+    show_default=True,
+    help="Fail when the candidate's pass rate is more than this many percentage points below the baseline's.",
+)
+@click.option(
+    "--max-tool-error-increase",
+    type=int,
+    default=8,
+    show_default=True,
+    help="Fail when the candidate has more than this many tool errors more than the baseline (all turns).",
+)
+@click.option(
+    "--max-invalid-study-increase",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Fail when the candidate links more than this many more distinct nonexistent study ids.",
+)
+@click.option("--model", default=None, help="Model to compare when the runs asked several.")
+@click.option("--title", default="Chat behavioral eval", show_default=True)
+@click.option(
+    "--summary",
+    "summary_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Append the markdown summary to this file (e.g. $GITHUB_STEP_SUMMARY).",
+)
+@click.option(
+    "--json",
+    "json_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write the verdict as JSON.",
+)
+def chat_eval_gate(
+    baseline_run: str,
+    candidate_run: str,
+    max_pass_drop: float,
+    max_tool_error_increase: int,
+    max_invalid_study_increase: int,
+    model: str | None,
+    title: str,
+    summary_path: Path | None,
+    json_path: Path | None,
+) -> None:
+    """Gate a candidate MCP server on its chat answers: compare CANDIDATE_RUN against BASELINE_RUN (same questions,
+    model, judge and data) and exit 1 when the pass rate dropped, or tool errors or nonexistent study ids rose,
+    beyond the thresholds."""
+    verdict = evaluate(
+        load_run_data(baseline_run),
+        load_run_data(candidate_run),
+        max_pass_drop=max_pass_drop,
+        max_tool_error_increase=max_tool_error_increase,
+        max_invalid_study_increase=max_invalid_study_increase,
+        model=model,
+    )
+    markdown = render_markdown(verdict, title)
+    click.echo(markdown)
+    if summary_path:
+        append_text(summary_path, markdown + "\n")
+    if json_path:
+        write_json(json_path, verdict_json(verdict), indent=1)
+    if not verdict.ok:
+        failed = [c.name for c in verdict.checks if not c.ok] + verdict.problems
+        raise click.ClickException(f"chat eval regression: {'; '.join(failed)}")
