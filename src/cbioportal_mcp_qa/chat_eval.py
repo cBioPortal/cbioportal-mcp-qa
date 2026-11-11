@@ -16,6 +16,7 @@ The gate fails when
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 from .dataset import Question, asked_question, definition_fields
 from .run import Run, record_key
@@ -25,6 +26,11 @@ TRACK_ORDER = ("data", "navigation", "analysis", "out_of_scope")
 
 def load_run_data(run_id_or_path: str) -> dict:
     return Run.load(run_id_or_path).data
+
+
+def exact(threshold: float | int | str) -> Fraction:
+    """A threshold as given (`10`, `10.0`, `"12.5"`), as an exact fraction: `0.1` is 1/10, not its binary float."""
+    return Fraction(str(threshold))
 
 
 def _repeats(data: dict) -> int | None:
@@ -327,15 +333,16 @@ def evaluate(
                 f"{m.failed_requests}, ungraded {m.ungraded})"
             )
     checks = []
-    if base.pass_rate is not None and cand.pass_rate is not None:
-        drop = base.pass_rate - cand.pass_rate
+    if base.eligible and cand.eligible:
+        # Exact: 28/130 → 15/130 is a drop of exactly 10 points, which floats compute as 10.000000000000002.
+        drop = Fraction(100 * base.passes, base.eligible) - Fraction(100 * cand.passes, cand.eligible)
         checks.append(
             Check(
                 "Pass rate (%)",
                 base.pass_rate,
                 cand.pass_rate,
                 f"drop ≤ {max_pass_drop:g} pts",
-                drop <= max_pass_drop,
+                drop <= exact(max_pass_drop),
             )
         )
     checks.append(

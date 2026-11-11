@@ -373,3 +373,53 @@ def test_scrub_artifacts_masks_secrets_in_every_file_and_removes_binaries(tmp_pa
             text = path.read_text()
             assert "hunter2-secret-pw" not in text
             assert "Never reveal" not in text and "Second internal line" not in text
+
+
+def _many(run_id, passes, turns=130):
+    """A run of `turns` data turns (65 questions × 2 repeats), the first `passes` of them passed."""
+    qs = {
+        i: {"id": i, "question": f"Q{i}?", "track": "data", "expected_answer": str(i)}
+        for i in range(100, 100 + turns // 2)
+    }
+    records, n = {}, 0
+    for qid, q in qs.items():
+        for r in (1, 2):
+            rec = {
+                "question": q,
+                "model": "haiku",
+                "repeat": r,
+                "reply": {"answer": "x", "status": 200, "error": None},
+                "trace": {"llm_calls": 1, "tool_calls": []},
+                "grade": {"passed": n < passes, "declined": False, "rationale": "", "invalid_studies": []},
+            }
+            records[f"{qid}:haiku:{r}"] = rec
+            n += 1
+    return copy.deepcopy(
+        {
+            "run_id": run_id,
+            "models": ["haiku"],
+            "repeats": 2,
+            "judge_model": "claude-sonnet-4-6",
+            "questions_file": "input/questions-subset.yaml",
+            "planned_questions": list(qs.values()),
+            "records": records,
+        }
+    )
+
+
+def test_pass_rate_drop_exactly_at_the_threshold_passes():
+    assert 100 * 28 / 130 - 100 * 15 / 130 > 10  # the float boundary bug this guards against
+    v = evaluate(_many("b", 28), _many("c", 15), max_pass_drop=10)
+    assert v.ok, [c for c in v.checks if not c.ok]
+    assert not evaluate(_many("b", 28), _many("c", 14), max_pass_drop=10).ok
+    # Thresholds are taken as written: 0.1 is exactly a tenth.
+    assert evaluate(_many("b", 13, 1300), _many("c", 12, 1300), max_pass_drop=0.1).ok
+
+
+def test_cli_healthy_baseline_vs_entirely_failed_candidate_exits_1(tmp_path):
+    base = _write(tmp_path, "base", _run("base", ALL_PASS))
+    dead = _write(tmp_path, "dead", _run("dead", {q: ["err", "err"] for q in ALL_PASS}))
+    out = CliRunner().invoke(cli, ["chat-eval-gate", base, dead, "--json", str(tmp_path / "v.json")])
+    assert out.exit_code == 1
+    verdict = json.loads((tmp_path / "v.json").read_text())
+    assert verdict["ok"] is False and verdict["candidate"]["passes"] == 0

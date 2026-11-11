@@ -1469,8 +1469,8 @@ def scrub_artifacts(root: Path, secret_envs: tuple[str, ...]) -> None:
     import os
 
     load_settings()  # registers the environment's secret-looking variables too
-    values = [os.environ.get(name, "") for name in secret_envs]
-    scrubbed, removed, leaks = scrub_tree(root, [v for v in values if v])
+    secrets = [(name, os.environ.get(name, "")) for name in secret_envs]
+    scrubbed, removed, problems = scrub_tree(root, secrets)
     click.echo(f"Scrubbed {scrubbed} files under {root}; removed {len(removed)} non-text files")
-    if leaks:
-        raise click.ClickException(f"secrets still present after scrubbing in: {', '.join(leaks)}")
+    if problems:
+        raise click.ClickException("not safe to upload: " + "; ".join(problems))

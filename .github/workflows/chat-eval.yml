@@ -231,6 +231,38 @@ jobs:
           fi
           { echo "skip=false"; echo "provider=$PROVIDER"; } >> "$GITHUB_OUTPUT"
 
+      - name: Mask secret values in the log
+        if: steps.cfg.outputs.skip != 'true'
+        shell: bash
+        env:
+          CHAT_SYSTEM_PROMPT: ${{ secrets.CHAT_SYSTEM_PROMPT }}
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          # Defense in depth: the log is also only ever printed after scrubbing. GitHub masks single-line secrets
+          # itself; this adds each long line of a multi-line one and base64 forms.
+          mask() {
+            local v="$1" line
+            [ -n "$v" ] || return 0
+            if [[ "$v" == *$'\n'* ]]; then
+              while IFS= read -r line; do
+                line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+                [ ${#line} -ge 8 ] && echo "::add-mask::$line"
+              done <<< "$v"
+            elif [ ${#v} -ge 4 ]; then
+              echo "::add-mask::$v"
+              b64=$(printf '%s' "$v" | base64 | tr -d '\n')
+              [ -n "$b64" ] && echo "::add-mask::$b64"
+            fi
+            return 0
+          }
+          for name in CHAT_SYSTEM_PROMPT CLICKHOUSE_HOST CLICKHOUSE_USER CLICKHOUSE_PASSWORD ANTHROPIC_API_KEY AWS_ROLE_ARN; do
+            mask "${!name}"
+          done
+
       - name: Check out the server under test
         if: steps.cfg.outputs.skip != 'true'
         uses: actions/checkout@v4
@@ -449,6 +481,17 @@ jobs:
           fi
           exit "$status"
 
+      - name: Capture server logs
+        if: always() && steps.cfg.outputs.skip != 'true'
+        shell: bash
+        run: |
+          # Into the directory that is scrubbed next; printed (on failure) only after scrubbing succeeds.
+          out="$RUNNER_TEMP/chat-eval"
+          mkdir -p "$out"
+          for name in candidate baseline; do
+            docker logs --tail 2000 "$name" > "$out/server-$name.log" 2>&1 || true
+          done
+
       - name: Scrub results and logs of secrets
         id: scrub
         if: always() && steps.cfg.outputs.skip != 'true'
@@ -481,11 +524,16 @@ jobs:
       - name: Logs and summary
         if: always() && steps.scrub.outputs.scrubbed == 'true'
         shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
         run: |
           out="$RUNNER_TEMP/chat-eval"
-          for log in baseline candidate gate; do
+          logs=(baseline candidate gate)
+          # The servers' own logs only when something failed.
+          [ "$JOB_STATUS" = "success" ] || logs+=(server-candidate server-baseline)
+          for log in "${logs[@]}"; do
             [ -f "$out/$log.log" ] || continue
-            echo "::group::$log log"; grep -v '%|' "$out/$log.log" | tail -150; echo "::endgroup::"
+            echo "::group::$log log"; grep -v '%|' "$out/$log.log" | tail -200; echo "::endgroup::"
           done
           [ -f "$out/summary.md" ] && cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
           exit 0
@@ -498,9 +546,3 @@ jobs:
           path: ${{ runner.temp }}/chat-eval
           if-no-files-found: ignore
           retention-days: 30
-
-      - name: Server logs
-        if: failure() && steps.cfg.outputs.skip != 'true'
-        run: |
-          echo "::group::candidate"; docker logs candidate 2>&1 | tail -200; echo "::endgroup::"
-          echo "::group::baseline"; docker logs baseline 2>&1 | tail -200; echo "::endgroup::"

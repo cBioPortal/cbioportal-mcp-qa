@@ -19,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import redact as redact_mod
+from . import secret_scan
 from .redact import MASK, add_env_secrets, mask_known, redact
 
 # A run is saved after every answer and grade: redact each distinct string once, until the known values change.
@@ -215,13 +216,17 @@ def secret_pieces(value: str) -> list[str]:
     return pieces
 
 
-def scrub_tree(root: Path, secrets: list[str]) -> tuple[int, list[str], list[str]]:
-    """Rewrite every text file under `root` with `secrets` (and every other known secret) masked, remove every
-    other file, then check no file still contains a secret. Returns (files scrubbed, files removed, files that
-    still leak), paths relative to `root`; the leaks name files, never values."""
-    pieces = [p for value in secrets if value for p in secret_pieces(value)]
-    for piece in pieces:
-        redact_mod.add_secret(piece)
+def scrub_tree(root: Path, secrets: list[tuple[str, str]]) -> tuple[int, list[str], list[str]]:
+    """Make `root` safe to upload. Every text file is rewritten with every known secret masked (`scrub`) and each
+    named secret masked in any form it could be written in (`secret_scan`: escapes, base64, line wraps); every
+    other file is removed. Then each file is checked again, normalized, for every named secret.
+
+    Returns (files scrubbed, files removed, problems). A problem — a secret too short to mask safely, or one still
+    found after masking — names the secret and the file, never the value; the caller must not upload on any."""
+    found, problems = secret_scan.matchers(secrets)
+    for _name, value in secrets:
+        if value:
+            redact_mod.add_secret(value)
     scrubbed, removed = 0, []
     for path in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
         rel = str(path.relative_to(root))
@@ -230,16 +235,16 @@ def scrub_tree(root: Path, secrets: list[str]) -> tuple[int, list[str], list[str
             removed.append(rel)
             continue
         text = path.read_bytes().decode("utf-8", errors="replace")
+        # The named secrets first, on the raw text: a pattern of `scrub` (e.g. `password: ...` to the end of the
+        # line) would otherwise cut a wrapped secret in two, leaving the rest unmatched.
+        for m in found:
+            text = m.mask(text)
         path.write_text(scrub(text))
         scrubbed += 1
-    leaks = []
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        data = path.read_bytes().decode("utf-8", errors="replace")
-        if any(
-            form in data
-            for piece in pieces
-            for form in redact_mod._forms(piece)
-            if len(form) >= redact_mod.MIN_SECRET
-        ):
-            leaks.append(str(path.relative_to(root)))
-    return scrubbed, removed, leaks
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        views = secret_scan.text_views(text)
+        for m in found:
+            if m.found_in(text, views):
+                problems.append(f"{m.name} still found in {path.relative_to(root)}")
+    return scrubbed, removed, problems

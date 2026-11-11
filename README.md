@@ -611,10 +611,17 @@ calls on PRs. It builds the PR's database MCP image and starts it next to `cbiop
 same ClickHouse at `/db/mcp`. It runs the subset against both in parallel (2 repeats by default), gates with
 `chat-eval-gate`, and uploads both runs (run.json, report.html, transcripts) as an artifact. Every input reaches
 the shell through an environment variable and is validated: repo-relative paths only, and bounded repeats (≤5),
-concurrency (≤6), questions (≤60) and answers per server (≤300). Logs, results and the summary are scrubbed of
+concurrency (≤6), questions (≤60) and answers per server (≤300). Logs (the servers' too), results and the summary are scrubbed of
 the secret values (`scrub-artifacts`: prompt, ClickHouse credentials, API key, AWS credentials) before they are
-printed, published to the job summary or uploaded. Non-text files are dropped, and nothing is uploaded if a
-value survives. Secrets:
+printed, published to the job summary or uploaded. Non-text files are dropped. Each value is also masked:
+
+- with any character JSON-`\uXXXX`, URL-`%XX` or HTML-escaped;
+- as base64 (both alphabets, padded or not, at every alignment inside a larger blob);
+- broken across lines.
+
+A normalized re-check fails the step if any form survives, and then nothing is uploaded. An explicitly named
+secret shorter than 4 characters can't be masked safely, so it also fails the step: use a ClickHouse user name of
+4+ characters. The secrets are also `::add-mask::`ed at the start of the job. Secrets:
 `CLICKHOUSE_HOST/PORT/USER/PASSWORD/DATABASE`; `ANTHROPIC_API_KEY`, or `AWS_ROLE_ARN` (a role with Bedrock
 access that trusts GitHub's OIDC provider; the calling job needs `id-token: write`); optionally
 `CHAT_SYSTEM_PROMPT` (prod's agent instructions). Without them it skips with a notice, or fails with
