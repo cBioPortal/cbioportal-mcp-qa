@@ -169,3 +169,124 @@ def matchers(secrets: list[tuple[str, str]]) -> tuple[list[Matcher], list[str]]:
                 if len(line) >= LINE_CHARS:
                     out.append(Matcher(f"{name} (line {i})", line, deep=False))
     return out, problems
+
+
+# --- Iterative decoding: a secret under any stack of encodings ---------------------------------------------------
+
+DECODE_ROUNDS = 5
+MAX_LAYERS = 64
+CHUNK = 50_000  # long lines are checked in overlapping chunks, so decoding stays bounded
+_JSON_ESC = re.compile(r'\\(u[0-9a-fA-F]{4}|["\\/bfnrt])')
+_JSON_ESC_CHARS = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+_B64_TOKEN = re.compile(r"[A-Za-z0-9+/_-]{12,}={0,2}")
+
+
+def _json_unescape(s: str) -> str:
+    return _JSON_ESC.sub(lambda m: chr(int(m[1][1:], 16)) if m[1][0] == "u" else _JSON_ESC_CHARS[m[1]], s)
+
+
+def _printable(text: str) -> bool:
+    return bool(text) and sum(c.isprintable() or c in "\n\r\t" for c in text) >= 0.9 * len(text)
+
+
+def _base64_decodings(s: str) -> list[str]:
+    """Every substring that decodes as base64 (either alphabet) to mostly printable text, decoded."""
+    out = []
+    for m in _B64_TOKEN.finditer(s):
+        token = m[0].rstrip("=")
+        for decode in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                raw = decode(token + "=" * (-len(token) % 4))
+            except ValueError:
+                continue
+            text = raw.decode("utf-8", errors="ignore")
+            if _printable(text):
+                out.append(text)
+        if len(out) >= 16:
+            break
+    return out
+
+
+def decode_layers(s: str, rounds: int = DECODE_ROUNDS, limit: int = MAX_LAYERS) -> list[str]:
+    """`s` and everything reachable from it by up to `rounds` decodings, in any order: JSON-string unescape
+    (`\\uXXXX`, `\\n`, `\\"` …), URL-decode, HTML-unescape, removing line wraps, and base64-decoding any substring that
+    decodes to text. At most `limit` distinct strings."""
+    seen = {s}
+    frontier = [s]
+    for _ in range(rounds):
+        nxt = []
+        for x in frontier:
+            for c in (
+                _json_unescape(x),
+                unquote(x),
+                html.unescape(x),
+                _SEP_RE.sub("", x),
+                *_base64_decodings(x),
+            ):
+                if c not in seen and len(seen) < limit:
+                    seen.add(c)
+                    nxt.append(c)
+        if not nxt:
+            break
+        frontier = nxt
+    return list(seen)
+
+
+def _hit(m: Matcher, s: str) -> bool:
+    if m.regex.search(s) or any(f in s for f in m.forms):
+        return True
+    stripped = re.sub(r"\s+", "", s)
+    return any(f in stripped for f in m.stripped_forms)
+
+
+def secret_in(s: str, found: list[Matcher]) -> str | None:
+    """The name of the first secret in any decoded layer of `s` (checked in overlapping chunks when long)."""
+    if not s or not found:
+        return None
+    pieces = [s] if len(s) <= CHUNK else [s[i : i + CHUNK + 1024] for i in range(0, len(s), CHUNK)]
+    for piece in pieces:
+        for layer in decode_layers(piece):
+            for m in found:
+                if _hit(m, layer):
+                    return m.name
+    return None
+
+
+def redact_json(obj, found: list[Matcher]):
+    """`obj` with every string value and key that holds a secret, in any decoded layer, replaced whole by MASK.
+    Numbers, booleans and null are never touched: a secret like `1234` or `true` in a non-string position isn't
+    a leak, and masking it would break the JSON."""
+    if isinstance(obj, str):
+        return MASK if secret_in(obj, found) else obj
+    if isinstance(obj, list):
+        return [redact_json(v, found) for v in obj]
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            new = MASK if secret_in(key, found) else key
+            base, n = new, 1
+            while new in out:
+                n += 1
+                new = f"{base} #{n}"
+            out[new] = redact_json(value, found)
+        return out
+    return obj
+
+
+def json_leaks(obj, found: list[Matcher], path: str = "$") -> list[str]:
+    """Where in `obj` (JSON paths) a string value or key still holds a secret, with the secret's name."""
+    out = []
+    if isinstance(obj, str):
+        if name := secret_in(obj, found):
+            out.append(f"{name} at {path}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            out += json_leaks(v, found, f"{path}[{i}]")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            if name := secret_in(k, found):
+                out.append(f"{name} in a key at {path}")
+                out += json_leaks(v, found, f"{path}.<redacted key>")
+            else:
+                out += json_leaks(v, found, f"{path}.{k}")
+    return out

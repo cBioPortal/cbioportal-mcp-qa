@@ -619,7 +619,12 @@ printed, published to the job summary or uploaded. Non-text files are dropped. E
 - as base64 (both alphabets, padded or not, at every alignment inside a larger blob);
 - broken across lines.
 
-A normalized re-check fails the step if any form survives, and then nothing is uploaded. An explicitly named
+JSON files (run.json, the verdict) are scrubbed by structure: each string value and key is decoded to a
+fixpoint, up to 5 rounds of JSON/`\uXXXX` unescaping, URL- and HTML-decoding, line unwrapping and base64. A string
+holding a secret in any layer is replaced whole. Numbers, booleans and null are never touched, so grades and counts
+survive and the JSON stays valid; it is re-parsed after scrubbing. In other text files, a line that still holds a
+secret in a decoded layer is replaced whole. A final pass re-checks every file the same way and fails the step on
+any hit (or on a JSON file that doesn't parse), and then nothing is uploaded. An explicitly named
 secret shorter than 4 characters can't be masked safely, so it also fails the step: use a ClickHouse user name of
 4+ characters. The secrets are also `::add-mask::`ed at the start of the job. Secrets:
 `CLICKHOUSE_HOST/PORT/USER/PASSWORD/DATABASE`; `ANTHROPIC_API_KEY`, or `AWS_ROLE_ARN` (a role with Bedrock

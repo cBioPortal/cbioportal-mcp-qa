@@ -147,3 +147,149 @@ def test_cli_fails_and_names_the_secret_when_unsafe(tmp_path, monkeypatch):
     out = CliRunner().invoke(cli, ["scrub-artifacts", str(root), "--secret-env", "CH_PASSWORD"])
     assert out.exit_code == 1
     assert "CH_PASSWORD still found in a.log" in out.output and PW not in out.output
+
+
+# --- structure-aware JSON scrubbing ---------------------------------------------------------------------------
+
+from cbioportal_mcp_qa.secret_scan import decode_layers, secret_in  # noqa: E402
+
+
+def _strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield k
+            yield from _strings(v)
+
+
+def _recoverable(obj, secrets):
+    found, _ = matchers(secrets)
+    return [s for s in _strings(obj) if secret_in(s, found)]
+
+
+def test_cli_double_escaped_unicode_tool_output_in_run_json(tmp_path, monkeypatch):
+    # The tool returned text with literal \uXXXX escapes; json.dumps escapes the backslashes again in run.json.
+    escaped = "".join(f"\\u{ord(c):04x}" for c in PW)
+    run = {
+        "records": {
+            "1:haiku:1": {
+                "trace": {
+                    "tool_calls": [
+                        {"name": "clickhouse_run_select_query", "ok": True, "result": f"pw={escaped}"}
+                    ]
+                },
+                "grade": {"passed": True},
+            }
+        }
+    }
+    root = tmp_path / "upload"
+    (root / "results").mkdir(parents=True)
+    path = root / "results" / "run.json"
+    path.write_text(json.dumps(run))
+    assert "\\\\u0068\\\\u0075" in path.read_text()  # really double-escaped on disk
+    monkeypatch.setenv("CH_PASSWORD", PW)
+    out = CliRunner().invoke(cli, ["scrub-artifacts", str(root), "--secret-env", "CH_PASSWORD"])
+    assert out.exit_code == 0, out.output
+    data = json.loads(path.read_text())
+    assert data["records"]["1:haiku:1"]["trace"]["tool_calls"][0]["result"] == MASK
+    assert data["records"]["1:haiku:1"]["grade"]["passed"] is True
+    assert _recoverable(data, [("CH_PASSWORD", PW)]) == []
+
+
+def test_run_json_round_trip_keeps_structure_and_values(tmp_path):
+    user, pw, token = "true", "1234", "S3cretToken-xyz"
+    basic = base64.b64encode(f"admin:{token}".encode()).decode()
+    nested = json.dumps({"rows": [{"auth": "".join(f"\\u{ord(c):04x}" for c in token)}]})  # JSON in a string
+    run = {
+        "run_id": "20261111-1200",
+        "repeats": 2,
+        "records": {
+            "1:haiku:1": {
+                "question": {"id": 1, "question": "How many studies?", "track": "data"},
+                "reply": {
+                    "status": 200,
+                    "answer": "There are 523 studies.",
+                    "prompt_tokens": 1234,
+                    "latency_s": 1.5,
+                },
+                "grade": {"passed": True, "declined": False, "number_match": None, "invalid_studies": []},
+                "trace": {
+                    "tool_calls": [
+                        {"name": "q", "ok": True, "result": nested},
+                        {"name": "q", "ok": False, "error": f"login {user}:{pw} refused"},
+                        {"name": "q", "ok": True, "input": f"Authorization: Basic {basic}"},
+                    ]
+                },
+            }
+        },
+    }
+    root = tmp_path / "upload"
+    root.mkdir()
+    (root / "run.json").write_text(json.dumps(run))
+    secrets = [("CLICKHOUSE_USER", user), ("CLICKHOUSE_PASSWORD", pw), ("API_TOKEN", token)]
+    _, _, problems = scrub_tree(root, secrets)
+    assert problems == []
+    data = json.loads((root / "run.json").read_text())  # still valid JSON
+    rec = data["records"]["1:haiku:1"]
+    # Non-string values are untouched, even when they equal a secret (1234, true).
+    assert rec["reply"]["prompt_tokens"] == 1234 and rec["reply"]["latency_s"] == 1.5
+    assert rec["grade"] == {"passed": True, "declined": False, "number_match": None, "invalid_studies": []}
+    assert data["repeats"] == 2
+    # Strings without a secret are unchanged; strings with one, in any layer, are gone whole.
+    assert rec["question"]["question"] == "How many studies?"
+    assert rec["reply"]["answer"] == "There are 523 studies."
+    assert [c.get("result") or c.get("error") or c.get("input") for c in rec["trace"]["tool_calls"]] == [
+        MASK
+    ] * 3
+    assert _recoverable(data, secrets) == []
+
+
+def test_jsonl_and_invalid_json(tmp_path):
+    root = tmp_path / "upload"
+    root.mkdir()
+    (root / "a.jsonl").write_text(json.dumps({"x": PW, "n": 3}) + "\n" + json.dumps({"y": "ok"}) + "\n")
+    (root / "broken.json").write_text('{"x": "' + PW)
+    _, removed, problems = scrub_tree(root, [("CH_PASSWORD", PW)])
+    assert [json.loads(line) for line in (root / "a.jsonl").read_text().splitlines()] == [
+        {"x": MASK, "n": 3},
+        {"y": "ok"},
+    ]
+    # A JSON file that doesn't parse can't be scrubbed by structure: removed, and the upload refused.
+    assert "broken.json" in removed and any("broken.json isn't valid JSON" in p for p in problems)
+
+
+@pytest.mark.parametrize(
+    "layered",
+    [
+        lambda v: base64.b64encode(json.dumps({"pw": v}).encode()).decode(),  # base64 of JSON
+        lambda v: quote(json.dumps(json.dumps(v)), safe=""),  # URL-encoded JSON in JSON
+        lambda v: json.dumps("".join(f"\\u{ord(c):04x}" for c in v)),  # \u escapes, escaped again
+        lambda v: base64.b64encode(base64.b64encode(v.encode())).decode(),  # base64 twice
+    ],
+)
+def test_stacked_encodings_are_decoded_to_a_fixpoint(layered):
+    found, _ = matchers([("CH_PASSWORD", PW)])
+    assert secret_in(f"note: {layered(PW)} end", found) == "CH_PASSWORD"
+    assert any(PW in layer for layer in decode_layers(layered(PW)))
+
+
+def test_stacked_encoding_in_a_text_file_redacts_the_line(tmp_path):
+    blob = base64.b64encode(json.dumps({"pw": PW}).encode()).decode()
+    text, problems = _scrub(tmp_path, f"keep this line\nconfig={blob}\nand this one\n")
+    assert problems == []
+    lines = text.splitlines()
+    assert lines[0] == "keep this line" and lines[2] == "and this one"
+    found, _ = matchers([("CH_PASSWORD", PW)])
+    assert secret_in(lines[1], found) is None and MASK in lines[1]
+
+
+def test_text_line_with_a_secret_only_in_a_deeper_layer_is_replaced(tmp_path):
+    # base64 of base64: no pattern locates it in the raw text; the decoded check replaces the whole line.
+    blob = base64.b64encode(base64.b64encode(PW.encode())).decode()
+    text, problems = _scrub(tmp_path, f"keep this line\nconfig={blob}\nand this one\n")
+    assert problems == []
+    assert text.splitlines() == ["keep this line", MASK, "and this one"]
