@@ -3,8 +3,7 @@
 Each test makes the same fixed tool calls against the server under test (--url, e.g. a PR build) and a
 baseline (--baseline-url, e.g. the released image) connected to the same data. A difference in results
 is a behavior change: it fails the test unless --allow-changes is given (CI passes that when the PR has
-the `mcp-behavior-change` label). A call that errors on the server under test but not on the baseline
-always fails.
+the `mcp-behavior-change` label). Candidate errors, missing expected tools, and golden assertions always fail.
 """
 
 import difflib
@@ -26,6 +25,9 @@ def pytest_addoption(parser):
         "--server", choices=["mcp", "navigator"], required=True, help="Which MCP server is under test."
     )
     group.addoption("--url", required=True, help="MCP endpoint of the server under test.")
+    group.addoption(
+        "--librechat-headers", action="store_true", help="Send synthetic LibreChat identity headers."
+    )
     group.addoption("--baseline-url", default=None, help="MCP endpoint of the baseline server.")
     group.addoption("--allow-changes", action="store_true", help="Report behavior changes without failing.")
 
@@ -36,14 +38,25 @@ def server(request) -> str:
 
 
 @pytest.fixture(scope="session")
-def candidate(request) -> McpClient:
-    return McpClient(request.config.getoption("--url"))
+def headers(request) -> dict:
+    if request.config.getoption("--librechat-headers"):
+        return {
+            "x-user-id": "mcp-regression-ci",
+            "x-user-email": "mcp-regression-ci@cbioportal.org",
+            "x-user-email-verified": "true",
+        }
+    return {}
 
 
 @pytest.fixture(scope="session")
-def baseline(request) -> McpClient | None:
+def candidate(request, headers) -> McpClient:
+    return McpClient(request.config.getoption("--url"), headers=headers)
+
+
+@pytest.fixture(scope="session")
+def baseline(request, headers) -> McpClient | None:
     url = request.config.getoption("--baseline-url")
-    return McpClient(url) if url else None
+    return McpClient(url, headers=headers) if url else None
 
 
 @pytest.fixture(scope="session")
