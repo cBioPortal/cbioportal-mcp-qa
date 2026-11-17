@@ -172,10 +172,12 @@ def openai_options(f):
 def claude_code_options(f):
     """Options of the claude-code runner (ignored by the Agents API runner)."""
     f = click.option(
-        "--require-beta-mcp",
-        is_flag=True,
+        "--require-beta-mcp/--no-require-beta-mcp",
+        default=True,
+        show_default=True,
         help="claude-code runner on a beta target: fail unless the database MCP is beta's (DATABASE_MCP_URL at "
-        "beta's service, or DATABASE_MCP_ENV=beta for a port-forward or local image) instead of warning.",
+        "beta's service, or DATABASE_MCP_ENV=beta for a port-forward or local image); --no-require-beta-mcp "
+        "only warns.",
     )(f)
     return claude_code_session_options(f)
 
@@ -313,6 +315,16 @@ def _database_connector(settings) -> str | None:
     return connector
 
 
+def _check_target_allowed(target: str, allow_prod: bool) -> None:
+    """Runs on prod add benchmark traffic to prod usage numbers (chat transcripts, Bedrock, MCP telemetry), so
+    they need an explicit opt-in."""
+    if target == "prod" and not allow_prod:
+        raise click.UsageError(
+            "--target prod sends benchmark traffic through production chat.cbioportal.org and its database "
+            "MCP, which counts in prod usage numbers. Use a beta target, or pass --allow-prod."
+        )
+
+
 def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) -> str | None:
     """Which database MCP (beta, prod, local, unknown, conflict) the claude-code runner reaches. Warns when a
     beta target would be answered from another one or it can't be told, and on any target when
@@ -342,7 +354,7 @@ def _check_database_mcp(settings, target: str, runner: str, require_beta: bool) 
     if require_beta and beta:
         raise click.ClickException(f"{problem} See README: point DATABASE_MCP_URL at the beta MCP.")
     bar = "!" * 100
-    hint = "Point DATABASE_MCP_URL at the beta MCP (README) or pass --require-beta-mcp to make this an error."
+    hint = "Point DATABASE_MCP_URL at the beta MCP (README); --require-beta-mcp makes this an error."
     click.echo(f"{bar}\nWARNING: {problem}\n{hint if beta else ''}\n{bar}", err=True)
     return env
 
@@ -743,6 +755,7 @@ def mcp_login(url: str | None) -> None:
 @cli.command()
 @click.argument("question")
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
+@click.option("--allow-prod", is_flag=True, help="Allow --target prod (counts in prod usage numbers).")
 @click.option(
     "--model",
     type=click.Choice(
@@ -759,6 +772,7 @@ def mcp_login(url: str | None) -> None:
 def ask(
     question: str,
     target: str,
+    allow_prod: bool,
     model: str | None,
     runner: str,
     system_prompt_file: Path | None,
@@ -772,6 +786,7 @@ def ask(
     provider: str | None,
 ) -> None:
     """Ask the deployed agent a single question."""
+    _check_target_allowed(target, allow_prod)
     settings = load_settings()
     model = _models(model, target, runner)[0]
     _check_runner_options(settings, runner, [model], system_prompt_file)
@@ -815,6 +830,7 @@ def ask(
 
 @cli.command()
 @click.option("--target", type=click.Choice(list(TARGETS)), default="beta", show_default=True)
+@click.option("--allow-prod", is_flag=True, help="Allow --target prod (counts in prod usage numbers).")
 @click.option(
     "--models",
     "models_arg",
@@ -874,6 +890,7 @@ def ask(
 @wait_options
 def run(
     target,
+    allow_prod,
     models_arg,
     selection,
     questions_file,
@@ -954,6 +971,7 @@ def run(
         runner = bench.data.get("runner", "agents-api")
     else:
         models = _models(models_arg, target, runner)
+    _check_target_allowed(target, allow_prod)
     _check_runner_options(settings, runner, bench.data["models"] if resume else models, system_prompt_file)
     _check_claude_code_effort(runner, bench.data["models"] if resume else models, reasoning_effort)
     _check_cost_caps(
@@ -1185,7 +1203,7 @@ RESTORED_ON_RESUME = (
 )
 PATH_OPTIONS = {"questions_file", "system_prompt_file"}
 # Fixed by the run itself on --resume.
-NOT_IN_RESUME = {"target", "models_arg", "repeats", "runner", "resume"}
+NOT_IN_RESUME = {"target", "allow_prod", "models_arg", "repeats", "runner", "resume"}
 
 
 def _resume_command(ctx: click.Context, opts: dict, bench: Run) -> str:

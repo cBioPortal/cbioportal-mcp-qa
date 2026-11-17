@@ -123,7 +123,7 @@ def test_cli_passes_the_opt_in_from_the_flag_and_the_environment(monkeypatch):
         raise cli.click.ClickException("stop here")
 
     monkeypatch.setattr(cli, "_client", fake_client)
-    base = ["ask", "q?", "--runner", "claude-code", "--target", "prod"]
+    base = ["ask", "q?", "--runner", "claude-code", "--target", "prod", "--allow-prod"]
     CliRunner().invoke(cli.cli, base)
     CliRunner().invoke(cli.cli, [*base, "--claude-code-trust-org-policy"])
     CliRunner().invoke(cli.cli, base, env={"CLAUDE_CODE_TRUST_ORG_POLICY": "1"})

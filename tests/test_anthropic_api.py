@@ -329,7 +329,7 @@ def test_run_refuses_over_its_caps_before_any_model_call(args, monkeypatch, resu
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-real")
     out = CliRunner().invoke(
         cli_mod.cli,
-        ["run", "--runner", "api", "--target", "prod", "--questions-file", SUBSET, "--no-grade", *args],
+        ["run", "--runner", "api", "--target", "prod", "--allow-prod", "--questions-file", SUBSET, "--no-grade", *args],
     )
     assert out.exit_code == 2, out.output
     assert not list(results_dir.iterdir())
@@ -356,6 +356,7 @@ def test_api_run_records_only_the_prompts_hash(tmp_path, monkeypatch, results_di
             "api",
             "--target",
             "prod",
+            "--allow-prod",
             "--questions-file",
             SUBSET,
             "--questions",
