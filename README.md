@@ -110,7 +110,7 @@ uv run cbioportal-mcp-qa report 20260923-1800
 | `beta` | unified beta agent `agent_OHVSJI9Gd6gwsDnFSL-Xl` | `haiku`, `sonnet` | with the `cBioPortalChatBeta` / `cBioPortalChatBetaSonnet` spec |
 | `beta-router` | handoff router `agent_cbiobeta_router` | `router` | no spec: the router and its specialists run their own models |
 | `beta-unified` | unified beta agent | `unified` | no spec: the agent's own model |
-| `prod` | prod agent `agent_9ZXhcwLIsROBQX0u4JS5F` | `haiku`, `sonnet` | with the prod specs |
+| `prod` | prod agent `agent_9ZXhcwLIsROBQX0u4JS5F` | `haiku`, `sonnet` | with the prod specs; needs `--allow-prod` (the traffic counts in prod usage numbers) |
 
 Once beta's `cBioPortalChatBeta` spec points at the router, `--target beta` returns 400 (the spec no longer
 selects a model for the unified agent) and `beta-unified` is the single-agent baseline. `router` and `unified`
@@ -466,8 +466,8 @@ the Bedrock-graded 09-23 run (20260923-1919) or any other Bedrock-graded run; re
 That public endpoint is **prod's** database MCP (`cbioagent-clickhouse-mcp`, `cbioportal/mcp:latest`). Beta
 runs its own, `cbioagent-clickhouse-mcp-beta` (`cbioportal/mcp:beta` on beta's ClickHouse buffers; see
 knowledgesystems-k8s-deployment#658, which was still open at the time of writing), with no public endpoint.
-So with a `beta*` target and no `DATABASE_MCP_URL`, answers come from prod's MCP: the runner prints a
-warning and records `database_mcp_env: prod` in `run.json`. `--require-beta-mcp` makes that an error. To
+So with a `beta*` target and no `DATABASE_MCP_URL`, answers would come from prod's MCP: the runner fails by
+default; `--no-require-beta-mcp` downgrades it to a warning and records `database_mcp_env: prod` in `run.json`. To
 benchmark beta, point `DATABASE_MCP_URL` at beta's MCP:
 
 ```bash
