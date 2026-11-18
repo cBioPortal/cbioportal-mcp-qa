@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -466,3 +467,23 @@ def test_tool_log_for_the_judge(tmp_path):
     assert "SELECT 2" in log and '{"rows": 7}' in log
     assert "Guide text" not in log and "═ answer" not in log
     assert tool_log({"trace": {}}, tmp_path) == ""
+
+
+def test_results_and_test_sets_pages_share_nav_and_width(tmp_path, monkeypatch):
+    monkeypatch.setattr(report_mod, "RESULTS_DIR", tmp_path)
+    (tmp_path / "db-latency-20260101").mkdir()
+    (tmp_path / "db-latency-20260101" / "check.json").write_text(
+        json.dumps({"title": "t", "date": "2026-01-01", "kind": "DB latency check", "summary": "s"})
+    )
+    report_mod.write_index()
+    index = (tmp_path / "index.html").read_text()
+    sets = (tmp_path / "test-sets.html").read_text()
+
+    def links(html):
+        nav = html[html.index('<nav class="pages">') : html.index("</nav>")]
+        return re.findall(r"<(?:a|span)[^>]*>([^<]+)</", nav)
+
+    assert links(index) == links(sets) == ["Benchmark results", "Test sets", "Comparisons and checks"]
+    assert 'href="index.html#checks"' in sets and 'href="#checks"' in index
+    style = lambda html: re.search(r"main \{ max-width: [^;]+;", html).group(0)
+    assert style(index) == style(sets)
