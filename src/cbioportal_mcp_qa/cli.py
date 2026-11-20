@@ -863,7 +863,7 @@ def ask(
     default=None,
     help="Refuse to start (before any model call) when questions × models × repeats exceeds this. A cost cap.",
 )
-@click.option("--concurrency", type=int, default=2, show_default=True, help="Parallel requests to the agent.")
+@click.option("--concurrency", type=int, default=3, show_default=True, help="Parallel requests to the agent.")
 @click.option(
     "--resume",
     default=None,
@@ -874,7 +874,7 @@ def ask(
 @click.option("--no-grade", is_flag=True, help="Only collect answers and traces.")
 @judge_options
 @click.option(
-    "--judge-concurrency", type=int, default=1, show_default=True, help="Answers graded in parallel."
+    "--judge-concurrency", type=int, default=6, show_default=True, help="Answers graded in parallel."
 )
 @click.option(
     "--render/--no-render",
