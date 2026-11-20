@@ -36,6 +36,8 @@ Decide whether the ANSWER passes. It passes when it meets this criterion for a {
 {criterion}
 It must also satisfy every "must" / "must not" requirement in the notes. Judge against the reference material, not your own knowledge of cBioPortal. Extra correct context is fine; do not penalize length.
 
+Clarifying questions: some questions are genuinely ambiguous or under-specified (an undefined term, a gene symbol that is a family shorthand, no study or cohort named, two plausible metrics). When the ambiguity is real and material, i.e. a reasonable reader would get different answers under different readings, an answer that asks a targeted clarifying question naming the actual ambiguity passes, and it is better still when it also gives a provisional answer or link under a stated assumption. When the notes spell out a required answer, follow the notes instead. A clarifying question does not pass when the question was already specific enough to answer, when it asks for information the assistant could have looked up with its tools, or when it is a generic "can you be more specific?".
+
 Also report `declined`: true when the answer refuses or says the data isn't available instead of answering (whether or not that is the right call).
 
 Write the rationale first, then decide: `passed` must agree with it. Keep the rationale to 1-3 sentences.
