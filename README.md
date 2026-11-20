@@ -172,7 +172,7 @@ it is the maximum, so small samples err high.
 Output goes to `results/<run-id>/`: `run.json` (every answer, trace and grade), `report.html`, and
 `summary.json`, plus `results/index.html` listing all runs. Commit the run directory to publish it.
 
-Keep `--concurrency` low (default 2, at most ~3): the beta pod is small and shared with real users. A full run
+Keep `--concurrency` low (default 3, at most ~3): the beta pod is small and shared with real users. A full run
 (146 questions × Haiku + Sonnet) takes about 1.5 hours and ~35M LibreChat credits (~$35 at list prices).
 
 ## Cheap runs with Claude Code (`--runner claude-code`)
@@ -353,7 +353,7 @@ uv run cbioportal-mcp-qa grade <run-id> --judge-runner claude-code --claude-code
 
 (`--claude-code-trust-org-policy` is needed on a Team/Enterprise login, e.g. an MSK claude.ai organization; a
 Pro or Max login doesn't need it.) `--concurrency N` grades N answers in parallel (default 1); `run` takes
-`--judge-concurrency`. `--judge-model` picks the judge for either runner: a model key (`sonnet-4.6`), a Bedrock
+`--judge-concurrency` (default 6, answers graded in parallel). `--judge-model` picks the judge for either runner: a model key (`sonnet-4.6`), a Bedrock
 id or a Claude Code id. By default the claude-code judge is the Bedrock judge's model (`JUDGE_MODEL`, Sonnet
 4.6) through Claude Code, i.e. `claude-sonnet-4-6`.
 
