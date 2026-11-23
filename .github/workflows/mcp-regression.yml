@@ -3,7 +3,8 @@
 # Builds the calling repo's PR as a Docker image, runs it next to the released image (the baseline)
 # against the same data, makes the fixed tool calls in mcp_tests/calls/<server>.yaml on both, and fails
 # on differences. Add the `mcp-behavior-change` label to a PR whose change is intended: the diffs are
-# still shown in the job summary but no longer fail the check.
+# still shown in the job summary but no longer fail the check. Candidate health, expected-tool
+# presence, and golden assertions are hard checks and cannot be waived.
 #
 # Called from cBioPortal/cbioportal-mcp and cBioPortal/cbioportal-navigator, e.g.
 #   jobs:
@@ -29,6 +30,18 @@ on:
         required: false
         type: string
         default: ""
+      http_path:
+        description: "HTTP endpoint path (also configures the mcp server)"
+        type: string
+        default: /mcp
+      librechat_headers:
+        description: "Send synthetic LibreChat identity headers"
+        type: boolean
+        default: false
+      fail_on_missing_secrets:
+        description: "Fail instead of skipping when ClickHouse secrets are unavailable"
+        type: boolean
+        default: false
     secrets:
       CLICKHOUSE_HOST:
         required: false
@@ -62,6 +75,8 @@ jobs:
         id: cfg
         shell: bash
         env:
+          HTTP_PATH: ${{ inputs.http_path }}
+          FAIL_ON_MISSING_SECRETS: ${{ inputs.fail_on_missing_secrets }}
           SERVER: ${{ inputs.server }}
           BASELINE_IMAGE: ${{ inputs.baseline-image }}
           CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
@@ -75,11 +90,19 @@ jobs:
           env_file="$RUNNER_TEMP/server.env"
           : > "$env_file"
           skip=false
+          path="$HTTP_PATH"
+          if [[ "$path" != /* || "$path" == *[$'\r\n']* ]]; then
+            echo "::error::http_path must be an absolute HTTP path without newlines"; exit 1
+          fi
           case "$SERVER" in
             mcp)
-              dockerfile=docker/Dockerfile; port=8000; path=/mcp
+              dockerfile=docker/Dockerfile; port=8000
               baseline="${BASELINE_IMAGE:-cbioportal/mcp:latest}"
-              if [ -z "$CLICKHOUSE_HOST" ]; then
+              if [ -z "$CLICKHOUSE_HOST" ] || [ -z "$CLICKHOUSE_USER" ] || [ -z "$CLICKHOUSE_PASSWORD" ] || [ -z "$CLICKHOUSE_DATABASE" ]; then
+                if [ "$FAIL_ON_MISSING_SECRETS" = "true" ]; then
+                  echo "::error::Missing required CLICKHOUSE_HOST/USER/PASSWORD/DATABASE secrets. Fork PRs cannot access secrets. A maintainer must push the branch to upstream and run its PR checks, or run the upstream workflow_dispatch for that branch."
+                  exit 1
+                fi
                 # The server refuses to start without a working read-only ClickHouse user, and PRs from forks
                 # don't receive secrets.
                 echo "::notice::No ClickHouse credentials available (e.g. a PR from a fork); skipping MCP regression tests."
@@ -97,10 +120,11 @@ jobs:
                 echo "CLICKHOUSE_MCP_SERVER_TRANSPORT=http"
                 echo "CLICKHOUSE_MCP_BIND_HOST=0.0.0.0"
                 echo "CLICKHOUSE_MCP_BIND_PORT=$port"
+                echo "CLICKHOUSE_MCP_HTTP_PATH=$path"
               } >> "$env_file"
               ;;
             navigator)
-              dockerfile=Dockerfile; port=8002; path=/mcp
+              dockerfile=Dockerfile; port=8002
               baseline="${BASELINE_IMAGE:-ghcr.io/cbioportal/cbioportal-navigator:latest}"
               {
                 echo "MCP_TRANSPORT=http"
@@ -130,6 +154,8 @@ jobs:
       - name: Start candidate and baseline
         if: steps.cfg.outputs.skip != 'true'
         shell: bash
+        env:
+          HTTP_PATH: ${{ inputs.http_path }}
         run: |
           set -euo pipefail
           docker pull -q "${{ steps.cfg.outputs.baseline }}"
@@ -137,7 +163,7 @@ jobs:
           docker run -d --name baseline --env-file "${{ steps.cfg.outputs.env_file }}" -p 8002:${{ steps.cfg.outputs.port }} "${{ steps.cfg.outputs.baseline }}"
           for host_port in 8001 8002; do
             for _ in $(seq 60); do
-              code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${host_port}${{ steps.cfg.outputs.path }}" || true)
+              code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${host_port}$HTTP_PATH" || true)
               [ "$code" != "000" ] && break
               sleep 2
             done
@@ -153,14 +179,17 @@ jobs:
         shell: bash
         env:
           ALLOW: ${{ steps.cfg.outputs.allow }}
+          LIBRECHAT_HEADERS: ${{ inputs.librechat_headers }}
+          HTTP_PATH: ${{ inputs.http_path }}
         run: |
           args=(--server "${{ inputs.server }}"
-                --url "http://localhost:8001${{ steps.cfg.outputs.path }}"
-                --baseline-url "http://localhost:8002${{ steps.cfg.outputs.path }}")
+                --url "http://localhost:8001$HTTP_PATH"
+                --baseline-url "http://localhost:8002$HTTP_PATH")
+          [ "$LIBRECHAT_HEADERS" = "true" ] && args+=(--librechat-headers)
           [ -n "$ALLOW" ] && args+=("$ALLOW")
           # Pinned: the newest interpreter on the runner (3.15) has no wheels for locked
           # dependencies (jiter) and fails to build them from source.
-          uv run --python 3.13 --group mcp-tests pytest mcp_tests -v -p no:cacheprovider "${args[@]}"
+          uv run --frozen --python 3.13 --group mcp-tests pytest mcp_tests -v -p no:cacheprovider "${args[@]}"
 
       - name: Server logs
         if: failure() && steps.cfg.outputs.skip != 'true'
