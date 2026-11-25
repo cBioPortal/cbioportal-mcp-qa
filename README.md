@@ -173,7 +173,7 @@ Output goes to `results/<run-id>/`: `run.json` (every answer, trace and grade), 
 `summary.json`, plus `results/index.html` listing all runs. Commit the run directory to publish it.
 
 Keep `--concurrency` low (default 3, at most ~3): the beta pod is small and shared with real users. A full run
-(162 questions × Haiku + Sonnet) takes about 1.5 hours and ~35M LibreChat credits (~$35 at list prices).
+(161 questions × Haiku + Sonnet) takes about 1.5 hours and ~35M LibreChat credits (~$35 at list prices).
 
 ## Cheap runs with Claude Code (`--runner claude-code`)
 
@@ -667,7 +667,7 @@ expected to be technical and are exempt from the "exposes internals" check.
 
 `input/questions-multiturn.yaml` is a separate set of follow-up questions modeled on real conversations in
 Langfuse (paraphrased; `trace_id` names the conversation it's based on). Its pass rates are kept apart from
-the main 162 questions so those stay comparable across runs:
+the main 161 questions so those stay comparable across runs:
 
 ```bash
 uv run cbioportal-mcp-qa run --questions-file input/questions-multiturn.yaml
