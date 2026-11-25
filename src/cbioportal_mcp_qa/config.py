@@ -15,6 +15,9 @@ class Price:
     output: float
     cache_write: float
     cache_read: float
+    # A single request whose prompt exceeds this many tokens is billed at `long_prompt_multiplier` times the rates.
+    long_prompt_tokens: int | None = None
+    long_prompt_multiplier: float = 1.0
 
     def cost(self, uncached: int, output: int, cache_write: int, cache_read: int) -> float:
         return (
@@ -23,6 +26,15 @@ class Price:
             + cache_write * self.cache_write
             + cache_read * self.cache_read
         ) / 1_000_000
+
+    def call_cost(self, uncached: int, output: int, cache_write: int, cache_read: int) -> float:
+        """Cost of one LLM request, with the long-prompt rate when its prompt is over the threshold. Sums over several
+        requests (an answer's totals) don't have a prompt size, so they use `cost`."""
+        cost = self.cost(uncached, output, cache_write, cache_read)
+        prompt = uncached + cache_write + cache_read
+        if self.long_prompt_tokens is not None and prompt > self.long_prompt_tokens:
+            return cost * self.long_prompt_multiplier
+        return cost
 
 
 @dataclass(frozen=True)
@@ -60,12 +72,12 @@ MODELS = {
         "claude-sonnet-5",
         effort_levels=("low", "medium", "high", "xhigh", "max"),
     ),
-    # Claude Code runner only (no Bedrock id configured); Claude API list price, same as Sonnet 5.
+    # Claude Code runner only (no Bedrock id configured); Claude API list price: Sonnet 5's, with cheaper cache reads.
     "sonnet-5.5": Model(
         "sonnet-5.5",
         "Sonnet 5.5",
         None,
-        Price(2.0, 10.0, 2.5, 0.20),
+        Price(2.0, 10.0, 2.5, 0.10),
         "claude-sonnet-5-5",
         effort_levels=("low", "medium", "high", "xhigh", "max"),
     ),
@@ -74,7 +86,7 @@ MODELS = {
         "haiku-5.5",
         "Haiku 5.5",
         None,
-        Price(0.10, 0.50, 0.125, 0.01),
+        Price(0.10, 0.50, 0.125, 0.01, long_prompt_tokens=100_000, long_prompt_multiplier=5.0),
         "claude-haiku-5-5",
         effort_levels=("low", "medium", "high", "xhigh", "max"),
     ),
@@ -106,7 +118,10 @@ def price_for(model_id: str | None) -> Price | None:
     if model_id in PRICES_BY_BEDROCK_ID:
         return PRICES_BY_BEDROCK_ID[model_id]
     family = _model_family(model_id)
-    return next((p for bid, p in PRICES_BY_BEDROCK_ID.items() if _model_family(bid) == family), None)
+    if price := next((p for bid, p in PRICES_BY_BEDROCK_ID.items() if _model_family(bid) == family), None):
+        return price
+    # Models without a Bedrock id here (Sonnet 5.5, Haiku 5.5) are priced by their Claude model name.
+    return next((m.price for m in MODELS.values() if m.price and m.claude_code_id == family), None)
 
 
 @dataclass(frozen=True)
