@@ -74,6 +74,10 @@ class TraceStats:
         return asdict(self)
 
 
+# The root observation of an agent run: `AgentRun` in older LibreChat tracing, `AgentGraph` since the OTel export.
+AGENT_RUN_NAMES = ("AgentRun", "AgentGraph")
+
+
 def short_tool_name(name: str) -> str:
     for suffix in ("_mcp_cbioportal-navigator", "_mcp_cbioportal-database", "_mcp_cbioportal-navigator-beta"):
         name = name.removesuffix(suffix)
@@ -99,29 +103,35 @@ class Langfuse:
             time.sleep(float(retry_after) if retry_after.isdigit() else min(2 ** (attempt + 1), 60))
         raise AssertionError("unreachable")
 
-    def _pages(self, path: str, **params):
-        page = 1
+    def _observations(self, **params):
+        """Observations from the v2 API (cursor-paged; `input`/`output` come back as JSON strings)."""
+        cursor = None
         while True:
-            data = self._get(path, page=page, limit=100, **params)
-            yield from data["data"]
-            if page >= data["meta"]["totalPages"] or not data["data"]:
+            extra = {"cursor": cursor} if cursor else {}
+            data = self._get("/v2/observations", limit=1000, **params, **extra)
+            for obs in data["data"]:
+                for key in ("input", "output"):
+                    obs[key] = _loads(obs.get(key))
+                yield obs
+            cursor = (data.get("meta") or {}).get("cursor")
+            if not cursor or not data["data"]:
                 return
-            page += 1
 
     def trace_ids_by_message(self, start: float, end: float) -> dict[str, str]:
         """Map messageId -> trace id for agent runs in a time window."""
         window_start = datetime.fromtimestamp(start, UTC) - timedelta(minutes=2)
         window_end = datetime.fromtimestamp(end, UTC) + timedelta(minutes=10)
         found: dict[str, str] = {}
-        for trace in self._pages(
-            "/traces",
-            name="AgentRun",
-            fromTimestamp=window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            toTimestamp=window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        ):
-            message_id = (trace.get("metadata") or {}).get("messageId")
-            if message_id:
-                found[message_id] = trace["id"]
+        for name in AGENT_RUN_NAMES:
+            for obs in self._observations(
+                name=name,
+                fields="core,basic,metadata",
+                fromStartTime=window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                toStartTime=window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ):
+                message_id = (obs.get("metadata") or {}).get("messageId")
+                if message_id:
+                    found.setdefault(message_id, obs["traceId"])
         return found
 
     def project_id(self) -> str:
@@ -133,7 +143,7 @@ class Langfuse:
         return trace_stats(
             trace_id,
             f"{self.host}/project/{self.project_id()}/traces/{trace_id}",
-            self._pages("/observations", traceId=trace_id),
+            self._observations(traceId=trace_id, fields="core,basic,io,usage,model,metadata"),
         )
 
 
@@ -146,8 +156,8 @@ def trace_stats(trace_id: str, url: str, observations) -> TraceStats:
     for obs in sorted(observations, key=lambda o: o.get("startTime") or ""):
         if obs["type"] == "GENERATION":
             stats.generations.append(generation(obs))
-        elif obs["type"] == "TOOL" and obs.get("name") == "tool_batch":
-            calls = _tool_calls(obs)
+        elif obs.get("name") in ("tool_batch", "tool-dispatch") and obs["type"] in ("TOOL", "CHAIN"):
+            calls = _dispatch_calls(obs) if obs.get("name") == "tool-dispatch" else _tool_calls(obs)
             transfers = [c for c in calls if c.name.startswith(TRANSFER_PREFIX)]
             results += transfers
             stats.tool_calls.extend(c for c in calls if not c.name.startswith(TRANSFER_PREFIX))
@@ -252,6 +262,51 @@ def _output_tool_calls(output) -> list[str]:
     msg = output.get("kwargs") or output
     calls = msg.get("tool_calls") or []
     return [c.get("name") for c in calls if isinstance(c, dict) and c.get("name")]
+
+
+def _loads(value):
+    """A v2 observation's `input` / `output`: a JSON string, or already decoded."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _looks_failed(text: str) -> bool:
+    head = text.lstrip()[:200].lower()
+    if head.startswith(("error", "tool error", "mcp error")):
+        return True
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and bool(parsed.get("error") or parsed.get("isError"))
+
+
+def _dispatch_calls(obs: dict) -> list[ToolCall]:
+    """Tool calls of one `tool-dispatch` step: `input` lists {name, args}; `output.messages` holds the results in the
+    same order."""
+    requested = obs.get("input") if isinstance(obs.get("input"), list) else []
+    messages = (obs.get("output") or {}).get("messages") if isinstance(obs.get("output"), dict) else []
+    calls = []
+    for i, msg in enumerate(messages or []):
+        req = requested[i] if i < len(requested) and isinstance(requested[i], dict) else {}
+        content = msg.get("content")
+        text = redact(content if isinstance(content, str) else json.dumps(content))
+        failed = (msg.get("status") == "error") or _looks_failed(text)
+        args = req.get("args")
+        calls.append(
+            ToolCall(
+                short_tool_name(req.get("name") or msg.get("name") or "?"),
+                not failed,
+                text[:500] if failed else None,
+                excerpt(redact(json.dumps(args, ensure_ascii=False))) if args is not None else None,
+                excerpt(text),
+            )
+        )
+    return calls
 
 
 def _tool_calls(obs: dict) -> list[ToolCall]:
