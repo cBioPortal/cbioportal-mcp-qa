@@ -148,6 +148,15 @@ TARGETS = {
         "cbioagent-librechat-beta",
         "cbioagent-clickhouse-mcp-beta",
     ),
+    # The 5.5 pickers on beta, selected by modelSpec like the Haiku 4.5 and Sonnet 5 pair above.
+    "beta-5.5": Target(
+        "beta-5.5",
+        "https://beta.chat.cbioportal.org",
+        "agent_OHVSJI9Gd6gwsDnFSL-Xl",
+        {"haiku-5.5": "cBioPortalChatBetaHaiku55", "sonnet-5.5": "cBioPortalChatBetaSonnet55"},
+        "cbioagent-librechat-beta",
+        "cbioagent-clickhouse-mcp-beta",
+    ),
     # Once cBioPortalChatBeta points at the handoff router (knowledgesystems-k8s-deployment#655), the specs above
     # no longer select a model for the unified agent (400 invalid_spec). These ask an agent directly, no spec.
     "beta-router": Target(
