@@ -239,7 +239,7 @@ def generation(obs: dict) -> Generation:
     )
     inp, out, read, write = usage_split(obs)
     price = price_for(obs.get("model"))
-    cost = price.cost(inp or 0, out or 0, write or 0, read or 0) if price and inp is not None else None
+    cost = price.call_cost(inp or 0, out or 0, write or 0, read or 0) if price and inp is not None else None
     return Generation(
         model=obs.get("model"),
         agent=agent,
