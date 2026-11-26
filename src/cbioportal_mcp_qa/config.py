@@ -72,20 +72,20 @@ MODELS = {
         "claude-sonnet-5",
         effort_levels=("low", "medium", "high", "xhigh", "max"),
     ),
-    # Claude Code runner only (no Bedrock id configured); Claude API list price: Sonnet 5's, with cheaper cache reads.
+    # Claude API list price: Sonnet 5's, with cheaper cache reads.
     "sonnet-5.5": Model(
         "sonnet-5.5",
         "Sonnet 5.5",
-        None,
+        "us.anthropic.claude-sonnet-5-5",
         Price(2.0, 10.0, 2.5, 0.10),
         "claude-sonnet-5-5",
         effort_levels=("low", "medium", "high", "xhigh", "max"),
     ),
-    # Claude Code runner only; Claude API list price for prompts up to 100k tokens (longer prompts cost 5x).
+    # Claude API list price for prompts up to 100k tokens (longer prompts cost 5x).
     "haiku-5.5": Model(
         "haiku-5.5",
         "Haiku 5.5",
-        None,
+        "us.anthropic.claude-haiku-5-5",
         Price(0.10, 0.50, 0.125, 0.01, long_prompt_tokens=100_000, long_prompt_multiplier=5.0),
         "claude-haiku-5-5",
         effort_levels=("low", "medium", "high", "xhigh", "max"),
@@ -215,7 +215,7 @@ def load_settings() -> Settings:
         langfuse_host=os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com"),
         langfuse_public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
         langfuse_secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
-        judge_model=os.environ.get("JUDGE_MODEL", MODELS["sonnet-4.6"].bedrock_id),
+        judge_model=os.environ.get("JUDGE_MODEL", MODELS["sonnet-5.5"].bedrock_id),
         aws_region=os.environ.get("AWS_REGION", "us-east-1"),
         aws_profile=os.environ.get("AWS_PROFILE") or None,
         chromium_path=os.environ.get("CHROMIUM_PATH") or None,

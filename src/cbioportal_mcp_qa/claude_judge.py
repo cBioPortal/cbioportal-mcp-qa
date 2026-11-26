@@ -48,8 +48,8 @@ ATTEMPTS = 2  # an invalid verdict is retried once, then the answer stays ungrad
 
 
 def claude_code_model(model: str) -> str:
-    """A Claude Code model id from a model key (`sonnet-4.6`), a Bedrock id (`us.anthropic.claude-sonnet-4-6`)
-    or a Claude Code id (`claude-sonnet-4-6`): by default the same model as the Bedrock judge."""
+    """A Claude Code model id from a model key (`sonnet-5.5`), a Bedrock id (`us.anthropic.claude-sonnet-5-5`)
+    or a Claude Code id (`claude-sonnet-5-5`): by default the same model as the Bedrock judge."""
     if model in MODELS:
         known = MODELS[model]
         if known.claude_code_id:

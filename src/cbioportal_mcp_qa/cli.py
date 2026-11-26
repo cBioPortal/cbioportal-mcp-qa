@@ -230,8 +230,8 @@ def judge_options(f):
     f = click.option(
         "--judge-model",
         default=None,
-        help="Judge model: a model key (sonnet-4.6), Bedrock id or Claude Code id. Default: JUDGE_MODEL "
-        "(Sonnet 4.6 on Bedrock), or the same model through Claude Code.",
+        help="Judge model: a model key (sonnet-5.5), Bedrock id or Claude Code id. Default: JUDGE_MODEL "
+        "(Sonnet 5.5 on Bedrock), or the same model through Claude Code.",
     )(f)
     f = click.option(
         "--judge-runner",
@@ -242,7 +242,7 @@ def judge_options(f):
         "`claude -p` on the Claude subscription, no tools; grades are recorded as claude-code:<model>, can't be "
         "at temperature 0, and aren't comparable with Bedrock grades. Takes the --claude-code-trust-org-policy "
         "and --claude-code-allow-api-billing options; user settings are never loaded. api: the Anthropic SDK on "
-        "the Claude API or Bedrock (see --provider), temperature 0; default judge sonnet-4.6.",
+        "the Claude API or Bedrock (see --provider), default judge sonnet-5.5.",
     )(f)
     f = click.option(
         "--judge-allow-managed-customizations",
