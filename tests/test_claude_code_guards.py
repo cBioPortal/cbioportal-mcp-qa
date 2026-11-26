@@ -437,8 +437,8 @@ def test_the_connector_probe_carries_the_request_body_too(monkeypatch):
     with tempfile.TemporaryDirectory() as workdir:
         probe_mcp_servers(ToolSetup({"navigator": "http://nav/mcp"}), workdir, {}, extra_body={"metadata": 1})
     settings = json.loads(seen[0][seen[0].index("--settings") + 1])
-    assert _extra_body(settings) == {"metadata": 1}
-    assert settings["env"]["MAX_THINKING_TOKENS"] == "0"
+    assert _extra_body(settings) == {"metadata": 1, "thinking": {"type": "disabled"}}
+    assert seen[0][seen[0].index("--model") + 1] == "claude-haiku-5-5"
 
 
 def test_run_start_warns_about_and_records_the_thinking_mode(capsys):

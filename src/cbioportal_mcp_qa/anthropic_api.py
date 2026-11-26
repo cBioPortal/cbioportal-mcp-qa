@@ -26,7 +26,7 @@ from .agent import AgentReply
 from .agent_prompt import prompt_fingerprint
 from .claude_code import HEADERS, NAVIGATOR_SERVER
 from .config import MODELS, _model_family
-from .grade import JUDGE_SCHEMA, BaseJudge
+from .grade import JUDGE_SCHEMA, BaseJudge, accepts_temperature
 from .mcp_http import AsyncMCPSession, MCPToolError
 from .openai_chat import (
     DATABASE_SERVER,
@@ -48,8 +48,8 @@ AWS_CREDENTIAL_VARS = (
     "AWS_CONTAINER_CREDENTIALS_FULL_URI",
     "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
 )
-DEFAULT_AGENT_MODEL = "haiku"  # Haiku 4.5: the model prod's default spec runs
-DEFAULT_JUDGE_MODEL = "sonnet-4.6"
+DEFAULT_AGENT_MODEL = "haiku-5.5"  # the model prod's default spec runs
+DEFAULT_JUDGE_MODEL = "sonnet-5.5"
 MAX_TOKENS = 8192
 SERVER_INSTRUCTIONS_DELIVERY = "api runner (appended to the system prompt, LibreChat order)"
 
@@ -317,9 +317,9 @@ class AnthropicAPIClient:
 
 
 class APIJudge(BaseJudge):
-    """The judge through the Anthropic SDK on either provider, at temperature 0, with structured output. Its grades
-    record the provider's model id (`claude-sonnet-4-6` on the Claude API, `us.anthropic.claude-sonnet-4-6` on
-    Bedrock), so `compare` keeps the two apart."""
+    """The judge through the Anthropic SDK on either provider, with structured output (at temperature 0 for the
+    models that accept it). Its grades record the provider's model id (`claude-sonnet-5-5` on the Claude API,
+    `us.anthropic.claude-sonnet-5-5` on Bedrock), so `compare` keeps the two apart."""
 
     def __init__(self, model: str, provider: str, aws_region: str = "us-east-1", client=None):
         self.provider = provider
@@ -330,7 +330,7 @@ class APIJudge(BaseJudge):
         response = self.client.messages.create(
             model=self.model,
             max_tokens=1024,
-            extra_body={"temperature": 0},
+            **({"extra_body": {"temperature": 0}} if accepts_temperature(self.model) else {}),
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
         )

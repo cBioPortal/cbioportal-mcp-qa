@@ -16,8 +16,7 @@ For every question × model (× repeat):
   (input, cache read, cache write, output) → estimated cost at Anthropic list prices.
 - **Execution trace** from Langfuse, matched by response id: number of LLM calls, every tool call, and
   tool errors (e.g. navigator schema errors).
-- **Grade**, pass/fail: an LLM judge (default Sonnet 4.6 on Bedrock, deliberately not one of the models under
-  test; or through the local Claude Code subscription with `--judge-runner claude-code`) checks the answer against the reference answer, expected links and the `notes` rubric, using the
+- **Grade**, pass/fail: an LLM judge (default Sonnet 5.5 on Bedrock; or through the local Claude Code subscription with `--judge-runner claude-code`) checks the answer against the reference answer, expected links and the `notes` rubric, using the
   criterion for the question's track (below). It also records whether the answer *declined*, so the report
   can separate precision (right when it answers) from coverage (how often it answers). The judge also sees the
   answer's tool calls (inputs and truncated results; guide text left out), so statistics the agent actually
@@ -394,9 +393,14 @@ uv run cbioportal-mcp-qa grade <run-id> --judge-runner claude-code --claude-code
 
 (`--claude-code-trust-org-policy` is needed on a Team/Enterprise login, e.g. an MSK claude.ai organization; a
 Pro or Max login doesn't need it.) `--concurrency N` grades N answers in parallel (default 1); `run` takes
-`--judge-concurrency` (default 6, answers graded in parallel). `--judge-model` picks the judge for either runner: a model key (`sonnet-4.6`), a Bedrock
+`--judge-concurrency` (default 6, answers graded in parallel). `--judge-model` picks the judge for either runner: a model key (`sonnet-5.5`), a Bedrock
 id or a Claude Code id. By default the claude-code judge is the Bedrock judge's model (`JUDGE_MODEL`, Sonnet
-4.6) through Claude Code, i.e. `claude-sonnet-4-6`.
+5.5) through Claude Code, i.e. `claude-sonnet-5-5`.
+
+The Bedrock judge sets temperature 0 only for models that accept it (Sonnet 4.5/4.6, Haiku 4.5); Sonnet 5.5 rejects
+`temperature`, so its grades can flip on a borderline answer when regraded. Grades from the earlier Sonnet 4.6 judge
+aren't comparable with Sonnet 5.5 grades (on 100 real conversations the two agreed on 64 verdicts): regrade the older run
+with the same judge before comparing (`grade <run> --regrade`).
 
 - **Same prompt and grade.** Each answer goes to `claude -p` with the Bedrock judge's prompt and rubric on
   stdin, the same JSON schema as structured output (`--json-schema`), and produces the same grade fields.
@@ -569,7 +573,7 @@ no LibreChat, kubectl, Claude Code or subscription, so it runs in CI. `--judge-r
 - **Models:** model keys resolve to each provider's id. The agent defaults to `haiku` (Haiku 4.5:
   `claude-haiku-4-5-20251001` / `us.anthropic.claude-haiku-4-5-20251001-v1:0`), the model prod's default spec
   runs, with thinking off as deployed; `haiku-5.5` is cheaper but Claude API only. The api judge defaults to
-  `sonnet-4.6` (`claude-sonnet-4-6` / `us.anthropic.claude-sonnet-4-6`) at temperature 0. Grades record the
+  `sonnet-5.5` (`claude-sonnet-5-5` / `us.anthropic.claude-sonnet-5-5`). Grades record the
   provider's id, so runs graded on different providers aren't compared.
 - **System prompt:** `--system-prompt-file` (optional: prod's agent instructions live in the cBioAgent MongoDB,
   not here), then each MCP server's served `instructions`, in LibreChat's `serverInstructions` order. Without

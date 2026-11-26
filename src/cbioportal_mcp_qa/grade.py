@@ -321,8 +321,16 @@ class BaseJudge:
         pass
 
 
+TEMPERATURE_MODELS = re.compile(r"claude-(sonnet-4-[56]|haiku-4-5)")
+
+
+def accepts_temperature(model: str) -> bool:
+    """Bedrock rejects `temperature` for the Claude 5 family and Opus 4.7 and later."""
+    return TEMPERATURE_MODELS.search(model) is not None
+
+
 class Judge(BaseJudge):
-    """The Bedrock judge, at temperature 0."""
+    """The Bedrock judge, at temperature 0 for the models that accept it."""
 
     def __init__(self, model: str, aws_region: str, aws_profile: str | None):
         self.model = model
@@ -332,7 +340,7 @@ class Judge(BaseJudge):
         response = self.client.messages.create(
             model=self.model,
             max_tokens=1024,
-            extra_body={"temperature": 0},
+            **({"extra_body": {"temperature": 0}} if accepts_temperature(self.model) else {}),
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
         )

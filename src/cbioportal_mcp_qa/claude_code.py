@@ -721,10 +721,10 @@ def probe_mcp_servers(
         "--output-format",
         "stream-json",
     ]
-    cmd += ["--verbose", "--no-session-persistence", "--model", MODELS["haiku"].claude_code_id]
+    cmd += ["--verbose", "--no-session-persistence", "--model", MODELS["haiku-5.5"].claude_code_id]
     cmd += [
         "--settings",
-        json.dumps(model_settings(settings or session_settings(), "haiku", extra_body)),
+        json.dumps(model_settings(settings or session_settings(), "haiku-5.5", extra_body)),
         *setting_sources_args(isolate_settings),
     ]
     # claude.ai connectors load only some of the time in headless mode, so retry until one shows up.

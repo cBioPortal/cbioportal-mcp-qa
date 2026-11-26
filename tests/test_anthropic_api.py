@@ -45,13 +45,15 @@ def test_model_ids_per_provider():
     assert model_id("haiku", "bedrock") == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     assert model_id("sonnet-4.6", "bedrock") == "us.anthropic.claude-sonnet-4-6"
     assert model_id("haiku-5.5", "anthropic") == "claude-haiku-5-5"
+    assert model_id("haiku-5.5", "bedrock") == "us.anthropic.claude-haiku-5-5"
+    assert model_id("sonnet-5.5", "bedrock") == "us.anthropic.claude-sonnet-5-5"
     with pytest.raises(ValueError, match="no bedrock model id"):
-        model_id("haiku-5.5", "bedrock")
+        model_id("router", "bedrock")
     assert model_id("claude-some-new-model", "anthropic") == "claude-some-new-model"
 
 
 def test_api_runner_models_default_to_haiku():
-    assert _models(None, "prod", "api") == ["haiku"]
+    assert _models(None, "prod", "api") == ["haiku-5.5"]
     assert _models("haiku-5.5,sonnet-4.6", "prod", "api") == ["haiku-5.5", "sonnet-4.6"]
     with pytest.raises(Exception, match="no model"):
         _models("llama3.1-8b", "prod", "api")
